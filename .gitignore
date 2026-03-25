@@ -1,0 +1,24 @@
+# Build artifacts
+/target
+debug/
+*.pdb
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.*
+
+# Local development docs (not for repo)
+/local/
+
+# Claude/AI
+.claude/
