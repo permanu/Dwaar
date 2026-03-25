@@ -1,0 +1,23 @@
+Dwaar
+Copyright (C) 2026 Permanu
+
+This product is built on the following open-source software:
+
+---
+
+Pingora
+Copyright (c) 2024 Cloudflare, Inc.
+Licensed under the Apache License, Version 2.0
+https://github.com/cloudflare/pingora
+
+---
+
+Tokio
+Copyright (c) 2023 Tokio Contributors
+Licensed under the MIT License
+https://github.com/tokio-rs/tokio
+
+---
+
+Additional third-party dependencies and their licenses can be found by running:
+  cargo license --manifest-path Cargo.toml
