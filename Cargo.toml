@@ -1,0 +1,166 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.86"
+license = "BSL-1.1"
+repository = "https://github.com/permanu/Dwaar"
+homepage = "https://dwaar.dev"
+authors = ["Permanu <hello@permanu.com>"]
+
+[workspace.dependencies]
+# Internal crates
+dwaar-core = { path = "crates/dwaar-core" }
+dwaar-config = { path = "crates/dwaar-config" }
+dwaar-tls = { path = "crates/dwaar-tls" }
+dwaar-analytics = { path = "crates/dwaar-analytics" }
+dwaar-plugins = { path = "crates/dwaar-plugins" }
+dwaar-admin = { path = "crates/dwaar-admin" }
+dwaar-docker = { path = "crates/dwaar-docker" }
+dwaar-geo = { path = "crates/dwaar-geo" }
+dwaar-log = { path = "crates/dwaar-log" }
+
+# Pingora
+pingora = { version = "0.8", features = ["proxy", "lb"] }
+pingora-core = { version = "0.8" }
+pingora-proxy = { version = "0.8" }
+pingora-http = { version = "0.8" }
+pingora-load-balancing = { version = "0.8" }
+pingora-limits = { version = "0.8" }
+pingora-timeout = { version = "0.8" }
+pingora-memory-cache = { version = "0.8" }
+pingora-error = { version = "0.8" }
+
+# Async runtime
+tokio = { version = "1", default-features = false }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1" }
+
+# Data structures
+arc-swap = "1"
+dashmap = "6"
+lru = "0.12"
+bytes = "1"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# HTTP types
+http = "1"
+
+# UUID
+uuid = { version = "1", features = ["v7"] }
+
+# Time
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+
+# Regex (bot detection)
+regex = "1"
+
+# File watching
+notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
+
+# GeoIP
+maxminddb = "0.24"
+
+# Analytics data structures
+hyperloglog = "1"
+
+# Crypto (visitor cookies)
+aes-gcm = "0.10"
+rand = "0.8"
+base64 = "0.22"
+
+# Compression
+flate2 = "1"
+brotli = "7"
+
+# Testing
+tokio-test = "0.4"
+tempfile = "3"
+assert_cmd = "2"
+predicates = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+unreachable_pub = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+# Enable pedantic but allow common exceptions
+pedantic = { level = "warn", priority = -2 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+
+# Hard denials — these are bugs
+print_stdout = "warn"
+print_stderr = "warn"
+dbg_macro = "warn"
+todo = "warn"
+get_unwrap = "deny"
+exit = "deny"
+unwrap_used = "warn"
+expect_used = "allow"
+redundant_clone = "warn"
+rc_buffer = "warn"
+rc_mutex = "warn"
+large_futures = "warn"
+
+# Build profiles
+[profile.dev]
+opt-level = 0
+debug = 1              # line tables only (faster compile than full debug)
+incremental = true
+codegen-units = 256    # maximum parallelism for dev builds
+
+[profile.release]
+opt-level = 3
+lto = "thin"           # good balance of speed vs compile time
+codegen-units = 1      # maximum optimization
+strip = "symbols"      # smaller binary
+panic = "abort"        # smaller binary, no unwinding overhead
+
+# Hot-path crates get maximum optimization even in dev
+[profile.dev.package.pingora]
+opt-level = 2
+[profile.dev.package.pingora-core]
+opt-level = 2
+[profile.dev.package.pingora-proxy]
+opt-level = 2
+[profile.dev.package.tokio]
+opt-level = 2
+[profile.dev.package.bytes]
+opt-level = 2
+
+# Profiling profile — release speed with debug info
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = "full"
+lto = false
+
+# Benchmark profile
+[profile.bench]
+inherits = "release"
+debug = true
+lto = "thin"

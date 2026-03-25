@@ -1,0 +1,18 @@
+[alias]
+# Developer shortcuts
+dev = "run --package dwaar-cli"
+ck = "clippy --workspace --all-targets -- -D warnings"
+ta = "test --workspace"
+nextest = "nextest run --workspace"
+fmt-check = "fmt --all --check"
+deny = "deny check --workspace"
+udeps = "udeps --workspace"
+
+# Quick build check (no tests, no docs)
+chk = "check --workspace --all-targets"
+
+[build]
+# Removed jobs config — cargo auto-detects core count
+
+[target.'cfg(target_os = "macos")']
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]

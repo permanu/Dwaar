@@ -1,0 +1,32 @@
+[package]
+name = "dwaar-core"
+version = "0.1.0"
+description = "Core proxy engine — ProxyHttp implementation, route table, request context"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+pingora = { workspace = true }
+pingora-core = { workspace = true }
+pingora-proxy = { workspace = true }
+pingora-http = { workspace = true }
+pingora-load-balancing = { workspace = true }
+pingora-error = { workspace = true }
+dwaar-plugins = { workspace = true }
+dwaar-log = { workspace = true }
+arc-swap = { workspace = true }
+bytes = { workspace = true }
+http = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+
+[lints]
+workspace = true

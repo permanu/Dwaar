@@ -1,0 +1,39 @@
+[package]
+name = "dwaar-cli"
+version = "0.1.0"
+description = "Dwaar CLI — binary entry point, commands, process management"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "dwaar"
+path = "src/main.rs"
+
+[dependencies]
+dwaar-core = { workspace = true }
+dwaar-config = { workspace = true }
+dwaar-tls = { workspace = true }
+dwaar-analytics = { workspace = true }
+dwaar-plugins = { workspace = true }
+dwaar-admin = { workspace = true }
+dwaar-docker = { workspace = true }
+dwaar-geo = { workspace = true }
+dwaar-log = { workspace = true }
+pingora = { workspace = true }
+pingora-core = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
