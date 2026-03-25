@@ -4,7 +4,7 @@ members = ["crates/*"]
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.86"
+rust-version = "1.94"
 license-file = "LICENSE"
 repository = "https://github.com/permanu/Dwaar"
 homepage = "https://dwaar.dev"
@@ -95,6 +95,7 @@ predicates = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+libc = "0.2"
 
 [workspace.lints.rust]
 unsafe_code = "warn"

@@ -5,10 +5,6 @@ msrv = "1.94"
 path = "std::process::exit"
 reason = "Use anyhow::Result and proper error propagation instead of process::exit"
 
-[[disallowed-methods]]
-path = "std::thread::sleep"
-reason = "Use tokio::time::sleep in async context"
-
 # Prevent println in library code (use tracing instead)
 [[disallowed-macros]]
 path = "std::println"

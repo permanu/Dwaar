@@ -814,6 +814,7 @@ dependencies = [
  "dwaar-log",
  "dwaar-plugins",
  "dwaar-tls",
+ "libc",
  "pingora",
  "pingora-core",
  "predicates",
