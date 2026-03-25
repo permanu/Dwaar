@@ -2,13 +2,12 @@
 # https://embarkstudios.github.io/cargo-deny/
 
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
-yanked = "warn"
-notice = "warn"
+# Check all crates (workspace + transitive dependencies)
+version = 2
+ignore = []
 
 [licenses]
-unlicensed = "deny"
+version = 2
 allow = [
     "MIT",
     "Apache-2.0",
@@ -20,8 +19,8 @@ allow = [
     "Unicode-DFS-2016",
     "OpenSSL",
     "Zlib",
+    "BSL-1.0",
 ]
-copyleft = "deny"
 exceptions = []
 
 [bans]
@@ -33,8 +32,6 @@ highlight = "all"
 deny = [
     # Use pingora's HTTP client, not reqwest
     { name = "reqwest", wrappers = [] },
-    # Use pingora's TLS, not direct openssl
-    # { name = "openssl", wrappers = ["pingora-openssl"] },
 ]
 
 [sources]
