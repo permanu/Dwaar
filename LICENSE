@@ -1,0 +1,248 @@
+DWAAR BUSINESS SOURCE LICENSE AGREEMENT
+
+Business Source License 1.1
+
+Parameters
+
+Licensor:             Permanu
+Licensed Work:        Dwaar 0.1.0
+                      The Licensed Work is
+                      (c) 2026 Permanu
+
+Additional Use Grant: You may use, copy, modify, create derivative works of,
+                      and deploy the Licensed Work in production, provided
+                      that you do not engage in Restricted Platform Use.
+
+                      "Restricted Platform Use" means using the Licensed Work
+                      to provide to third parties (other than your own
+                      employees, contractors, and affiliates acting solely on
+                      your behalf) any hosted, managed, embedded, white-labeled,
+                      or resold service or platform feature where the Licensed
+                      Work is used to provide proxying, routing, load balancing,
+                      TLS termination, traffic management, CDN functionality,
+                      request logging, web analytics, bot detection, or similar
+                      infrastructure functionality for such third parties'
+                      applications, domains, workloads, or network traffic.
+
+                      For clarity, the following are permitted without a
+                      commercial license:
+
+                      (a) Self-hosting: running the Licensed Work for your own
+                          applications, websites, APIs, or internal services.
+                      (b) Internal business use: using the Licensed Work as
+                          part of your own infrastructure, even at scale.
+                      (c) Operating your own SaaS, APIs, or websites where
+                          the Licensed Work serves only as internal
+                          infrastructure and is not itself offered as a
+                          platform, managed service, or infrastructure feature
+                          to customers.
+                      (d) Consulting and integration: installing, configuring,
+                          or operating the Licensed Work for a specific
+                          customer's own internal use, provided you do not
+                          offer a reusable multi-tenant platform based on the
+                          Licensed Work.
+                      (e) Redistribution: packaging, mirroring, or
+                          redistributing unmodified or modified copies of the
+                          Licensed Work (including by Linux distributions,
+                          container registries, and package managers), provided
+                          the redistribution does not itself constitute
+                          Restricted Platform Use.
+                      (f) Academic, research, and educational use.
+
+                      A commercial license is required for Restricted Platform
+                      Use, including but not limited to:
+
+                      - Proxy-as-a-service, CDN-as-a-service, load-balancing-
+                        as-a-service, edge-platform, or similar offerings.
+                      - PaaS, hosting, cloud, ingress, gateway, or
+                        infrastructure platforms that allow customers to
+                        onboard domains, applications, upstreams, containers,
+                        services, or traffic flows that are routed, proxied,
+                        analyzed, or managed by the Licensed Work.
+                      - Managed web analytics, request logging, bot protection,
+                        or traffic intelligence services for third parties.
+                      - OEM, embedded, white-label, or reseller distribution
+                        of the Licensed Work as part of a commercial
+                        infrastructure or platform product.
+
+Change Date:          2036-03-25 (for Dwaar 0.1.0)
+
+                      Each subsequent version of the Licensed Work
+                      released by Licensor will specify its own
+                      Change Date. If a version does not specify a
+                      Change Date, the Change Date for that version
+                      is the tenth anniversary of its first publicly
+                      available distribution under this License.
+
+Change License:       GNU Affero General Public License v3.0
+
+For information about alternative licensing arrangements for the Software,
+please visit: https://dwaar.dev
+
+Notice
+
+The Business Source License (this document, or the "License") is not an Open
+Source license. However, the Licensed Work will eventually be made available
+under an Open Source License, as stated in this License.
+
+License text copyright (c) 2017 MariaDB Corporation Ab, All Rights Reserved.
+"Business Source License" is a trademark of MariaDB Corporation Ab.
+
+-----------------------------------------------------------------------------
+
+Base License and Subdirectory Specific Licenses
+
+1. Repository-Wide License
+Except as provided in Section 2 below, the contents of this repository are
+licensed under the Business Source License ("BSL"), which includes a change
+date resulting in a licensing change to the GNU Affero General Public License
+v3.0 on that date. See the full BSL terms below and the AGPL at
+https://www.gnu.org/licenses/agpl-3.0.html.
+
+2. Subdirectory-Specific Licenses
+Certain subdirectories within this repository may be licensed under different
+terms.
+
+If a subdirectory contains its own LICENSE or LICENSE.txt file, the terms in
+that file apply exclusively to all files and subfolders within that
+subdirectory.
+
+In the event of any conflict between this base license and a subdirectory's
+license, the base license will govern for that subdirectory's contents.
+
+3. Contributor Acknowledgement
+By contributing to this repository, you agree that:
+
+Your contributions will be licensed under the license applicable to the
+directory or subdirectory in which your contribution is made.
+
+If you contribute to multiple subdirectories, the applicable license for each
+subdirectory will apply to your contributions in that subdirectory.
+
+4. Reading the Applicable License
+Before using, modifying, or distributing code from this repository, you must
+read:
+
+This base LICENSE file for the overall repository license.
+
+Any LICENSE or LICENSE.txt file in a subdirectory that you intend to use or
+contribute to.
+
+-----------------------------------------------------------------------------
+
+Business Source License 1.1
+
+Terms
+
+The Licensor hereby grants you the right to copy, modify, create derivative
+works, redistribute, and make non-production use of the Licensed Work. The
+Licensor may make an Additional Use Grant, above, permitting limited
+production use.
+
+Effective on the Change Date, or the fourth anniversary of the first publicly
+available distribution of a specific version of the Licensed Work under this
+License, whichever comes first, the Licensor hereby grants you rights under
+the terms of the Change License, and the rights granted in the paragraph
+above terminate.
+
+If your use of the Licensed Work does not comply with the requirements
+currently in effect as described in this License, you must purchase a
+commercial license from the Licensor, its affiliated entities, or authorized
+resellers, or you must refrain from using the Licensed Work.
+
+All copies of the original and modified Licensed Work, and derivative works
+of the Licensed Work, are subject to this License. This License applies
+separately for each version of the Licensed Work and the Change Date may vary
+for each version of the Licensed Work released by Licensor.
+
+You must conspicuously display this License on each original or modified copy
+of the Licensed Work. If you receive the Licensed Work in original or
+modified form from a third party, the terms and conditions set forth in this
+License apply to your use of that work.
+
+Any use of the Licensed Work in violation of this License will automatically
+terminate your rights under this License for the current and all other
+versions of the Licensed Work.
+
+This License does not grant you any right in any trademark or logo of
+Licensor or its affiliates (provided that you may use a trademark or logo of
+Licensor as expressly required by this License).
+
+TO THE EXTENT PERMITTED BY APPLICABLE LAW, THE LICENSED WORK IS PROVIDED ON
+AN "AS IS" BASIS. LICENSOR HEREBY DISCLAIMS ALL WARRANTIES AND CONDITIONS,
+EXPRESS OR IMPLIED, INCLUDING (WITHOUT LIMITATION) WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT, AND
+TITLE.
+
+MariaDB hereby grants you permission to use this License's text to license
+your works, and to refer to it using the trademark "Business Source License",
+as long as you comply with the Covenants of Licensor below.
+
+Covenants of Licensor
+
+In consideration of the right to use this License's text and the "Business
+Source License" name and trademark, Licensor covenants to MariaDB, and to all
+other recipients of the licensed work to be provided by Licensor:
+
+1. To specify as the Change License the GPL Version 2.0 or any later version,
+   or a license that is compatible with GPL Version 2.0 or a later version,
+   where "compatible" means that software provided under the Change License can
+   be included in a program with software provided under GPL Version 2.0 or a
+   later version. Licensor may specify additional Change Licenses without
+   limitation.
+
+2. To either: (a) specify an additional grant of rights to use that does not
+   impose any additional restriction on the right granted in this License, as
+   the Additional Use Grant; or (b) insert the text "None".
+
+3. To specify a Change Date.
+
+4. Not to modify this License in any other way.
+
+-----------------------------------------------------------------------------
+
+Copyright (C) 2026 Permanu
+
+Change License: GNU Affero General Public License v3.0
+Full text: https://www.gnu.org/licenses/agpl-3.0.html
+SPDX identifier: AGPL-3.0-only
+
+-----------------------------------------------------------------------------
+
+Trademark Notice
+
+"Dwaar" and "Permanu" are trademarks of Permanu. Nothing in this License
+grants permission to use these trademarks in any product name, service name,
+domain name, marketing material, or user-facing branding of any derivative
+work, fork, or service offering. You may use the trademarks solely to
+identify the origin of the Licensed Work (e.g., "based on Dwaar" or
+"derived from Dwaar") in source code notices and documentation, provided
+such use does not imply endorsement by or affiliation with Permanu.
+
+-----------------------------------------------------------------------------
+
+AGPL Supplementary Terms (GNU AGPL v3.0, Section 7)
+
+The following additional terms apply to all copies of the Licensed Work
+that become available under the GNU Affero General Public License v3.0
+upon the applicable Change Date. These terms are permitted additional
+restrictions under Section 7 of the AGPL:
+
+1. Trademark Restriction (Section 7(e)):
+   You may not use the trade names, trademarks, service marks, or product
+   names of Permanu (including "Dwaar" and "Permanu") to endorse, promote,
+   or name any modified version, derivative work, fork, or hosted service,
+   except as required for reasonable and customary attribution of origin
+   (e.g., "based on Dwaar" in a source notice or credits page).
+
+2. Indemnification (Section 7(f)):
+   If you modify the Licensed Work and propagate or convey it, or offer it
+   as a network service, you agree to indemnify Permanu against any
+   liability, damages, or costs arising from your modifications or your
+   operation of the modified work.
+
+3. Preservation of Legal Notices:
+   You must retain all copyright notices, trademark notices, and this
+   Supplementary Terms section in all copies and derivative works of the
+   Licensed Work, including when conveying modified versions or offering
+   the work as a network service.
