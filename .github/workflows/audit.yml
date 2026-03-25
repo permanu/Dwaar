@@ -20,7 +20,7 @@ jobs:
     name: Dependency Audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       # Use latest stable Rust for cargo-audit (not our pinned toolchain)
       # cargo-audit inspects Cargo.lock, doesn't compile our code
       - uses: dtolnay/rust-toolchain@stable
