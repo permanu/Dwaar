@@ -1,0 +1,22 @@
+[package]
+name = "dwaar-tls"
+version = "0.1.0"
+description = "TLS termination, ACME client (Let's Encrypt + ZeroSSL), certificate management"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+pingora-core = { workspace = true }
+lru = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["fs", "time"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

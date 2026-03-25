@@ -1,0 +1,21 @@
+# Dwaarfile — Dwaar configuration
+# https://dwaar.dev/docs/config
+
+# Simple reverse proxy with automatic HTTPS
+example.com {
+    proxy localhost:8080
+    analytics on
+}
+
+# API with rate limiting
+api.example.com {
+    proxy localhost:3000
+    rate_limit 100/s
+    analytics off
+}
+
+# Static site with compression
+blog.example.com {
+    proxy localhost:4000
+    analytics on
+}

@@ -1,0 +1,22 @@
+[package]
+name = "dwaar-admin"
+version = "0.1.0"
+description = "Admin API service — route management, health, metrics, config"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+dwaar-core = { workspace = true }
+pingora-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+arc-swap = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util"] }
+
+[lints]
+workspace = true

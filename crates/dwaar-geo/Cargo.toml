@@ -1,0 +1,20 @@
+[package]
+name = "dwaar-geo"
+version = "0.1.0"
+description = "GeoIP lookup — IP to country/city via MaxMind GeoLite2"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+maxminddb = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[lints]
+workspace = true

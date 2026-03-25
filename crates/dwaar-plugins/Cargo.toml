@@ -1,0 +1,25 @@
+[package]
+name = "dwaar-plugins"
+version = "0.1.0"
+description = "Plugin trait, plugin chain, built-in plugins (bot detection, rate limiting, compression, security headers)"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+pingora-http = { workspace = true }
+pingora-limits = { workspace = true }
+bytes = { workspace = true }
+regex = { workspace = true }
+flate2 = { workspace = true }
+brotli = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[lints]
+workspace = true
