@@ -1,0 +1,146 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: dwaar-linux-amd64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: dwaar-linux-arm64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            artifact: dwaar-darwin-amd64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact: dwaar-darwin-arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/dwaar dist/${{ matrix.artifact }}
+          chmod +x dist/${{ matrix.artifact }}
+          cd dist
+          sha256sum ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Verify license date matches tag
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          LICENSED_VERSION=$(grep "Licensed Work:" LICENSE | head -1 | awk '{print $NF}')
+          if [ "$TAG" != "$LICENSED_VERSION" ]; then
+            echo "ERROR: Tag v${TAG} does not match LICENSE version ${LICENSED_VERSION}"
+            echo "Run: ./scripts/bump-license-date.sh ${TAG}"
+            exit 1
+          fi
+          echo "License version matches tag: v${TAG}"
+
+      - name: Extract changelog for this version
+        id: changelog
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          # Extract section between this version and the next version header
+          NOTES=$(awk "/^## \[${TAG}\]/{flag=1;next}/^## \[/{flag=0}flag" CHANGELOG.md)
+          if [ -z "$NOTES" ]; then
+            NOTES="Release v${TAG}"
+          fi
+          echo "notes<<EOFNOTES" >> $GITHUB_OUTPUT
+          echo "$NOTES" >> $GITHUB_OUTPUT
+          echo "EOFNOTES" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body: ${{ steps.changelog.outputs.notes }}
+          files: artifacts/*
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  docker:
+    name: Docker Image
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dwaar-linux-amd64
+          path: dist/
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          chmod +x dist/dwaar-linux-amd64
+
+          cat > Dockerfile.release <<'DOCKERFILE'
+          FROM gcr.io/distroless/cc-debian12:nonroot
+          COPY dist/dwaar-linux-amd64 /usr/local/bin/dwaar
+          ENTRYPOINT ["dwaar"]
+          DOCKERFILE
+
+          docker build -f Dockerfile.release -t ghcr.io/permanu/dwaar:${TAG} -t ghcr.io/permanu/dwaar:latest .
+          docker push ghcr.io/permanu/dwaar:${TAG}
+          docker push ghcr.io/permanu/dwaar:latest
