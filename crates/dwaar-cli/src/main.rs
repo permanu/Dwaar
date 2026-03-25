@@ -15,11 +15,14 @@
 
 mod cli;
 
+use std::net::SocketAddr;
+
 use pingora_core::server::Server;
 use pingora_core::server::configuration::{Opt as PingoraOpt, ServerConf};
 use tracing::info;
 
 use cli::{Cli, Commands};
+use dwaar_core::proxy::DwaarProxy;
 
 fn main() {
     let cli = Cli::parse_args();
@@ -78,8 +81,26 @@ fn main() {
         "server bootstrapped"
     );
 
-    // Services will be registered here in later issues:
-    // ISSUE-005: proxy service (HTTP forwarding)
+    // ISSUE-005: Create and register the proxy service.
+    // Hardcoded upstream for now — ISSUE-010 replaces with RouteTable.
+    let upstream: SocketAddr = "127.0.0.1:8080"
+        .parse()
+        .expect("hardcoded upstream address must be valid");
+
+    let proxy = DwaarProxy::new(upstream);
+
+    let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, proxy);
+    proxy_service.add_tcp("0.0.0.0:6188");
+
+    info!(
+        listen = "0.0.0.0:6188",
+        upstream = %upstream,
+        "proxy service registered"
+    );
+
+    server.add_service(proxy_service);
+
+    // Future services:
     // ISSUE-017: ACME background service (cert renewal)
     // ISSUE-022: admin API service
 

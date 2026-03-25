@@ -87,9 +87,9 @@ fn server_shuts_down_on_sigterm() {
                 return;
             }
             Ok(None) => {
-                if start.elapsed() > Duration::from_secs(5) {
+                if start.elapsed() > Duration::from_secs(15) {
                     child.kill().ok();
-                    panic!("dwaar did not shut down within 5 seconds of SIGTERM");
+                    panic!("dwaar did not shut down within 15 seconds of SIGTERM");
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }

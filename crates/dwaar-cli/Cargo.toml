@@ -24,6 +24,7 @@ dwaar-geo = { workspace = true }
 dwaar-log = { workspace = true }
 pingora = { workspace = true }
 pingora-core = { workspace = true }
+pingora-proxy = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
@@ -35,6 +36,8 @@ assert_cmd = { workspace = true }
 predicates = { workspace = true }
 tempfile = { workspace = true }
 libc = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }
 
 [lints]
 workspace = true
