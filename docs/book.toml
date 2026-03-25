@@ -1,0 +1,23 @@
+[book]
+title = "Dwaar Documentation"
+authors = ["Permanu"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "../target/docs"
+create-missing = false
+
+[output.html]
+git-repository-url = "https://github.com/permanu/Dwaar"
+edit-url-template = "https://github.com/permanu/Dwaar/edit/main/docs/{path}"
+site-url = "https://dwaar.dev/docs/"
+no-section-label = false
+
+[output.html.search]
+enable = true
+limit-results = 20
+
+[output.html.fold]
+enable = true
+level = 1

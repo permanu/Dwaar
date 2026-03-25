@@ -20,5 +20,8 @@ Thumbs.db
 # Local development docs (not for repo)
 /local/
 
+# Built docs
+/target/docs/
+
 # Claude/AI
 .claude/
