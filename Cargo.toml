@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 edition = "2024"
 rust-version = "1.86"
-license = "BSL-1.1"
+license-file = "LICENSE"
 repository = "https://github.com/permanu/Dwaar"
 homepage = "https://dwaar.dev"
 authors = ["Permanu <hello@permanu.com>"]

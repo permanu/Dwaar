@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Core proxy engine — ProxyHttp implementation, route table, request context"
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file = "../../LICENSE"
 repository.workspace = true
 authors.workspace = true
 

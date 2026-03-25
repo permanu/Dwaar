@@ -5,7 +5,7 @@ ck = "clippy --workspace --all-targets -- -D warnings"
 ta = "test --workspace"
 nextest = "nextest run --workspace"
 fmt-check = "fmt --all --check"
-deny = "deny check --workspace"
+denycheck = "deny check --workspace"
 udeps = "udeps --workspace"
 
 # Quick build check (no tests, no docs)
