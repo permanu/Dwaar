@@ -1,0 +1,50 @@
+name: Feature Request
+description: Suggest a new feature for Dwaar
+title: "[Feature]: "
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting a feature. Please describe what you need.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement
+      description: What problem are you trying to solve?
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: How should Dwaar solve this?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: What other approaches did you consider?
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Affected Area
+      options:
+        - Core Proxy
+        - Dwaarfile Config
+        - TLS / HTTPS
+        - Analytics
+        - Admin API
+        - Docker Integration
+        - CLI
+        - Plugins
+        - Performance
+        - Documentation
+        - Other
+    validations:
+      required: true
