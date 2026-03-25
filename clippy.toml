@@ -1,4 +1,4 @@
-msrv = "1.86"
+msrv = "1.94"
 
 # Architectural enforcement — prevent direct use of APIs we wrap
 [[disallowed-methods]]

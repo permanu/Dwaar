@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Dwaar CLI — binary entry point, commands, process management"
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
+license-file = "../../LICENSE"
 repository.workspace = true
 authors.workspace = true
 

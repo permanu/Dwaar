@@ -3,24 +3,18 @@
 
 [advisories]
 version = 2
-# Ignore advisories from Pingora's transitive dependencies we can't control
 ignore = [
-    # maxminddb mmap unsoundness — we use it read-only, acceptable risk
-    "RUSTSEC-2023-0078",
-    "RUSTSEC-2025-0132",
-    # protobuf recursion crash — Pingora's tracing dep, not in our hot path
-    "RUSTSEC-2024-0437",
-    # daemonize unmaintained — Pingora dep, no alternative available
-    "RUSTSEC-2024-0370",
-    "RUSTSEC-2025-0069",
-    # derivative unmaintained — Pingora dep, will be resolved upstream
-    "RUSTSEC-2024-0388",
-    # instant unmaintained — Pingora transitive dep via web-time
-    "RUSTSEC-2024-0384",
+    "RUSTSEC-2025-0132",  # maxminddb mmap — read-only usage, acceptable
+    "RUSTSEC-2025-0069",  # daemonize unmaintained — Pingora dep
+    "RUSTSEC-2024-0388",  # derivative unmaintained — Pingora dep
+    "RUSTSEC-2024-0384",  # instant unmaintained — Pingora transitive
+    "RUSTSEC-2024-0437",  # protobuf recursion — Pingora tracing dep
 ]
 
 [licenses]
 version = 2
+# Only check third-party crates, skip our own BSL-licensed crates
+private = { ignore = true, registries = [] }
 allow = [
     "MIT",
     "Apache-2.0",
@@ -33,19 +27,6 @@ allow = [
     "Zlib",
     "BSL-1.0",
     "AGPL-3.0-or-later",
-]
-# Exclude our own crates from license checking — we know our own license (BSL-1.1)
-exceptions = [
-    { allow = ["AGPL-3.0-or-later"], crate = "dwaar-core" },
-    { allow = ["AGPL-3.0-or-later"], crate = "dwaar-config" },
-    { allow = ["AGPL-3.0-or-later"], crate = "dwaar-tls" },
-    { allow = ["AGPL-3.0-or-later"], crate = "dwaar-analytics" },
-    { allow = ["AGPL-3.0-or-later"], crate = "dwaar-plugins" },
-    { allow = ["AGPL-3.0-or-later"], crate = "dwaar-admin" },
-    { allow = ["AGPL-3.0-or-later"], crate = "dwaar-docker" },
-    { allow = ["AGPL-3.0-or-later"], crate = "dwaar-geo" },
-    { allow = ["AGPL-3.0-or-later"], crate = "dwaar-log" },
-    { allow = ["AGPL-3.0-or-later"], crate = "dwaar-cli" },
 ]
 
 [bans]
