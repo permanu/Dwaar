@@ -7,10 +7,12 @@ version = 2
 ignore = [
     # maxminddb mmap unsoundness — we use it read-only, acceptable risk
     "RUSTSEC-2023-0078",
+    "RUSTSEC-2025-0132",
     # protobuf recursion crash — Pingora's tracing dep, not in our hot path
     "RUSTSEC-2024-0437",
     # daemonize unmaintained — Pingora dep, no alternative available
     "RUSTSEC-2024-0370",
+    "RUSTSEC-2025-0069",
     # derivative unmaintained — Pingora dep, will be resolved upstream
     "RUSTSEC-2024-0388",
     # instant unmaintained — Pingora transitive dep via web-time
