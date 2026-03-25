@@ -22,6 +22,7 @@ Thumbs.db
 
 # Built docs
 /target/docs/
+/docs/book/
 
 # Claude/AI
 .claude/
