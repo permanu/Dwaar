@@ -82,16 +82,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      # cargo-deny requires latest Rust but our rust-toolchain.toml pins 1.86
-      # Temporarily hide the toolchain file so we get the latest stable
-      - name: Install latest Rust (bypassing rust-toolchain.toml)
-        run: |
-          mv rust-toolchain.toml rust-toolchain.toml.bak
-          rustup default stable
-          rustup update stable
+      - uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked
-      - name: Restore toolchain file
-        run: mv rust-toolchain.toml.bak rust-toolchain.toml
       - name: Run cargo-deny
-        run: cargo deny check --workspace
+        run: cargo deny check
