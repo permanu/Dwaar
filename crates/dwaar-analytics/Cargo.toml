@@ -1,0 +1,30 @@
+[package]
+name = "dwaar-analytics"
+version = "0.1.0"
+description = "First-party analytics — JS injection, beacon collection, in-memory aggregation"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+dwaar-core = { workspace = true }
+bytes = { workspace = true }
+dashmap = { workspace = true }
+hyperloglog = { workspace = true }
+aes-gcm = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[lints]
+workspace = true

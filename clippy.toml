@@ -1,0 +1,19 @@
+msrv = "1.86"
+
+# Architectural enforcement — prevent direct use of APIs we wrap
+[[disallowed-methods]]
+path = "std::process::exit"
+reason = "Use anyhow::Result and proper error propagation instead of process::exit"
+
+[[disallowed-methods]]
+path = "std::thread::sleep"
+reason = "Use tokio::time::sleep in async context"
+
+# Prevent println in library code (use tracing instead)
+[[disallowed-macros]]
+path = "std::println"
+reason = "Use tracing::info!, tracing::debug!, etc. instead of println!"
+
+[[disallowed-macros]]
+path = "std::eprintln"
+reason = "Use tracing::error!, tracing::warn!, etc. instead of eprintln!"
