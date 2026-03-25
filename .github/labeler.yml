@@ -1,0 +1,54 @@
+# Auto-label PRs based on file paths
+# Used by .github/workflows/labeler.yml
+
+core:
+  - changed-files:
+    - any-glob-to-any-file: 'crates/dwaar-core/**'
+
+config:
+  - changed-files:
+    - any-glob-to-any-file: 'crates/dwaar-config/**'
+
+tls:
+  - changed-files:
+    - any-glob-to-any-file: 'crates/dwaar-tls/**'
+
+analytics:
+  - changed-files:
+    - any-glob-to-any-file: 'crates/dwaar-analytics/**'
+
+plugins:
+  - changed-files:
+    - any-glob-to-any-file: 'crates/dwaar-plugins/**'
+
+admin-api:
+  - changed-files:
+    - any-glob-to-any-file: 'crates/dwaar-admin/**'
+
+docker:
+  - changed-files:
+    - any-glob-to-any-file: 'crates/dwaar-docker/**'
+
+cli:
+  - changed-files:
+    - any-glob-to-any-file: 'crates/dwaar-cli/**'
+
+logging:
+  - changed-files:
+    - any-glob-to-any-file: 'crates/dwaar-log/**'
+
+documentation:
+  - changed-files:
+    - any-glob-to-any-file:
+      - '**/*.md'
+      - 'docs/**'
+
+ci:
+  - changed-files:
+    - any-glob-to-any-file: '.github/**'
+
+tests:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'tests/**'
+      - 'benches/**'
