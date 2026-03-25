@@ -85,4 +85,5 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
-          arguments: --workspace
+          arguments: --workspace --hide-inclusion-graph
+          log-level: error
