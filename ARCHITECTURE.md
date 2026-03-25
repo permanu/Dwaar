@@ -6,14 +6,23 @@ Dwaar is a reverse proxy built on Cloudflare's Pingora framework. It combines Pi
 
 ## System Context
 
+Dwaar is a standalone proxy with zero external dependencies. It does NOT require Cloudflare, AWS, or any cloud provider.
+
 ```
-Internet → Cloudflare Edge → CF Tunnel → Dwaar (:443) → App Containers
-                                           │
-                                           ├── Analytics collected (same-origin, ad-blocker-proof)
-                                           ├── Request logged (34+ fields, batch-written)
-                                           ├── Bot detected (UA + behavior)
-                                           └── All in ~25 MB RAM
+Standalone (default):
+  Internet → Dwaar (:443) → App Containers
+
+Behind any tunnel/CDN (optional, user's choice):
+  Internet → [Any CDN/Tunnel] → Dwaar (:443) → App Containers
+
+                                    │
+                                    ├── Analytics collected (same-origin, ad-blocker-proof)
+                                    ├── Request logged (34+ fields, batch-written)
+                                    ├── Bot detected (UA + behavior)
+                                    └── All in ~25 MB RAM
 ```
+
+> Note: Dwaar is built on Pingora (an open-source Rust library by Cloudflare). Pingora is a standalone crate with zero ties to Cloudflare's infrastructure. Using Pingora does NOT require or connect to any Cloudflare service.
 
 ## Process Architecture
 
