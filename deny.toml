@@ -82,14 +82,7 @@ multiple-versions = "warn"
 wildcards = "allow"  # workspace = true deps show as wildcards
 highlight = "all"
 
-deny = [
-    # Use pingora's HTTP client, not reqwest (except in dev-deps for testing)
-    { name = "reqwest", wrappers = [] },
-]
-# Allow reqwest in dev-dependencies (testing)
-skip = [
-    { name = "reqwest" },
-]
+deny = []
 
 [sources]
 unknown-registry = "deny"
