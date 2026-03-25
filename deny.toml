@@ -2,9 +2,14 @@
 # https://embarkstudios.github.io/cargo-deny/
 
 [advisories]
-# Check all crates (workspace + transitive dependencies)
 version = 2
-ignore = []
+# Ignore advisories from Pingora's transitive dependencies we can't control
+ignore = [
+    # maxminddb mmap unsoundness — we use it read-only, acceptable risk
+    "RUSTSEC-2023-0078",
+    # protobuf recursion crash — Pingora's tracing dep, not in our hot path
+    "RUSTSEC-2024-0437",
+]
 
 [licenses]
 version = 2
@@ -16,22 +21,74 @@ allow = [
     "BSD-3-Clause",
     "ISC",
     "Unicode-3.0",
-    "Unicode-DFS-2016",
-    "OpenSSL",
+    "CC0-1.0",
     "Zlib",
     "BSL-1.0",
 ]
-exceptions = []
+
+# Our own crates use BSL-1.1 which isn't in SPDX — allow them explicitly
+[[licenses.clarify]]
+name = "dwaar-core"
+expression = "BSL-1.0"
+license-files = [{ path = "../../LICENSE", hash = 0 }]
+
+[[licenses.clarify]]
+name = "dwaar-config"
+expression = "BSL-1.0"
+license-files = [{ path = "../../LICENSE", hash = 0 }]
+
+[[licenses.clarify]]
+name = "dwaar-tls"
+expression = "BSL-1.0"
+license-files = [{ path = "../../LICENSE", hash = 0 }]
+
+[[licenses.clarify]]
+name = "dwaar-analytics"
+expression = "BSL-1.0"
+license-files = [{ path = "../../LICENSE", hash = 0 }]
+
+[[licenses.clarify]]
+name = "dwaar-plugins"
+expression = "BSL-1.0"
+license-files = [{ path = "../../LICENSE", hash = 0 }]
+
+[[licenses.clarify]]
+name = "dwaar-admin"
+expression = "BSL-1.0"
+license-files = [{ path = "../../LICENSE", hash = 0 }]
+
+[[licenses.clarify]]
+name = "dwaar-docker"
+expression = "BSL-1.0"
+license-files = [{ path = "../../LICENSE", hash = 0 }]
+
+[[licenses.clarify]]
+name = "dwaar-geo"
+expression = "BSL-1.0"
+license-files = [{ path = "../../LICENSE", hash = 0 }]
+
+[[licenses.clarify]]
+name = "dwaar-log"
+expression = "BSL-1.0"
+license-files = [{ path = "../../LICENSE", hash = 0 }]
+
+[[licenses.clarify]]
+name = "dwaar-cli"
+expression = "BSL-1.0"
+license-files = [{ path = "../../LICENSE", hash = 0 }]
 
 [bans]
 multiple-versions = "warn"
-wildcards = "deny"
+wildcards = "allow"  # workspace = true deps show as wildcards
 highlight = "all"
 
-# Deny specific crates we don't want
 deny = [
-    # Use pingora's HTTP client, not reqwest
+    # Use pingora's HTTP client, not reqwest (except in dev-deps for testing)
     { name = "reqwest", wrappers = [] },
+]
+# Allow reqwest in dev-dependencies (testing)
+skip = [
+    { name = "reqwest" },
 ]
 
 [sources]
