@@ -34,6 +34,7 @@ tokio = { workspace = true, features = ["full"] }
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
 tempfile = { workspace = true }
+libc = { workspace = true }
 
 [lints]
 workspace = true
