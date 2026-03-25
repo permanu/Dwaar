@@ -30,64 +30,26 @@ allow = [
     "CC0-1.0",
     "Zlib",
     "BSL-1.0",
+    "AGPL-3.0-or-later",
 ]
-
-# Our own crates use BSL-1.1 which isn't in SPDX — allow them explicitly
-[[licenses.clarify]]
-name = "dwaar-core"
-expression = "BSL-1.0"
-license-files = [{ path = "../../LICENSE", hash = 0 }]
-
-[[licenses.clarify]]
-name = "dwaar-config"
-expression = "BSL-1.0"
-license-files = [{ path = "../../LICENSE", hash = 0 }]
-
-[[licenses.clarify]]
-name = "dwaar-tls"
-expression = "BSL-1.0"
-license-files = [{ path = "../../LICENSE", hash = 0 }]
-
-[[licenses.clarify]]
-name = "dwaar-analytics"
-expression = "BSL-1.0"
-license-files = [{ path = "../../LICENSE", hash = 0 }]
-
-[[licenses.clarify]]
-name = "dwaar-plugins"
-expression = "BSL-1.0"
-license-files = [{ path = "../../LICENSE", hash = 0 }]
-
-[[licenses.clarify]]
-name = "dwaar-admin"
-expression = "BSL-1.0"
-license-files = [{ path = "../../LICENSE", hash = 0 }]
-
-[[licenses.clarify]]
-name = "dwaar-docker"
-expression = "BSL-1.0"
-license-files = [{ path = "../../LICENSE", hash = 0 }]
-
-[[licenses.clarify]]
-name = "dwaar-geo"
-expression = "BSL-1.0"
-license-files = [{ path = "../../LICENSE", hash = 0 }]
-
-[[licenses.clarify]]
-name = "dwaar-log"
-expression = "BSL-1.0"
-license-files = [{ path = "../../LICENSE", hash = 0 }]
-
-[[licenses.clarify]]
-name = "dwaar-cli"
-expression = "BSL-1.0"
-license-files = [{ path = "../../LICENSE", hash = 0 }]
+# Exclude our own crates from license checking — we know our own license (BSL-1.1)
+exceptions = [
+    { allow = ["AGPL-3.0-or-later"], crate = "dwaar-core" },
+    { allow = ["AGPL-3.0-or-later"], crate = "dwaar-config" },
+    { allow = ["AGPL-3.0-or-later"], crate = "dwaar-tls" },
+    { allow = ["AGPL-3.0-or-later"], crate = "dwaar-analytics" },
+    { allow = ["AGPL-3.0-or-later"], crate = "dwaar-plugins" },
+    { allow = ["AGPL-3.0-or-later"], crate = "dwaar-admin" },
+    { allow = ["AGPL-3.0-or-later"], crate = "dwaar-docker" },
+    { allow = ["AGPL-3.0-or-later"], crate = "dwaar-geo" },
+    { allow = ["AGPL-3.0-or-later"], crate = "dwaar-log" },
+    { allow = ["AGPL-3.0-or-later"], crate = "dwaar-cli" },
+]
 
 [bans]
 multiple-versions = "warn"
-wildcards = "allow"  # workspace = true deps show as wildcards
+wildcards = "allow"
 highlight = "all"
-
 deny = []
 
 [sources]
