@@ -23,79 +23,78 @@ dwaar-geo = { path = "crates/dwaar-geo" }
 dwaar-log = { path = "crates/dwaar-log" }
 
 # Pingora
-pingora = { version = "0.8", features = ["proxy", "lb"] }
-pingora-core = { version = "0.8" }
-pingora-proxy = { version = "0.8" }
-pingora-http = { version = "0.8" }
-pingora-load-balancing = { version = "0.8" }
-pingora-limits = { version = "0.8" }
-pingora-timeout = { version = "0.8" }
-pingora-memory-cache = { version = "0.8" }
-pingora-error = { version = "0.8" }
+pingora = { version = "0.8.0", features = ["proxy", "lb"] }
+pingora-core = { version = "0.8.0" }
+pingora-proxy = { version = "0.8.0" }
+pingora-http = { version = "0.8.0" }
+pingora-load-balancing = { version = "0.8.0" }
+pingora-limits = { version = "0.8.0" }
+pingora-timeout = { version = "0.8.0" }
+pingora-memory-cache = { version = "0.8.0" }
+pingora-error = { version = "0.8.0" }
 
 # Async runtime
-tokio = { version = "1", default-features = false }
+tokio = { version = "1.50.0", default-features = false }
 
 # Serialization
-serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.149" }
 
 # Data structures
-arc-swap = "1"
-dashmap = "6"
-lru = "0.12"
-bytes = "1"
+arc-swap = "1.9.0"
+dashmap = "6.1.0"
+lru = "0.16.3"
+bytes = "1.11.1"
 
 # Error handling
-thiserror = "2"
-anyhow = "1"
+thiserror = "2.0.18"
+anyhow = "1.0.102"
 
 # Logging / tracing
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 
 # CLI
-clap = { version = "4", features = ["derive", "env"] }
+clap = { version = "4.6.0", features = ["derive", "env"] }
 
 # HTTP types
-http = "1"
+http = "1.4.0"
 
 # UUID
-uuid = { version = "1", features = ["v7"] }
+uuid = { version = "1.22.0", features = ["v7"] }
 
 # Time
-chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+chrono = { version = "0.4.44", default-features = false, features = ["clock", "serde"] }
 
 # Regex (bot detection)
-regex = "1"
+regex = "1.12.3"
 
 # File watching
-notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
+notify = { version = "8.2.0", default-features = false, features = ["macos_kqueue"] }
 
 # GeoIP
-maxminddb = "0.24"
+maxminddb = "0.27.3"
 
 # Analytics data structures
-hyperloglog = "1"
+hyperloglog = "1.0.3"
 
 # Crypto (visitor cookies)
-aes-gcm = "0.10"
-rand = "0.8"
-base64 = "0.22"
+aes-gcm = "0.10.3"
+rand = "0.10.0"
+base64 = "0.22.1"
 
 # Compression
-flate2 = "1"
-brotli = "7"
+flate2 = "1.1.9"
+brotli = "8.0.2"
 
 # Testing
-tokio-test = "0.4"
-tempfile = "3"
-assert_cmd = "2"
-predicates = "3"
-criterion = { version = "0.5", features = ["html_reports"] }
-proptest = "1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-libc = "0.2"
+tokio-test = "0.4.5"
+tempfile = "3.27.0"
+assert_cmd = "2.2.0"
+predicates = "3.1.4"
+criterion = { version = "0.8.2", features = ["html_reports"] }
+proptest = "1.11.0"
+reqwest = { version = "0.13.2", default-features = false, features = ["rustls-tls"] }
 
 [workspace.lints.rust]
 unsafe_code = "warn"
