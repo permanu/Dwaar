@@ -4,14 +4,12 @@
 // This file is part of Dwaar — https://dwaar.dev
 // Licensed under the Business Source License 1.1
 
-//! dwaar-core
+//! dwaar-core — the proxy engine.
+//!
+//! This crate contains the `ProxyHttp` implementation that powers Dwaar.
+//! It is the heart of the system: every HTTP request flows through
+//! [`proxy::DwaarProxy`], with per-request state tracked in
+//! [`context::RequestContext`].
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_compiles() {
-        // Placeholder — replaced with real tests as features are implemented
-        let x = 1 + 1;
-        assert_eq!(x, 2);
-    }
-}
+pub mod context;
+pub mod proxy;
