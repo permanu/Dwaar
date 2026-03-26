@@ -4,14 +4,11 @@
 // This file is part of Dwaar — https://dwaar.dev
 // Licensed under the Business Source License 1.1
 
-//! dwaar-log
+//! dwaar-log — structured request logging with batch writing.
+//!
+//! Provides [`RequestLog`] for capturing per-request metrics and
+//! a batch writer pipeline for efficient I/O.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_compiles() {
-        // Placeholder — replaced with real tests as features are implemented
-        let x = 1 + 1;
-        assert_eq!(x, 2);
-    }
-}
+pub mod request_log;
+
+pub use request_log::RequestLog;
