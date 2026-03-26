@@ -4,12 +4,12 @@
 // This file is part of Dwaar — https://dwaar.dev
 // Licensed under the Business Source License 1.1
 
-//! Integration tests for the proxy forwarding pipeline (ISSUE-005).
+//! Integration tests for the proxy forwarding pipeline.
 //!
 //! Proves that Dwaar accepts HTTP requests, forwards them to an upstream,
-//! and returns the upstream's response to the client.
+//! and returns the upstream's response with Dwaar-added headers.
 //!
-//! ## Port constraints (ISSUE-005 only)
+//! ## Port constraints
 //!
 //! The upstream is hardcoded at 127.0.0.1:8080. Tests run sequentially
 //! because they share this port. ISSUE-010 (configurable routes) will
@@ -18,11 +18,18 @@
 // Test-only: we need unsafe for libc::kill and u32→i32 cast for PID
 #![allow(unsafe_code, clippy::cast_possible_wrap)]
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
+
+/// Mutex to serialize tests that need exclusive access to ports 8080 and 6188.
+/// Tests acquire this lock before binding ports, preventing parallel conflicts.
+/// Removed once ISSUE-010 allows ephemeral ports.
+static PORT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Status text for common HTTP status codes.
 fn status_text(code: u16) -> &'static str {
@@ -35,7 +42,7 @@ fn status_text(code: u16) -> &'static str {
 }
 
 /// Accept one connection on `listener`, read the request, respond with
-/// the given status and body. This is a complete HTTP server in ~20 lines.
+/// the given status and body.
 fn serve_one_request(listener: &TcpListener, status: u16, body: &str) {
     let (mut stream, _) = listener.accept().expect("accept connection");
 
@@ -100,12 +107,17 @@ fn stop_dwaar(mut child: std::process::Child) {
     }
 }
 
-/// Send a GET request through the proxy (blocking) and return (status, body).
-fn send_through_proxy(path: &str) -> (u16, String) {
+/// Response from the proxy: status code, body, and headers.
+struct ProxyResponse {
+    status: u16,
+    body: String,
+    headers: HashMap<String, String>,
+}
+
+/// Send a GET request through the proxy and return the full response.
+fn send_through_proxy(path: &str) -> ProxyResponse {
     let url = format!("http://127.0.0.1:6188{path}");
 
-    // Use reqwest's blocking client — no async runtime needed.
-    // We build a one-off runtime just for this request.
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -122,19 +134,33 @@ fn send_through_proxy(path: &str) -> (u16, String) {
             .send()
             .await
             .expect("request should succeed");
+
         let status = resp.status().as_u16();
+        let headers: HashMap<String, String> = resp
+            .headers()
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.as_str().to_lowercase(),
+                    v.to_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect();
         let body = resp.text().await.expect("read body");
-        (status, body)
+
+        ProxyResponse {
+            status,
+            body,
+            headers,
+        }
     })
 }
 
-/// Core proxy integration test: verifies that Dwaar forwards HTTP requests
-/// to the upstream and returns the upstream's response unchanged.
-///
-/// Tests 200, 404, and 500 sequentially. All three must pass — a proxy
-/// must faithfully forward any status code from the upstream.
+/// ISSUE-005: Verifies that Dwaar forwards HTTP requests to the upstream
+/// and returns the upstream's response with the correct status code and body.
 #[test]
 fn proxy_forwards_upstream_responses() {
+    let _lock = PORT_LOCK.lock().expect("acquire port lock");
     let upstream =
         TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
 
@@ -145,30 +171,78 @@ fn proxy_forwards_upstream_responses() {
         let upstream_fd = upstream.try_clone().expect("clone listener");
         move || serve_one_request(&upstream_fd, 200, "hello from upstream")
     });
-    let (status, body) = send_through_proxy("/");
+    let resp = send_through_proxy("/");
     handle.join().expect("upstream thread");
-    assert_eq!(status, 200, "proxy should forward 200 status");
-    assert_eq!(body, "hello from upstream");
+    assert_eq!(resp.status, 200, "proxy should forward 200 status");
+    assert_eq!(resp.body, "hello from upstream");
 
     // --- Test 404 Not Found ---
     let handle = thread::spawn({
         let upstream_fd = upstream.try_clone().expect("clone listener");
         move || serve_one_request(&upstream_fd, 404, "page not found")
     });
-    let (status, body) = send_through_proxy("/missing");
+    let resp = send_through_proxy("/missing");
     handle.join().expect("upstream thread");
-    assert_eq!(status, 404, "proxy should forward 404 status");
-    assert_eq!(body, "page not found");
+    assert_eq!(resp.status, 404, "proxy should forward 404 status");
+    assert_eq!(resp.body, "page not found");
 
     // --- Test 500 Internal Server Error ---
     let handle = thread::spawn({
         let upstream_fd = upstream.try_clone().expect("clone listener");
         move || serve_one_request(&upstream_fd, 500, "server error")
     });
-    let (status, body) = send_through_proxy("/error");
+    let resp = send_through_proxy("/error");
     handle.join().expect("upstream thread");
-    assert_eq!(status, 500, "proxy should forward 500 status");
-    assert_eq!(body, "server error");
+    assert_eq!(resp.status, 500, "proxy should forward 500 status");
+    assert_eq!(resp.body, "server error");
+
+    stop_dwaar(child);
+}
+
+/// ISSUE-006: Verifies that every proxied response includes an X-Request-Id
+/// header with a valid UUID v7 value, and that each request gets a unique ID.
+#[test]
+fn proxy_adds_x_request_id_header() {
+    let _lock = PORT_LOCK.lock().expect("acquire port lock");
+    let upstream =
+        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+
+    let child = start_dwaar_proxy();
+
+    // Send first request
+    let handle = thread::spawn({
+        let upstream_fd = upstream.try_clone().expect("clone listener");
+        move || serve_one_request(&upstream_fd, 200, "ok")
+    });
+    let resp1 = send_through_proxy("/first");
+    handle.join().expect("upstream thread");
+
+    // Assert X-Request-Id is present and looks like a UUID
+    let id1 = resp1
+        .headers
+        .get("x-request-id")
+        .expect("response should have X-Request-Id header");
+    assert_eq!(id1.len(), 36, "request ID should be a 36-char UUID");
+    assert_eq!(
+        id1.chars().filter(|c| *c == '-').count(),
+        4,
+        "UUID should have 4 dashes (8-4-4-4-12 format)"
+    );
+
+    // Send second request — ID should be different
+    let handle = thread::spawn({
+        let upstream_fd = upstream.try_clone().expect("clone listener");
+        move || serve_one_request(&upstream_fd, 200, "ok")
+    });
+    let resp2 = send_through_proxy("/second");
+    handle.join().expect("upstream thread");
+
+    let id2 = resp2
+        .headers
+        .get("x-request-id")
+        .expect("second response should also have X-Request-Id");
+
+    assert_ne!(id1, id2, "each request must get a unique request ID");
 
     stop_dwaar(child);
 }
