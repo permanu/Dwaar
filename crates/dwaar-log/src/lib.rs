@@ -10,5 +10,7 @@
 //! a batch writer pipeline for efficient I/O.
 
 pub mod request_log;
+pub mod writer;
 
 pub use request_log::RequestLog;
+pub use writer::{LogOutput, LogSender, StdoutWriter, channel, spawn_writer};
