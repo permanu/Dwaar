@@ -21,11 +21,13 @@ use pingora_core::server::configuration::{Opt as PingoraOpt, ServerConf};
 use tracing::info;
 
 use cli::{Cli, Commands};
-use dwaar_config::compile::{compile_acme_domains, compile_routes, compile_tls_configs, has_tls_sites};
+use dwaar_config::compile::{
+    compile_acme_domains, compile_routes, compile_tls_configs, has_tls_sites,
+};
 use dwaar_core::proxy::DwaarProxy;
+use dwaar_tls::acme::ChallengeSolver;
 use dwaar_tls::acme::issuer::CertIssuer;
 use dwaar_tls::acme::service::AcmeService;
-use dwaar_tls::acme::ChallengeSolver;
 use dwaar_tls::cert_store::CertStore;
 use dwaar_tls::sni::{DomainTlsConfig, SniResolver};
 
@@ -136,11 +138,7 @@ fn main() -> anyhow::Result<()> {
             Arc::clone(solver),
             Arc::clone(&cert_store),
         ));
-        let acme_service = AcmeService::new(
-            acme_domains.clone(),
-            "/etc/dwaar/certs",
-            issuer,
-        );
+        let acme_service = AcmeService::new(acme_domains.clone(), "/etc/dwaar/certs", issuer);
 
         let bg = pingora_core::services::background::background_service(
             "ACME cert manager",
@@ -154,9 +152,7 @@ fn main() -> anyhow::Result<()> {
     server.run_forever();
 }
 
-fn load_config(
-    path: &std::path::Path,
-) -> anyhow::Result<dwaar_config::model::DwaarConfig> {
+fn load_config(path: &std::path::Path) -> anyhow::Result<dwaar_config::model::DwaarConfig> {
     let metadata = std::fs::metadata(path)
         .with_context(|| format!("failed to stat config file: {}", path.display()))?;
     if metadata.len() > MAX_CONFIG_SIZE {
@@ -170,8 +166,7 @@ fn load_config(
     let config_text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config file: {}", path.display()))?;
 
-    let config =
-        dwaar_config::parser::parse(&config_text).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let config = dwaar_config::parser::parse(&config_text).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     info!(
         sites = config.sites.len(),

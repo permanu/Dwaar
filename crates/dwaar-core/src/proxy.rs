@@ -233,12 +233,8 @@ impl ProxyHttp for DwaarProxy {
                     );
                     let mut resp = ResponseHeader::build(200, Some(1))?;
                     resp.insert_header("Content-Length", key_auth.len().to_string())
-                        .map_err(|e| {
-                            Error::explain(HTTPStatus(500), format!("bad header: {e}"))
-                        })?;
-                    session
-                        .write_response_header(Box::new(resp), false)
-                        .await?;
+                        .map_err(|e| Error::explain(HTTPStatus(500), format!("bad header: {e}")))?;
+                    session.write_response_header(Box::new(resp), false).await?;
                     session
                         .write_response_body(Some(bytes::Bytes::from(key_auth)), true)
                         .await?;

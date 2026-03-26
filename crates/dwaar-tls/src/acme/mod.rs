@@ -28,8 +28,7 @@ pub const RENEWAL_WINDOW_DAYS: u32 = 30;
 pub const LE_DIRECTORY_URL: &str = "https://acme-v02.api.letsencrypt.org/directory";
 
 /// Let's Encrypt staging (for development — issues untrusted certs).
-pub const LE_STAGING_DIRECTORY_URL: &str =
-    "https://acme-staging-v02.api.letsencrypt.org/directory";
+pub const LE_STAGING_DIRECTORY_URL: &str = "https://acme-staging-v02.api.letsencrypt.org/directory";
 
 /// Google Trust Services ACME directory (fallback CA).
 pub const GTS_DIRECTORY_URL: &str = "https://dv.acme-v02.api.pki.goog/directory";
