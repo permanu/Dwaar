@@ -25,6 +25,7 @@ use dwaar_config::compile::{
     compile_acme_domains, compile_routes, compile_tls_configs, has_tls_sites,
 };
 use dwaar_core::proxy::DwaarProxy;
+use dwaar_log::{StdoutWriter, channel as log_channel, spawn_writer};
 use dwaar_tls::acme::ChallengeSolver;
 use dwaar_tls::acme::issuer::CertIssuer;
 use dwaar_tls::acme::service::TlsBackgroundService;
@@ -110,7 +111,9 @@ fn main() -> anyhow::Result<()> {
         Some(Arc::new(ChallengeSolver::new()))
     };
 
-    let proxy = DwaarProxy::new(route_table, challenge_solver.clone());
+    let (log_sender, log_receiver) = log_channel();
+
+    let proxy = DwaarProxy::new(route_table, challenge_solver.clone(), Some(log_sender));
 
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, proxy);
 
@@ -152,6 +155,10 @@ fn main() -> anyhow::Result<()> {
         server.add_service(bg);
         info!(domains = acme_domains.len(), "TLS background service registered");
     }
+
+    // Spawn log batch writer — runs as a standalone tokio task
+    let _log_writer = spawn_writer(log_receiver, Box::new(StdoutWriter));
+    info!("log writer started (JSON lines to stdout)");
 
     info!("entering run loop, waiting for connections or signals");
     server.run_forever();

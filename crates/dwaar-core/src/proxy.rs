@@ -18,11 +18,13 @@
 //! - `upstream_peer()` — resolves Host header via `RouteTable`, returns 502 on miss
 //! - `upstream_request_filter()` — adds proxy headers, strips hop-by-hop
 //! - `response_filter()` — adds `X-Request-Id` + security headers
+//! - `logging()` — emits structured request log to the batch writer
 
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use chrono::Utc;
 use pingora_core::Result;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_error::{Error, ErrorType::HTTPStatus};
@@ -30,6 +32,7 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
 use tracing::{debug, warn};
 
+use dwaar_log::{LogSender, RequestLog};
 use dwaar_tls::acme::ChallengeSolver;
 
 use crate::context::RequestContext;
@@ -63,6 +66,8 @@ pub struct DwaarProxy {
     route_table: Arc<ArcSwap<RouteTable>>,
     /// ACME HTTP-01 challenge solver. `None` if no `tls auto` domains.
     challenge_solver: Option<Arc<ChallengeSolver>>,
+    /// Non-blocking sender for the batch log writer. `None` disables logging.
+    log_sender: Option<LogSender>,
 }
 
 impl DwaarProxy {
@@ -73,10 +78,12 @@ impl DwaarProxy {
     pub fn new(
         route_table: Arc<ArcSwap<RouteTable>>,
         challenge_solver: Option<Arc<ChallengeSolver>>,
+        log_sender: Option<LogSender>,
     ) -> Self {
         Self {
             route_table,
             challenge_solver,
+            log_sender,
         }
     }
 }
@@ -465,6 +472,85 @@ impl ProxyHttp for DwaarProxy {
 
         Ok(())
     }
+
+    /// Emit a structured log entry for every completed request.
+    ///
+    /// Called by Pingora after the response is fully sent (or on fatal error).
+    /// Builds a [`RequestLog`] from the request context and session metadata,
+    /// then pushes it to the batch writer via the non-blocking [`LogSender`].
+    async fn logging(
+        &self,
+        session: &mut Session,
+        _e: Option<&pingora_error::Error>,
+        ctx: &mut Self::CTX,
+    ) where
+        Self::CTX: Send + Sync,
+    {
+        let Some(ref sender) = self.log_sender else {
+            return;
+        };
+
+        let response_time_us = ctx.start_time.elapsed().as_micros() as u64;
+
+        // Extract status code from the response (0 if no response was sent)
+        let status = session
+            .response_written()
+            .map_or(0, |r| r.status.as_u16());
+
+        // Split path and query
+        let (path, query) = if let Some(qmark) = ctx.path.find('?') {
+            (
+                ctx.path[..qmark].to_string(),
+                Some(ctx.path[qmark + 1..].to_string()),
+            )
+        } else {
+            (ctx.path.clone(), None)
+        };
+
+        let log = RequestLog {
+            timestamp: Utc::now(),
+            request_id: ctx.request_id.clone(),
+            method: ctx.method.clone(),
+            path,
+            query,
+            host: ctx.host.clone().unwrap_or_default(),
+            status,
+            response_time_us,
+            client_ip: ctx
+                .client_ip
+                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+            user_agent: session
+                .req_header()
+                .headers
+                .get("user-agent")
+                .and_then(|v| v.to_str().ok())
+                .map(ToString::to_string),
+            referer: session
+                .req_header()
+                .headers
+                .get("referer")
+                .and_then(|v| v.to_str().ok())
+                .map(ToString::to_string),
+            bytes_sent: session.body_bytes_sent() as u64,
+            bytes_received: session.body_bytes_read() as u64,
+            tls_version: session
+                .downstream_session
+                .digest()
+                .and_then(|d| d.ssl_digest.as_ref())
+                .map(|ssl| ssl.version.to_string()),
+            http_version: format!("{:?}", session.req_header().version),
+            is_bot: false,
+            country: None,
+            upstream_addr: ctx
+                .route_upstream
+                .map_or_else(String::new, |a| a.to_string()),
+            upstream_response_time_us: 0,
+            cache_status: None,
+            compression: None,
+        };
+
+        sender.send(log);
+    }
 }
 
 #[cfg(test)]
@@ -476,7 +562,7 @@ mod tests {
 
     fn make_proxy(routes: Vec<Route>) -> DwaarProxy {
         let table = RouteTable::new(routes);
-        DwaarProxy::new(Arc::new(ArcSwap::from_pointee(table)), None)
+        DwaarProxy::new(Arc::new(ArcSwap::from_pointee(table)), None, None)
     }
 
     #[test]
