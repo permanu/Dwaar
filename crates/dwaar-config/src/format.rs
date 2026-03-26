@@ -68,10 +68,11 @@ fn format_tls(out: &mut String, tls: &TlsDirective) {
             cert_path,
             key_path,
         } => {
-            out.push_str("tls ");
+            out.push_str("tls \"");
             out.push_str(cert_path);
-            out.push(' ');
+            out.push_str("\" \"");
             out.push_str(key_path);
+            out.push('"');
         }
     }
 }
@@ -147,7 +148,7 @@ web.example.com {
         let input = "\
 example.com {
     reverse_proxy 127.0.0.1:8080
-    tls /cert.pem /key.pem
+    tls \"/cert.pem\" \"/key.pem\"
     header X-Custom \"my value\"
     header -Server
     redir /old /new 301

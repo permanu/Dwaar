@@ -33,6 +33,21 @@ use tracing::{debug, warn};
 use crate::context::RequestContext;
 use crate::route::RouteTable;
 
+/// Sanitize a request path for use in a redirect Location header.
+/// Prevents CRLF injection and protocol-relative open redirects.
+fn sanitize_redirect_path(path: &str) -> String {
+    // Strip CR/LF to prevent header injection
+    let cleaned: String = path.chars().filter(|c| *c != '\r' && *c != '\n').collect();
+    // Collapse leading slashes to prevent //evil.com open redirect
+    if cleaned.starts_with("//") {
+        format!("/{}", cleaned.trim_start_matches('/'))
+    } else if cleaned.is_empty() {
+        "/".to_string()
+    } else {
+        cleaned
+    }
+}
+
 /// The Dwaar proxy engine.
 ///
 /// Implements Pingora's `ProxyHttp` to handle every HTTP request that
@@ -111,7 +126,9 @@ impl DwaarProxy {
         ctx: &RequestContext,
         canonical_domain: &str,
     ) -> Result<bool> {
-        let location = format!("https://{canonical_domain}{}", ctx.path);
+        // Sanitize path to prevent header injection (CRLF) and open redirects (//)
+        let safe_path = sanitize_redirect_path(&ctx.path);
+        let location = format!("https://{canonical_domain}{safe_path}");
 
         debug!(
             request_id = %ctx.request_id,
@@ -121,11 +138,11 @@ impl DwaarProxy {
 
         let mut resp = ResponseHeader::build(301, Some(3))?;
         resp.insert_header("Location", &location)
-            .expect("location URL is valid header value");
+            .map_err(|e| Error::explain(HTTPStatus(500), format!("bad redirect header: {e}")))?;
         resp.insert_header("Content-Length", "0")
-            .expect("static header value");
+            .map_err(|e| Error::explain(HTTPStatus(500), format!("bad header: {e}")))?;
         resp.insert_header("Connection", "close")
-            .expect("static header value");
+            .map_err(|e| Error::explain(HTTPStatus(500), format!("bad header: {e}")))?;
 
         session.write_response_header(Box::new(resp), true).await?;
 
@@ -189,6 +206,15 @@ impl ProxyHttp for DwaarProxy {
             "request metadata extracted"
         );
 
+        // HTTP/1.1 requires a Host header (RFC 7230 §5.4). Without it (and
+        // without :authority in HTTP/2), we can't route the request.
+        if ctx.host.is_none() {
+            warn!(request_id = %ctx.request_id, "missing Host header — returning 400");
+            let resp = ResponseHeader::build(400, Some(1))?;
+            session.write_response_header(Box::new(resp), true).await?;
+            return Ok(true);
+        }
+
         // --- HTTP→HTTPS redirect (ISSUE-016) ---
         if let Some(canonical_domain) = self.https_redirect_domain(session, ctx) {
             return self
@@ -230,7 +256,10 @@ impl ProxyHttp for DwaarProxy {
             "route resolved"
         );
 
-        let peer = HttpPeer::new(route.upstream, false, String::new());
+        let mut peer = HttpPeer::new(route.upstream, false, String::new());
+        peer.options.connection_timeout = Some(std::time::Duration::from_secs(10));
+        peer.options.read_timeout = Some(std::time::Duration::from_secs(30));
+        peer.options.write_timeout = Some(std::time::Duration::from_secs(30));
         Ok(Box::new(peer))
     }
 
@@ -273,22 +302,13 @@ impl ProxyHttp for DwaarProxy {
                 .insert_header("X-Real-IP", &ip_str)
                 .expect("IP string is valid header value");
 
-            // X-Forwarded-For: append client IP to the chain.
-            // If the client sent "X-Forwarded-For: 1.2.3.4" (claiming to be
-            // behind another proxy), we append our client_ip: "1.2.3.4, 5.6.7.8".
-            // This builds a chain: [original client, proxy1, proxy2, ...].
-            let xff = upstream_request
-                .headers
-                .get("X-Forwarded-For")
-                .and_then(|v| v.to_str().ok())
-                .map_or_else(
-                    || ip_str.clone(),
-                    |existing| format!("{existing}, {ip_str}"),
-                );
-
+            // X-Forwarded-For: set to the direct client IP only.
+            // We strip any client-supplied XFF to prevent IP spoofing.
+            // Trusted proxy chains require explicit trusted_proxies config (not yet implemented).
+            upstream_request.remove_header("X-Forwarded-For");
             upstream_request
-                .insert_header("X-Forwarded-For", &xff)
-                .expect("X-Forwarded-For value is valid");
+                .insert_header("X-Forwarded-For", &ip_str)
+                .expect("IP string is valid header value");
         }
 
         // X-Forwarded-Proto: "https" if the client connected over TLS, "http" otherwise.
@@ -354,7 +374,7 @@ impl ProxyHttp for DwaarProxy {
     /// - `X-Request-Id` — lets clients correlate their request with server logs
     async fn response_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         upstream_response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()>
@@ -365,16 +385,16 @@ impl ProxyHttp for DwaarProxy {
         // Each insert_header call uses a static string value, so .expect()
         // is safe — these can never fail at runtime.
 
-        // HSTS: tell browsers to always use HTTPS for this domain.
-        // max-age=31536000 = 1 year. includeSubDomains extends to all subdomains.
-        // Browsers only honor HSTS over HTTPS connections and ignore it
-        // over HTTP, so this is safe to set unconditionally.
-        upstream_response
-            .insert_header(
-                "Strict-Transport-Security",
-                "max-age=31536000; includeSubDomains",
-            )
-            .expect("static header value");
+        // HSTS: only on TLS connections. Emitting on plain HTTP could break
+        // intentionally HTTP-only routes if the response is ever cached.
+        if Self::is_tls_connection(session) {
+            upstream_response
+                .insert_header(
+                    "Strict-Transport-Security",
+                    "max-age=31536000; includeSubDomains",
+                )
+                .expect("static header value");
+        }
 
         // Prevent browsers from MIME-sniffing the response body.
         // Without this, a browser might execute uploaded .txt as JavaScript.

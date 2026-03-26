@@ -160,7 +160,19 @@ impl<'a> Tokenizer<'a> {
                     }
                 }
             } else {
-                value.push(char::from(self.input[self.pos]));
+                // Read a full UTF-8 character from the input.
+                // The input is valid UTF-8 (constructor takes &str), so this is safe.
+                let remaining = &self.input[self.pos..];
+                let s = std::str::from_utf8(remaining).expect("input is valid UTF-8");
+                if let Some(ch) = s.chars().next() {
+                    value.push(ch);
+                    // advance() for each byte of the character to keep pos tracking correct
+                    // (multi-byte chars are never newlines, so col tracking stays accurate)
+                    for _ in 1..ch.len_utf8() {
+                        self.pos += 1;
+                        self.col += 1;
+                    }
+                }
             }
             self.advance();
         }

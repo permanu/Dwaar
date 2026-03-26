@@ -49,6 +49,13 @@ impl std::fmt::Debug for CertStore {
 }
 
 impl CertStore {
+    fn lock_cache(&self) -> std::sync::MutexGuard<'_, LruCache<String, CachedCert>> {
+        self.cache.lock().unwrap_or_else(|poisoned| {
+            warn!("cert cache mutex was poisoned — recovering");
+            poisoned.into_inner()
+        })
+    }
+
     /// Create a new cert store loading from `cert_dir` with the given cache capacity.
     pub fn new(cert_dir: impl Into<PathBuf>, capacity: usize) -> Self {
         let cap = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::new(1000).expect("nonzero"));
@@ -61,10 +68,7 @@ impl CertStore {
     /// Look up a cert for `domain`. Returns from cache if available,
     /// otherwise loads from disk and caches it.
     pub fn get(&self, domain: &str) -> Option<CachedCert> {
-        let mut cache = self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut cache = self.lock_cache();
 
         // Cache hit — LRU promotes this entry to most-recently-used
         if let Some(cached) = cache.get(domain) {
@@ -78,10 +82,7 @@ impl CertStore {
         let cert = self.load_from_disk(domain)?;
 
         // Re-acquire lock and insert
-        let mut cache = self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut cache = self.lock_cache();
         cache.put(domain.to_string(), cert.clone());
         Some(cert)
     }
@@ -94,10 +95,7 @@ impl CertStore {
         cert_path: &Path,
         key_path: &Path,
     ) -> Option<CachedCert> {
-        let mut cache = self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut cache = self.lock_cache();
 
         if let Some(cached) = cache.get(domain) {
             return Some(cached.clone());
@@ -106,10 +104,7 @@ impl CertStore {
 
         let cert = load_pem_pair(cert_path, key_path)?;
 
-        let mut cache = self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut cache = self.lock_cache();
         cache.put(domain.to_string(), cert.clone());
         Some(cert)
     }
@@ -124,10 +119,7 @@ impl CertStore {
 
     /// Number of cached entries (for diagnostics).
     pub fn cached_count(&self) -> usize {
-        self.cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
+        self.lock_cache().len()
     }
 }
 
@@ -165,7 +157,36 @@ fn load_pem_pair(cert_path: &Path, key_path: &Path) -> Option<CachedCert> {
         }
     };
 
-    debug!(cert = %cert_path.display(), key = %key_path.display(), "loaded cert+key from disk");
+    // Verify the private key matches the certificate's public key
+    match cert.public_key() {
+        Ok(cert_pubkey) => {
+            if !cert_pubkey.public_eq(&key) {
+                warn!(
+                    cert = %cert_path.display(),
+                    key = %key_path.display(),
+                    "cert/key mismatch — the private key does not match the certificate"
+                );
+                return None;
+            }
+        }
+        Err(e) => {
+            warn!(cert = %cert_path.display(), error = %e, "failed to extract public key from cert");
+            return None;
+        }
+    }
+
+    // Warn if cert is expired or expiring soon (still load it — the log helps operators diagnose)
+    if let Ok(now) = openssl::asn1::Asn1Time::days_from_now(0) {
+        if cert.not_after() < now {
+            warn!(cert = %cert_path.display(), "certificate is expired");
+        } else if let Ok(soon) = openssl::asn1::Asn1Time::days_from_now(30)
+            && cert.not_after() < soon
+        {
+            warn!(cert = %cert_path.display(), "certificate expires within 30 days");
+        }
+    }
+
+    debug!(cert = %cert_path.display(), "loaded cert from disk");
     Some(CachedCert { cert, key })
 }
 

@@ -114,6 +114,12 @@ impl RouteTable {
     pub fn new(routes: Vec<Route>) -> Self {
         let mut map = HashMap::with_capacity_and_hasher(routes.len(), RandomState::default());
         for route in routes {
+            if map.contains_key(&route.domain) {
+                tracing::warn!(
+                    domain = %route.domain,
+                    "duplicate route — later definition wins"
+                );
+            }
             map.insert(route.domain.clone(), route);
         }
         Self { routes: map }
