@@ -4,14 +4,14 @@
 // This file is part of Dwaar — https://dwaar.dev
 // Licensed under the Business Source License 1.1
 
-//! dwaar-tls
+//! dwaar-tls — TLS termination with SNI-based cert selection.
+//!
+//! Provides a [`CertStore`](cert_store::CertStore) for loading and caching
+//! certificates, and an [`SniResolver`](sni::SniResolver) that implements
+//! Pingora's `TlsAccept` trait for dynamic cert selection during handshake.
+
+pub mod cert_store;
+pub mod sni;
 
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_compiles() {
-        // Placeholder — replaced with real tests as features are implemented
-        let x = 1 + 1;
-        assert_eq!(x, 2);
-    }
-}
+pub(crate) mod test_util;

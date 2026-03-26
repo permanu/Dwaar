@@ -23,8 +23,8 @@ dwaar-geo = { path = "crates/dwaar-geo" }
 dwaar-log = { path = "crates/dwaar-log" }
 
 # Pingora
-pingora = { version = "0.8.0", features = ["proxy", "lb"] }
-pingora-core = { version = "0.8.0" }
+pingora = { version = "0.8.0", features = ["proxy", "lb", "openssl"] }
+pingora-core = { version = "0.8.0", features = ["openssl"] }
 pingora-proxy = { version = "0.8.0" }
 pingora-http = { version = "0.8.0" }
 pingora-load-balancing = { version = "0.8.0" }
@@ -87,6 +87,9 @@ hyperloglog = "1.0.3"
 aes-gcm = "0.10.3"
 rand = "0.10.0"
 base64 = "0.22.1"
+
+# OpenSSL (for TLS cert handling in dwaar-tls)
+openssl = { version = "0.10.72", features = ["vendored"] }
 
 # Compression
 flate2 = "1.1.9"
