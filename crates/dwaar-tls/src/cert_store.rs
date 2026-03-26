@@ -275,7 +275,9 @@ mod tests {
         assert_eq!(store.cached_count(), 0);
 
         // Next get() reloads from disk
-        store.get("evict.example.com").expect("should reload from disk");
+        store
+            .get("evict.example.com")
+            .expect("should reload from disk");
         assert_eq!(store.cached_count(), 1);
     }
 
