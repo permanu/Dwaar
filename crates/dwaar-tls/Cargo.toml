@@ -16,6 +16,10 @@ lru = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "time"] }
+instant-acme = { workspace = true }
+dashmap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

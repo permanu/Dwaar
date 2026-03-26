@@ -88,6 +88,9 @@ aes-gcm = "0.10.3"
 rand = "0.10.0"
 base64 = "0.22.1"
 
+# ACME (automatic certificate provisioning)
+instant-acme = "0.7"
+
 # OpenSSL (for TLS cert handling in dwaar-tls)
 openssl = { version = "0.10.72", features = ["vendored"] }
 

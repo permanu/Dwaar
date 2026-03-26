@@ -10,6 +10,7 @@
 //! certificates, and an [`SniResolver`](sni::SniResolver) that implements
 //! Pingora's `TlsAccept` trait for dynamic cert selection during handshake.
 
+pub mod acme;
 pub mod cert_store;
 pub mod sni;
 
