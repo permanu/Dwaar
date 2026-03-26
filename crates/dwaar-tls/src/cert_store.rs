@@ -26,6 +26,8 @@ use tracing::{debug, warn};
 pub struct CachedCert {
     pub cert: X509,
     pub key: PKey<Private>,
+    pub issuer: Option<X509>,
+    pub ocsp_response: Option<Vec<u8>>,
 }
 
 /// Certificate store that loads from filesystem and caches in LRU.
@@ -152,12 +154,23 @@ fn load_pem_pair(cert_path: &Path, key_path: &Path) -> Option<CachedCert> {
         }
     };
 
-    let cert = match X509::from_pem(&cert_pem) {
-        Ok(c) => c,
+    let certs = match X509::stack_from_pem(&cert_pem) {
+        Ok(stack) if !stack.is_empty() => stack,
+        Ok(_) => {
+            warn!(path = %cert_path.display(), "cert PEM file contains no certificates");
+            return None;
+        }
         Err(e) => {
             warn!(path = %cert_path.display(), error = %e, "invalid cert PEM");
             return None;
         }
+    };
+
+    let cert = certs[0].clone();
+    let issuer = if certs.len() > 1 {
+        Some(certs[1].clone())
+    } else {
+        None
     };
 
     let key = match PKey::private_key_from_pem(&key_pem) {
@@ -198,7 +211,7 @@ fn load_pem_pair(cert_path: &Path, key_path: &Path) -> Option<CachedCert> {
     }
 
     debug!(cert = %cert_path.display(), "loaded cert from disk");
-    Some(CachedCert { cert, key })
+    Some(CachedCert { cert, key, issuer, ocsp_response: None })
 }
 
 #[cfg(test)]
@@ -287,6 +300,45 @@ mod tests {
         let store = CertStore::new(dir.path(), 100);
         store.invalidate("ghost.example.com"); // should not panic
         assert_eq!(store.cached_count(), 0);
+    }
+
+    #[test]
+    fn load_pem_pair_parses_chain_with_issuer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cert_pem, key_pem, ca_pem) =
+            crate::test_util::generate_ca_signed("chain.example.com");
+
+        // Write chain: leaf + issuer concatenated
+        let mut chain = cert_pem;
+        chain.extend_from_slice(&ca_pem);
+        std::fs::write(dir.path().join("chain.example.com.pem"), &chain).expect("write chain");
+        std::fs::write(dir.path().join("chain.example.com.key"), &key_pem).expect("write key");
+
+        let store = CertStore::new(dir.path(), 100);
+        let cached = store.get("chain.example.com").expect("should load chain");
+
+        assert!(cached.issuer.is_some(), "issuer should be parsed from chain");
+        assert!(
+            cached.ocsp_response.is_none(),
+            "no OCSP response yet"
+        );
+    }
+
+    #[test]
+    fn load_pem_pair_single_cert_has_no_issuer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cert_pem, key_pem) = generate_self_signed("single.example.com");
+
+        std::fs::write(dir.path().join("single.example.com.pem"), &cert_pem).expect("write cert");
+        std::fs::write(dir.path().join("single.example.com.key"), &key_pem).expect("write key");
+
+        let store = CertStore::new(dir.path(), 100);
+        let cached = store.get("single.example.com").expect("should load");
+
+        assert!(
+            cached.issuer.is_none(),
+            "self-signed has no issuer in chain"
+        );
     }
 
     #[test]
