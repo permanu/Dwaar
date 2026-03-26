@@ -15,7 +15,7 @@ openssl = { workspace = true }
 lru = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["fs", "time"] }
+tokio = { workspace = true, features = ["fs", "time", "net", "io-util"] }
 instant-acme = { workspace = true }
 dashmap = { workspace = true }
 serde = { workspace = true }
