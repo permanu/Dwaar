@@ -16,6 +16,7 @@ pingora-http = { workspace = true }
 pingora-load-balancing = { workspace = true }
 pingora-error = { workspace = true }
 dwaar-plugins = { workspace = true }
+dwaar-tls = { workspace = true }
 dwaar-log = { workspace = true }
 ahash = { workspace = true }
 arc-swap = { workspace = true }

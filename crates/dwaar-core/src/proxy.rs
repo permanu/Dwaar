@@ -30,6 +30,8 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
 use tracing::{debug, warn};
 
+use dwaar_tls::acme::ChallengeSolver;
+
 use crate::context::RequestContext;
 use crate::route::RouteTable;
 
@@ -59,6 +61,8 @@ pub struct DwaarProxy {
     /// Readers pay ~1ns (atomic pointer load), writers swap the entire
     /// table atomically on config reload.
     route_table: Arc<ArcSwap<RouteTable>>,
+    /// ACME HTTP-01 challenge solver. `None` if no `tls auto` domains.
+    challenge_solver: Option<Arc<ChallengeSolver>>,
 }
 
 impl DwaarProxy {
@@ -66,8 +70,14 @@ impl DwaarProxy {
     ///
     /// The `ArcSwap` allows hot-reloading routes without restarting
     /// the proxy — config reload code calls `route_table.store(new_table)`.
-    pub fn new(route_table: Arc<ArcSwap<RouteTable>>) -> Self {
-        Self { route_table }
+    pub fn new(
+        route_table: Arc<ArcSwap<RouteTable>>,
+        challenge_solver: Option<Arc<ChallengeSolver>>,
+    ) -> Self {
+        Self {
+            route_table,
+            challenge_solver,
+        }
     }
 }
 
@@ -205,6 +215,37 @@ impl ProxyHttp for DwaarProxy {
             path = %ctx.path,
             "request metadata extracted"
         );
+
+        // --- ACME HTTP-01 challenge response ---
+        // Must happen before HTTPS redirect — challenges arrive on port 80.
+        // Responds directly from the in-memory solver without touching upstream.
+        if let Some(ref solver) = self.challenge_solver {
+            const CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
+            if ctx.path.starts_with(CHALLENGE_PREFIX) {
+                let token = &ctx.path[CHALLENGE_PREFIX.len()..];
+                if ChallengeSolver::is_valid_token(token)
+                    && let Some(key_auth) = solver.get(token)
+                {
+                    debug!(
+                        request_id = %ctx.request_id,
+                        token = %token,
+                        "serving ACME challenge response"
+                    );
+                    let mut resp = ResponseHeader::build(200, Some(1))?;
+                    resp.insert_header("Content-Length", key_auth.len().to_string())
+                        .map_err(|e| {
+                            Error::explain(HTTPStatus(500), format!("bad header: {e}"))
+                        })?;
+                    session
+                        .write_response_header(Box::new(resp), false)
+                        .await?;
+                    session
+                        .write_response_body(Some(bytes::Bytes::from(key_auth)), true)
+                        .await?;
+                    return Ok(true);
+                }
+            }
+        }
 
         // HTTP/1.1 requires a Host header (RFC 7230 §5.4). Without it (and
         // without :authority in HTTP/2), we can't route the request.
@@ -439,7 +480,7 @@ mod tests {
 
     fn make_proxy(routes: Vec<Route>) -> DwaarProxy {
         let table = RouteTable::new(routes);
-        DwaarProxy::new(Arc::new(ArcSwap::from_pointee(table)))
+        DwaarProxy::new(Arc::new(ArcSwap::from_pointee(table)), None)
     }
 
     #[test]
