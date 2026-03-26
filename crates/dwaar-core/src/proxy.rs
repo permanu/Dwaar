@@ -94,16 +94,15 @@ impl ProxyHttp for DwaarProxy {
         // done all the HTTP/1.1 and HTTP/2 parsing by this point.
         let header = session.req_header();
 
-        // --- Host ---
-        // In HTTP/1.1, the Host header is mandatory (RFC 7230 §5.4).
-        // In HTTP/2, it's the `:authority` pseudo-header.
-        // Pingora normalizes both into the header map under "host".
-        // .to_str() converts the HeaderValue bytes to &str (fails if not UTF-8).
+        // HTTP/1.1 sends the hostname in the Host header (RFC 7230 §5.4).
+        // HTTP/2 uses the :authority pseudo-header, which Pingora stores in
+        // the URI authority — not in the headers map. We check both.
         ctx.host = header
             .headers
             .get(http::header::HOST)
             .and_then(|v| v.to_str().ok())
-            .map(ToString::to_string);
+            .map(ToString::to_string)
+            .or_else(|| header.uri.authority().map(|a| a.as_str().to_string()));
 
         // --- Method ---
         // .as_str() returns "GET", "POST", etc. as a &str.
