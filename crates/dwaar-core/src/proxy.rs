@@ -24,11 +24,11 @@
 //! - `new_ctx()` — sets `start_time` and `request_id` (ISSUE-005)
 //! - `request_filter()` — extracts client IP, host, method, path (ISSUE-006)
 //! - `upstream_peer()` — returns the hardcoded upstream (ISSUE-005)
+//! - `upstream_request_filter()` — adds proxy headers, strips hop-by-hop (ISSUE-007)
 //! - `response_filter()` — adds `X-Request-Id` header (ISSUE-006)
 //!
 //! ## Later issues
 //!
-//! - ISSUE-007: `upstream_request_filter()` sets proxy headers
 //! - ISSUE-008: `response_filter()` adds security headers
 //! - ISSUE-010: `upstream_peer()` uses `RouteTable` instead of hardcoded addr
 
@@ -37,7 +37,7 @@ use std::net::SocketAddr;
 use async_trait::async_trait;
 use pingora_core::Result;
 use pingora_core::upstreams::peer::HttpPeer;
-use pingora_http::ResponseHeader;
+use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
 use tracing::debug;
 
@@ -151,6 +151,104 @@ impl ProxyHttp for DwaarProxy {
 
         let peer = HttpPeer::new(self.upstream, false, String::new());
         Ok(Box::new(peer))
+    }
+
+    /// Add standard proxy headers and strip hop-by-hop headers (ISSUE-007).
+    ///
+    /// This runs after `upstream_peer()` has selected the backend but before
+    /// Pingora sends the request. We modify the request headers that the
+    /// **upstream** will see — not the original client request.
+    ///
+    /// ## Headers added
+    ///
+    /// - `X-Real-IP`: The client's direct TCP connection IP.
+    /// - `X-Forwarded-For`: Appends client IP to the existing chain
+    ///   (or creates a new chain if none exists). Preserves any upstream
+    ///   proxy IPs that were already in the header.
+    /// - `X-Forwarded-Proto`: `http` (ISSUE-015 will set `https` for TLS).
+    /// - `X-Request-Id`: The UUID v7 from the request context.
+    ///
+    /// ## Headers removed (RFC 7230 §6.1)
+    ///
+    /// Hop-by-hop headers are meaningful only for a single transport-level
+    /// connection — they must not be forwarded to the upstream.
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        // --- Add proxy identity headers ---
+
+        // X-Real-IP: the direct client IP (not from X-Forwarded-For).
+        // Backends use this as the authoritative client IP when they
+        // trust the proxy.
+        if let Some(ip) = &ctx.client_ip {
+            let ip_str = ip.to_string();
+            upstream_request
+                .insert_header("X-Real-IP", &ip_str)
+                .expect("IP string is valid header value");
+
+            // X-Forwarded-For: append client IP to the chain.
+            // If the client sent "X-Forwarded-For: 1.2.3.4" (claiming to be
+            // behind another proxy), we append our client_ip: "1.2.3.4, 5.6.7.8".
+            // This builds a chain: [original client, proxy1, proxy2, ...].
+            let xff = upstream_request
+                .headers
+                .get("X-Forwarded-For")
+                .and_then(|v| v.to_str().ok())
+                .map_or_else(
+                    || ip_str.clone(),
+                    |existing| format!("{existing}, {ip_str}"),
+                );
+
+            upstream_request
+                .insert_header("X-Forwarded-For", &xff)
+                .expect("X-Forwarded-For value is valid");
+        }
+
+        // X-Forwarded-Proto: always "http" for now since we don't have TLS yet.
+        // ISSUE-015 will check the downstream connection and set "https" when
+        // the client connected over TLS.
+        upstream_request
+            .insert_header("X-Forwarded-Proto", "http")
+            .expect("static header value is valid");
+
+        // X-Request-Id: lets the backend correlate its logs with ours.
+        upstream_request
+            .insert_header("X-Request-Id", &ctx.request_id)
+            .expect("UUID is valid header value");
+
+        // --- Strip hop-by-hop headers (RFC 7230 §6.1) ---
+        // These headers describe the client→proxy connection and must not
+        // leak to the upstream. Pingora handles some of these internally
+        // (like Connection and Transfer-Encoding for HTTP/1↔HTTP/2 translation),
+        // but we explicitly remove the full set for safety.
+        //
+        // IMPORTANT: Use remove_header(), not headers.remove(). Pingora
+        // maintains a case-preserving header_name_map alongside the HeaderMap.
+        // Direct removal from headers causes a desync panic on serialization.
+        for header_name in &[
+            "Proxy-Connection",
+            "Proxy-Authenticate",
+            "Proxy-Authorization",
+            "TE",
+            "Trailer",
+            "Upgrade",
+        ] {
+            upstream_request.remove_header(*header_name);
+        }
+
+        debug!(
+            request_id = %ctx.request_id,
+            client_ip = ?ctx.client_ip,
+            "proxy headers added, hop-by-hop stripped"
+        );
+
+        Ok(())
     }
 
     /// Add the `X-Request-Id` header to every response sent to the client.

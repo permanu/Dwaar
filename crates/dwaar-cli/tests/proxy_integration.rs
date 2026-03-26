@@ -156,11 +156,51 @@ fn send_through_proxy(path: &str) -> ProxyResponse {
     })
 }
 
+/// Accept one connection, capture the request headers the upstream received,
+/// send a 200 response back. Returns the captured headers as a HashMap.
+fn serve_and_capture_headers(listener: &TcpListener) -> HashMap<String, String> {
+    let (mut stream, _) = listener.accept().expect("accept connection");
+
+    let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+    let mut headers = HashMap::new();
+    let mut line = String::new();
+
+    // Skip the request line (e.g., "GET / HTTP/1.1")
+    line.clear();
+    let _ = reader.read_line(&mut line);
+
+    // Read headers until blank line
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+            break;
+        }
+        // Parse "Header-Name: value\r\n"
+        if let Some((name, value)) = line.trim_end().split_once(": ") {
+            headers.insert(name.to_lowercase(), value.to_string());
+        }
+    }
+
+    let body = "ok";
+    let response = format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+
+    headers
+}
+
 /// ISSUE-005: Verifies that Dwaar forwards HTTP requests to the upstream
 /// and returns the upstream's response with the correct status code and body.
 #[test]
 fn proxy_forwards_upstream_responses() {
-    let _lock = PORT_LOCK.lock().expect("acquire port lock");
+    let _lock = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let upstream =
         TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
 
@@ -203,7 +243,7 @@ fn proxy_forwards_upstream_responses() {
 /// header with a valid UUID v7 value, and that each request gets a unique ID.
 #[test]
 fn proxy_adds_x_request_id_header() {
-    let _lock = PORT_LOCK.lock().expect("acquire port lock");
+    let _lock = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let upstream =
         TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
 
@@ -243,6 +283,117 @@ fn proxy_adds_x_request_id_header() {
         .expect("second response should also have X-Request-Id");
 
     assert_ne!(id1, id2, "each request must get a unique request ID");
+
+    stop_dwaar(child);
+}
+
+/// ISSUE-007: Verifies that Dwaar adds standard proxy headers to the request
+/// sent to the upstream, and that hop-by-hop headers are stripped.
+#[test]
+fn proxy_adds_standard_proxy_headers() {
+    let _lock = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let upstream =
+        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+
+    let child = start_dwaar_proxy();
+
+    // Spawn a thread to capture what the upstream receives
+    let handle = thread::spawn({
+        let upstream_fd = upstream.try_clone().expect("clone listener");
+        move || serve_and_capture_headers(&upstream_fd)
+    });
+
+    // Send a request through the proxy
+    let _resp = send_through_proxy("/api/test");
+    let upstream_headers = handle.join().expect("upstream thread");
+
+    // --- X-Real-IP: should be 127.0.0.1 (the test client's IP) ---
+    let real_ip = upstream_headers
+        .get("x-real-ip")
+        .expect("upstream should receive X-Real-IP");
+    assert_eq!(real_ip, "127.0.0.1");
+
+    // --- X-Forwarded-For: should contain 127.0.0.1 ---
+    let xff = upstream_headers
+        .get("x-forwarded-for")
+        .expect("upstream should receive X-Forwarded-For");
+    assert!(
+        xff.contains("127.0.0.1"),
+        "X-Forwarded-For should contain client IP, got: {xff}"
+    );
+
+    // --- X-Forwarded-Proto: should be "http" (no TLS yet) ---
+    let proto = upstream_headers
+        .get("x-forwarded-proto")
+        .expect("upstream should receive X-Forwarded-Proto");
+    assert_eq!(proto, "http");
+
+    // --- X-Request-Id: should be a UUID ---
+    let request_id = upstream_headers
+        .get("x-request-id")
+        .expect("upstream should receive X-Request-Id");
+    assert_eq!(request_id.len(), 36, "request ID should be a UUID");
+
+    // --- Hop-by-hop headers should NOT be present ---
+    assert!(
+        upstream_headers.get("proxy-connection").is_none(),
+        "Proxy-Connection should be stripped"
+    );
+
+    stop_dwaar(child);
+}
+
+/// ISSUE-007: Verifies that X-Forwarded-For appends to an existing chain
+/// rather than replacing it (chained proxy scenario).
+#[test]
+fn proxy_appends_to_existing_x_forwarded_for() {
+    let _lock = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let upstream =
+        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+
+    let child = start_dwaar_proxy();
+
+    let handle = thread::spawn({
+        let upstream_fd = upstream.try_clone().expect("clone listener");
+        move || serve_and_capture_headers(&upstream_fd)
+    });
+
+    // Send a request with a pre-existing X-Forwarded-For header,
+    // simulating a request that already passed through another proxy.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    rt.block_on(async {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build client");
+
+        let _resp = client
+            .get("http://127.0.0.1:6188/chained")
+            .header("X-Forwarded-For", "10.0.0.1")
+            .send()
+            .await
+            .expect("request should succeed");
+    });
+
+    let upstream_headers = handle.join().expect("upstream thread");
+
+    // X-Forwarded-For should be "10.0.0.1, 127.0.0.1" — the original
+    // client's claim preserved, with Dwaar appending the direct connection IP.
+    let xff = upstream_headers
+        .get("x-forwarded-for")
+        .expect("upstream should receive X-Forwarded-For");
+    assert!(
+        xff.contains("10.0.0.1") && xff.contains("127.0.0.1"),
+        "X-Forwarded-For should contain both original and proxy IP, got: {xff}"
+    );
+    assert!(
+        xff.starts_with("10.0.0.1"),
+        "original IP should come first in the chain, got: {xff}"
+    );
 
     stop_dwaar(child);
 }
