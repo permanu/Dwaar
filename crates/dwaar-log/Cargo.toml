@@ -12,8 +12,9 @@ authors.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
-tokio = { workspace = true, features = ["sync", "io-util", "fs", "time"] }
+tokio = { workspace = true, features = ["sync", "io-util", "fs", "time", "rt", "macros"] }
 tracing = { workspace = true }
+async-trait = { workspace = true }
 thiserror = { workspace = true }
 
 [lints]
