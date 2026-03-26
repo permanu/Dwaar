@@ -6,8 +6,8 @@
 
 //! Dwaar CLI entry point.
 //!
-//! Reads a Dwaarfile, parses it, compiles routes, and starts the
-//! Pingora proxy server. Handles CLI args, logging, and signals.
+//! Reads a Dwaarfile, parses it, compiles routes and TLS config,
+//! and starts the Pingora proxy server with HTTP and optional TLS listeners.
 
 mod cli;
 
@@ -15,18 +15,20 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use arc_swap::ArcSwap;
+use pingora_core::listeners::tls::TlsSettings;
 use pingora_core::server::Server;
 use pingora_core::server::configuration::{Opt as PingoraOpt, ServerConf};
 use tracing::info;
 
 use cli::{Cli, Commands};
-use dwaar_config::compile::compile_routes;
+use dwaar_config::compile::{compile_routes, compile_tls_configs, has_tls_sites};
 use dwaar_core::proxy::DwaarProxy;
+use dwaar_tls::cert_store::CertStore;
+use dwaar_tls::sni::{DomainTlsConfig, SniResolver};
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse_args();
 
-    // Handle subcommands that don't need the full server
     match &cli.command {
         Some(Commands::Version) => {
             print_version();
@@ -52,7 +54,6 @@ fn main() -> anyhow::Result<()> {
         "starting dwaar"
     );
 
-    // Read and parse the Dwaarfile
     let config_path = &cli.config;
     let config_text = std::fs::read_to_string(config_path)
         .with_context(|| format!("failed to read config file: {}", config_path.display()))?;
@@ -66,7 +67,6 @@ fn main() -> anyhow::Result<()> {
         "config loaded"
     );
 
-    // Test mode: validate config and exit
     if cli.test {
         info!("config valid");
         return Ok(());
@@ -96,7 +96,7 @@ fn main() -> anyhow::Result<()> {
         "server bootstrapped"
     );
 
-    // Compile parsed config into a route table for the proxy engine
+    // Compile routes
     let route_table = compile_routes(&dwaar_config);
     if route_table.is_empty() {
         bail!("no valid routes found in config — nothing to proxy");
@@ -107,14 +107,62 @@ fn main() -> anyhow::Result<()> {
     let proxy = DwaarProxy::new(route_table);
 
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, proxy);
-    proxy_service.add_tcp("0.0.0.0:6188");
 
-    info!(listen = "0.0.0.0:6188", "proxy service registered");
+    // Always listen on HTTP
+    proxy_service.add_tcp("0.0.0.0:6188");
+    info!(
+        listen = "0.0.0.0:6188",
+        protocol = "http",
+        "listener registered"
+    );
+
+    if has_tls_sites(&dwaar_config) {
+        setup_tls_listener(&dwaar_config, &mut proxy_service)?;
+    }
 
     server.add_service(proxy_service);
 
     info!("entering run loop, waiting for connections or signals");
     server.run_forever();
+}
+
+fn setup_tls_listener(
+    config: &dwaar_config::model::DwaarConfig,
+    proxy_service: &mut pingora_core::services::listening::Service<
+        pingora_proxy::HttpProxy<DwaarProxy>,
+    >,
+) -> anyhow::Result<()> {
+    let tls_configs = compile_tls_configs(config);
+
+    let cert_store = Arc::new(CertStore::new("/etc/dwaar/certs", 1000));
+    let mut sni_resolver = SniResolver::new(cert_store);
+
+    if let Some(first_domain) = tls_configs.keys().next() {
+        sni_resolver.set_default_domain(first_domain);
+    }
+
+    for (domain, tls_config) in &tls_configs {
+        sni_resolver.add_domain(
+            domain,
+            DomainTlsConfig {
+                cert_path: tls_config.cert_path.clone(),
+                key_path: tls_config.key_path.clone(),
+            },
+        );
+        info!(domain, cert = %tls_config.cert_path.display(), "TLS cert registered");
+    }
+
+    let mut tls_settings = TlsSettings::with_callbacks(Box::new(sni_resolver))
+        .context("failed to create TLS settings")?;
+    tls_settings.enable_h2();
+
+    proxy_service.add_tls_with_settings("0.0.0.0:6189", None, tls_settings);
+    info!(
+        listen = "0.0.0.0:6189",
+        protocol = "https",
+        "TLS listener registered"
+    );
+    Ok(())
 }
 
 fn fmt_config(path: &std::path::Path, check: bool) -> anyhow::Result<()> {

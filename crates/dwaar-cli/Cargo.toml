@@ -13,8 +13,8 @@ name = "dwaar"
 path = "src/main.rs"
 
 [dependencies]
-dwaar-core = { workspace = true }
 dwaar-config = { workspace = true }
+dwaar-core = { workspace = true }
 dwaar-tls = { workspace = true }
 dwaar-analytics = { workspace = true }
 dwaar-plugins = { workspace = true }

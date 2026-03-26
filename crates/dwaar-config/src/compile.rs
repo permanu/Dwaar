@@ -4,19 +4,20 @@
 // This file is part of Dwaar — https://dwaar.dev
 // Licensed under the Business Source License 1.1
 
-//! Compile a parsed [`DwaarConfig`] into a [`RouteTable`].
+//! Compile a parsed [`DwaarConfig`] into runtime structures.
 //!
-//! The parser produces rich config (TLS, headers, compression, etc.)
-//! but the proxy engine only needs domain→upstream for routing.
-//! This module extracts the routing info and builds the hot-path
-//! data structure.
+//! The parser produces rich config (TLS, headers, compression, etc.).
+//! This module extracts routing info for the proxy engine and TLS
+//! config for the cert store.
 
+use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::path::PathBuf;
 
 use dwaar_core::route::{Route, RouteTable};
 use tracing::warn;
 
-use crate::model::{Directive, DwaarConfig, ReverseProxyDirective, UpstreamAddr};
+use crate::model::{Directive, DwaarConfig, ReverseProxyDirective, TlsDirective, UpstreamAddr};
 
 /// Compile a parsed config into a route table for the proxy engine.
 ///
@@ -52,6 +53,55 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
     }
 
     RouteTable::new(routes)
+}
+
+/// Per-domain TLS config extracted from the parsed Dwaarfile.
+#[derive(Debug, Clone)]
+pub struct CompiledTlsConfig {
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
+}
+
+/// Extract TLS configs from the parsed Dwaarfile.
+///
+/// Returns a map of domain → cert/key paths for sites that have
+/// `tls /cert.pem /key.pem` directives. Sites with `tls auto`,
+/// `tls off`, or `tls internal` are not included (those are handled
+/// by ACME or skipped).
+pub fn compile_tls_configs(config: &DwaarConfig) -> HashMap<String, CompiledTlsConfig> {
+    let mut tls_configs = HashMap::new();
+
+    for site in &config.sites {
+        for directive in &site.directives {
+            if let Directive::Tls(TlsDirective::Manual {
+                cert_path,
+                key_path,
+            }) = directive
+            {
+                tls_configs.insert(
+                    site.address.to_lowercase(),
+                    CompiledTlsConfig {
+                        cert_path: PathBuf::from(cert_path),
+                        key_path: PathBuf::from(key_path),
+                    },
+                );
+            }
+        }
+    }
+
+    tls_configs
+}
+
+/// Returns true if any site in the config has a TLS directive
+/// that requires a TLS listener (manual certs or auto).
+pub fn has_tls_sites(config: &DwaarConfig) -> bool {
+    config.sites.iter().any(|site| {
+        site.directives.iter().any(|d| match d {
+            Directive::Tls(TlsDirective::Off) => false,
+            Directive::Tls(_) => true,
+            _ => false,
+        })
+    })
 }
 
 fn find_reverse_proxy(directives: &[Directive]) -> Option<&ReverseProxyDirective> {
