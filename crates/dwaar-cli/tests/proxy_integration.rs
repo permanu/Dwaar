@@ -157,7 +157,7 @@ fn send_through_proxy(path: &str) -> ProxyResponse {
 }
 
 /// Accept one connection, capture the request headers the upstream received,
-/// send a 200 response back. Returns the captured headers as a HashMap.
+/// send a 200 response back. Returns the captured headers as a `HashMap`.
 fn serve_and_capture_headers(listener: &TcpListener) -> HashMap<String, String> {
     let (mut stream, _) = listener.accept().expect("accept connection");
 
@@ -200,7 +200,9 @@ fn serve_and_capture_headers(listener: &TcpListener) -> HashMap<String, String> 
 /// and returns the upstream's response with the correct status code and body.
 #[test]
 fn proxy_forwards_upstream_responses() {
-    let _lock = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = PORT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let upstream =
         TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
 
@@ -243,7 +245,9 @@ fn proxy_forwards_upstream_responses() {
 /// header with a valid UUID v7 value, and that each request gets a unique ID.
 #[test]
 fn proxy_adds_x_request_id_header() {
-    let _lock = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = PORT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let upstream =
         TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
 
@@ -291,7 +295,9 @@ fn proxy_adds_x_request_id_header() {
 /// sent to the upstream, and that hop-by-hop headers are stripped.
 #[test]
 fn proxy_adds_standard_proxy_headers() {
-    let _lock = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = PORT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let upstream =
         TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
 
@@ -336,7 +342,7 @@ fn proxy_adds_standard_proxy_headers() {
 
     // --- Hop-by-hop headers should NOT be present ---
     assert!(
-        upstream_headers.get("proxy-connection").is_none(),
+        !upstream_headers.contains_key("proxy-connection"),
         "Proxy-Connection should be stripped"
     );
 
@@ -347,7 +353,9 @@ fn proxy_adds_standard_proxy_headers() {
 /// rather than replacing it (chained proxy scenario).
 #[test]
 fn proxy_appends_to_existing_x_forwarded_for() {
-    let _lock = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = PORT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let upstream =
         TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
 
@@ -402,7 +410,9 @@ fn proxy_appends_to_existing_x_forwarded_for() {
 /// of security headers and replaces the upstream's Server banner.
 #[test]
 fn proxy_adds_security_response_headers() {
-    let _lock = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _lock = PORT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let upstream =
         TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
 
