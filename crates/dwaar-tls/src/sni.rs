@@ -34,13 +34,15 @@ pub struct DomainTlsConfig {
 ///
 /// Holds a reference to the cert store and a map of domain-specific
 /// TLS configs (from `tls /cert /key` directives in the Dwaarfile).
-/// Falls back to the cert store's default directory layout when no
-/// explicit paths are configured.
+/// Falls back to a default cert when no SNI is provided (e.g.,
+/// clients connecting by IP address).
 #[derive(Debug)]
 pub struct SniResolver {
     cert_store: Arc<CertStore>,
     /// Explicit cert paths from `tls /cert /key` directives
     domain_configs: HashMap<String, DomainTlsConfig>,
+    /// Domain to use when client doesn't send SNI (IP-based connections)
+    default_domain: Option<String>,
 }
 
 impl SniResolver {
@@ -48,7 +50,14 @@ impl SniResolver {
         Self {
             cert_store,
             domain_configs: HashMap::new(),
+            default_domain: None,
         }
+    }
+
+    /// Set a fallback domain for connections without SNI.
+    /// The first TLS-enabled domain is typically used as the default.
+    pub fn set_default_domain(&mut self, domain: &str) {
+        self.default_domain = Some(domain.to_lowercase());
     }
 
     /// Register an explicit cert/key path for a domain.
@@ -93,11 +102,19 @@ impl SniResolver {
 #[async_trait]
 impl TlsAccept for SniResolver {
     async fn certificate_callback(&self, ssl: &mut TlsRef) {
-        let Some(sni_str) = ssl.servername(NameType::HOST_NAME) else {
-            warn!("TLS handshake without SNI — no cert to select");
-            return;
+        let sni = match ssl.servername(NameType::HOST_NAME) {
+            Some(name) => name.to_string(),
+            None => {
+                // No SNI — use the default domain if configured (handles IP-based connections)
+                if let Some(default) = &self.default_domain {
+                    debug!("no SNI in handshake, falling back to default domain");
+                    default.clone()
+                } else {
+                    warn!("TLS handshake without SNI and no default domain configured");
+                    return;
+                }
+            }
         };
-        let sni = sni_str.to_string();
 
         let Some(cached) = self.resolve_cert(&sni) else {
             warn!(sni = %sni, "no cert found for SNI hostname");
