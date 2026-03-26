@@ -54,6 +54,15 @@ pub(crate) enum Commands {
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
+    /// Format Dwaarfile to canonical style
+    Fmt {
+        /// Path to Dwaarfile (overrides --config)
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        /// Check formatting without modifying the file (exit 1 if unformatted)
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 impl Cli {
@@ -146,6 +155,29 @@ mod tests {
             );
         } else {
             panic!("expected Validate command");
+        }
+    }
+
+    #[test]
+    fn fmt_subcommand() {
+        let cli = Cli::try_parse_from(["dwaar", "fmt"]).expect("should parse fmt");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Fmt {
+                config: None,
+                check: false
+            })
+        ));
+    }
+
+    #[test]
+    fn fmt_check_flag() {
+        let cli =
+            Cli::try_parse_from(["dwaar", "fmt", "--check"]).expect("should parse fmt --check");
+        if let Some(Commands::Fmt { check, .. }) = &cli.command {
+            assert!(check);
+        } else {
+            panic!("expected Fmt command");
         }
     }
 
