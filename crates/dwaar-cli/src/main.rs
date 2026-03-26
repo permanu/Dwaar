@@ -213,6 +213,12 @@ fn setup_tls_listener(
         .set_min_proto_version(Some(pingora_core::tls::ssl::SslVersion::TLS1_2))
         .context("failed to set minimum TLS version")?;
 
+    // Enable OCSP stapling — OpenSSL requires this callback on the SslContext
+    // for set_ocsp_status() to actually send the response to clients.
+    tls_settings
+        .set_status_callback(|ssl| Ok(ssl.ocsp_status().is_some()))
+        .expect("set OCSP status callback");
+
     proxy_service.add_tls_with_settings("0.0.0.0:6189", None, tls_settings);
     info!(
         listen = "0.0.0.0:6189",
