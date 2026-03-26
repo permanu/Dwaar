@@ -110,6 +110,20 @@ pub fn has_tls_sites(config: &DwaarConfig) -> bool {
         .any(|site| site_has_tls(&site.directives))
 }
 
+/// Extract domains that use `tls auto` — these need ACME cert provisioning.
+pub fn compile_acme_domains(config: &DwaarConfig) -> Vec<String> {
+    config
+        .sites
+        .iter()
+        .filter(|site| {
+            site.directives
+                .iter()
+                .any(|d| matches!(d, Directive::Tls(TlsDirective::Auto)))
+        })
+        .map(|site| site.address.to_lowercase())
+        .collect()
+}
+
 /// Validate that a site address is a legal hostname or wildcard pattern.
 /// Rejects path traversal, null bytes, and other non-hostname characters.
 fn is_valid_domain(s: &str) -> bool {
@@ -363,5 +377,53 @@ mod tests {
 
         assert!(secure.tls, "secure route should have tls = true");
         assert!(!plain.tls, "plain route should have tls = false");
+    }
+
+    #[test]
+    fn compile_acme_domains_extracts_auto_only() {
+        let config = DwaarConfig {
+            sites: vec![
+                SiteBlock {
+                    address: "auto.example.com".to_string(),
+                    directives: vec![rp("127.0.0.1:3000"), Directive::Tls(TlsDirective::Auto)],
+                },
+                SiteBlock {
+                    address: "manual.example.com".to_string(),
+                    directives: vec![
+                        rp("127.0.0.1:4000"),
+                        Directive::Tls(TlsDirective::Manual {
+                            cert_path: "/etc/certs/cert.pem".to_string(),
+                            key_path: "/etc/certs/key.pem".to_string(),
+                        }),
+                    ],
+                },
+                SiteBlock {
+                    address: "plain.example.com".to_string(),
+                    directives: vec![rp("127.0.0.1:5000"), Directive::Tls(TlsDirective::Off)],
+                },
+            ],
+        };
+
+        let domains = compile_acme_domains(&config);
+        assert_eq!(domains, vec!["auto.example.com"]);
+    }
+
+    #[test]
+    fn compile_acme_domains_empty_when_no_auto() {
+        let config = DwaarConfig {
+            sites: vec![SiteBlock {
+                address: "manual.example.com".to_string(),
+                directives: vec![
+                    rp("127.0.0.1:3000"),
+                    Directive::Tls(TlsDirective::Manual {
+                        cert_path: "/cert.pem".to_string(),
+                        key_path: "/key.pem".to_string(),
+                    }),
+                ],
+            }],
+        };
+
+        let domains = compile_acme_domains(&config);
+        assert!(domains.is_empty());
     }
 }
