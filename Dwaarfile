@@ -1,0 +1,7 @@
+# Default Dwaarfile for local development.
+# Routes requests to 127.0.0.1 (what curl/reqwest send by default)
+# to a backend on port 8080.
+
+127.0.0.1 {
+    reverse_proxy 127.0.0.1:8080
+}

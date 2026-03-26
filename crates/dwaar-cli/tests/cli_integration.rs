@@ -42,18 +42,59 @@ fn help_flag_shows_usage() {
 }
 
 #[test]
-fn test_flag_exits_successfully() {
-    dwaar().arg("--test").assert().success();
+fn test_flag_validates_config_and_exits() {
+    // --test reads the default Dwaarfile (in workspace root), validates it, exits 0
+    dwaar()
+        .arg("--test")
+        .current_dir(env!("CARGO_MANIFEST_DIR").to_string() + "/../..")
+        .assert()
+        .success();
 }
 
 #[test]
-fn custom_config_path_accepted() {
-    // --test with custom config should still exit cleanly
-    // (config validation not yet implemented, just verifies flag is accepted)
+fn test_flag_with_custom_config() {
+    // Create a temp Dwaarfile to validate
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let config_path = dir.path().join("Dwaarfile");
+    std::fs::write(
+        &config_path,
+        "example.com {\n    reverse_proxy 127.0.0.1:8080\n}\n",
+    )
+    .expect("write temp config");
+
     dwaar()
-        .args(["--config", "/tmp/nonexistent.conf", "--test"])
+        .args([
+            "--config",
+            config_path.to_str().expect("valid path"),
+            "--test",
+        ])
         .assert()
         .success();
+}
+
+#[test]
+fn missing_config_file_fails() {
+    dwaar()
+        .args(["--config", "/tmp/nonexistent_dwaarfile.conf", "--test"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("failed to read config file"));
+}
+
+#[test]
+fn invalid_config_content_fails() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let config_path = dir.path().join("Dwaarfile");
+    std::fs::write(&config_path, "example.com { badstuff }").expect("write bad config");
+
+    dwaar()
+        .args([
+            "--config",
+            config_path.to_str().expect("valid path"),
+            "--test",
+        ])
+        .assert()
+        .failure();
 }
 
 #[test]
