@@ -98,6 +98,43 @@ fn invalid_config_content_fails() {
 }
 
 #[test]
+fn validate_subcommand_with_valid_config() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let config_path = dir.path().join("Dwaarfile");
+    std::fs::write(
+        &config_path,
+        "example.com {\n    reverse_proxy 127.0.0.1:8080\n}\n",
+    )
+    .expect("write temp config");
+
+    dwaar()
+        .args(["validate", "--config", config_path.to_str().expect("path")])
+        .assert()
+        .success();
+}
+
+#[test]
+fn validate_subcommand_with_invalid_config() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let config_path = dir.path().join("Dwaarfile");
+    std::fs::write(&config_path, "example.com { badstuff }").expect("write bad config");
+
+    dwaar()
+        .args(["validate", "--config", config_path.to_str().expect("path")])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn validate_subcommand_missing_file() {
+    dwaar()
+        .args(["validate", "--config", "/tmp/does_not_exist_dwaarfile"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("failed to read config file"));
+}
+
+#[test]
 fn unknown_flag_fails() {
     dwaar().arg("--nonexistent-flag").assert().failure();
 }

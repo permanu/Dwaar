@@ -48,6 +48,12 @@ pub(crate) struct Cli {
 pub(crate) enum Commands {
     /// Show version information
     Version,
+    /// Validate Dwaarfile and exit without starting the server
+    Validate {
+        /// Path to Dwaarfile (overrides --config)
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
 }
 
 impl Cli {
@@ -117,6 +123,30 @@ mod tests {
         let cli =
             Cli::try_parse_from(["dwaar", "version"]).expect("should parse version subcommand");
         assert!(matches!(cli.command, Some(Commands::Version)));
+    }
+
+    #[test]
+    fn validate_subcommand() {
+        let cli =
+            Cli::try_parse_from(["dwaar", "validate"]).expect("should parse validate subcommand");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Validate { config: None })
+        ));
+    }
+
+    #[test]
+    fn validate_with_custom_config() {
+        let cli = Cli::try_parse_from(["dwaar", "validate", "--config", "/tmp/test.conf"])
+            .expect("should parse validate with config");
+        if let Some(Commands::Validate { config }) = &cli.command {
+            assert_eq!(
+                config.as_deref(),
+                Some(std::path::Path::new("/tmp/test.conf"))
+            );
+        } else {
+            panic!("expected Validate command");
+        }
     }
 
     #[test]
