@@ -25,11 +25,10 @@
 //! - `request_filter()` — extracts client IP, host, method, path (ISSUE-006)
 //! - `upstream_peer()` — returns the hardcoded upstream (ISSUE-005)
 //! - `upstream_request_filter()` — adds proxy headers, strips hop-by-hop (ISSUE-007)
-//! - `response_filter()` — adds `X-Request-Id` header (ISSUE-006)
+//! - `response_filter()` — adds `X-Request-Id` + security headers (ISSUE-006, ISSUE-008)
 //!
 //! ## Later issues
 //!
-//! - ISSUE-008: `response_filter()` adds security headers
 //! - ISSUE-010: `upstream_peer()` uses `RouteTable` instead of hardcoded addr
 
 use std::net::SocketAddr;
@@ -251,11 +250,23 @@ impl ProxyHttp for DwaarProxy {
         Ok(())
     }
 
-    /// Add the `X-Request-Id` header to every response sent to the client.
+    /// Add security headers and `X-Request-Id` to every response.
     ///
-    /// This header lets clients correlate their request with server-side logs.
-    /// If a user reports "my request failed," they can include the request ID
-    /// and we can find it in our logs instantly.
+    /// ## Security headers (ISSUE-008)
+    ///
+    /// These provide a baseline defense against common web attacks. All are
+    /// set unconditionally for now. ISSUE-010 (`RouteTable`) will add per-route
+    /// toggles so apps that set their own headers can disable specific ones.
+    ///
+    /// - `Strict-Transport-Security` — prevents HTTPS protocol downgrade
+    /// - `X-Content-Type-Options` — prevents MIME type sniffing
+    /// - `X-Frame-Options` — prevents clickjacking via iframes
+    /// - `Referrer-Policy` — limits referrer info leaked to third parties
+    /// - `Server` — replaces upstream's server banner to avoid fingerprinting
+    ///
+    /// ## Tracing header (ISSUE-006)
+    ///
+    /// - `X-Request-Id` — lets clients correlate their request with server logs
     async fn response_filter(
         &self,
         _session: &mut Session,
@@ -265,9 +276,51 @@ impl ProxyHttp for DwaarProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // --- Security headers (ISSUE-008) ---
+        // Each insert_header call uses a static string value, so .expect()
+        // is safe — these can never fail at runtime.
+
+        // HSTS: tell browsers to always use HTTPS for this domain.
+        // max-age=31536000 = 1 year. includeSubDomains extends to all subdomains.
+        // Note: this is safe even before we have TLS (ISSUE-015), because
+        // browsers only honor HSTS headers received over HTTPS connections.
+        // Over plain HTTP, browsers ignore it per the RFC.
+        upstream_response
+            .insert_header(
+                "Strict-Transport-Security",
+                "max-age=31536000; includeSubDomains",
+            )
+            .expect("static header value");
+
+        // Prevent browsers from MIME-sniffing the response body.
+        // Without this, a browser might execute uploaded .txt as JavaScript.
+        upstream_response
+            .insert_header("X-Content-Type-Options", "nosniff")
+            .expect("static header value");
+
+        // Prevent the page from being loaded inside an iframe on another domain.
+        // SAMEORIGIN = only the same origin can embed. Blocks clickjacking.
+        upstream_response
+            .insert_header("X-Frame-Options", "SAMEORIGIN")
+            .expect("static header value");
+
+        // Control how much URL information is sent in the Referer header.
+        // strict-origin-when-cross-origin: send full URL for same-origin,
+        // only origin (no path) for cross-origin, nothing for downgrade.
+        upstream_response
+            .insert_header("Referrer-Policy", "strict-origin-when-cross-origin")
+            .expect("static header value");
+
+        // Replace upstream's server banner (e.g., "Apache/2.4.41 (Ubuntu)")
+        // to avoid leaking backend technology details to attackers.
+        upstream_response
+            .insert_header("Server", "Dwaar")
+            .expect("static header value");
+
+        // --- Request tracing (ISSUE-006) ---
         upstream_response
             .insert_header("X-Request-Id", &ctx.request_id)
-            .expect("X-Request-Id header value is always valid ASCII");
+            .expect("UUID is valid header value");
 
         Ok(())
     }
