@@ -16,13 +16,16 @@
 mod cli;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use pingora_core::server::Server;
 use pingora_core::server::configuration::{Opt as PingoraOpt, ServerConf};
 use tracing::info;
 
 use cli::{Cli, Commands};
 use dwaar_core::proxy::DwaarProxy;
+use dwaar_core::route::{Route, RouteTable};
 
 fn main() {
     let cli = Cli::parse_args();
@@ -81,13 +84,20 @@ fn main() {
         "server bootstrapped"
     );
 
-    // ISSUE-005: Create and register the proxy service.
-    // Hardcoded upstream for now — ISSUE-010 replaces with RouteTable.
+    // Build the route table. ISSUE-011 will parse these from a Dwaarfile;
+    // for now we hardcode a single catch-all wildcard route.
     let upstream: SocketAddr = "127.0.0.1:8080"
         .parse()
         .expect("hardcoded upstream address must be valid");
 
-    let proxy = DwaarProxy::new(upstream);
+    // Default route for localhost — matches "127.0.0.1" (what reqwest/curl send
+    // when hitting the proxy by IP). ISSUE-011 replaces with Dwaarfile-parsed routes.
+    let route_table = Arc::new(ArcSwap::from_pointee(RouteTable::new(vec![Route::new(
+        "127.0.0.1",
+        upstream,
+    )])));
+
+    let proxy = DwaarProxy::new(route_table);
 
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, proxy);
     proxy_service.add_tcp("0.0.0.0:6188");

@@ -8,62 +8,51 @@
 //!
 //! `DwaarProxy` implements Pingora's [`ProxyHttp`] trait, which defines how
 //! every HTTP request is processed. Pingora calls our lifecycle methods in
-//! order:
-//!
-//! 1. `new_ctx()` — create per-request state
-//! 2. `early_request_filter()` — before any modules run
-//! 3. `request_filter()` — validate, rate-limit, access control
-//! 4. `upstream_peer()` — **where should this request go?**
-//! 5. `upstream_request_filter()` — modify headers before sending upstream
-//! 6. `upstream_response_filter()` — modify response headers from upstream
-//! 7. `response_filter()` — modify headers before sending to client
-//! 8. `logging()` — emit metrics and access logs
+//! order: `new_ctx` → `request_filter` → `upstream_peer` →
+//! `upstream_request_filter` → `response_filter` → `logging`.
 //!
 //! ## Implemented hooks
 //!
-//! - `new_ctx()` — sets `start_time` and `request_id` (ISSUE-005)
-//! - `request_filter()` — extracts client IP, host, method, path (ISSUE-006)
-//! - `upstream_peer()` — returns the hardcoded upstream (ISSUE-005)
-//! - `upstream_request_filter()` — adds proxy headers, strips hop-by-hop (ISSUE-007)
-//! - `response_filter()` — adds `X-Request-Id` + security headers (ISSUE-006, ISSUE-008)
-//!
-//! ## Later issues
-//!
-//! - ISSUE-010: `upstream_peer()` uses `RouteTable` instead of hardcoded addr
+//! - `new_ctx()` — sets `start_time` and `request_id`
+//! - `request_filter()` — extracts client IP, host, method, path
+//! - `upstream_peer()` — resolves Host header via `RouteTable`, returns 502 on miss
+//! - `upstream_request_filter()` — adds proxy headers, strips hop-by-hop
+//! - `response_filter()` — adds `X-Request-Id` + security headers
 
-use std::net::SocketAddr;
+use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use pingora_core::Result;
 use pingora_core::upstreams::peer::HttpPeer;
+use pingora_error::{Error, ErrorType::HTTPStatus};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::context::RequestContext;
+use crate::route::RouteTable;
 
 /// The Dwaar proxy engine.
 ///
 /// Implements Pingora's `ProxyHttp` to handle every HTTP request that
-/// arrives at the proxy. Currently forwards all traffic to a single
-/// upstream; ISSUE-009/010 will replace this with a route table.
+/// arrives at the proxy. Routes requests to different upstreams based
+/// on the `Host` header, using a lock-free [`RouteTable`] for lookups.
 #[derive(Debug)]
 pub struct DwaarProxy {
-    /// The upstream server address to forward all requests to.
-    ///
-    /// This is a simple `SocketAddr` for now. ISSUE-009 replaces it with
-    /// `Arc<ArcSwap<RouteTable>>` for dynamic, per-host routing.
-    upstream: SocketAddr,
+    /// Lock-free route table shared across all worker threads.
+    /// Readers pay ~1ns (atomic pointer load), writers swap the entire
+    /// table atomically on config reload.
+    route_table: Arc<ArcSwap<RouteTable>>,
 }
 
 impl DwaarProxy {
-    /// Create a new proxy that forwards all traffic to the given upstream.
+    /// Create a new proxy backed by the given route table.
     ///
-    /// # Arguments
-    ///
-    /// * `upstream` - The backend server address (e.g., `127.0.0.1:8080`)
-    pub fn new(upstream: SocketAddr) -> Self {
-        Self { upstream }
+    /// The `ArcSwap` allows hot-reloading routes without restarting
+    /// the proxy — config reload code calls `route_table.store(new_table)`.
+    pub fn new(route_table: Arc<ArcSwap<RouteTable>>) -> Self {
+        Self { route_table }
     }
 }
 
@@ -144,11 +133,35 @@ impl ProxyHttp for DwaarProxy {
     async fn upstream_peer(
         &self,
         _session: &mut Session,
-        _ctx: &mut Self::CTX,
+        ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        debug!(upstream = %self.upstream, "selecting upstream peer");
+        // Extract the host, stripping any port suffix (e.g. "example.com:8080" → "example.com")
+        let host = ctx
+            .host
+            .as_deref()
+            .map_or("", |h| h.split(':').next().unwrap_or(h));
 
-        let peer = HttpPeer::new(self.upstream, false, String::new());
+        // Load the route table — one atomic pointer read, no lock
+        let table = self.route_table.load();
+
+        let route = table.resolve(host).ok_or_else(|| {
+            warn!(host = %host, request_id = %ctx.request_id, "no route for host");
+            Error::explain(
+                HTTPStatus(502),
+                format!("no route configured for host: {host}"),
+            )
+        })?;
+
+        ctx.route_upstream = Some(route.upstream);
+
+        debug!(
+            host = %host,
+            upstream = %route.upstream,
+            request_id = %ctx.request_id,
+            "route resolved"
+        );
+
+        let peer = HttpPeer::new(route.upstream, false, String::new());
         Ok(Box::new(peer))
     }
 
@@ -328,29 +341,57 @@ impl ProxyHttp for DwaarProxy {
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+
     use super::*;
+    use crate::route::Route;
+
+    fn make_proxy(routes: Vec<Route>) -> DwaarProxy {
+        let table = RouteTable::new(routes);
+        DwaarProxy::new(Arc::new(ArcSwap::from_pointee(table)))
+    }
 
     #[test]
-    fn proxy_stores_upstream() {
-        let addr: SocketAddr = "127.0.0.1:8080".parse().expect("valid addr");
-        let proxy = DwaarProxy::new(addr);
-        assert_eq!(proxy.upstream, addr);
+    fn proxy_holds_route_table() {
+        let proxy = make_proxy(vec![Route::new(
+            "example.com",
+            "127.0.0.1:8080".parse().expect("valid"),
+        )]);
+        let table = proxy.route_table.load();
+        assert_eq!(table.len(), 1);
     }
 
     #[test]
     fn new_ctx_has_request_id_and_timing() {
-        let addr: SocketAddr = "127.0.0.1:8080".parse().expect("valid addr");
-        let proxy = DwaarProxy::new(addr);
+        let proxy = make_proxy(vec![]);
         let ctx = proxy.new_ctx();
 
-        // request_id should be a 36-char UUID v7
         assert_eq!(ctx.request_id.len(), 36);
-        // start_time should be very recent (within 1 second)
         assert!(ctx.start_time.elapsed().as_secs() < 1);
-        // Metadata fields should be empty (populated in request_filter)
         assert!(ctx.client_ip.is_none());
         assert!(ctx.host.is_none());
         assert!(ctx.method.is_empty());
         assert!(ctx.path.is_empty());
+        assert!(ctx.route_upstream.is_none());
+    }
+
+    #[test]
+    fn route_table_can_be_swapped_at_runtime() {
+        let addr1: SocketAddr = "127.0.0.1:3000".parse().expect("valid");
+        let addr2: SocketAddr = "127.0.0.1:4000".parse().expect("valid");
+
+        let proxy = make_proxy(vec![Route::new("v1.example.com", addr1)]);
+
+        // Initial table has v1
+        assert!(proxy.route_table.load().resolve("v1.example.com").is_some());
+        assert!(proxy.route_table.load().resolve("v2.example.com").is_none());
+
+        // Swap in a new table with v2 instead — simulates config reload
+        let new_table = RouteTable::new(vec![Route::new("v2.example.com", addr2)]);
+        proxy.route_table.store(Arc::new(new_table));
+
+        // Old route gone, new route available
+        assert!(proxy.route_table.load().resolve("v1.example.com").is_none());
+        assert!(proxy.route_table.load().resolve("v2.example.com").is_some());
     }
 }

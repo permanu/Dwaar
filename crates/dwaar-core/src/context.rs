@@ -28,7 +28,7 @@
 //! [drop]              → context freed, request complete
 //! ```
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 
 use uuid::Uuid;
@@ -85,8 +85,13 @@ pub struct RequestContext {
     pub method: String,
 
     /// Request path including query string (e.g., `/api/users?page=2`).
-    /// Used for logging, analytics, and URL-based routing (ISSUE-010).
+    /// Used for logging, analytics, and URL-based routing.
     pub path: String,
+
+    /// The upstream address selected by route resolution in `upstream_peer()`.
+    /// `None` until routing completes. Later phases (logging, analytics) use
+    /// this to know which backend handled the request.
+    pub route_upstream: Option<SocketAddr>,
 }
 
 impl RequestContext {
@@ -103,6 +108,7 @@ impl RequestContext {
             host: None,
             method: String::new(),
             path: String::new(),
+            route_upstream: None,
         }
     }
 }
@@ -171,5 +177,6 @@ mod tests {
         assert!(ctx.host.is_none());
         assert!(ctx.method.is_empty());
         assert!(ctx.path.is_empty());
+        assert!(ctx.route_upstream.is_none());
     }
 }
