@@ -397,3 +397,92 @@ fn proxy_appends_to_existing_x_forwarded_for() {
 
     stop_dwaar(child);
 }
+
+/// ISSUE-008: Verifies that every proxied response includes the full set
+/// of security headers and replaces the upstream's Server banner.
+#[test]
+fn proxy_adds_security_response_headers() {
+    let _lock = PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let upstream =
+        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+
+    let child = start_dwaar_proxy();
+
+    // The mock upstream responds with its own Server header — Dwaar should replace it.
+    let handle = thread::spawn({
+        let upstream_fd = upstream.try_clone().expect("clone listener");
+        move || {
+            let (mut stream, _) = upstream_fd.accept().expect("accept");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            let response = "HTTP/1.1 200 OK\r\n\
+                            Server: Express/4.18.2\r\n\
+                            Content-Length: 2\r\n\
+                            Connection: close\r\n\
+                            \r\n\
+                            ok";
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    let resp = send_through_proxy("/");
+    handle.join().expect("upstream thread");
+
+    // --- Strict-Transport-Security ---
+    let hsts = resp
+        .headers
+        .get("strict-transport-security")
+        .expect("response should have Strict-Transport-Security");
+    assert!(
+        hsts.contains("max-age=31536000"),
+        "HSTS should have 1-year max-age, got: {hsts}"
+    );
+    assert!(
+        hsts.contains("includeSubDomains"),
+        "HSTS should include subdomains, got: {hsts}"
+    );
+
+    // --- X-Content-Type-Options ---
+    let xcto = resp
+        .headers
+        .get("x-content-type-options")
+        .expect("response should have X-Content-Type-Options");
+    assert_eq!(xcto, "nosniff");
+
+    // --- X-Frame-Options ---
+    let xfo = resp
+        .headers
+        .get("x-frame-options")
+        .expect("response should have X-Frame-Options");
+    assert_eq!(xfo, "SAMEORIGIN");
+
+    // --- Referrer-Policy ---
+    let rp = resp
+        .headers
+        .get("referrer-policy")
+        .expect("response should have Referrer-Policy");
+    assert_eq!(rp, "strict-origin-when-cross-origin");
+
+    // --- Server: should be "Dwaar", NOT the upstream's "Express/4.18.2" ---
+    let server = resp
+        .headers
+        .get("server")
+        .expect("response should have Server");
+    assert_eq!(server, "Dwaar", "Server banner should be replaced by Dwaar");
+
+    // --- X-Request-Id should still be present (ISSUE-006 regression check) ---
+    let request_id = resp
+        .headers
+        .get("x-request-id")
+        .expect("response should still have X-Request-Id");
+    assert_eq!(request_id.len(), 36);
+
+    stop_dwaar(child);
+}
