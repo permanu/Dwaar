@@ -902,6 +902,7 @@ name = "dwaar-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "assert_cmd",
  "clap",
  "dwaar-admin",
@@ -943,10 +944,12 @@ dependencies = [
 name = "dwaar-core"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "arc-swap",
  "async-trait",
  "bytes",
  "chrono",
+ "criterion",
  "dwaar-log",
  "dwaar-plugins",
  "http",
