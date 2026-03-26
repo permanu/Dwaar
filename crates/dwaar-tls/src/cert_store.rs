@@ -121,6 +121,17 @@ impl CertStore {
     pub fn cached_count(&self) -> usize {
         self.lock_cache().len()
     }
+
+    /// Evict a domain from the cache so the next `get()` reloads from disk.
+    ///
+    /// Used by the ACME service after writing a freshly issued cert.
+    /// No-op if the domain isn't cached.
+    pub fn invalidate(&self, domain: &str) {
+        let mut cache = self.lock_cache();
+        if cache.pop(domain).is_some() {
+            debug!(domain, "cert cache invalidated");
+        }
+    }
 }
 
 /// Read PEM files from disk and parse into `X509` + `PKey`.
@@ -243,6 +254,37 @@ mod tests {
 
         assert!(cert.cert.to_pem().is_ok());
         assert_eq!(store.cached_count(), 1);
+    }
+
+    #[test]
+    fn invalidate_evicts_cached_cert() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cert_pem, key_pem) = generate_self_signed("evict.example.com");
+
+        std::fs::write(dir.path().join("evict.example.com.pem"), &cert_pem).expect("write cert");
+        std::fs::write(dir.path().join("evict.example.com.key"), &key_pem).expect("write key");
+
+        let store = CertStore::new(dir.path(), 100);
+
+        // Load into cache
+        store.get("evict.example.com").expect("should load");
+        assert_eq!(store.cached_count(), 1);
+
+        // Invalidate removes from cache
+        store.invalidate("evict.example.com");
+        assert_eq!(store.cached_count(), 0);
+
+        // Next get() reloads from disk
+        store.get("evict.example.com").expect("should reload from disk");
+        assert_eq!(store.cached_count(), 1);
+    }
+
+    #[test]
+    fn invalidate_nonexistent_domain_is_noop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = CertStore::new(dir.path(), 100);
+        store.invalidate("ghost.example.com"); // should not panic
+        assert_eq!(store.cached_count(), 0);
     }
 
     #[test]
