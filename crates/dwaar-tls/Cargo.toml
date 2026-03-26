@@ -1,7 +1,7 @@
 [package]
 name = "dwaar-tls"
 version = "0.1.0"
-description = "TLS termination, ACME client (Let's Encrypt + ZeroSSL), certificate management"
+description = "TLS termination, ACME client (Let's Encrypt + Google Trust Services), certificate management"
 edition.workspace = true
 rust-version.workspace = true
 license-file = "../../LICENSE"
