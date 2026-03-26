@@ -78,7 +78,7 @@ fn missing_config_file_fails() {
         .args(["--config", "/tmp/nonexistent_dwaarfile.conf", "--test"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("failed to read config file"));
+        .stderr(predicate::str::contains("failed to stat config file"));
 }
 
 #[test]
@@ -131,7 +131,7 @@ fn validate_subcommand_missing_file() {
         .args(["validate", "--config", "/tmp/does_not_exist_dwaarfile"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("failed to read config file"));
+        .stderr(predicate::str::contains("failed to stat config file"));
 }
 
 #[test]

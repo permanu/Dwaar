@@ -23,6 +23,23 @@ use tracing::{debug, warn};
 
 use crate::cert_store::CertStore;
 
+/// Validate that an SNI hostname is a legal DNS name.
+/// Rejects path traversal attempts, null bytes, and other non-hostname characters.
+fn is_valid_sni_hostname(s: &str) -> bool {
+    if s.is_empty() || s.len() > 253 {
+        return false;
+    }
+    s.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'*')
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+    })
+}
+
 /// Per-domain TLS config from the Dwaarfile `tls` directive.
 #[derive(Debug, Clone)]
 pub struct DomainTlsConfig {
@@ -68,6 +85,11 @@ impl SniResolver {
     /// Resolve cert for a domain — tries explicit config first,
     /// then wildcard, then default directory layout.
     fn resolve_cert(&self, sni: &str) -> Option<crate::cert_store::CachedCert> {
+        if !is_valid_sni_hostname(sni) {
+            warn!(sni = %sni, "invalid SNI hostname — rejecting");
+            return None;
+        }
+
         let sni_lower = sni.to_lowercase();
 
         // Try explicit cert path for this exact domain
@@ -180,5 +202,16 @@ mod tests {
         let store = Arc::new(CertStore::new("/tmp/nonexistent_cert_dir", 100));
         let resolver = SniResolver::new(store);
         assert!(resolver.resolve_cert("unknown.com").is_none());
+    }
+
+    #[test]
+    fn rejects_path_traversal_sni() {
+        assert!(!is_valid_sni_hostname("../../etc/shadow"));
+        assert!(!is_valid_sni_hostname("../../../etc/passwd"));
+        assert!(!is_valid_sni_hostname(""));
+        assert!(!is_valid_sni_hostname(&"a".repeat(254)));
+        assert!(is_valid_sni_hostname("example.com"));
+        assert!(is_valid_sni_hostname("*.example.com"));
+        assert!(is_valid_sni_hostname("sub.domain.example.com"));
     }
 }

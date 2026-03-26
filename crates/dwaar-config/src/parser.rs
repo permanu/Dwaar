@@ -262,6 +262,29 @@ fn parse_tls(t: &mut Tokenizer<'_>) -> Result<TlsDirective, ParseError> {
                 }
             }
         }
+        TokenKind::QuotedString(_) => {
+            // Quoted cert path — next token should be key path
+            let cert_tok = t.next_token();
+            let TokenKind::QuotedString(cert_path) = cert_tok.kind else {
+                unreachable!()
+            };
+            let key_tok = t.next_token();
+            let (TokenKind::Word(key_path) | TokenKind::QuotedString(key_path)) = key_tok.kind
+            else {
+                return Err(ParseError {
+                    line: key_tok.line,
+                    col: key_tok.col,
+                    kind: ParseErrorKind::InvalidValue {
+                        directive: "tls".to_string(),
+                        message: "expected key file path after cert path".to_string(),
+                    },
+                });
+            };
+            Ok(TlsDirective::Manual {
+                cert_path,
+                key_path,
+            })
+        }
         // No arg means auto (Caddy default)
         _ => Ok(TlsDirective::Auto),
     }
@@ -343,7 +366,20 @@ fn parse_redir(t: &mut Tokenizer<'_>) -> Result<RedirDirective, ParseError> {
         TokenKind::Word(ref w) if w.parse::<u16>().is_ok() => {
             let tok = t.next_token();
             if let TokenKind::Word(w) = tok.kind {
-                w.parse().unwrap_or(308)
+                let parsed: u16 = w.parse().unwrap_or(308);
+                if !matches!(parsed, 301 | 302 | 303 | 307 | 308) {
+                    return Err(ParseError {
+                        line: tok.line,
+                        col: tok.col,
+                        kind: ParseErrorKind::InvalidValue {
+                            directive: "redir".to_string(),
+                            message: format!(
+                                "invalid redirect code {parsed} — must be 301, 302, 303, 307, or 308"
+                            ),
+                        },
+                    });
+                }
+                parsed
             } else {
                 308
             }

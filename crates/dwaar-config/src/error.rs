@@ -117,6 +117,11 @@ pub fn suggest_directive(input: &str) -> Option<&'static str> {
 
 /// Levenshtein edit distance between two strings.
 fn edit_distance(a: &str, b: &str) -> usize {
+    // Short-circuit for inputs longer than any known directive name
+    if a.len() > 64 || b.len() > 64 {
+        return usize::MAX;
+    }
+
     let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
     let (m, n) = (a.len(), b.len());

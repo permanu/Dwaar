@@ -392,18 +392,18 @@ fn proxy_appends_to_existing_x_forwarded_for() {
 
     let upstream_headers = handle.join().expect("upstream thread");
 
-    // X-Forwarded-For should be "10.0.0.1, 127.0.0.1" — the original
-    // client's claim preserved, with Dwaar appending the direct connection IP.
+    // X-Forwarded-For should contain ONLY the direct client IP (127.0.0.1).
+    // Client-sent XFF headers are stripped to prevent IP spoofing.
     let xff = upstream_headers
         .get("x-forwarded-for")
         .expect("upstream should receive X-Forwarded-For");
-    assert!(
-        xff.contains("10.0.0.1") && xff.contains("127.0.0.1"),
-        "X-Forwarded-For should contain both original and proxy IP, got: {xff}"
+    assert_eq!(
+        xff, "127.0.0.1",
+        "X-Forwarded-For should be only the direct client IP, got: {xff}"
     );
     assert!(
-        xff.starts_with("10.0.0.1"),
-        "original IP should come first in the chain, got: {xff}"
+        !xff.contains("10.0.0.1"),
+        "client-supplied XFF should be stripped, got: {xff}"
     );
 
     stop_dwaar(child);
@@ -449,17 +449,11 @@ fn proxy_adds_security_response_headers() {
     handle.join().expect("upstream thread");
 
     // --- Strict-Transport-Security ---
-    let hsts = resp
-        .headers
-        .get("strict-transport-security")
-        .expect("response should have Strict-Transport-Security");
+    // HSTS is only emitted on TLS connections (not on plaintext HTTP).
+    // This test uses plaintext, so HSTS should be absent.
     assert!(
-        hsts.contains("max-age=31536000"),
-        "HSTS should have 1-year max-age, got: {hsts}"
-    );
-    assert!(
-        hsts.contains("includeSubDomains"),
-        "HSTS should include subdomains, got: {hsts}"
+        !resp.headers.contains_key("strict-transport-security"),
+        "HSTS should NOT be present on plaintext HTTP responses"
     );
 
     // --- X-Content-Type-Options ---

@@ -26,6 +26,9 @@ use dwaar_core::proxy::DwaarProxy;
 use dwaar_tls::cert_store::CertStore;
 use dwaar_tls::sni::{DomainTlsConfig, SniResolver};
 
+/// Maximum config file size (10 MB) to prevent OOM on crafted input.
+const MAX_CONFIG_SIZE: u64 = 10 * 1024 * 1024;
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse_args();
 
@@ -55,6 +58,16 @@ fn main() -> anyhow::Result<()> {
     );
 
     let config_path = &cli.config;
+    let metadata = std::fs::metadata(config_path)
+        .with_context(|| format!("failed to stat config file: {}", config_path.display()))?;
+    if metadata.len() > MAX_CONFIG_SIZE {
+        bail!(
+            "config file too large ({} bytes, max {} bytes)",
+            metadata.len(),
+            MAX_CONFIG_SIZE
+        );
+    }
+
     let config_text = std::fs::read_to_string(config_path)
         .with_context(|| format!("failed to read config file: {}", config_path.display()))?;
 
@@ -156,6 +169,12 @@ fn setup_tls_listener(
         .context("failed to create TLS settings")?;
     tls_settings.enable_h2();
 
+    // Enforce TLS 1.2 minimum — SSLv3, TLS 1.0, and TLS 1.1 have known
+    // vulnerabilities and are deprecated by RFC 8996.
+    tls_settings
+        .set_min_proto_version(Some(pingora_core::tls::ssl::SslVersion::TLS1_2))
+        .context("failed to set minimum TLS version")?;
+
     proxy_service.add_tls_with_settings("0.0.0.0:6189", None, tls_settings);
     info!(
         listen = "0.0.0.0:6189",
@@ -166,6 +185,16 @@ fn setup_tls_listener(
 }
 
 fn fmt_config(path: &std::path::Path, check: bool) -> anyhow::Result<()> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("failed to stat config file: {}", path.display()))?;
+    if metadata.len() > MAX_CONFIG_SIZE {
+        bail!(
+            "config file too large ({} bytes, max {} bytes)",
+            metadata.len(),
+            MAX_CONFIG_SIZE
+        );
+    }
+
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config file: {}", path.display()))?;
 
@@ -189,6 +218,16 @@ fn fmt_config(path: &std::path::Path, check: bool) -> anyhow::Result<()> {
 }
 
 fn validate_config(path: &std::path::Path) -> anyhow::Result<()> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("failed to stat config file: {}", path.display()))?;
+    if metadata.len() > MAX_CONFIG_SIZE {
+        bail!(
+            "config file too large ({} bytes, max {} bytes)",
+            metadata.len(),
+            MAX_CONFIG_SIZE
+        );
+    }
+
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config file: {}", path.display()))?;
 

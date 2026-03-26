@@ -40,6 +40,14 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
             continue;
         };
 
+        if !is_valid_domain(&site.address) {
+            warn!(
+                address = %site.address,
+                "site address is not a valid hostname, skipping"
+            );
+            continue;
+        }
+
         // Use the first upstream (load balancing comes later)
         let Some(addr) = resolve_upstream(&rp.upstreams) else {
             warn!(
@@ -100,6 +108,25 @@ pub fn has_tls_sites(config: &DwaarConfig) -> bool {
         .sites
         .iter()
         .any(|site| site_has_tls(&site.directives))
+}
+
+/// Validate that a site address is a legal hostname or wildcard pattern.
+/// Rejects path traversal, null bytes, and other non-hostname characters.
+fn is_valid_domain(s: &str) -> bool {
+    if s.is_empty() || s.len() > 253 {
+        return false;
+    }
+    // Must not contain path separators or parent-directory references
+    if s.contains('/') || s.contains("..") || s.contains('\0') {
+        return false;
+    }
+    s.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'*')
+    })
 }
 
 /// Returns true if a site's directives include a TLS config that
