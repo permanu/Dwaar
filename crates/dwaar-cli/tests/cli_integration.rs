@@ -135,6 +135,72 @@ fn validate_subcommand_missing_file() {
 }
 
 #[test]
+fn fmt_subcommand_formats_file() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let config_path = dir.path().join("Dwaarfile");
+    // Messy formatting — extra spaces, inconsistent indentation
+    std::fs::write(
+        &config_path,
+        "  example.com  {\n  reverse_proxy   127.0.0.1:8080  \n tls   auto \n}\n",
+    )
+    .expect("write messy config");
+
+    dwaar()
+        .args(["fmt", "--config", config_path.to_str().expect("path")])
+        .assert()
+        .success();
+
+    // File should now be canonically formatted
+    let result = std::fs::read_to_string(&config_path).expect("read formatted");
+    assert_eq!(
+        result,
+        "example.com {\n    reverse_proxy 127.0.0.1:8080\n    tls auto\n}\n"
+    );
+}
+
+#[test]
+fn fmt_check_passes_when_already_formatted() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let config_path = dir.path().join("Dwaarfile");
+    std::fs::write(
+        &config_path,
+        "example.com {\n    reverse_proxy 127.0.0.1:8080\n}\n",
+    )
+    .expect("write canonical config");
+
+    dwaar()
+        .args([
+            "fmt",
+            "--check",
+            "--config",
+            config_path.to_str().expect("path"),
+        ])
+        .assert()
+        .success();
+}
+
+#[test]
+fn fmt_check_fails_when_unformatted() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let config_path = dir.path().join("Dwaarfile");
+    std::fs::write(
+        &config_path,
+        "  example.com  { reverse_proxy  127.0.0.1:8080 }",
+    )
+    .expect("write messy");
+
+    dwaar()
+        .args([
+            "fmt",
+            "--check",
+            "--config",
+            config_path.to_str().expect("path"),
+        ])
+        .assert()
+        .failure();
+}
+
+#[test]
 fn unknown_flag_fails() {
     dwaar().arg("--nonexistent-flag").assert().failure();
 }

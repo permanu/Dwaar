@@ -37,6 +37,10 @@ fn main() -> anyhow::Result<()> {
             let path = config.as_ref().unwrap_or(&cli.config);
             return validate_config(path);
         }
+        Some(Commands::Fmt { config, check }) => {
+            let path = config.as_ref().unwrap_or(&cli.config);
+            return fmt_config(path, *check);
+        }
         None => {}
     }
 
@@ -111,6 +115,29 @@ fn main() -> anyhow::Result<()> {
 
     info!("entering run loop, waiting for connections or signals");
     server.run_forever();
+}
+
+fn fmt_config(path: &std::path::Path, check: bool) -> anyhow::Result<()> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read config file: {}", path.display()))?;
+
+    let config = dwaar_config::parser::parse(&text).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let formatted = dwaar_config::format::format_config(&config);
+
+    if check {
+        if text == formatted {
+            return Ok(());
+        }
+        bail!(
+            "Dwaarfile is not formatted. Run `dwaar fmt` to fix.\n{}",
+            path.display()
+        );
+    }
+
+    std::fs::write(path, &formatted)
+        .with_context(|| format!("failed to write formatted config: {}", path.display()))?;
+
+    Ok(())
 }
 
 fn validate_config(path: &std::path::Path) -> anyhow::Result<()> {

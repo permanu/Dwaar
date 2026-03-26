@@ -27,6 +27,7 @@
 
 pub mod compile;
 pub mod error;
+pub mod format;
 pub mod model;
 pub mod parser;
 mod token;
