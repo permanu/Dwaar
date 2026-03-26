@@ -6,37 +6,31 @@
 
 //! Dwaar CLI entry point.
 //!
-//! This is the process entry point for the Dwaar proxy. It:
-//! 1. Parses CLI arguments (config path, daemon mode, test mode)
-//! 2. Initializes structured logging (JSON to stderr)
-//! 3. Creates a Pingora Server (process manager)
-//! 4. Registers services (proxy, admin, background — added in later issues)
-//! 5. Calls `run_forever()` which blocks and handles OS signals
+//! Reads a Dwaarfile, parses it, compiles routes, and starts the
+//! Pingora proxy server. Handles CLI args, logging, and signals.
 
 mod cli;
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
+use anyhow::{Context, bail};
 use arc_swap::ArcSwap;
 use pingora_core::server::Server;
 use pingora_core::server::configuration::{Opt as PingoraOpt, ServerConf};
 use tracing::info;
 
 use cli::{Cli, Commands};
+use dwaar_config::compile::compile_routes;
 use dwaar_core::proxy::DwaarProxy;
-use dwaar_core::route::{Route, RouteTable};
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     let cli = Cli::parse_args();
 
-    // Handle subcommands that exit immediately
     if let Some(Commands::Version) = &cli.command {
         print_version();
-        return;
+        return Ok(());
     }
 
-    // Initialize structured logging
     init_logging(&cli);
 
     info!(
@@ -45,14 +39,26 @@ fn main() {
         "starting dwaar"
     );
 
+    // Read and parse the Dwaarfile
+    let config_path = &cli.config;
+    let config_text = std::fs::read_to_string(config_path)
+        .with_context(|| format!("failed to read config file: {}", config_path.display()))?;
+
+    let dwaar_config =
+        dwaar_config::parser::parse(&config_text).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    info!(
+        sites = dwaar_config.sites.len(),
+        path = %config_path.display(),
+        "config loaded"
+    );
+
     // Test mode: validate config and exit
-    // Full config validation will be added in ISSUE-011 (Dwaarfile parser)
     if cli.test {
-        info!("config validation not yet implemented, exiting");
-        return;
+        info!("config valid");
+        return Ok(());
     }
 
-    // Create Pingora server options from our CLI args
     let pingora_opt = PingoraOpt {
         upgrade: cli.upgrade,
         daemon: cli.daemon,
@@ -61,20 +67,13 @@ fn main() {
         conf: None,
     };
 
-    // Configure Pingora server with sensible defaults.
-    // grace_period_seconds: how long to wait before starting final shutdown
-    // graceful_shutdown_timeout_seconds: hard cutoff for draining connections
     let conf = ServerConf {
         grace_period_seconds: Some(5),
         graceful_shutdown_timeout_seconds: Some(5),
         ..ServerConf::default()
     };
 
-    // Create the Pingora server — this is the process manager that owns
-    // all services (proxy, admin API, background tasks)
     let mut server = Server::new_with_opt_and_conf(Some(pingora_opt), conf);
-
-    // Bootstrap initializes internals: signal handlers, PID file, Tokio runtimes.
     server.bootstrap();
 
     info!(
@@ -84,56 +83,32 @@ fn main() {
         "server bootstrapped"
     );
 
-    // Build the route table. ISSUE-011 will parse these from a Dwaarfile;
-    // for now we hardcode a single catch-all wildcard route.
-    let upstream: SocketAddr = "127.0.0.1:8080"
-        .parse()
-        .expect("hardcoded upstream address must be valid");
+    // Compile parsed config into a route table for the proxy engine
+    let route_table = compile_routes(&dwaar_config);
+    if route_table.is_empty() {
+        bail!("no valid routes found in config — nothing to proxy");
+    }
+    info!(routes = route_table.len(), "route table compiled");
 
-    // Default route for localhost — matches "127.0.0.1" (what reqwest/curl send
-    // when hitting the proxy by IP). ISSUE-011 replaces with Dwaarfile-parsed routes.
-    let route_table = Arc::new(ArcSwap::from_pointee(RouteTable::new(vec![Route::new(
-        "127.0.0.1",
-        upstream,
-    )])));
-
+    let route_table = Arc::new(ArcSwap::from_pointee(route_table));
     let proxy = DwaarProxy::new(route_table);
 
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, proxy);
     proxy_service.add_tcp("0.0.0.0:6188");
 
-    info!(
-        listen = "0.0.0.0:6188",
-        upstream = %upstream,
-        "proxy service registered"
-    );
+    info!(listen = "0.0.0.0:6188", "proxy service registered");
 
     server.add_service(proxy_service);
 
-    // Future services:
-    // ISSUE-017: ACME background service (cert renewal)
-    // ISSUE-022: admin API service
-
     info!("entering run loop, waiting for connections or signals");
-
-    // run_forever() blocks the main thread. It:
-    // - Starts all registered services on their own Tokio runtimes
-    // - Handles SIGTERM (graceful shutdown) and SIGQUIT (graceful upgrade)
-    // - Never returns (the ! return type)
     server.run_forever();
 }
 
-/// Print version and exit. Uses stderr to match convention for CLI tools
-/// (stdout is for data, stderr is for human messages).
 fn print_version() {
     use std::io::Write;
     let _ = writeln!(std::io::stderr(), "dwaar v{}", env!("CARGO_PKG_VERSION"));
 }
 
-/// Initialize tracing subscriber for structured logging.
-///
-/// Log level is controlled by `DWAAR_LOG_LEVEL` env var (default: info).
-/// Output format is human-readable for development, JSON for production (--daemon).
 fn init_logging(cli: &Cli) {
     use tracing_subscriber::EnvFilter;
 
@@ -141,14 +116,12 @@ fn init_logging(cli: &Cli) {
         EnvFilter::try_from_env("DWAAR_LOG_LEVEL").unwrap_or_else(|_| EnvFilter::new("info"));
 
     if cli.daemon {
-        // JSON format for daemon mode (machine-readable, parseable by log aggregators)
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .json()
             .with_target(false)
             .init();
     } else {
-        // Human-readable format for interactive use
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_target(false)

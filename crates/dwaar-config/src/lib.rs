@@ -25,6 +25,7 @@
 //! assert_eq!(config.sites[0].address, "example.com");
 //! ```
 
+pub mod compile;
 pub mod error;
 pub mod model;
 pub mod parser;

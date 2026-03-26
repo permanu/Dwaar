@@ -72,8 +72,11 @@ fn serve_one_request(listener: &TcpListener, status: u16, body: &str) {
 }
 
 /// Start dwaar proxy as a subprocess.
+/// Sets CWD to workspace root so it finds the default Dwaarfile.
 fn start_dwaar_proxy() -> std::process::Child {
+    let workspace_root = format!("{}/../..", env!("CARGO_MANIFEST_DIR"));
     let child = Command::new(env!("CARGO_BIN_EXE_dwaar"))
+        .current_dir(workspace_root)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
