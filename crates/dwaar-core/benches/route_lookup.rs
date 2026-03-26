@@ -23,14 +23,14 @@ fn build_table(n: usize) -> RouteTable {
         let domain = format!("app-{i}.example.com");
         let port = 3000 + (i as u16 % 10000);
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
-        routes.push(Route::new(&domain, addr));
+        routes.push(Route::new(&domain, addr, false));
     }
 
     // Add wildcard patterns for 10 different base domains
     for i in 0..n / 10 {
         let domain = format!("*.base-{i}.example.com");
         let addr = SocketAddr::from(([127, 0, 0, 1], 9000));
-        routes.push(Route::new(&domain, addr));
+        routes.push(Route::new(&domain, addr, false));
     }
 
     RouteTable::new(routes)
