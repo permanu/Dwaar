@@ -134,6 +134,20 @@ impl CertStore {
             debug!(domain, "cert cache invalidated");
         }
     }
+
+    /// Update the cached OCSP response for a domain.
+    ///
+    /// Uses `peek_mut()` to avoid promoting the entry in the LRU —
+    /// OCSP refresh is a background operation and shouldn't affect
+    /// eviction order (which should reflect actual handshake traffic).
+    /// No-op if the domain isn't cached.
+    pub fn update_ocsp(&self, domain: &str, response: Vec<u8>) {
+        let mut cache = self.lock_cache();
+        if let Some(entry) = cache.peek_mut(domain) {
+            entry.ocsp_response = Some(response);
+            debug!(domain, "OCSP response updated in cache");
+        }
+    }
 }
 
 /// Read PEM files from disk and parse into `X509` + `PKey`.
@@ -339,6 +353,62 @@ mod tests {
             cached.issuer.is_none(),
             "self-signed has no issuer in chain"
         );
+    }
+
+    #[test]
+    fn update_ocsp_sets_response_for_cached_domain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cert_pem, key_pem) = generate_self_signed("ocsp.example.com");
+
+        std::fs::write(dir.path().join("ocsp.example.com.pem"), &cert_pem).expect("write cert");
+        std::fs::write(dir.path().join("ocsp.example.com.key"), &key_pem).expect("write key");
+
+        let store = CertStore::new(dir.path(), 100);
+        store.get("ocsp.example.com").expect("load");
+
+        let fake_ocsp = vec![0x30, 0x03, 0x0A, 0x01, 0x00];
+        store.update_ocsp("ocsp.example.com", fake_ocsp.clone());
+
+        let cached = store.get("ocsp.example.com").expect("should be cached");
+        assert_eq!(cached.ocsp_response.as_deref(), Some(fake_ocsp.as_slice()));
+    }
+
+    #[test]
+    fn update_ocsp_noop_for_uncached_domain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = CertStore::new(dir.path(), 100);
+        store.update_ocsp("ghost.example.com", vec![1, 2, 3]);
+        assert_eq!(store.cached_count(), 0);
+    }
+
+    #[test]
+    fn update_ocsp_does_not_promote_in_lru() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        for i in 0..3 {
+            let domain = format!("lru{i}.example.com");
+            let (cert_pem, key_pem) = generate_self_signed(&domain);
+            std::fs::write(dir.path().join(format!("{domain}.pem")), &cert_pem).expect("write");
+            std::fs::write(dir.path().join(format!("{domain}.key")), &key_pem).expect("write");
+        }
+
+        let store = CertStore::new(dir.path(), 3);
+        store.get("lru0.example.com").expect("load 0");
+        store.get("lru1.example.com").expect("load 1");
+        store.get("lru2.example.com").expect("load 2");
+
+        // Update OCSP for lru0 — should NOT promote it
+        store.update_ocsp("lru0.example.com", vec![1]);
+
+        // Load a 4th — should evict lru0 (still oldest)
+        let (cert4, key4) = generate_self_signed("lru3.example.com");
+        std::fs::write(dir.path().join("lru3.example.com.pem"), &cert4).expect("write");
+        std::fs::write(dir.path().join("lru3.example.com.key"), &key4).expect("write");
+        store.get("lru3.example.com").expect("load 3");
+
+        assert_eq!(store.cached_count(), 3);
+        assert!(store.get("lru1.example.com").is_some(), "lru1 still cached");
+        assert!(store.get("lru2.example.com").is_some(), "lru2 still cached");
     }
 
     #[test]
