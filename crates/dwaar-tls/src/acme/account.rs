@@ -3,3 +3,137 @@
 //
 // This file is part of Dwaar — https://dwaar.dev
 // Licensed under the Business Source License 1.1
+
+//! ACME account credential management.
+//!
+//! Handles saving and loading `instant-acme` `AccountCredentials` as JSON
+//! files in `/etc/dwaar/acme/`. Each CA gets its own credentials file.
+
+use std::path::{Path, PathBuf};
+
+use tokio::fs;
+use tracing::{debug, info};
+
+use super::AcmeError;
+
+/// Build the credentials file path for a given CA identifier.
+/// e.g., `("le")` → `/etc/dwaar/acme/le_account.json`
+pub fn credentials_path(acme_dir: &Path, ca_id: &str) -> PathBuf {
+    acme_dir.join(format!("{ca_id}_account.json"))
+}
+
+/// Ensure the ACME directory exists with `0700` permissions.
+pub async fn ensure_acme_dir(dir: &Path) -> Result<(), AcmeError> {
+    fs::create_dir_all(dir)
+        .await
+        .map_err(AcmeError::AccountIo)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o700);
+        fs::set_permissions(dir, perms)
+            .await
+            .map_err(AcmeError::AccountIo)?;
+    }
+
+    debug!(dir = %dir.display(), "ACME directory ready");
+    Ok(())
+}
+
+/// Save serialized credentials JSON to disk with `0600` permissions.
+pub async fn save_credentials(path: &Path, json: &str) -> Result<(), AcmeError> {
+    // Atomic write: write to .tmp, then rename
+    let tmp_path = path.with_extension("json.tmp");
+
+    fs::write(&tmp_path, json.as_bytes())
+        .await
+        .map_err(AcmeError::AccountIo)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        fs::set_permissions(&tmp_path, perms)
+            .await
+            .map_err(AcmeError::AccountIo)?;
+    }
+
+    fs::rename(&tmp_path, path)
+        .await
+        .map_err(AcmeError::AccountIo)?;
+
+    info!(path = %path.display(), "ACME account credentials saved");
+    Ok(())
+}
+
+/// Load credentials JSON from disk.
+pub async fn load_credentials(path: &Path) -> Result<String, AcmeError> {
+    let json = fs::read_to_string(path)
+        .await
+        .map_err(AcmeError::AccountIo)?;
+    debug!(path = %path.display(), "ACME account credentials loaded");
+    Ok(json)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn credentials_path_construction() {
+        let acme_dir = std::path::Path::new("/etc/dwaar/acme");
+        let path = credentials_path(acme_dir, "le");
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("/etc/dwaar/acme/le_account.json")
+        );
+    }
+
+    #[tokio::test]
+    async fn save_and_load_roundtrip() {
+        let dir = TempDir::new().expect("tempdir");
+        let dummy_json = r#"{"id":"test","key_pkcs8":"AAAA","urls":{"newNonce":"https://a","newAccount":"https://b","newOrder":"https://c"}}"#;
+
+        let path = dir.path().join("test_account.json");
+        save_credentials(&path, dummy_json).await.expect("save");
+
+        let loaded = load_credentials(&path).await.expect("load");
+        assert_eq!(loaded, dummy_json);
+
+        // Verify file permissions (Unix only)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::metadata(&path).expect("metadata").permissions();
+            assert_eq!(perms.mode() & 0o777, 0o600);
+        }
+    }
+
+    #[tokio::test]
+    async fn load_missing_returns_error() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("nonexistent.json");
+        let result = load_credentials(&path).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn ensure_dir_creates_with_permissions() {
+        let dir = TempDir::new().expect("tempdir");
+        let acme_dir = dir.path().join("acme");
+        ensure_acme_dir(&acme_dir).await.expect("create dir");
+
+        assert!(acme_dir.is_dir());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::metadata(&acme_dir)
+                .expect("metadata")
+                .permissions();
+            assert_eq!(perms.mode() & 0o777, 0o700);
+        }
+    }
+}
