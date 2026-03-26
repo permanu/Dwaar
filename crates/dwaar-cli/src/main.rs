@@ -27,7 +27,7 @@ use dwaar_config::compile::{
 use dwaar_core::proxy::DwaarProxy;
 use dwaar_tls::acme::ChallengeSolver;
 use dwaar_tls::acme::issuer::CertIssuer;
-use dwaar_tls::acme::service::AcmeService;
+use dwaar_tls::acme::service::TlsBackgroundService;
 use dwaar_tls::cert_store::CertStore;
 use dwaar_tls::sni::{DomainTlsConfig, SniResolver};
 
@@ -138,14 +138,19 @@ fn main() -> anyhow::Result<()> {
             Arc::clone(solver),
             Arc::clone(&cert_store),
         ));
-        let acme_service = AcmeService::new(acme_domains.clone(), "/etc/dwaar/certs", issuer);
+        let tls_service = TlsBackgroundService::new(
+            acme_domains.clone(),
+            "/etc/dwaar/certs",
+            issuer,
+            Arc::clone(&cert_store),
+        );
 
         let bg = pingora_core::services::background::background_service(
-            "ACME cert manager",
-            acme_service,
+            "TLS cert & OCSP manager",
+            tls_service,
         );
         server.add_service(bg);
-        info!(domains = acme_domains.len(), "ACME service registered");
+        info!(domains = acme_domains.len(), "TLS background service registered");
     }
 
     info!("entering run loop, waiting for connections or signals");

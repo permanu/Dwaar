@@ -4,10 +4,11 @@
 // This file is part of Dwaar — https://dwaar.dev
 // Licensed under the Business Source License 1.1
 
-//! Pingora background service for ACME certificate issuance and renewal.
+//! Pingora background service for TLS certificate management.
 //!
-//! On startup, checks all `tls auto` domains for missing or expiring certs.
-//! Then runs a daily loop to renew certs within 30 days of expiry.
+//! On startup, checks all `tls auto` domains for missing or expiring certs
+//! and fetches OCSP responses. Then runs a 12-hour loop to refresh OCSP
+//! staples and renew certs within 30 days of expiry.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -22,33 +23,41 @@ use tracing::{debug, error, info, warn};
 
 use super::issuer::CertIssuer;
 use super::{
-    AcmeError, DAILY_CHECK_INTERVAL, GTS_DIRECTORY_URL, INTER_DOMAIN_DELAY, RENEWAL_WINDOW_DAYS,
-    le_directory_url,
+    AcmeError, GTS_DIRECTORY_URL, INTER_DOMAIN_DELAY, RENEWAL_WINDOW_DAYS, le_directory_url,
 };
+use crate::cert_store::CertStore;
 
-/// Background service that provisions and renews ACME certificates.
-pub struct AcmeService {
+/// Background service that provisions/renews ACME certificates and refreshes
+/// OCSP staples.
+pub struct TlsBackgroundService {
     domains: Vec<String>,
     cert_dir: String,
     issuer: Arc<CertIssuer>,
+    cert_store: Arc<CertStore>,
     in_flight: tokio::sync::Mutex<HashSet<String>>,
 }
 
-impl std::fmt::Debug for AcmeService {
+impl std::fmt::Debug for TlsBackgroundService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AcmeService")
+        f.debug_struct("TlsBackgroundService")
             .field("domains", &self.domains)
             .field("cert_dir", &self.cert_dir)
             .finish_non_exhaustive()
     }
 }
 
-impl AcmeService {
-    pub fn new(domains: Vec<String>, cert_dir: &str, issuer: Arc<CertIssuer>) -> Self {
+impl TlsBackgroundService {
+    pub fn new(
+        domains: Vec<String>,
+        cert_dir: &str,
+        issuer: Arc<CertIssuer>,
+        cert_store: Arc<CertStore>,
+    ) -> Self {
         Self {
             domains,
             cert_dir: cert_dir.to_string(),
             issuer,
+            cert_store,
             in_flight: tokio::sync::Mutex::new(HashSet::new()),
         }
     }
@@ -130,8 +139,49 @@ impl AcmeService {
 
     // NOTE: The spec describes exponential retry backoff (1h → 2h → 4h → 8h → 24h cap)
     // and "3 consecutive failures" warnings. This is deferred to a follow-up task.
-    // For now, failed domains are retried on the next daily check (24h later).
+    // For now, failed domains are retried on the next check cycle (12h later).
     // The fallback CA (GTS) provides immediate retry within a single attempt.
+
+    /// Fetch fresh OCSP responses for all domains with cached certs.
+    async fn refresh_ocsp_responses(&self) {
+        debug!("OCSP refresh cycle started");
+
+        for domain in &self.domains {
+            let Some(cached) = self.cert_store.get(domain) else {
+                continue;
+            };
+
+            let Some(ref issuer) = cached.issuer else {
+                debug!(domain, "no issuer in chain, skipping OCSP");
+                continue;
+            };
+
+            match crate::ocsp::fetch_ocsp_response(domain, &cached.cert, issuer).await {
+                Ok(response) => {
+                    self.cert_store.update_ocsp(domain, response);
+                    info!(domain, "OCSP response refreshed");
+                }
+                Err(crate::ocsp::OcspError::NoResponder) => {
+                    debug!(domain, "cert has no OCSP responder URL");
+                }
+                Err(crate::ocsp::OcspError::CertRevoked {
+                    domain: ref revoked_domain,
+                    ref serial,
+                }) => {
+                    error!(
+                        domain = %revoked_domain,
+                        serial = %serial,
+                        "CERTIFICATE IS REVOKED — not stapling"
+                    );
+                }
+                Err(e) => {
+                    warn!(domain, error = %e, "OCSP fetch failed");
+                }
+            }
+
+            tokio::time::sleep(super::OCSP_INTER_DOMAIN_DELAY).await;
+        }
+    }
 
     /// Run the startup scan: issue certs for domains that need them.
     async fn startup_scan(&self) {
@@ -153,9 +203,9 @@ impl AcmeService {
         }
     }
 
-    /// Run the daily renewal check.
+    /// Run the periodic renewal check.
     async fn daily_renewal(&self) {
-        debug!("ACME daily renewal check");
+        debug!("ACME renewal check");
 
         for domain in &self.domains {
             if !self.needs_issuance(domain).await {
@@ -174,19 +224,19 @@ impl AcmeService {
 }
 
 #[async_trait]
-impl BackgroundService for AcmeService {
+impl BackgroundService for TlsBackgroundService {
     async fn start(&self, mut shutdown: ShutdownWatch) {
-        // Startup: immediately provision missing/expiring certs
         self.startup_scan().await;
+        self.refresh_ocsp_responses().await;
 
-        // Daily loop: check and renew
         loop {
             tokio::select! {
-                () = tokio::time::sleep(DAILY_CHECK_INTERVAL) => {
+                () = tokio::time::sleep(super::SERVICE_CHECK_INTERVAL) => {
+                    self.refresh_ocsp_responses().await;
                     self.daily_renewal().await;
                 }
                 _ = shutdown.changed() => {
-                    info!("ACME service shutting down");
+                    info!("TLS background service shutting down");
                     return;
                 }
             }
@@ -202,16 +252,16 @@ mod tests {
     use crate::cert_store::CertStore;
     use crate::test_util::generate_self_signed;
 
-    fn make_service(domains: Vec<String>, cert_dir: &Path) -> AcmeService {
+    fn make_service(domains: Vec<String>, cert_dir: &Path) -> TlsBackgroundService {
         let solver = Arc::new(ChallengeSolver::new());
         let cert_store = Arc::new(CertStore::new(cert_dir, 100));
         let issuer = Arc::new(CertIssuer::new(
             cert_dir.join("acme"),
             cert_dir,
             solver,
-            cert_store,
+            Arc::clone(&cert_store),
         ));
-        AcmeService::new(domains, cert_dir.to_str().expect("utf8"), issuer)
+        TlsBackgroundService::new(domains, cert_dir.to_str().expect("utf8"), issuer, cert_store)
     }
 
     #[tokio::test]

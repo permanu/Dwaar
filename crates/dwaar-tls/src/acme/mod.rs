@@ -42,8 +42,11 @@ pub const CHALLENGE_CLEANUP_DELAY: Duration = Duration::from_secs(300);
 /// Max time to wait for challenge validation before giving up.
 pub const CHALLENGE_POLL_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// How often to check for certs needing renewal.
-pub const DAILY_CHECK_INTERVAL: Duration = Duration::from_secs(86_400);
+/// Combined interval for OCSP refresh + cert renewal (12 hours).
+pub const SERVICE_CHECK_INTERVAL: Duration = Duration::from_secs(43_200);
+
+/// Delay between OCSP fetches for different domains.
+pub const OCSP_INTER_DOMAIN_DELAY: Duration = Duration::from_secs(1);
 
 /// Returns the LE directory URL, respecting `DWAAR_ACME_STAGING=1` env var.
 pub fn le_directory_url() -> &'static str {
