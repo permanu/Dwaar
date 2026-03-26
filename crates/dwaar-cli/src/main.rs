@@ -26,9 +26,18 @@ use dwaar_core::proxy::DwaarProxy;
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse_args();
 
-    if let Some(Commands::Version) = &cli.command {
-        print_version();
-        return Ok(());
+    // Handle subcommands that don't need the full server
+    match &cli.command {
+        Some(Commands::Version) => {
+            print_version();
+            return Ok(());
+        }
+        Some(Commands::Validate { config }) => {
+            init_logging(&cli);
+            let path = config.as_ref().unwrap_or(&cli.config);
+            return validate_config(path);
+        }
+        None => {}
     }
 
     init_logging(&cli);
@@ -102,6 +111,22 @@ fn main() -> anyhow::Result<()> {
 
     info!("entering run loop, waiting for connections or signals");
     server.run_forever();
+}
+
+fn validate_config(path: &std::path::Path) -> anyhow::Result<()> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read config file: {}", path.display()))?;
+
+    let config = dwaar_config::parser::parse(&text).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let table = compile_routes(&config);
+    info!(
+        sites = config.sites.len(),
+        routes = table.len(),
+        path = %path.display(),
+        "config valid"
+    );
+    Ok(())
 }
 
 fn print_version() {
