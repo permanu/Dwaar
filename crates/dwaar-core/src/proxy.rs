@@ -56,6 +56,83 @@ impl DwaarProxy {
     }
 }
 
+impl DwaarProxy {
+    /// Check whether the downstream connection used TLS.
+    ///
+    /// Pingora stores an `SslDigest` in the connection digest when TLS
+    /// was negotiated. If it's `None`, the client connected over plaintext.
+    fn is_tls_connection(session: &Session) -> bool {
+        session
+            .downstream_session
+            .digest()
+            .and_then(|d| d.ssl_digest.as_ref())
+            .is_some()
+    }
+
+    /// Check whether this request should be redirected to HTTPS.
+    ///
+    /// Returns the route's canonical domain if all three conditions hold:
+    /// 1. The connection is plaintext (no TLS)
+    /// 2. The path is NOT an ACME HTTP-01 challenge (those must stay on HTTP)
+    /// 3. The matched route has TLS enabled
+    ///
+    /// Returns the canonical domain from the route table — NOT the client's
+    /// Host header — so the redirect Location can't be forged by the client.
+    fn https_redirect_domain(&self, session: &Session, ctx: &RequestContext) -> Option<String> {
+        if Self::is_tls_connection(session) {
+            return None;
+        }
+
+        // ACME HTTP-01 challenges arrive on port 80 and must be served
+        // over plaintext — Let's Encrypt's validation servers expect HTTP
+        if ctx.path.starts_with("/.well-known/acme-challenge/") {
+            return None;
+        }
+
+        let host = ctx
+            .host
+            .as_deref()
+            .map_or("", |h| h.split(':').next().unwrap_or(h));
+
+        let table = self.route_table.load();
+        table
+            .resolve(host)
+            .filter(|route| route.tls)
+            .map(|route| route.domain.clone())
+    }
+
+    /// Send a 301 redirect from HTTP to HTTPS and short-circuit the request.
+    ///
+    /// Uses the route's canonical domain for the Location header to prevent
+    /// open-redirect attacks via a forged Host header.
+    async fn send_https_redirect(
+        &self,
+        session: &mut Session,
+        ctx: &RequestContext,
+        canonical_domain: &str,
+    ) -> Result<bool> {
+        let location = format!("https://{canonical_domain}{}", ctx.path);
+
+        debug!(
+            request_id = %ctx.request_id,
+            location = %location,
+            "redirecting HTTP → HTTPS"
+        );
+
+        let mut resp = ResponseHeader::build(301, Some(3))?;
+        resp.insert_header("Location", &location)
+            .expect("location URL is valid header value");
+        resp.insert_header("Content-Length", "0")
+            .expect("static header value");
+        resp.insert_header("Connection", "close")
+            .expect("static header value");
+
+        session.write_response_header(Box::new(resp), true).await?;
+
+        Ok(true)
+    }
+}
+
 #[async_trait]
 impl ProxyHttp for DwaarProxy {
     type CTX = RequestContext;
@@ -64,39 +141,31 @@ impl ProxyHttp for DwaarProxy {
         RequestContext::new()
     }
 
-    /// Extract per-request metadata from the incoming HTTP request.
+    /// Extract per-request metadata and handle HTTP→HTTPS redirects.
     ///
     /// This runs after Pingora has parsed the HTTP headers but before
-    /// `upstream_peer()` selects the backend. We read:
-    /// - Client IP from the TCP socket's peer address
-    /// - Host from the `Host` header (or HTTP/2 `:authority` pseudo-header)
-    /// - HTTP method (GET, POST, etc.)
-    /// - Request path including query string
+    /// `upstream_peer()` selects the backend. Two responsibilities:
     ///
-    /// Returns `Ok(false)` — meaning "don't short-circuit, continue to the
-    /// next lifecycle phase." Returning `Ok(true)` would mean "I already
-    /// sent a response, skip everything else."
+    /// 1. Populate `RequestContext` with client IP, host, method, path
+    /// 2. If the connection is plaintext and the route wants TLS,
+    ///    send a 301 redirect to HTTPS and short-circuit
+    ///
+    /// Returns `Ok(false)` to continue to the next phase, or `Ok(true)`
+    /// if we already sent a response (redirect).
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool>
     where
         Self::CTX: Send + Sync,
     {
         // --- Client IP ---
-        // session.client_addr() returns Pingora's SocketAddr enum (Inet or Unix).
-        // .as_inet() extracts the std::net::SocketAddr if it's a TCP connection.
-        // .map(|addr| addr.ip()) extracts just the IpAddr, discarding the port.
         ctx.client_ip = session
             .client_addr()
             .and_then(|addr| addr.as_inet())
             .map(std::net::SocketAddr::ip);
 
         // --- HTTP headers ---
-        // req_header() gives us the parsed HTTP request. Pingora has already
-        // done all the HTTP/1.1 and HTTP/2 parsing by this point.
         let header = session.req_header();
 
-        // HTTP/1.1 sends the hostname in the Host header (RFC 7230 §5.4).
-        // HTTP/2 uses the :authority pseudo-header, which Pingora stores in
-        // the URI authority — not in the headers map. We check both.
+        // HTTP/1.1 uses Host header, HTTP/2 uses :authority pseudo-header
         ctx.host = header
             .headers
             .get(http::header::HOST)
@@ -104,14 +173,8 @@ impl ProxyHttp for DwaarProxy {
             .map(ToString::to_string)
             .or_else(|| header.uri.authority().map(|a| a.as_str().to_string()));
 
-        // --- Method ---
-        // .as_str() returns "GET", "POST", etc. as a &str.
         ctx.method = header.method.as_str().to_string();
 
-        // --- Path ---
-        // .uri.path() returns just the path component ("/api/users").
-        // .uri.path_and_query() includes the query string ("/api/users?page=2").
-        // We store path_and_query because analytics and logging need the full URL.
         ctx.path = header
             .uri
             .path_and_query()
@@ -125,6 +188,13 @@ impl ProxyHttp for DwaarProxy {
             path = %ctx.path,
             "request metadata extracted"
         );
+
+        // --- HTTP→HTTPS redirect (ISSUE-016) ---
+        if let Some(canonical_domain) = self.https_redirect_domain(session, ctx) {
+            return self
+                .send_https_redirect(session, ctx, &canonical_domain)
+                .await;
+        }
 
         Ok(false)
     }
@@ -176,7 +246,7 @@ impl ProxyHttp for DwaarProxy {
     /// - `X-Forwarded-For`: Appends client IP to the existing chain
     ///   (or creates a new chain if none exists). Preserves any upstream
     ///   proxy IPs that were already in the header.
-    /// - `X-Forwarded-Proto`: `http` (ISSUE-015 will set `https` for TLS).
+    /// - `X-Forwarded-Proto`: `https` when the downstream connection is TLS, `http` otherwise.
     /// - `X-Request-Id`: The UUID v7 from the request context.
     ///
     /// ## Headers removed (RFC 7230 §6.1)
@@ -185,7 +255,7 @@ impl ProxyHttp for DwaarProxy {
     /// connection — they must not be forwarded to the upstream.
     async fn upstream_request_filter(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         upstream_request: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()>
@@ -221,11 +291,14 @@ impl ProxyHttp for DwaarProxy {
                 .expect("X-Forwarded-For value is valid");
         }
 
-        // X-Forwarded-Proto: always "http" for now since we don't have TLS yet.
-        // ISSUE-015 will check the downstream connection and set "https" when
-        // the client connected over TLS.
+        // X-Forwarded-Proto: "https" if the client connected over TLS, "http" otherwise.
+        let proto = if Self::is_tls_connection(session) {
+            "https"
+        } else {
+            "http"
+        };
         upstream_request
-            .insert_header("X-Forwarded-Proto", "http")
+            .insert_header("X-Forwarded-Proto", proto)
             .expect("static header value is valid");
 
         // X-Request-Id: lets the backend correlate its logs with ours.
@@ -294,9 +367,8 @@ impl ProxyHttp for DwaarProxy {
 
         // HSTS: tell browsers to always use HTTPS for this domain.
         // max-age=31536000 = 1 year. includeSubDomains extends to all subdomains.
-        // Note: this is safe even before we have TLS (ISSUE-015), because
-        // browsers only honor HSTS headers received over HTTPS connections.
-        // Over plain HTTP, browsers ignore it per the RFC.
+        // Browsers only honor HSTS over HTTPS connections and ignore it
+        // over HTTP, so this is safe to set unconditionally.
         upstream_response
             .insert_header(
                 "Strict-Transport-Security",
@@ -355,6 +427,7 @@ mod tests {
         let proxy = make_proxy(vec![Route::new(
             "example.com",
             "127.0.0.1:8080".parse().expect("valid"),
+            false,
         )]);
         let table = proxy.route_table.load();
         assert_eq!(table.len(), 1);
@@ -379,14 +452,14 @@ mod tests {
         let addr1: SocketAddr = "127.0.0.1:3000".parse().expect("valid");
         let addr2: SocketAddr = "127.0.0.1:4000".parse().expect("valid");
 
-        let proxy = make_proxy(vec![Route::new("v1.example.com", addr1)]);
+        let proxy = make_proxy(vec![Route::new("v1.example.com", addr1, false)]);
 
         // Initial table has v1
         assert!(proxy.route_table.load().resolve("v1.example.com").is_some());
         assert!(proxy.route_table.load().resolve("v2.example.com").is_none());
 
         // Swap in a new table with v2 instead — simulates config reload
-        let new_table = RouteTable::new(vec![Route::new("v2.example.com", addr2)]);
+        let new_table = RouteTable::new(vec![Route::new("v2.example.com", addr2, false)]);
         proxy.route_table.store(Arc::new(new_table));
 
         // Old route gone, new route available

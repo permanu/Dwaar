@@ -24,8 +24,8 @@
 //! use dwaar_core::route::{Route, RouteTable};
 //!
 //! let routes = vec![
-//!     Route::new("api.example.com", "127.0.0.1:3000".parse().unwrap()),
-//!     Route::new("*.example.com",   "127.0.0.1:8080".parse().unwrap()),
+//!     Route::new("api.example.com", "127.0.0.1:3000".parse().unwrap(), false),
+//!     Route::new("*.example.com",   "127.0.0.1:8080".parse().unwrap(), false),
 //! ];
 //! let table = RouteTable::new(routes);
 //!
@@ -51,9 +51,6 @@ use std::net::SocketAddr;
 use ahash::RandomState;
 
 /// A single routing entry: one domain mapped to one upstream backend.
-///
-/// In later issues this will grow fields for TLS mode, plugin config,
-/// health check settings, etc. For now it carries just the essentials.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Route {
     /// The domain pattern this route matches.
@@ -64,14 +61,19 @@ pub struct Route {
 
     /// The backend address to forward matching requests to.
     pub upstream: SocketAddr,
+
+    /// Whether this route expects TLS. When true, plaintext HTTP requests
+    /// are redirected to HTTPS. When false, HTTP is served directly.
+    pub tls: bool,
 }
 
 impl Route {
     /// Create a new route mapping `domain` to `upstream`.
-    pub fn new(domain: &str, upstream: SocketAddr) -> Self {
+    pub fn new(domain: &str, upstream: SocketAddr, tls: bool) -> Self {
         Self {
             domain: domain.to_lowercase(),
             upstream,
+            tls,
         }
     }
 }
@@ -192,8 +194,8 @@ mod tests {
     #[test]
     fn exact_match_returns_correct_route() {
         let table = RouteTable::new(vec![
-            Route::new("api.example.com", addr(3000)),
-            Route::new("web.example.com", addr(8080)),
+            Route::new("api.example.com", addr(3000), false),
+            Route::new("web.example.com", addr(8080), false),
         ]);
 
         let route = table.resolve("api.example.com").expect("should match");
@@ -202,7 +204,7 @@ mod tests {
 
     #[test]
     fn exact_match_is_case_insensitive() {
-        let table = RouteTable::new(vec![Route::new("API.Example.COM", addr(3000))]);
+        let table = RouteTable::new(vec![Route::new("API.Example.COM", addr(3000), false)]);
 
         // Host header arrives in mixed case — should still match
         let route = table.resolve("api.example.com").expect("should match");
@@ -216,7 +218,7 @@ mod tests {
 
     #[test]
     fn wildcard_matches_any_subdomain() {
-        let table = RouteTable::new(vec![Route::new("*.example.com", addr(9000))]);
+        let table = RouteTable::new(vec![Route::new("*.example.com", addr(9000), false)]);
 
         let route = table.resolve("api.example.com").expect("should match");
         assert_eq!(route.upstream, addr(9000));
@@ -228,8 +230,8 @@ mod tests {
     #[test]
     fn exact_match_takes_priority_over_wildcard() {
         let table = RouteTable::new(vec![
-            Route::new("api.example.com", addr(3000)),
-            Route::new("*.example.com", addr(9000)),
+            Route::new("api.example.com", addr(3000), false),
+            Route::new("*.example.com", addr(9000), false),
         ]);
 
         // api.example.com → exact match (port 3000), not wildcard
@@ -245,7 +247,7 @@ mod tests {
 
     #[test]
     fn no_match_returns_none() {
-        let table = RouteTable::new(vec![Route::new("api.example.com", addr(3000))]);
+        let table = RouteTable::new(vec![Route::new("api.example.com", addr(3000), false)]);
 
         assert!(table.resolve("other.dev").is_none());
     }
@@ -260,7 +262,7 @@ mod tests {
 
     #[test]
     fn bare_hostname_without_dot_has_no_wildcard() {
-        let table = RouteTable::new(vec![Route::new("*.com", addr(9000))]);
+        let table = RouteTable::new(vec![Route::new("*.com", addr(9000), false)]);
 
         // "localhost" has no dot — can't strip a label for wildcard
         assert!(table.resolve("localhost").is_none());
@@ -268,7 +270,7 @@ mod tests {
 
     #[test]
     fn wildcard_does_not_match_deeper_subdomains() {
-        let table = RouteTable::new(vec![Route::new("*.example.com", addr(9000))]);
+        let table = RouteTable::new(vec![Route::new("*.example.com", addr(9000), false)]);
 
         // *.example.com should match one level deep only
         // "deep.sub.example.com" — first dot gives "*.sub.example.com", not "*.example.com"
@@ -284,8 +286,8 @@ mod tests {
         assert_eq!(empty.len(), 0);
 
         let table = RouteTable::new(vec![
-            Route::new("a.com", addr(1000)),
-            Route::new("b.com", addr(2000)),
+            Route::new("a.com", addr(1000), false),
+            Route::new("b.com", addr(2000), false),
         ]);
         assert!(!table.is_empty());
         assert_eq!(table.len(), 2);
@@ -295,5 +297,16 @@ mod tests {
     fn route_table_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<RouteTable>();
+    }
+
+    // ── Route TLS field (ISSUE-016) ──────────────────────────
+
+    #[test]
+    fn route_tls_flag() {
+        let tls_route = Route::new("example.com", addr(3000), true);
+        assert!(tls_route.tls);
+
+        let plain_route = Route::new("example.com", addr(3000), false);
+        assert!(!plain_route.tls);
     }
 }
