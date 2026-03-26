@@ -21,8 +21,11 @@ use pingora_core::server::configuration::{Opt as PingoraOpt, ServerConf};
 use tracing::info;
 
 use cli::{Cli, Commands};
-use dwaar_config::compile::{compile_routes, compile_tls_configs, has_tls_sites};
+use dwaar_config::compile::{compile_acme_domains, compile_routes, compile_tls_configs, has_tls_sites};
 use dwaar_core::proxy::DwaarProxy;
+use dwaar_tls::acme::issuer::CertIssuer;
+use dwaar_tls::acme::service::AcmeService;
+use dwaar_tls::acme::ChallengeSolver;
 use dwaar_tls::cert_store::CertStore;
 use dwaar_tls::sni::{DomainTlsConfig, SniResolver};
 
@@ -58,27 +61,7 @@ fn main() -> anyhow::Result<()> {
     );
 
     let config_path = &cli.config;
-    let metadata = std::fs::metadata(config_path)
-        .with_context(|| format!("failed to stat config file: {}", config_path.display()))?;
-    if metadata.len() > MAX_CONFIG_SIZE {
-        bail!(
-            "config file too large ({} bytes, max {} bytes)",
-            metadata.len(),
-            MAX_CONFIG_SIZE
-        );
-    }
-
-    let config_text = std::fs::read_to_string(config_path)
-        .with_context(|| format!("failed to read config file: {}", config_path.display()))?;
-
-    let dwaar_config =
-        dwaar_config::parser::parse(&config_text).map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    info!(
-        sites = dwaar_config.sites.len(),
-        path = %config_path.display(),
-        "config loaded"
-    );
+    let dwaar_config = load_config(config_path)?;
 
     if cli.test {
         info!("config valid");
@@ -117,7 +100,15 @@ fn main() -> anyhow::Result<()> {
     info!(routes = route_table.len(), "route table compiled");
 
     let route_table = Arc::new(ArcSwap::from_pointee(route_table));
-    let proxy = DwaarProxy::new(route_table, None);
+
+    let acme_domains = compile_acme_domains(&dwaar_config);
+    let challenge_solver = if acme_domains.is_empty() {
+        None
+    } else {
+        Some(Arc::new(ChallengeSolver::new()))
+    };
+
+    let proxy = DwaarProxy::new(route_table, challenge_solver.clone());
 
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, proxy);
 
@@ -129,14 +120,66 @@ fn main() -> anyhow::Result<()> {
         "listener registered"
     );
 
+    let cert_store = Arc::new(CertStore::new("/etc/dwaar/certs", 1000));
+
     if has_tls_sites(&dwaar_config) {
-        setup_tls_listener(&dwaar_config, &mut proxy_service)?;
+        setup_tls_listener(&dwaar_config, &mut proxy_service, &cert_store)?;
     }
 
     server.add_service(proxy_service);
 
+    // ACME background service for automatic cert issuance + renewal
+    if let Some(ref solver) = challenge_solver {
+        let issuer = Arc::new(CertIssuer::new(
+            "/etc/dwaar/acme",
+            "/etc/dwaar/certs",
+            Arc::clone(solver),
+            Arc::clone(&cert_store),
+        ));
+        let acme_service = AcmeService::new(
+            acme_domains.clone(),
+            "/etc/dwaar/certs",
+            issuer,
+        );
+
+        let bg = pingora_core::services::background::background_service(
+            "ACME cert manager",
+            acme_service,
+        );
+        server.add_service(bg);
+        info!(domains = acme_domains.len(), "ACME service registered");
+    }
+
     info!("entering run loop, waiting for connections or signals");
     server.run_forever();
+}
+
+fn load_config(
+    path: &std::path::Path,
+) -> anyhow::Result<dwaar_config::model::DwaarConfig> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("failed to stat config file: {}", path.display()))?;
+    if metadata.len() > MAX_CONFIG_SIZE {
+        bail!(
+            "config file too large ({} bytes, max {} bytes)",
+            metadata.len(),
+            MAX_CONFIG_SIZE
+        );
+    }
+
+    let config_text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read config file: {}", path.display()))?;
+
+    let config =
+        dwaar_config::parser::parse(&config_text).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    info!(
+        sites = config.sites.len(),
+        path = %path.display(),
+        "config loaded"
+    );
+
+    Ok(config)
 }
 
 fn setup_tls_listener(
@@ -144,11 +187,11 @@ fn setup_tls_listener(
     proxy_service: &mut pingora_core::services::listening::Service<
         pingora_proxy::HttpProxy<DwaarProxy>,
     >,
+    cert_store: &Arc<CertStore>,
 ) -> anyhow::Result<()> {
     let tls_configs = compile_tls_configs(config);
 
-    let cert_store = Arc::new(CertStore::new("/etc/dwaar/certs", 1000));
-    let mut sni_resolver = SniResolver::new(cert_store);
+    let mut sni_resolver = SniResolver::new(Arc::clone(cert_store));
 
     if let Some(first_domain) = tls_configs.keys().next() {
         sni_resolver.set_default_domain(first_domain);
