@@ -4,14 +4,28 @@
 // This file is part of Dwaar — https://dwaar.dev
 // Licensed under the Business Source License 1.1
 
-//! dwaar-config
+//! dwaar-config — Dwaarfile parser and configuration management.
+//!
+//! Parses Dwaarfile syntax (a superset of Caddyfile) into typed
+//! [`model::DwaarConfig`] structs. The parser produces clear error
+//! messages with line numbers and typo suggestions.
+//!
+//! ## Usage
+//!
+//! ```
+//! use dwaar_config::parser;
+//!
+//! let config = parser::parse(r#"
+//!     example.com {
+//!         reverse_proxy localhost:8080
+//!     }
+//! "#).expect("valid config");
+//!
+//! assert_eq!(config.sites.len(), 1);
+//! assert_eq!(config.sites[0].address, "example.com");
+//! ```
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_compiles() {
-        // Placeholder — replaced with real tests as features are implemented
-        let x = 1 + 1;
-        assert_eq!(x, 2);
-    }
-}
+pub mod error;
+pub mod model;
+pub mod parser;
+mod token;
