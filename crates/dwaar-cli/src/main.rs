@@ -25,7 +25,7 @@ use dwaar_config::compile::{
     compile_acme_domains, compile_routes, compile_tls_configs, has_tls_sites,
 };
 use dwaar_core::proxy::DwaarProxy;
-use dwaar_log::{StdoutWriter, channel as log_channel, spawn_writer};
+use dwaar_log::{StdoutWriter, channel as log_channel, run_writer};
 use dwaar_tls::acme::ChallengeSolver;
 use dwaar_tls::acme::issuer::CertIssuer;
 use dwaar_tls::acme::service::TlsBackgroundService;
@@ -133,19 +133,38 @@ fn main() -> anyhow::Result<()> {
 
     server.add_service(proxy_service);
 
-    // ACME background service for automatic cert issuance + renewal
-    if let Some(ref solver) = challenge_solver {
+    register_background_services(
+        &mut server,
+        challenge_solver.as_ref(),
+        &acme_domains,
+        &cert_store,
+        log_receiver,
+    );
+
+    info!("entering run loop, waiting for connections or signals");
+    server.run_forever();
+}
+
+fn register_background_services(
+    server: &mut Server,
+    challenge_solver: Option<&Arc<ChallengeSolver>>,
+    acme_domains: &[String],
+    cert_store: &Arc<CertStore>,
+    log_receiver: dwaar_log::LogReceiver,
+) {
+    // ACME + OCSP background service
+    if let Some(solver) = challenge_solver {
         let issuer = Arc::new(CertIssuer::new(
             "/etc/dwaar/acme",
             "/etc/dwaar/certs",
             Arc::clone(solver),
-            Arc::clone(&cert_store),
+            Arc::clone(cert_store),
         ));
         let tls_service = TlsBackgroundService::new(
-            acme_domains.clone(),
+            acme_domains.to_vec(),
             "/etc/dwaar/certs",
             issuer,
-            Arc::clone(&cert_store),
+            Arc::clone(cert_store),
         );
 
         let bg = pingora_core::services::background::background_service(
@@ -156,12 +175,15 @@ fn main() -> anyhow::Result<()> {
         info!(domains = acme_domains.len(), "TLS background service registered");
     }
 
-    // Spawn log batch writer — runs as a standalone tokio task
-    let _log_writer = spawn_writer(log_receiver, Box::new(StdoutWriter));
-    info!("log writer started (JSON lines to stdout)");
-
-    info!("entering run loop, waiting for connections or signals");
-    server.run_forever();
+    // Log batch writer
+    let log_bg = pingora_core::services::background::background_service(
+        "log writer",
+        LogWriterService {
+            receiver: std::sync::Mutex::new(Some(log_receiver)),
+        },
+    );
+    server.add_service(log_bg);
+    info!("log writer registered (JSON lines to stdout)");
 }
 
 fn load_config(path: &std::path::Path) -> anyhow::Result<dwaar_config::model::DwaarConfig> {
@@ -302,6 +324,32 @@ fn validate_config(path: &std::path::Path) -> anyhow::Result<()> {
 fn print_version() {
     use std::io::Write;
     let _ = writeln!(std::io::stderr(), "dwaar v{}", env!("CARGO_PKG_VERSION"));
+}
+
+/// Wraps the log batch writer as a Pingora `BackgroundService`.
+///
+/// Needed because `run_writer` is async and requires a tokio runtime.
+/// Pingora's `run_forever()` creates the runtime, so we can't call
+/// `tokio::spawn` before it. Instead, Pingora runs this service
+/// inside its own runtime.
+struct LogWriterService {
+    receiver: std::sync::Mutex<Option<dwaar_log::LogReceiver>>,
+}
+
+#[async_trait::async_trait]
+impl pingora_core::services::background::BackgroundService for LogWriterService {
+    async fn start(&self, _shutdown: pingora_core::server::ShutdownWatch) {
+        // Take the receiver out of the Mutex. start() is called once by Pingora.
+        let receiver = self
+            .receiver
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+
+        if let Some(rx) = receiver {
+            run_writer(rx, Box::new(StdoutWriter)).await;
+        }
+    }
 }
 
 fn init_logging(cli: &Cli) {
