@@ -154,6 +154,15 @@ impl TlsAccept for SniResolver {
             return;
         }
 
+        // Staple OCSP response if available
+        if let Some(ref ocsp_der) = cached.ocsp_response {
+            if let Err(e) = ssl.set_ocsp_status(ocsp_der) {
+                warn!(sni = %sni, error = %e, "failed to staple OCSP response");
+            } else {
+                debug!(sni = %sni, "OCSP response stapled to handshake");
+            }
+        }
+
         debug!(sni = %sni, "cert loaded for TLS handshake");
     }
 }
