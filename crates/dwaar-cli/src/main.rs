@@ -117,7 +117,7 @@ fn main() -> anyhow::Result<()> {
     info!(routes = route_table.len(), "route table compiled");
 
     let route_table = Arc::new(ArcSwap::from_pointee(route_table));
-    let proxy = DwaarProxy::new(route_table);
+    let proxy = DwaarProxy::new(route_table, None);
 
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, proxy);
 
