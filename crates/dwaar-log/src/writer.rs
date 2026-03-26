@@ -91,18 +91,28 @@ pub struct LogReceiver {
 
 /// Spawn the batch writer as a background tokio task.
 ///
-/// Drains the channel in batches of up to [`BATCH_SIZE`] entries,
-/// flushing every [`FLUSH_INTERVAL`] or when the batch is full.
+/// Requires an active tokio runtime. For use inside Pingora's runtime,
+/// use [`run_writer`] directly from a `BackgroundService` instead.
 pub fn spawn_writer(
     receiver: LogReceiver,
     output: Box<dyn LogOutput>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        run_writer(receiver.rx, output).await;
+        run_writer(receiver, output).await;
     })
 }
 
-async fn run_writer(mut rx: mpsc::Receiver<RequestLog>, output: Box<dyn LogOutput>) {
+/// Run the batch writer loop. Drains the channel in batches of up to
+/// [`BATCH_SIZE`] entries, flushing every [`FLUSH_INTERVAL`] or when
+/// the batch is full.
+///
+/// This is the async entry point — call it from a `BackgroundService`
+/// or use [`spawn_writer`] if a tokio runtime is already active.
+pub async fn run_writer(receiver: LogReceiver, output: Box<dyn LogOutput>) {
+    run_writer_inner(receiver.rx, output).await;
+}
+
+async fn run_writer_inner(mut rx: mpsc::Receiver<RequestLog>, output: Box<dyn LogOutput>) {
     let mut batch = Vec::with_capacity(BATCH_SIZE);
     let mut flush_timer = tokio::time::interval(FLUSH_INTERVAL);
     // First tick completes immediately — skip it so the timer starts fresh.
