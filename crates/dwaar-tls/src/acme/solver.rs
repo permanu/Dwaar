@@ -70,13 +70,18 @@ impl Default for ChallengeSolver {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     #[test]
     fn insert_and_get_token() {
         let solver = ChallengeSolver::new();
         solver.set("test-token-abc", "key-auth-xyz");
-        assert_eq!(solver.get("test-token-abc").as_deref(), Some("key-auth-xyz"));
+        assert_eq!(
+            solver.get("test-token-abc").as_deref(),
+            Some("key-auth-xyz")
+        );
     }
 
     #[test]
@@ -108,9 +113,30 @@ mod tests {
         assert!(!ChallengeSolver::is_valid_token("token/slash"));
     }
 
+    #[tokio::test]
+    async fn delayed_cleanup_removes_token() {
+        use std::time::Duration;
+
+        let solver = Arc::new(ChallengeSolver::new());
+        solver.set("cleanup-token", "auth-value");
+
+        // Simulate the cleanup spawn (with a much shorter delay for testing)
+        let s = Arc::clone(&solver);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            s.remove("cleanup-token");
+        });
+
+        // Token exists immediately
+        assert!(solver.get("cleanup-token").is_some());
+
+        // Token gone after delay
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(solver.get("cleanup-token").is_none());
+    }
+
     #[test]
     fn concurrent_access() {
-        use std::sync::Arc;
         use std::thread;
 
         let solver = Arc::new(ChallengeSolver::new());

@@ -22,8 +22,8 @@ use tracing::{debug, error, info, warn};
 
 use super::issuer::CertIssuer;
 use super::{
-    le_directory_url, AcmeError, DAILY_CHECK_INTERVAL, GTS_DIRECTORY_URL, INTER_DOMAIN_DELAY,
-    RENEWAL_WINDOW_DAYS,
+    AcmeError, DAILY_CHECK_INTERVAL, GTS_DIRECTORY_URL, INTER_DOMAIN_DELAY, RENEWAL_WINDOW_DAYS,
+    le_directory_url,
 };
 
 /// Background service that provisions and renews ACME certificates.
@@ -191,5 +191,46 @@ impl BackgroundService for AcmeService {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::acme::issuer::CertIssuer;
+    use crate::acme::solver::ChallengeSolver;
+    use crate::cert_store::CertStore;
+    use crate::test_util::generate_self_signed;
+
+    fn make_service(domains: Vec<String>, cert_dir: &Path) -> AcmeService {
+        let solver = Arc::new(ChallengeSolver::new());
+        let cert_store = Arc::new(CertStore::new(cert_dir, 100));
+        let issuer = Arc::new(CertIssuer::new(
+            cert_dir.join("acme"),
+            cert_dir,
+            solver,
+            cert_store,
+        ));
+        AcmeService::new(domains, cert_dir.to_str().expect("utf8"), issuer)
+    }
+
+    #[tokio::test]
+    async fn needs_issuance_when_cert_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let svc = make_service(vec!["missing.example.com".into()], dir.path());
+        assert!(svc.needs_issuance("missing.example.com").await);
+    }
+
+    #[tokio::test]
+    async fn no_issuance_needed_for_valid_cert() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cert_pem, key_pem) = generate_self_signed("valid.example.com");
+
+        std::fs::write(dir.path().join("valid.example.com.pem"), &cert_pem).expect("write cert");
+        std::fs::write(dir.path().join("valid.example.com.key"), &key_pem).expect("write key");
+
+        let svc = make_service(vec!["valid.example.com".into()], dir.path());
+        // generate_self_signed creates certs valid for 365 days
+        assert!(!svc.needs_issuance("valid.example.com").await);
     }
 }

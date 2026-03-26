@@ -100,18 +100,15 @@ impl CertIssuer {
     }
 
     /// Process all authorizations for the order, setting up HTTP-01 challenges.
-    async fn solve_challenges(
-        &self,
-        domain: &str,
-        order: &mut Order,
-    ) -> Result<(), AcmeError> {
-        let authorizations = order
-            .authorizations()
-            .await
-            .map_err(|e| AcmeError::ChallengeValidation {
-                domain: domain.to_string(),
-                reason: e.to_string(),
-            })?;
+    async fn solve_challenges(&self, domain: &str, order: &mut Order) -> Result<(), AcmeError> {
+        let authorizations =
+            order
+                .authorizations()
+                .await
+                .map_err(|e| AcmeError::ChallengeValidation {
+                    domain: domain.to_string(),
+                    reason: e.to_string(),
+                })?;
 
         for authz in &authorizations {
             self.solve_single_authz(domain, order, authz).await?;
@@ -175,12 +172,13 @@ impl CertIssuer {
     async fn poll_order_ready(domain: &str, order: &mut Order) -> Result<(), AcmeError> {
         let mut attempts = 10_u32;
         loop {
-            let state = order.refresh().await.map_err(|e| {
-                AcmeError::ChallengeValidation {
+            let state = order
+                .refresh()
+                .await
+                .map_err(|e| AcmeError::ChallengeValidation {
                     domain: domain.to_string(),
                     reason: e.to_string(),
-                }
-            })?;
+                })?;
 
             match state.status {
                 OrderStatus::Ready | OrderStatus::Valid => return Ok(()),
@@ -191,12 +189,13 @@ impl CertIssuer {
                     });
                 }
                 OrderStatus::Pending | OrderStatus::Processing => {
-                    attempts = attempts.checked_sub(1).ok_or_else(|| {
-                        AcmeError::ChallengeValidation {
-                            domain: domain.to_string(),
-                            reason: "order did not become ready after polling".to_string(),
-                        }
-                    })?;
+                    attempts =
+                        attempts
+                            .checked_sub(1)
+                            .ok_or_else(|| AcmeError::ChallengeValidation {
+                                domain: domain.to_string(),
+                                reason: "order did not become ready after polling".to_string(),
+                            })?;
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
             }
@@ -348,4 +347,52 @@ fn generate_key_and_csr(domain: &str) -> Result<(String, Vec<u8>), openssl::erro
         .expect("PEM output should be valid UTF-8");
 
     Ok((key_pem, csr_der))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cert_store::CertStore;
+
+    #[tokio::test]
+    async fn write_cert_files_atomic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert_dir = dir.path().join("certs");
+        let acme_dir = dir.path().join("acme");
+
+        let solver = Arc::new(ChallengeSolver::new());
+        let cert_store = Arc::new(CertStore::new(&cert_dir, 100));
+
+        let issuer = CertIssuer::new(&acme_dir, &cert_dir, solver, cert_store);
+
+        let fake_cert = "-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n";
+        let fake_key = "-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----\n";
+
+        issuer
+            .write_cert_files("test.example.com", fake_cert, fake_key)
+            .await
+            .expect("write should succeed");
+
+        // Verify files exist with correct content
+        let cert_content =
+            std::fs::read_to_string(cert_dir.join("test.example.com.pem")).expect("cert file");
+        assert_eq!(cert_content, fake_cert);
+
+        let key_content =
+            std::fs::read_to_string(cert_dir.join("test.example.com.key")).expect("key file");
+        assert_eq!(key_content, fake_key);
+
+        // Verify key file permissions (Unix)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::metadata(cert_dir.join("test.example.com.key"))
+                .expect("metadata")
+                .permissions();
+            assert_eq!(perms.mode() & 0o777, 0o600);
+        }
+
+        // Verify no .tmp files remain
+        assert!(!cert_dir.join("test.example.com.tmp").exists());
+    }
 }
