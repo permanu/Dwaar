@@ -10,6 +10,10 @@
 //! It is the heart of the system: every HTTP request flows through
 //! [`proxy::DwaarProxy`], with per-request state tracked in
 //! [`context::RequestContext`].
+//!
+//! The [`route`] module provides the domain→upstream mapping that
+//! `upstream_peer()` consults on every request.
 
 pub mod context;
 pub mod proxy;
+pub mod route;

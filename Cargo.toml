@@ -42,6 +42,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149" }
 
 # Data structures
+ahash = "0.8.12"
 arc-swap = "1.9.0"
 dashmap = "6.1.0"
 lru = "0.16.3"
