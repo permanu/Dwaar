@@ -21,6 +21,7 @@ use pingora_core::server::configuration::{Opt as PingoraOpt, ServerConf};
 use tracing::info;
 
 use cli::{Cli, Commands};
+use dwaar_admin::AdminService;
 use dwaar_config::compile::{
     compile_acme_domains, compile_routes, compile_tls_configs, has_tls_sites,
 };
@@ -113,6 +114,7 @@ fn main() -> anyhow::Result<()> {
 
     let (log_sender, log_receiver) = log_channel();
 
+    let route_table_for_admin = Arc::clone(&route_table);
     let proxy = DwaarProxy::new(route_table, challenge_solver.clone(), Some(log_sender));
 
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, proxy);
@@ -132,6 +134,21 @@ fn main() -> anyhow::Result<()> {
     }
 
     server.add_service(proxy_service);
+
+    // Admin API service
+    let admin_token = std::env::var("DWAAR_ADMIN_TOKEN").ok();
+    let admin_service = AdminService::new(
+        route_table_for_admin,
+        std::time::Instant::now(),
+        admin_token,
+    );
+    let mut admin_listening = pingora_core::services::listening::Service::new(
+        "admin API".to_string(),
+        admin_service,
+    );
+    admin_listening.add_tcp("127.0.0.1:6190");
+    server.add_service(admin_listening);
+    info!(listen = "127.0.0.1:6190", "admin API registered");
 
     register_background_services(
         &mut server,
