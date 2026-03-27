@@ -7,3 +7,4 @@
 //! dwaar-plugins
 
 pub mod bot_detect;
+pub mod rate_limit;
