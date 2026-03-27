@@ -6,12 +6,4 @@
 
 //! dwaar-plugins
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_compiles() {
-        // Placeholder — replaced with real tests as features are implemented
-        let x = 1 + 1;
-        assert_eq!(x, 2);
-    }
-}
+pub mod bot_detect;
