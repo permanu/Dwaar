@@ -58,7 +58,8 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
         };
 
         let tls = site_has_tls(&site.directives);
-        routes.push(Route::new(&site.address, addr, tls, None));
+        let rate_limit_rps = find_rate_limit(&site.directives);
+        routes.push(Route::new(&site.address, addr, tls, rate_limit_rps));
     }
 
     RouteTable::new(routes)
@@ -138,6 +139,13 @@ fn site_has_tls(directives: &[Directive]) -> bool {
 fn find_reverse_proxy(directives: &[Directive]) -> Option<&ReverseProxyDirective> {
     directives.iter().find_map(|d| match d {
         Directive::ReverseProxy(rp) => Some(rp),
+        _ => None,
+    })
+}
+
+fn find_rate_limit(directives: &[Directive]) -> Option<u32> {
+    directives.iter().find_map(|d| match d {
+        Directive::RateLimit(rl) => Some(rl.requests_per_second),
         _ => None,
     })
 }
@@ -406,5 +414,54 @@ mod tests {
 
         let domains = compile_acme_domains(&config);
         assert!(domains.is_empty());
+    }
+
+    // ── Rate limit extraction (ISSUE-031) ───────────────────
+
+    #[test]
+    fn compile_route_with_rate_limit() {
+        let config = DwaarConfig {
+            sites: vec![SiteBlock {
+                address: "api.example.com".to_string(),
+                directives: vec![
+                    rp("127.0.0.1:3000"),
+                    Directive::RateLimit(RateLimitDirective {
+                        requests_per_second: 100,
+                    }),
+                ],
+            }],
+        };
+        let table = compile_routes(&config);
+        let route = table.resolve("api.example.com").expect("should resolve");
+        assert_eq!(route.rate_limit_rps, Some(100));
+    }
+
+    #[test]
+    fn compile_route_without_rate_limit() {
+        let config = DwaarConfig {
+            sites: vec![SiteBlock {
+                address: "example.com".to_string(),
+                directives: vec![rp("127.0.0.1:8080")],
+            }],
+        };
+        let table = compile_routes(&config);
+        let route = table.resolve("example.com").expect("should resolve");
+        assert_eq!(route.rate_limit_rps, None);
+    }
+
+    #[test]
+    fn compile_from_parsed_rate_limit() {
+        let config = crate::parser::parse(
+            r"
+        api.example.com {
+            reverse_proxy 127.0.0.1:3000
+            rate_limit 500/s
+        }
+        ",
+        )
+        .expect("should parse");
+        let table = compile_routes(&config);
+        let route = table.resolve("api.example.com").expect("api route");
+        assert_eq!(route.rate_limit_rps, Some(500));
     }
 }
