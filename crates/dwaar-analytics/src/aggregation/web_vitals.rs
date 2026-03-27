@@ -8,8 +8,8 @@
 //!
 //! Three independent `TDigest` instances track LCP (Largest Contentful
 //! Paint), CLS (Cumulative Layout Shift), and INP (Interaction to
-//! Next Paint). Each supports streaming inserts and quantile queries
-//! at p50/p75/p95/p99.
+//! Next Paint). Values are buffered and merged in batches to avoid
+//! per-record heap allocation. Queries flush the buffer first.
 
 use serde::Serialize;
 use tdigest::TDigest;
@@ -23,51 +23,106 @@ pub struct Percentiles {
     pub p99: f64,
 }
 
+/// Batch size for buffered `TDigest` merges.
+///
+/// At 100, each merge amortizes the Vec allocation and sort across 100
+/// values instead of allocating per-record. 100 is small enough that
+/// queries see near-real-time data (at most 100 values behind).
+const BATCH_SIZE: usize = 100;
+
+/// Buffered `TDigest` wrapper that batches inserts.
+///
+/// Values accumulate in a fixed-capacity buffer. When the buffer is
+/// full (or when a percentile query arrives), the buffer is flushed
+/// into the `TDigest` in one `merge_unsorted` call.
+#[derive(Debug)]
+struct BufferedDigest {
+    digest: TDigest,
+    buffer: Vec<f64>,
+}
+
+impl BufferedDigest {
+    fn new() -> Self {
+        // TDigest size of 100 centroids — ~1 KB memory, ~1-5% accuracy
+        Self {
+            digest: TDigest::new_with_size(100),
+            buffer: Vec::with_capacity(BATCH_SIZE),
+        }
+    }
+
+    fn record(&mut self, value: f64) {
+        self.buffer.push(value);
+        if self.buffer.len() >= BATCH_SIZE {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.buffer.is_empty() {
+            return;
+        }
+        // Single allocation + sort for the whole batch
+        let batch = std::mem::replace(&mut self.buffer, Vec::with_capacity(BATCH_SIZE));
+        self.digest = self.digest.merge_unsorted(batch);
+    }
+
+    fn estimate_quantile(&mut self, q: f64) -> f64 {
+        self.flush(); // ensure all values are merged
+        self.digest.estimate_quantile(q)
+    }
+
+    fn is_empty(&mut self) -> bool {
+        self.flush();
+        self.digest.is_empty()
+    }
+}
+
 /// Streaming Web Vitals percentile tracker.
 ///
-/// Each metric is tracked independently. `TDigest` gives ~1-5% accuracy
-/// at all quantiles with bounded memory (~1 KB per digest).
+/// Each metric is tracked independently via a buffered `TDigest`.
+/// Inserts are O(1) amortized (buffered). Queries flush the buffer
+/// first, so they always reflect the latest data.
 #[derive(Debug)]
 pub struct WebVitals {
-    lcp: TDigest,
-    cls: TDigest,
-    inp: TDigest,
+    lcp: BufferedDigest,
+    cls: BufferedDigest,
+    inp: BufferedDigest,
 }
 
 impl WebVitals {
     pub fn new() -> Self {
         Self {
-            lcp: TDigest::new_with_size(100),
-            cls: TDigest::new_with_size(100),
-            inp: TDigest::new_with_size(100),
+            lcp: BufferedDigest::new(),
+            cls: BufferedDigest::new(),
+            inp: BufferedDigest::new(),
         }
     }
 
     pub fn record_lcp(&mut self, ms: f64) {
-        self.lcp = self.lcp.merge_unsorted(vec![ms]);
+        self.lcp.record(ms);
     }
 
     pub fn record_cls(&mut self, score: f64) {
-        self.cls = self.cls.merge_unsorted(vec![score]);
+        self.cls.record(score);
     }
 
     pub fn record_inp(&mut self, ms: f64) {
-        self.inp = self.inp.merge_unsorted(vec![ms]);
+        self.inp.record(ms);
     }
 
-    pub fn lcp_percentiles(&self) -> Percentiles {
-        Self::query(&self.lcp)
+    pub fn lcp_percentiles(&mut self) -> Percentiles {
+        Self::query(&mut self.lcp)
     }
 
-    pub fn cls_percentiles(&self) -> Percentiles {
-        Self::query(&self.cls)
+    pub fn cls_percentiles(&mut self) -> Percentiles {
+        Self::query(&mut self.cls)
     }
 
-    pub fn inp_percentiles(&self) -> Percentiles {
-        Self::query(&self.inp)
+    pub fn inp_percentiles(&mut self) -> Percentiles {
+        Self::query(&mut self.inp)
     }
 
-    fn query(digest: &TDigest) -> Percentiles {
+    fn query(digest: &mut BufferedDigest) -> Percentiles {
         if digest.is_empty() {
             return Percentiles { p50: 0.0, p75: 0.0, p95: 0.0, p99: 0.0 };
         }
@@ -123,7 +178,7 @@ mod tests {
 
     #[test]
     fn empty_returns_zeros() {
-        let wv = WebVitals::new();
+        let mut wv = WebVitals::new();
         let p = wv.lcp_percentiles();
         assert!(p.p50.abs() < f64::EPSILON);
         assert!(p.p99.abs() < f64::EPSILON);
@@ -144,5 +199,28 @@ mod tests {
         let p99_err = (p.p99 - exact_p99).abs() / exact_p99;
         assert!(p50_err < 0.05, "p50 error {p50_err:.4} exceeds 5%");
         assert!(p99_err < 0.05, "p99 error {p99_err:.4} exceeds 5%");
+    }
+
+    #[test]
+    fn batch_flush_happens_at_capacity() {
+        let mut bd = BufferedDigest::new();
+        for i in 0..BATCH_SIZE {
+            bd.record(f64::from(i as u32));
+        }
+        // Buffer should have auto-flushed at BATCH_SIZE
+        assert!(bd.buffer.is_empty(), "buffer should be empty after reaching batch size");
+        assert!(!bd.digest.is_empty(), "digest should have data after flush");
+    }
+
+    #[test]
+    fn partial_buffer_flushed_on_query() {
+        let mut bd = BufferedDigest::new();
+        bd.record(42.0);
+        bd.record(84.0);
+        assert_eq!(bd.buffer.len(), 2, "buffer holds values before flush");
+        // Query forces flush
+        let p50 = bd.estimate_quantile(0.5);
+        assert!(bd.buffer.is_empty(), "query should flush buffer");
+        assert!((p50 - 63.0).abs() < 25.0, "p50={p50}");
     }
 }
