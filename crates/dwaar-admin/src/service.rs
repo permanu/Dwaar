@@ -53,6 +53,17 @@ impl AdminService {
     }
 }
 
+/// Check whether a connection came over a Unix domain socket.
+/// UDS connections are trusted because access is controlled by filesystem
+/// permissions on the socket file — only processes with read/write on the
+/// socket can connect.
+fn is_trusted_transport(session: &ServerSession) -> bool {
+    session
+        .client_addr()
+        .and_then(|addr| addr.as_unix())
+        .is_some()
+}
+
 #[async_trait]
 impl ServeHttp for AdminService {
     async fn response(&self, session: &mut ServerSession) -> Response<Vec<u8>> {
@@ -68,15 +79,20 @@ impl ServeHttp for AdminService {
             .unwrap_or("")
             .to_string();
 
+        let is_uds = is_trusted_transport(session);
+        let source = if is_uds { "uds" } else { "tcp" };
+        debug!(source, method = %method, path = %path, "admin request");
+
         // Health check — no auth required
         if method == "GET" && path == "/health" {
-            debug!("health check");
+            debug!(source, "health check");
             return json_response(200, &handlers::health(&self.start_time));
         }
 
-        // All other endpoints require auth
-        if let Err(reason) = self.auth.check(&auth_header) {
-            warn!(reason, "admin auth failed");
+        // UDS connections are trusted — OS filesystem permissions on the socket
+        // file control access. TCP connections require a bearer token.
+        if !is_uds && let Err(reason) = self.auth.check(&auth_header) {
+            warn!(source, reason, "admin auth failed");
             return json_response(401, r#"{"error":"unauthorized"}"#);
         }
 
@@ -91,7 +107,7 @@ impl ServeHttp for AdminService {
                     Err((status, msg)) => json_response(status, &format!(r#"{{"error":"{msg}"}}"#)),
                     Ok(data) => match handlers::add_route(&self.route_table, &data) {
                         Ok(json) => {
-                            info!("route added/updated via admin API");
+                            info!(source, "route added/updated via admin API");
                             json_response(201, &json)
                         }
                         Err(e) => json_response(400, &format!(r#"{{"error":"{e}"}}"#)),
@@ -108,7 +124,7 @@ impl ServeHttp for AdminService {
                 }
                 match handlers::delete_route(&self.route_table, domain) {
                     Some(deleted) => {
-                        info!(domain = %deleted, "route deleted via admin API");
+                        info!(source, domain = %deleted, "route deleted via admin API");
                         json_response(200, &format!(r#"{{"deleted":"{deleted}"}}"#))
                     }
                     None => json_response(404, r#"{"error":"route not found"}"#),
