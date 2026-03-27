@@ -93,6 +93,7 @@ pub fn suggest_directive(input: &str) -> Option<&'static str> {
         "header",
         "redir",
         "encode",
+        "rate_limit",
         "basicauth",
         "forward_auth",
         "file_server",
@@ -197,6 +198,11 @@ mod tests {
         assert_eq!(suggest_directive("tsl"), Some("tls"));
         assert_eq!(suggest_directive("headr"), Some("header"));
         assert_eq!(suggest_directive("encod"), Some("encode"));
+    }
+
+    #[test]
+    fn suggest_rate_limit_typo() {
+        assert_eq!(suggest_directive("rate_limt"), Some("rate_limit"));
     }
 
     #[test]
