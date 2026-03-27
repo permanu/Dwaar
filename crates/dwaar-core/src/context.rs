@@ -104,6 +104,13 @@ pub struct RequestContext {
     /// `response_filter()` when Content-Encoding is detected on HTML responses.
     /// `response_body_filter()` decompresses each chunk before passing to the injector.
     pub decompressor: Option<Decompressor>,
+
+    /// Whether this request was classified as a bot by the `BotDetector`.
+    /// Set in `request_filter()`, read in `logging()`.
+    pub is_bot: bool,
+
+    /// Bot classification category, if detected. `None` for human traffic.
+    pub bot_category: Option<dwaar_plugins::bot_detect::BotCategory>,
 }
 
 impl RequestContext {
@@ -123,6 +130,8 @@ impl RequestContext {
             route_upstream: None,
             injector: None,
             decompressor: None,
+            is_bot: false,
+            bot_category: None,
         }
     }
 }
@@ -194,5 +203,7 @@ mod tests {
         assert!(ctx.route_upstream.is_none());
         assert!(ctx.injector.is_none());
         assert!(ctx.decompressor.is_none());
+        assert!(!ctx.is_bot);
+        assert!(ctx.bot_category.is_none());
     }
 }
