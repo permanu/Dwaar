@@ -130,12 +130,14 @@ fn run_server(
     let route_table_for_admin = Arc::clone(&route_table);
     let route_table_for_watcher = Arc::clone(&route_table);
     let route_table_for_agg = Arc::clone(&route_table_for_watcher);
+    let bot_detector = Arc::new(dwaar_plugins::bot_detect::BotDetector::new());
     let proxy = DwaarProxy::new(
         route_table,
         challenge_solver.clone(),
         Some(log_sender),
         Some(beacon_sender),
         Some(agg_sender),
+        bot_detector,
     );
 
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, proxy);

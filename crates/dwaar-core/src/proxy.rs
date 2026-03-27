@@ -78,6 +78,8 @@ pub struct DwaarProxy {
     beacon_sender: Option<BeaconSender>,
     /// Non-blocking sender for request log aggregation. `None` disables.
     agg_sender: Option<AggSender>,
+    /// Bot detector — classifies User-Agent strings into bot categories.
+    bot_detector: Arc<dwaar_plugins::bot_detect::BotDetector>,
 }
 
 impl DwaarProxy {
@@ -91,6 +93,7 @@ impl DwaarProxy {
         log_sender: Option<LogSender>,
         beacon_sender: Option<BeaconSender>,
         agg_sender: Option<AggSender>,
+        bot_detector: Arc<dwaar_plugins::bot_detect::BotDetector>,
     ) -> Self {
         Self {
             route_table,
@@ -98,6 +101,7 @@ impl DwaarProxy {
             log_sender,
             beacon_sender,
             agg_sender,
+            bot_detector,
         }
     }
 }
@@ -279,6 +283,20 @@ impl ProxyHttp for DwaarProxy {
             path = %ctx.path,
             "request metadata extracted"
         );
+
+        // --- Bot detection (ISSUE-030) ---
+        if let Some(ua) = session.req_header().headers.get(http::header::USER_AGENT)
+            && let Ok(ua_str) = ua.to_str()
+            && let Some(category) = self.bot_detector.classify(ua_str)
+        {
+            ctx.is_bot = true;
+            ctx.bot_category = Some(category);
+            debug!(
+                request_id = %ctx.request_id,
+                category = category.as_str(),
+                "bot detected"
+            );
+        }
 
         // --- Analytics JS serving (ISSUE-024) ---
         // Serve the compiled-in analytics script from memory. Same-origin
@@ -690,7 +708,7 @@ impl ProxyHttp for DwaarProxy {
                 .and_then(|d| d.ssl_digest.as_ref())
                 .map(|ssl| ssl.version.to_string()),
             http_version: format!("{:?}", session.req_header().version),
-            is_bot: false,
+            is_bot: ctx.is_bot,
             country: None,
             upstream_addr: ctx
                 .route_upstream
@@ -717,15 +735,18 @@ mod tests {
 
     use super::*;
     use crate::route::Route;
+    use dwaar_plugins::bot_detect::BotDetector;
 
     fn make_proxy(routes: Vec<Route>) -> DwaarProxy {
         let table = RouteTable::new(routes);
+        let bot_detector = Arc::new(BotDetector::new());
         DwaarProxy::new(
             Arc::new(ArcSwap::from_pointee(table)),
             None,
             None,
             None,
             None,
+            bot_detector,
         )
     }
 
