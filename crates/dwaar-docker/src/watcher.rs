@@ -357,14 +357,12 @@ mod tests {
     #[test]
     fn merge_dwaarfile_shadows_docker() {
         let watcher = make_watcher();
-        watcher
-            .dwaarfile_routes
-            .store(Arc::new(vec![Route::new(
-                "example.com",
-                addr(3000),
-                true,
-                None,
-            )]));
+        watcher.dwaarfile_routes.store(Arc::new(vec![Route::new(
+            "example.com",
+            addr(3000),
+            true,
+            None,
+        )]));
         {
             let mut docker = watcher.docker_routes.lock();
             docker.insert(
@@ -491,9 +489,12 @@ mod tests {
     #[test]
     fn merge_combines_dwaarfile_and_docker() {
         let watcher = make_watcher();
-        watcher.dwaarfile_routes.store(Arc::new(vec![
-            Route::new("static.example.com", addr(3000), true, None),
-        ]));
+        watcher.dwaarfile_routes.store(Arc::new(vec![Route::new(
+            "static.example.com",
+            addr(3000),
+            true,
+            None,
+        )]));
         {
             let mut docker = watcher.docker_routes.lock();
             docker.insert(

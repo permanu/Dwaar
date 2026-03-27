@@ -45,10 +45,7 @@ pub fn parse_container(inspect: &serde_json::Value) -> Option<ContainerRoute> {
         }
     };
 
-    let tls = labels
-        .get("dwaar.tls")
-        .and_then(|v| v.as_str())
-        == Some("true");
+    let tls = labels.get("dwaar.tls").and_then(|v| v.as_str()) == Some("true");
 
     let rate_limit_rps = labels
         .get("dwaar.rate_limit")
