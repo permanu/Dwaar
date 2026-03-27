@@ -13,4 +13,6 @@ pub mod request_log;
 pub mod writer;
 
 pub use request_log::RequestLog;
-pub use writer::{LogOutput, LogReceiver, LogSender, StdoutWriter, channel, run_writer, spawn_writer};
+pub use writer::{
+    LogOutput, LogReceiver, LogSender, StdoutWriter, channel, run_writer, spawn_writer,
+};

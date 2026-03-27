@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
-use dwaar_core::route::{is_valid_domain, Route, RouteTable};
+use dwaar_core::route::{Route, RouteTable, is_valid_domain};
 use serde::Deserialize;
 
 /// Request body for `POST /routes`.
@@ -35,10 +35,7 @@ pub fn list_routes(route_table: &ArcSwap<RouteTable>) -> Result<String, String> 
 }
 
 /// Add or update a route. Returns the created route as JSON.
-pub fn add_route(
-    route_table: &ArcSwap<RouteTable>,
-    body: &[u8],
-) -> Result<String, String> {
+pub fn add_route(route_table: &ArcSwap<RouteTable>, body: &[u8]) -> Result<String, String> {
     let req: CreateRouteRequest =
         serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))?;
 
@@ -64,10 +61,7 @@ pub fn add_route(
 }
 
 /// Delete a route by domain. Returns the deleted domain or None if not found.
-pub fn delete_route(
-    route_table: &ArcSwap<RouteTable>,
-    domain: &str,
-) -> Option<String> {
+pub fn delete_route(route_table: &ArcSwap<RouteTable>, domain: &str) -> Option<String> {
     let domain_lower = domain.to_lowercase();
     let table = route_table.load();
 

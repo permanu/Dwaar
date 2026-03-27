@@ -26,3 +26,4 @@ Thumbs.db
 
 # Claude/AI
 .claude/
+libauth.rlib

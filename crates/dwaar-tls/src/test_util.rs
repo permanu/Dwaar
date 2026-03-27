@@ -35,20 +35,14 @@ pub(crate) fn generate_ca_signed(domain: &str) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let serial = BigNum::from_u32(1).expect("bn");
     let serial = serial.to_asn1_integer().expect("asn1");
     ca_builder.set_serial_number(&serial).expect("set serial");
-    ca_builder
-        .set_subject_name(&ca_name)
-        .expect("set subject");
+    ca_builder.set_subject_name(&ca_name).expect("set subject");
     ca_builder.set_issuer_name(&ca_name).expect("set issuer");
     ca_builder.set_pubkey(&ca_key).expect("set pubkey");
     let not_before = Asn1Time::days_from_now(0).expect("not_before");
     let not_after = Asn1Time::days_from_now(365).expect("not_after");
     ca_builder.set_not_before(&not_before).expect("set nb");
     ca_builder.set_not_after(&not_after).expect("set na");
-    let bc = BasicConstraints::new()
-        .critical()
-        .ca()
-        .build()
-        .expect("bc");
+    let bc = BasicConstraints::new().critical().ca().build().expect("bc");
     ca_builder.append_extension(bc).expect("append bc");
     ca_builder
         .sign(&ca_key, MessageDigest::sha256())

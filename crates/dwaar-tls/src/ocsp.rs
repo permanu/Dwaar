@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use openssl::hash::MessageDigest;
 use openssl::ocsp::{OcspCertStatus, OcspFlag, OcspRequest, OcspResponse, OcspResponseStatus};
-use openssl::x509::store::X509StoreBuilder;
 use openssl::x509::X509;
+use openssl::x509::store::X509StoreBuilder;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
@@ -165,10 +165,7 @@ async fn http_post_ocsp(url: &str, body: &[u8]) -> Result<Vec<u8>, OcspError> {
         .position(|w| w == b"\r\n\r\n")
         .ok_or_else(|| OcspError::HttpFetch("malformed HTTP response".to_string()))?;
 
-    let status_line_end = response_buf
-        .iter()
-        .position(|&b| b == b'\r')
-        .unwrap_or(0);
+    let status_line_end = response_buf.iter().position(|&b| b == b'\r').unwrap_or(0);
     let status_line = std::str::from_utf8(&response_buf[..status_line_end]).unwrap_or("");
     if !status_line.contains("200") {
         return Err(OcspError::HttpFetch(format!(
@@ -218,9 +215,9 @@ fn validate_ocsp_response(
     let cert_id = openssl::ocsp::OcspCertId::from_cert(MessageDigest::sha1(), cert, issuer)
         .map_err(|e| OcspError::InvalidResponse(format!("cert ID creation failed: {e}")))?;
 
-    let cert_status = basic.find_status(&cert_id).ok_or_else(|| {
-        OcspError::InvalidResponse("cert not found in OCSP response".to_string())
-    })?;
+    let cert_status = basic
+        .find_status(&cert_id)
+        .ok_or_else(|| OcspError::InvalidResponse("cert not found in OCSP response".to_string()))?;
 
     // Check response freshness (thisUpdate/nextUpdate timestamps)
     if let Err(e) = cert_status.check_validity(300, None) {
