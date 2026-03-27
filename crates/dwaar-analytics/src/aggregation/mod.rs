@@ -13,6 +13,7 @@
 pub mod bounded_counter;
 pub mod minute_buckets;
 pub mod service;
+pub mod snapshot;
 pub mod top_k;
 pub mod web_vitals;
 
