@@ -29,7 +29,10 @@ const API_VERSION: &str = "/v1.43";
 #[derive(Debug, thiserror::Error)]
 pub enum DockerError {
     #[error("failed to connect to Docker socket at {path}: {source}")]
-    Connect { path: String, source: std::io::Error },
+    Connect {
+        path: String,
+        source: std::io::Error,
+    },
     #[error("Docker API error: {0}")]
     Io(#[from] std::io::Error),
     #[error("Docker API returned HTTP {status}")]
@@ -138,10 +141,7 @@ impl DockerClient {
     }
 
     /// Get full details for a single container.
-    pub async fn inspect_container(
-        &self,
-        id: &str,
-    ) -> Result<serde_json::Value, DockerError> {
+    pub async fn inspect_container(&self, id: &str) -> Result<serde_json::Value, DockerError> {
         self.request(&format!("{API_VERSION}/containers/{id}/json"))
             .await
     }
@@ -153,7 +153,8 @@ impl DockerClient {
     pub async fn stream_events(&self) -> Result<EventStream, DockerError> {
         let mut reader = self.connect().await?;
 
-        let filters = encode_filters(&[("type", "container"), ("event", "start"), ("event", "die")]);
+        let filters =
+            encode_filters(&[("type", "container"), ("event", "start"), ("event", "die")]);
         let path = format!("{API_VERSION}/events?filters={filters}");
         let request = format_request(&path, "keep-alive");
 
@@ -257,14 +258,13 @@ fn format_request(path: &str, connection: &str) -> String {
 /// Parse the HTTP status code out of a status line like `HTTP/1.1 200 OK`.
 fn parse_status_code(line: &str) -> Result<u16, DockerError> {
     // Status line format: HTTP/1.x <status> <reason>
-    let status_str = line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed status line"))?;
+    let status_str = line.split_whitespace().nth(1).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "malformed status line")
+    })?;
 
-    status_str
-        .parse::<u16>()
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "non-numeric status code").into())
+    status_str.parse::<u16>().map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "non-numeric status code").into()
+    })
 }
 
 /// URL-encode a set of Docker API filter parameters.
@@ -412,7 +412,8 @@ mod tests {
 
     #[test]
     fn test_encode_filters_merges_duplicate_keys() {
-        let encoded = encode_filters(&[("event", "start"), ("event", "die"), ("type", "container")]);
+        let encoded =
+            encode_filters(&[("event", "start"), ("event", "die"), ("type", "container")]);
         // Decode for verification
         let decoded = encoded
             .replace("%7B", "{")
@@ -423,7 +424,8 @@ mod tests {
             .replace("%3A", ":")
             .replace("%2C", ",");
 
-        let parsed: serde_json::Value = serde_json::from_str(&decoded).expect("should be valid JSON");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&decoded).expect("should be valid JSON");
         let events = parsed["event"].as_array().expect("event should be array");
         assert_eq!(events.len(), 2);
         assert!(events.contains(&serde_json::Value::String("start".into())));
@@ -453,9 +455,6 @@ mod tests {
     #[test]
     fn test_url_encode_special_chars() {
         let encoded = url_encode(r#"{"key":["val"]}"#);
-        assert_eq!(
-            encoded,
-            "%7B%22key%22%3A%5B%22val%22%5D%7D"
-        );
+        assert_eq!(encoded, "%7B%22key%22%3A%5B%22val%22%5D%7D");
     }
 }

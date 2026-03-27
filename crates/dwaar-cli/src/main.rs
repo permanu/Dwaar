@@ -114,7 +114,17 @@ fn run_server(
     }
     info!(routes = route_table.len(), "route table compiled");
 
+    // Capture initial routes before wrapping — DockerWatcher needs a
+    // separate snapshot of Dwaarfile routes for merge operations.
+    let initial_routes = route_table.all_routes();
+
     let route_table = Arc::new(ArcSwap::from_pointee(route_table));
+
+    // Shared state for Docker mode: the snapshot holds compiled Dwaarfile
+    // routes, and the Notify wakes DockerWatcher to re-merge after changes.
+    let dwaarfile_snapshot: Arc<ArcSwap<Vec<dwaar_core::route::Route>>> =
+        Arc::new(ArcSwap::from_pointee(initial_routes));
+    let config_notify = Arc::new(tokio::sync::Notify::new());
 
     let acme_domains = compile_acme_domains(dwaar_config);
     let challenge_solver = if acme_domains.is_empty() {
@@ -129,7 +139,8 @@ fn run_server(
 
     let route_table_for_admin = Arc::clone(&route_table);
     let route_table_for_watcher = Arc::clone(&route_table);
-    let route_table_for_agg = Arc::clone(&route_table_for_watcher);
+    let route_table_for_docker = Arc::clone(&route_table);
+    let route_table_for_agg = Arc::clone(&route_table);
     let bot_detector = Arc::new(dwaar_plugins::bot_detect::BotDetector::new());
     let rate_limiter = Arc::new(dwaar_plugins::rate_limit::RateLimiter::new());
     let proxy = DwaarProxy::new(
@@ -181,12 +192,16 @@ fn run_server(
 
     register_background_services(
         &mut server,
+        cli,
         challenge_solver.as_ref(),
         &acme_domains,
         &cert_store,
         log_receiver,
         config_path,
         &route_table_for_watcher,
+        &route_table_for_docker,
+        &dwaarfile_snapshot,
+        &config_notify,
         beacon_receiver,
         agg_receiver,
         &route_table_for_agg,
@@ -200,12 +215,16 @@ fn run_server(
 #[allow(clippy::too_many_arguments)]
 fn register_background_services(
     server: &mut Server,
+    cli: &Cli,
     challenge_solver: Option<&Arc<ChallengeSolver>>,
     acme_domains: &[String],
     cert_store: &Arc<CertStore>,
     log_receiver: dwaar_log::LogReceiver,
     config_path: &std::path::Path,
     route_table: &Arc<ArcSwap<dwaar_core::route::RouteTable>>,
+    main_route_table: &Arc<ArcSwap<dwaar_core::route::RouteTable>>,
+    dwaarfile_snapshot: &Arc<ArcSwap<Vec<dwaar_core::route::Route>>>,
+    config_notify: &Arc<tokio::sync::Notify>,
     beacon_receiver: tokio::sync::mpsc::Receiver<dwaar_analytics::beacon::BeaconEvent>,
     agg_receiver: aggregation::AggReceiver,
     route_table_for_agg: &Arc<ArcSwap<dwaar_core::route::RouteTable>>,
@@ -254,10 +273,31 @@ fn register_background_services(
         Arc::clone(route_table),
         initial_hash,
     );
+    let config_watcher = if cli.docker_socket.is_some() {
+        config_watcher.with_docker_mode(Arc::clone(dwaarfile_snapshot), Arc::clone(config_notify))
+    } else {
+        config_watcher
+    };
     let config_bg =
         pingora_core::services::background::background_service("config watcher", config_watcher);
     server.add_service(config_bg);
     info!(path = %config_path.display(), "config watcher registered");
+
+    // Docker container auto-discovery
+    if let Some(ref socket_path) = cli.docker_socket {
+        let docker_watcher = dwaar_docker::watcher::DockerWatcher::new(
+            socket_path.clone(),
+            Arc::clone(main_route_table),
+            Arc::clone(dwaarfile_snapshot),
+            Arc::clone(config_notify),
+        );
+        let docker_bg = pingora_core::services::background::background_service(
+            "Docker watcher",
+            docker_watcher,
+        );
+        server.add_service(docker_bg);
+        info!(socket = %socket_path.display(), "Docker watcher registered");
+    }
 
     // Analytics aggregation service
     let agg_service = AggregationService::new(

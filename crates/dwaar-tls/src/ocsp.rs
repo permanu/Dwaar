@@ -368,8 +368,7 @@ mod tests {
                     .expect("system time")
                     .as_secs();
 
-                let this_update =
-                    openssl_sys::ASN1_TIME_set(ptr::null_mut(), now.cast_signed());
+                let this_update = openssl_sys::ASN1_TIME_set(ptr::null_mut(), now.cast_signed());
                 let next_update =
                     openssl_sys::ASN1_TIME_set(ptr::null_mut(), (now + 86_400).cast_signed());
 
