@@ -661,6 +661,58 @@ impl ProxyHttp for DwaarProxy {
             }
         }
 
+        // --- Response compression (ISSUE-035) ---
+        // Negotiate encoding from client's Accept-Encoding. Compress
+        // compressible text responses (HTML, CSS, JS, JSON, SVG).
+        // For HTML that went through decompressor→injector, this recompresses.
+        let accept_encoding = session
+            .req_header()
+            .headers
+            .get(http::header::ACCEPT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        let content_type = upstream_response
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok());
+
+        let content_encoding = upstream_response
+            .headers
+            .get(http::header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok());
+
+        let content_length = upstream_response
+            .headers
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+
+        // If we already have a decompressor (HTML injection path), the
+        // Content-Encoding was stripped above, so should_compress sees
+        // no encoding and will compress the now-decompressed body.
+        if !accept_encoding.is_empty() {
+            use dwaar_plugins::compress::{negotiate_encoding, should_compress};
+
+            if should_compress(content_type, content_encoding, content_length)
+                && let Some(enc) = negotiate_encoding(accept_encoding)
+            {
+                use dwaar_plugins::compress::ResponseCompressor;
+
+                ctx.compressor = Some(ResponseCompressor::new(enc));
+                upstream_response
+                    .insert_header("Content-Encoding", enc.header_value())
+                    .expect("static header value");
+                upstream_response.remove_header("Content-Length");
+
+                debug!(
+                    request_id = %ctx.request_id,
+                    encoding = enc.header_value(),
+                    "response compression enabled"
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -690,6 +742,11 @@ impl ProxyHttp for DwaarProxy {
         // Then inject into the decompressed HTML
         if let Some(ref mut injector) = ctx.injector {
             injector.process(body, end_of_stream);
+        }
+
+        // Finally, compress for the wire (after all modifications)
+        if let Some(ref mut compressor) = ctx.compressor {
+            compressor.compress(body, end_of_stream);
         }
 
         Ok(None)
