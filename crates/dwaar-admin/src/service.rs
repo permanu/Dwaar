@@ -11,6 +11,8 @@ use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use dashmap::DashMap;
+use dwaar_analytics::aggregation::DomainMetrics;
 use dwaar_core::route::RouteTable;
 use http::Response;
 use pingora_core::apps::http_app::ServeHttp;
@@ -27,6 +29,7 @@ const MAX_BODY_SIZE: usize = 65_536;
 #[allow(missing_debug_implementations)]
 pub struct AdminService {
     route_table: Arc<ArcSwap<RouteTable>>,
+    metrics: Arc<DashMap<String, DomainMetrics>>,
     start_time: Instant,
     auth: Auth,
 }
@@ -34,6 +37,7 @@ pub struct AdminService {
 impl AdminService {
     pub fn new(
         route_table: Arc<ArcSwap<RouteTable>>,
+        metrics: Arc<DashMap<String, DomainMetrics>>,
         start_time: Instant,
         admin_token: Option<String>,
     ) -> Self {
@@ -42,6 +46,7 @@ impl AdminService {
         }
         Self {
             route_table,
+            metrics,
             start_time,
             auth: Auth::new(admin_token),
         }
@@ -107,6 +112,24 @@ impl ServeHttp for AdminService {
                         json_response(200, &format!(r#"{{"deleted":"{deleted}"}}"#))
                     }
                     None => json_response(404, r#"{"error":"route not found"}"#),
+                }
+            }
+            ("GET", "/analytics") => match handlers::list_all_analytics(&self.metrics) {
+                Ok(json) => json_response(200, &json),
+                Err(e) => json_response(500, &format!(r#"{{"error":"{e}"}}"#)),
+            },
+            ("GET", _) if path.starts_with("/analytics/") => {
+                let domain = path
+                    .strip_prefix("/analytics/")
+                    .unwrap_or("")
+                    .trim_end_matches('/');
+                if domain.is_empty() || !dwaar_core::route::is_valid_domain(domain) {
+                    return json_response(400, r#"{"error":"invalid domain"}"#);
+                }
+                let domain_lower = domain.to_lowercase();
+                match handlers::get_domain_analytics(&self.metrics, &domain_lower) {
+                    Some(json) => json_response(200, &json),
+                    None => json_response(404, r#"{"error":"no analytics for domain"}"#),
                 }
             }
             _ => json_response(405, r#"{"error":"method not allowed"}"#),
