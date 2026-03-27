@@ -123,7 +123,12 @@ fn run_server(
 
     let route_table_for_admin = Arc::clone(&route_table);
     let route_table_for_watcher = Arc::clone(&route_table);
-    let proxy = DwaarProxy::new(route_table, challenge_solver.clone(), Some(log_sender));
+    let proxy = DwaarProxy::new(
+        route_table,
+        challenge_solver.clone(),
+        Some(log_sender),
+        None,
+    );
 
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, proxy);
 

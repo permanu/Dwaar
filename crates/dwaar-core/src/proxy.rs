@@ -34,6 +34,7 @@ use tracing::{debug, warn};
 
 use bytes::Bytes;
 use dwaar_analytics::ANALYTICS_JS;
+use dwaar_analytics::beacon::{self, BeaconEvent, BeaconSender};
 use dwaar_analytics::decompress::{Decompressor, Encoding};
 use dwaar_analytics::injector::HtmlInjector;
 use dwaar_log::{LogSender, RequestLog};
@@ -72,6 +73,8 @@ pub struct DwaarProxy {
     challenge_solver: Option<Arc<ChallengeSolver>>,
     /// Non-blocking sender for the batch log writer. `None` disables logging.
     log_sender: Option<LogSender>,
+    /// Non-blocking sender for beacon events. `None` disables beacon collection.
+    beacon_sender: Option<BeaconSender>,
 }
 
 impl DwaarProxy {
@@ -83,11 +86,13 @@ impl DwaarProxy {
         route_table: Arc<ArcSwap<RouteTable>>,
         challenge_solver: Option<Arc<ChallengeSolver>>,
         log_sender: Option<LogSender>,
+        beacon_sender: Option<BeaconSender>,
     ) -> Self {
         Self {
             route_table,
             challenge_solver,
             log_sender,
+            beacon_sender,
         }
     }
 }
@@ -169,6 +174,49 @@ impl DwaarProxy {
 
         Ok(true)
     }
+
+    /// Handle a `POST /_dwaar/collect` beacon request.
+    ///
+    /// Reads the body from the downstream, parses the JSON beacon, enriches
+    /// it with server-side context, and pushes to the analytics channel.
+    /// Always returns a response (204 on success, 400 on bad payload).
+    async fn handle_beacon(&self, session: &mut Session, ctx: &RequestContext) -> Result<bool> {
+        if let Some(ref sender) = self.beacon_sender {
+            // Read the full POST body chunk by chunk (bounded by parse_beacon's 4KB limit)
+            let mut body = Vec::new();
+            while let Ok(Some(chunk)) = session.downstream_session.read_request_body().await {
+                body.extend_from_slice(&chunk);
+                if body.len() > beacon::MAX_BEACON_SIZE {
+                    break;
+                }
+            }
+
+            match beacon::parse_beacon(&body) {
+                Ok(raw) => {
+                    let client_ip = ctx
+                        .client_ip
+                        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+                    let host = ctx.host.clone().unwrap_or_default();
+                    let event = BeaconEvent::from_raw(raw, client_ip, host);
+
+                    // Non-blocking — drops the event if the channel is full
+                    let _ = sender.try_send(event);
+
+                    debug!(request_id = %ctx.request_id, "beacon collected");
+                }
+                Err(msg) => {
+                    warn!(request_id = %ctx.request_id, error = %msg, "invalid beacon");
+                    let resp = ResponseHeader::build(400, Some(1))?;
+                    session.write_response_header(Box::new(resp), true).await?;
+                    return Ok(true);
+                }
+            }
+        }
+
+        let resp = ResponseHeader::build(204, Some(0))?;
+        session.write_response_header(Box::new(resp), true).await?;
+        Ok(true)
+    }
 }
 
 #[async_trait]
@@ -245,6 +293,13 @@ impl ProxyHttp for DwaarProxy {
                 .write_response_body(Some(bytes::Bytes::from_static(ANALYTICS_JS)), true)
                 .await?;
             return Ok(true);
+        }
+
+        // --- Beacon collection (ISSUE-027) ---
+        // Intercept analytics beacons sent by the injected JS. Parsed and
+        // enriched in handle_beacon(); returns 204 or 400, never forwarded.
+        if ctx.path == "/_dwaar/collect" && ctx.method == "POST" {
+            return self.handle_beacon(session, ctx).await;
         }
 
         // --- ACME HTTP-01 challenge response ---
@@ -653,7 +708,7 @@ mod tests {
 
     fn make_proxy(routes: Vec<Route>) -> DwaarProxy {
         let table = RouteTable::new(routes);
-        DwaarProxy::new(Arc::new(ArcSwap::from_pointee(table)), None, None)
+        DwaarProxy::new(Arc::new(ArcSwap::from_pointee(table)), None, None, None)
     }
 
     #[test]
