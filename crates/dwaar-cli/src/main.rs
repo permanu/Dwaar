@@ -11,6 +11,8 @@
 
 mod cli;
 
+use std::fs::Permissions;
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
@@ -78,6 +80,7 @@ fn main() -> anyhow::Result<()> {
     run_server(&cli, &dwaar_config, config_path)
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_server(
     cli: &Cli,
     dwaar_config: &dwaar_config::model::DwaarConfig,
@@ -187,6 +190,23 @@ fn run_server(
     let mut admin_listening =
         pingora_core::services::listening::Service::new("admin API".to_string(), admin_service);
     admin_listening.add_tcp("127.0.0.1:6190");
+
+    if let Some(ref socket_path) = cli.admin_socket {
+        let path_str = socket_path
+            .to_str()
+            .context("admin socket path must be valid UTF-8")?;
+
+        // Stale socket cleanup — a leftover file from a crash blocks bind
+        match std::fs::remove_file(socket_path) {
+            Ok(()) => tracing::debug!("removed stale admin socket"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => bail!("cannot remove stale admin socket {path_str}: {e}"),
+        }
+
+        admin_listening.add_uds(path_str, Some(Permissions::from_mode(0o660)));
+        info!(socket = path_str, "admin API UDS listener registered");
+    }
+
     server.add_service(admin_listening);
     info!(listen = "127.0.0.1:6190", "admin API registered");
 
