@@ -32,7 +32,9 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
 use tracing::{debug, warn};
 
+use bytes::Bytes;
 use dwaar_analytics::ANALYTICS_JS;
+use dwaar_analytics::injector::HtmlInjector;
 use dwaar_log::{LogSender, RequestLog};
 use dwaar_tls::acme::ChallengeSolver;
 
@@ -491,7 +493,50 @@ impl ProxyHttp for DwaarProxy {
             .insert_header("X-Request-Id", &ctx.request_id)
             .expect("UUID is valid header value");
 
+        // --- Analytics injection setup (ISSUE-026a) ---
+        // Detect 2xx HTML responses and prepare the injector. We remove
+        // Content-Length because injection changes the body size — Pingora
+        // will use chunked transfer encoding instead.
+        let status = upstream_response.status.as_u16();
+        if (200..300).contains(&status) {
+            let is_html = upstream_response
+                .headers
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|ct| ct.starts_with("text/html"));
+
+            if is_html {
+                debug!(request_id = %ctx.request_id, "HTML response detected, enabling script injection");
+                ctx.injector = Some(HtmlInjector::new());
+                upstream_response.remove_header("Content-Length");
+            }
+        }
+
         Ok(())
+    }
+
+    /// Inject analytics script into HTML response bodies (ISSUE-026a).
+    ///
+    /// Called by Pingora for every chunk of the response body. If the
+    /// request context has an active `HtmlInjector`, passes the chunk
+    /// through it. The injector modifies the body in-place when it
+    /// finds `</head>`.
+    ///
+    /// Returns `Ok(None)` — no processing delay needed.
+    fn response_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<Option<std::time::Duration>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        if let Some(ref mut injector) = ctx.injector {
+            injector.process(body, end_of_stream);
+        }
+        Ok(None)
     }
 
     /// Emit a structured log entry for every completed request.
@@ -607,6 +652,7 @@ mod tests {
         assert!(ctx.method.is_empty());
         assert!(ctx.path.is_empty());
         assert!(ctx.route_upstream.is_none());
+        assert!(ctx.injector.is_none());
     }
 
     #[test]
