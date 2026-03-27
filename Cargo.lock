@@ -933,13 +933,18 @@ dependencies = [
 name = "dwaar-config"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
+ "async-trait",
  "dwaar-core",
  "notify",
+ "openssl",
+ "pingora-core",
  "proptest",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 

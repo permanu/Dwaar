@@ -493,9 +493,7 @@ impl ProxyHttp for DwaarProxy {
         let response_time_us = ctx.start_time.elapsed().as_micros() as u64;
 
         // Extract status code from the response (0 if no response was sent)
-        let status = session
-            .response_written()
-            .map_or(0, |r| r.status.as_u16());
+        let status = session.response_written().map_or(0, |r| r.status.as_u16());
 
         // Split path and query
         let (path, query) = if let Some(qmark) = ctx.path.find('?') {

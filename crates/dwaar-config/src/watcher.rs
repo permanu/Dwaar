@@ -23,9 +23,9 @@ use pingora_core::services::background::BackgroundService;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use crate::MAX_CONFIG_SIZE;
 use crate::compile::compile_routes;
 use crate::parser;
-use crate::MAX_CONFIG_SIZE;
 
 const DEBOUNCE_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -99,7 +99,10 @@ impl ConfigWatcher {
         };
 
         {
-            let last = self.last_hash.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let last = self
+                .last_hash
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if *last == new_hash {
                 debug!("config hash unchanged, skipping reload");
                 return;
@@ -137,7 +140,10 @@ impl ConfigWatcher {
         self.route_table.store(Arc::new(new_table));
 
         // Update hash
-        let mut last = self.last_hash.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut last = self
+            .last_hash
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *last = new_hash;
 
         info!(path = %self.config_path.display(), "config reloaded successfully");
@@ -196,10 +202,7 @@ fn setup_watcher(
     let mut watcher = RecommendedWatcher::new(
         move |res: Result<Event, notify::Error>| {
             if let Ok(event) = res
-                && matches!(
-                    event.kind,
-                    EventKind::Modify(_) | EventKind::Create(_)
-                )
+                && matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_))
             {
                 let _ = tx.try_send(());
             }
@@ -325,15 +328,18 @@ mod tests {
         let config_path = dir.path().join("Dwaarfile");
 
         // Write a valid config first
-        std::fs::write(&config_path, "a.com {\n    reverse_proxy 127.0.0.1:8080\n}\n")
-            .expect("write");
-        let initial_hash = hash_content(
-            &std::fs::read(&config_path).expect("read"),
-        );
+        std::fs::write(
+            &config_path,
+            "a.com {\n    reverse_proxy 127.0.0.1:8080\n}\n",
+        )
+        .expect("write");
+        let initial_hash = hash_content(&std::fs::read(&config_path).expect("read"));
 
-        let table = Arc::new(ArcSwap::from_pointee(RouteTable::new(vec![
-            Route::new("a.com", addr(8080), false),
-        ])));
+        let table = Arc::new(ArcSwap::from_pointee(RouteTable::new(vec![Route::new(
+            "a.com",
+            addr(8080),
+            false,
+        )])));
 
         let watcher = ConfigWatcher::new(config_path.clone(), Arc::clone(&table), initial_hash);
 

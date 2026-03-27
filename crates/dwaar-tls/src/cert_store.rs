@@ -225,7 +225,12 @@ fn load_pem_pair(cert_path: &Path, key_path: &Path) -> Option<CachedCert> {
     }
 
     debug!(cert = %cert_path.display(), "loaded cert from disk");
-    Some(CachedCert { cert, key, issuer, ocsp_response: None })
+    Some(CachedCert {
+        cert,
+        key,
+        issuer,
+        ocsp_response: None,
+    })
 }
 
 #[cfg(test)]
@@ -319,8 +324,7 @@ mod tests {
     #[test]
     fn load_pem_pair_parses_chain_with_issuer() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let (cert_pem, key_pem, ca_pem) =
-            crate::test_util::generate_ca_signed("chain.example.com");
+        let (cert_pem, key_pem, ca_pem) = crate::test_util::generate_ca_signed("chain.example.com");
 
         // Write chain: leaf + issuer concatenated
         let mut chain = cert_pem;
@@ -331,11 +335,11 @@ mod tests {
         let store = CertStore::new(dir.path(), 100);
         let cached = store.get("chain.example.com").expect("should load chain");
 
-        assert!(cached.issuer.is_some(), "issuer should be parsed from chain");
         assert!(
-            cached.ocsp_response.is_none(),
-            "no OCSP response yet"
+            cached.issuer.is_some(),
+            "issuer should be parsed from chain"
         );
+        assert!(cached.ocsp_response.is_none(), "no OCSP response yet");
     }
 
     #[test]

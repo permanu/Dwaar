@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 
-use dwaar_core::route::{is_valid_domain, Route, RouteTable};
+use dwaar_core::route::{Route, RouteTable, is_valid_domain};
 use tracing::warn;
 
 use crate::model::{Directive, DwaarConfig, ReverseProxyDirective, TlsDirective, UpstreamAddr};

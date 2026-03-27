@@ -83,9 +83,7 @@ impl ServeHttp for AdminService {
             ("POST", "/routes") => {
                 let body = read_body(session, MAX_BODY_SIZE).await;
                 match body {
-                    Err((status, msg)) => {
-                        json_response(status, &format!(r#"{{"error":"{msg}"}}"#))
-                    }
+                    Err((status, msg)) => json_response(status, &format!(r#"{{"error":"{msg}"}}"#)),
                     Ok(data) => match handlers::add_route(&self.route_table, &data) {
                         Ok(json) => {
                             info!("route added/updated via admin API");
@@ -126,10 +124,7 @@ fn json_response(status: u16, body: &str) -> Response<Vec<u8>> {
 }
 
 /// Read the request body up to `max_size` bytes.
-async fn read_body(
-    session: &mut ServerSession,
-    max_size: usize,
-) -> Result<Vec<u8>, (u16, String)> {
+async fn read_body(session: &mut ServerSession, max_size: usize) -> Result<Vec<u8>, (u16, String)> {
     let mut body = Vec::new();
     loop {
         match session.read_request_body().await {

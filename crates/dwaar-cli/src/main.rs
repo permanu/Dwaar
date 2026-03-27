@@ -22,11 +22,11 @@ use tracing::info;
 
 use cli::{Cli, Commands};
 use dwaar_admin::AdminService;
+use dwaar_config::MAX_CONFIG_SIZE;
 use dwaar_config::compile::{
     compile_acme_domains, compile_routes, compile_tls_configs, has_tls_sites,
 };
 use dwaar_config::watcher::{ConfigWatcher, hash_content};
-use dwaar_config::MAX_CONFIG_SIZE;
 use dwaar_core::proxy::DwaarProxy;
 use dwaar_log::{StdoutWriter, channel as log_channel, run_writer};
 use dwaar_tls::acme::ChallengeSolver;
@@ -129,7 +129,11 @@ fn run_server(
 
     // Always listen on HTTP
     proxy_service.add_tcp("0.0.0.0:6188");
-    info!(listen = "0.0.0.0:6188", protocol = "http", "listener registered");
+    info!(
+        listen = "0.0.0.0:6188",
+        protocol = "http",
+        "listener registered"
+    );
 
     let cert_store = Arc::new(CertStore::new("/etc/dwaar/certs", 1000));
 
@@ -146,10 +150,8 @@ fn run_server(
         std::time::Instant::now(),
         admin_token,
     );
-    let mut admin_listening = pingora_core::services::listening::Service::new(
-        "admin API".to_string(),
-        admin_service,
-    );
+    let mut admin_listening =
+        pingora_core::services::listening::Service::new("admin API".to_string(), admin_service);
     admin_listening.add_tcp("127.0.0.1:6190");
     server.add_service(admin_listening);
     info!(listen = "127.0.0.1:6190", "admin API registered");
@@ -197,7 +199,10 @@ fn register_background_services(
             tls_service,
         );
         server.add_service(bg);
-        info!(domains = acme_domains.len(), "TLS background service registered");
+        info!(
+            domains = acme_domains.len(),
+            "TLS background service registered"
+        );
     }
 
     // Log batch writer
@@ -211,18 +216,14 @@ fn register_background_services(
     info!("log writer registered (JSON lines to stdout)");
 
     // Config file watcher for hot-reload
-    let initial_hash = hash_content(
-        &std::fs::read(config_path).unwrap_or_default(),
-    );
+    let initial_hash = hash_content(&std::fs::read(config_path).unwrap_or_default());
     let config_watcher = ConfigWatcher::new(
         config_path.to_path_buf(),
         Arc::clone(route_table),
         initial_hash,
     );
-    let config_bg = pingora_core::services::background::background_service(
-        "config watcher",
-        config_watcher,
-    );
+    let config_bg =
+        pingora_core::services::background::background_service("config watcher", config_watcher);
     server.add_service(config_bg);
     info!(path = %config_path.display(), "config watcher registered");
 }

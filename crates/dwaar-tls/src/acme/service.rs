@@ -261,7 +261,12 @@ mod tests {
             solver,
             Arc::clone(&cert_store),
         ));
-        TlsBackgroundService::new(domains, cert_dir.to_str().expect("utf8"), issuer, cert_store)
+        TlsBackgroundService::new(
+            domains,
+            cert_dir.to_str().expect("utf8"),
+            issuer,
+            cert_store,
+        )
     }
 
     #[tokio::test]
