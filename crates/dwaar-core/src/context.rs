@@ -31,6 +31,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 
+use dwaar_analytics::injector::HtmlInjector;
 use uuid::Uuid;
 
 /// Per-request state shared across all Pingora lifecycle hooks.
@@ -92,6 +93,11 @@ pub struct RequestContext {
     /// `None` until routing completes. Later phases (logging, analytics) use
     /// this to know which backend handled the request.
     pub route_upstream: Option<SocketAddr>,
+
+    /// HTML script injector for analytics. Created in `response_filter()` when
+    /// the response is 2xx text/html. `response_body_filter()` passes body
+    /// chunks through this. `None` for non-HTML or non-2xx responses.
+    pub injector: Option<HtmlInjector>,
 }
 
 impl RequestContext {
@@ -109,6 +115,7 @@ impl RequestContext {
             method: String::new(),
             path: String::new(),
             route_upstream: None,
+            injector: None,
         }
     }
 }
@@ -178,5 +185,6 @@ mod tests {
         assert!(ctx.method.is_empty());
         assert!(ctx.path.is_empty());
         assert!(ctx.route_upstream.is_none());
+        assert!(ctx.injector.is_none());
     }
 }
