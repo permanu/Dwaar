@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use dwaar_core::route::RouteTable;
+use dwaar_core::route::{Route, RouteTable};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use openssl::hash::MessageDigest;
 use pingora_core::server::ShutdownWatch;
@@ -34,6 +34,11 @@ pub struct ConfigWatcher {
     config_path: PathBuf,
     route_table: Arc<ArcSwap<RouteTable>>,
     last_hash: std::sync::Mutex<Vec<u8>>,
+    /// When Docker mode is active, store compiled routes here instead of
+    /// writing to `route_table` directly. `DockerWatcher` handles the merge.
+    dwaarfile_snapshot: Option<Arc<ArcSwap<Vec<Route>>>>,
+    /// Signal `DockerWatcher` to re-merge after a Dwaarfile change.
+    config_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl std::fmt::Debug for ConfigWatcher {
@@ -58,7 +63,23 @@ impl ConfigWatcher {
             config_path,
             route_table,
             last_hash: std::sync::Mutex::new(initial_hash),
+            dwaarfile_snapshot: None,
+            config_notify: None,
         }
+    }
+
+    /// Enable Docker mode: compiled routes go into the shared snapshot
+    /// instead of the route table, and a `Notify` wakes `DockerWatcher`
+    /// to re-merge Dwaarfile + Docker routes.
+    #[must_use]
+    pub fn with_docker_mode(
+        mut self,
+        snapshot: Arc<ArcSwap<Vec<Route>>>,
+        notify: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.dwaarfile_snapshot = Some(snapshot);
+        self.config_notify = Some(notify);
+        self
     }
 
     /// Process a file change: hash -> compare -> parse -> compile -> swap.
@@ -133,20 +154,26 @@ impl ConfigWatcher {
             return;
         }
 
-        // Log diff
-        log_route_diff(&old_table, &new_table);
+        if let Some(ref snapshot) = self.dwaarfile_snapshot {
+            // Docker mode: update snapshot, notify DockerWatcher to re-merge
+            snapshot.store(Arc::new(new_table.all_routes()));
+            if let Some(ref notify) = self.config_notify {
+                notify.notify_one();
+            }
+            info!(path = %self.config_path.display(), "config reloaded — Docker watcher will re-merge");
+        } else {
+            // Standard mode: write directly to route table
+            log_route_diff(&old_table, &new_table);
+            self.route_table.store(Arc::new(new_table));
+            info!(path = %self.config_path.display(), "config reloaded successfully");
+        }
 
-        // Swap
-        self.route_table.store(Arc::new(new_table));
-
-        // Update hash
+        // Update hash — must run in both branches
         let mut last = self
             .last_hash
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *last = new_hash;
-
-        info!(path = %self.config_path.display(), "config reloaded successfully");
     }
 }
 
