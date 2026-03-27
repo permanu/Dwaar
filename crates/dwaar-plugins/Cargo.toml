@@ -3,6 +3,7 @@ name = "dwaar-plugins"
 version = "0.1.0"
 description = "Plugin trait, plugin chain, built-in plugins (bot detection, rate limiting, compression, security headers)"
 edition.workspace = true
+publish = false
 rust-version.workspace = true
 license-file = "../../LICENSE"
 repository.workspace = true

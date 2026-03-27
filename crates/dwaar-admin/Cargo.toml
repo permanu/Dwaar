@@ -3,6 +3,7 @@ name = "dwaar-admin"
 version = "0.1.0"
 description = "Admin API service — route management, health, metrics, config"
 edition.workspace = true
+publish = false
 rust-version.workspace = true
 license-file = "../../LICENSE"
 repository.workspace = true

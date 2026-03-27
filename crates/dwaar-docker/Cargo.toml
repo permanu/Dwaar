@@ -3,6 +3,7 @@ name = "dwaar-docker"
 version = "0.1.0"
 description = "Docker socket watcher — auto-discover containers via labels"
 edition.workspace = true
+publish = false
 rust-version.workspace = true
 license-file = "../../LICENSE"
 repository.workspace = true

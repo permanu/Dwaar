@@ -3,6 +3,7 @@ name = "dwaar-analytics"
 version = "0.1.0"
 description = "First-party analytics — JS injection, beacon collection, in-memory aggregation"
 edition.workspace = true
+publish = false
 rust-version.workspace = true
 license-file = "../../LICENSE"
 repository.workspace = true
