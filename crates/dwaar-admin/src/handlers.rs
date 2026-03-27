@@ -10,6 +10,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
+use dashmap::DashMap;
+use dwaar_analytics::aggregation::DomainMetrics;
+use dwaar_analytics::aggregation::snapshot::AnalyticsSnapshot;
 use dwaar_core::route::{Route, RouteTable, is_valid_domain};
 use serde::Deserialize;
 
@@ -60,6 +63,26 @@ pub fn add_route(route_table: &ArcSwap<RouteTable>, body: &[u8]) -> Result<Strin
     serde_json::to_string(&route).map_err(|e| format!("serialize error: {e}"))
 }
 
+/// Get analytics snapshot for a single domain.
+/// Returns None if the domain has no metrics.
+pub fn get_domain_analytics(
+    metrics: &DashMap<String, DomainMetrics>,
+    domain: &str,
+) -> Option<String> {
+    let entry = metrics.get(domain)?;
+    let snapshot = AnalyticsSnapshot::from_metrics(domain, &entry);
+    serde_json::to_string(&snapshot).ok()
+}
+
+/// Get analytics snapshots for all tracked domains.
+pub fn list_all_analytics(metrics: &DashMap<String, DomainMetrics>) -> Result<String, String> {
+    let snapshots: Vec<AnalyticsSnapshot> = metrics
+        .iter()
+        .map(|entry| AnalyticsSnapshot::from_metrics(entry.key(), entry.value()))
+        .collect();
+    serde_json::to_string(&snapshots).map_err(|e| format!("serialize error: {e}"))
+}
+
 /// Delete a route by domain. Returns the deleted domain or None if not found.
 pub fn delete_route(route_table: &ArcSwap<RouteTable>, domain: &str) -> Option<String> {
     let domain_lower = domain.to_lowercase();
@@ -82,6 +105,8 @@ pub fn delete_route(route_table: &ArcSwap<RouteTable>, domain: &str) -> Option<S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dashmap::DashMap;
+    use dwaar_analytics::aggregation::DomainMetrics;
     use std::net::SocketAddr;
 
     fn make_table(routes: Vec<Route>) -> Arc<ArcSwap<RouteTable>> {
@@ -164,5 +189,60 @@ mod tests {
     fn delete_nonexistent_returns_none() {
         let table = make_table(vec![]);
         assert!(delete_route(&table, "ghost.com").is_none());
+    }
+
+    fn make_metrics() -> Arc<DashMap<String, DomainMetrics>> {
+        let map = Arc::new(DashMap::new());
+        let mut dm = DomainMetrics::new();
+        dm.ingest_log(&dwaar_log::RequestLog {
+            timestamp: chrono::Utc::now(),
+            request_id: String::new(),
+            method: "GET".into(),
+            path: "/home".into(),
+            query: None,
+            host: "test.example.com".into(),
+            status: 200,
+            response_time_us: 100,
+            client_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+            user_agent: None,
+            referer: None,
+            bytes_sent: 1024,
+            bytes_received: 0,
+            tls_version: None,
+            http_version: "HTTP/1.1".into(),
+            is_bot: false,
+            country: None,
+            upstream_addr: "127.0.0.1:8080".into(),
+            upstream_response_time_us: 50,
+            cache_status: None,
+            compression: None,
+        });
+        map.insert("test.example.com".to_string(), dm);
+        map
+    }
+
+    #[test]
+    fn get_domain_analytics_returns_snapshot() {
+        let metrics = make_metrics();
+        let result = get_domain_analytics(&metrics, "test.example.com");
+        assert!(result.is_some());
+        let json = result.expect("should have analytics");
+        assert!(json.contains("\"domain\":\"test.example.com\""));
+        assert!(json.contains("\"page_views_1m\""));
+    }
+
+    #[test]
+    fn get_domain_analytics_unknown_returns_none() {
+        let metrics = make_metrics();
+        assert!(get_domain_analytics(&metrics, "ghost.com").is_none());
+    }
+
+    #[test]
+    fn list_all_analytics_returns_array() {
+        let metrics = make_metrics();
+        let json = list_all_analytics(&metrics).expect("should serialize");
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).expect("parse");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["domain"], "test.example.com");
     }
 }
