@@ -10,6 +10,8 @@ authors.workspace = true
 
 [dependencies]
 bytes = { workspace = true }
+flate2 = { workspace = true }
+brotli = { workspace = true }
 dashmap = { workspace = true }
 hyperloglog = { workspace = true }
 aes-gcm = { workspace = true }
