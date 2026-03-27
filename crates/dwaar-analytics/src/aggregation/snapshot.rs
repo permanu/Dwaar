@@ -1,0 +1,211 @@
+// Copyright (C) 2026 Permanu
+// SPDX-License-Identifier: BSL-1.1
+//
+// This file is part of Dwaar — https://dwaar.dev
+// Licensed under the Business Source License 1.1
+
+//! Serializable snapshot of [`DomainMetrics`] for the Admin API.
+//!
+//! [`AnalyticsSnapshot`] takes an immutable reference to live aggregates and
+//! copies out only what the HTTP response needs. This keeps the Admin API
+//! read-only — no flushes, no mutable borrows, no side-effects on the
+//! hot aggregation path.
+
+use serde::Serialize;
+
+use super::DomainMetrics;
+use super::web_vitals::Percentiles;
+
+/// A single top-page entry, ordered by page-view count descending.
+#[derive(Debug, Serialize)]
+pub struct PageEntry {
+    pub path: String,
+    pub views: u64,
+}
+
+/// A single referrer domain entry, ordered by count descending.
+#[derive(Debug, Serialize)]
+pub struct ReferrerEntry {
+    pub domain: String,
+    pub count: u64,
+}
+
+/// A single country entry, ordered by count descending.
+#[derive(Debug, Serialize)]
+pub struct CountryEntry {
+    pub country: String,
+    pub count: u64,
+}
+
+/// HTTP status code breakdown across the six standard buckets.
+#[derive(Debug, Serialize)]
+pub struct StatusCodeBreakdown {
+    pub s1xx: u64,
+    pub s2xx: u64,
+    pub s3xx: u64,
+    pub s4xx: u64,
+    pub s5xx: u64,
+    pub other: u64,
+}
+
+/// Percentile snapshot for LCP, CLS, and INP Web Vitals.
+///
+/// Read via `peek_*_percentiles` — intentionally does not flush the
+/// pending `TDigest` buffer, so values may lag by up to `BATCH_SIZE`
+/// observations. Accurate enough for a dashboard read; the flush
+/// happens at the 60-second aggregation cycle regardless.
+#[derive(Debug, Serialize)]
+pub struct VitalsSnapshot {
+    pub lcp: Percentiles,
+    pub cls: Percentiles,
+    pub inp: Percentiles,
+}
+
+/// Serializable read-only view of per-domain analytics.
+///
+/// Constructed from an immutable `&DomainMetrics` — never mutates
+/// the live aggregates. Safe to call on every Admin API GET.
+#[derive(Debug, Serialize)]
+pub struct AnalyticsSnapshot {
+    pub domain: String,
+    /// May include stale counts if no traffic has arrived recently — the 60s flush cycle clears stale buckets.
+    pub page_views_1m: u64,
+    pub page_views_60m: u64,
+    pub unique_visitors: u64,
+    pub top_pages: Vec<PageEntry>,
+    pub referrers: Vec<ReferrerEntry>,
+    pub countries: Vec<CountryEntry>,
+    pub status_codes: StatusCodeBreakdown,
+    pub bytes_sent: u64,
+    pub web_vitals: VitalsSnapshot,
+    pub timestamp: String,
+}
+
+impl AnalyticsSnapshot {
+    /// Build a snapshot from immutable domain metrics.
+    ///
+    /// All reads are non-mutating — safe to call concurrently with ingestion.
+    pub fn from_metrics(domain: &str, m: &DomainMetrics) -> Self {
+        let top_pages = m
+            .top_pages
+            .top()
+            .into_iter()
+            .map(|(path, views)| PageEntry { path, views })
+            .collect();
+
+        let referrers = m
+            .referrers
+            .top()
+            .into_iter()
+            .map(|(domain, count)| ReferrerEntry { domain, count })
+            .collect();
+
+        let countries = m
+            .countries
+            .top()
+            .into_iter()
+            .map(|(country, count)| CountryEntry { country, count })
+            .collect();
+
+        // status_codes layout: [1xx, 2xx, 3xx, 4xx, 5xx, other]
+        let sc = &m.status_codes;
+        let status_codes = StatusCodeBreakdown {
+            s1xx: sc[0],
+            s2xx: sc[1],
+            s3xx: sc[2],
+            s4xx: sc[3],
+            s5xx: sc[4],
+            other: sc[5],
+        };
+
+        let web_vitals = VitalsSnapshot {
+            lcp: m.web_vitals.peek_lcp_percentiles(),
+            cls: m.web_vitals.peek_cls_percentiles(),
+            inp: m.web_vitals.peek_inp_percentiles(),
+        };
+
+        Self {
+            domain: domain.to_owned(),
+            page_views_1m: m.page_views.count_last_n_now(1),
+            page_views_60m: m.page_views.count_last_n_now(60),
+            unique_visitors: m.unique_visitors.len() as u64,
+            top_pages,
+            referrers,
+            countries,
+            status_codes,
+            bytes_sent: m.bytes_sent,
+            web_vitals,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::aggregation::DomainMetrics;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn test_log(path: &str, status: u16) -> dwaar_log::RequestLog {
+        dwaar_log::RequestLog {
+            timestamp: chrono::Utc::now(),
+            request_id: String::new(),
+            method: "GET".into(),
+            path: path.into(),
+            query: None,
+            host: "test.example.com".into(),
+            status,
+            response_time_us: 100,
+            client_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            user_agent: None,
+            referer: Some("https://google.com/search".into()),
+            bytes_sent: 1024,
+            bytes_received: 0,
+            tls_version: None,
+            http_version: "HTTP/1.1".into(),
+            is_bot: false,
+            country: Some("US".into()),
+            upstream_addr: "127.0.0.1:8080".into(),
+            upstream_response_time_us: 50,
+            cache_status: None,
+            compression: None,
+        }
+    }
+
+    #[test]
+    fn snapshot_reflects_ingested_logs() {
+        let mut dm = DomainMetrics::new();
+        for _ in 0..5 {
+            dm.ingest_log(&test_log("/home", 200));
+        }
+        dm.ingest_log(&test_log("/about", 404));
+
+        let snap = AnalyticsSnapshot::from_metrics("test.example.com", &dm);
+
+        assert_eq!(snap.domain, "test.example.com");
+        assert_eq!(snap.page_views_1m, 6);
+        assert_eq!(snap.unique_visitors, 1);
+        assert_eq!(snap.status_codes.s2xx, 5);
+        assert_eq!(snap.status_codes.s4xx, 1);
+        assert_eq!(snap.bytes_sent, 6 * 1024);
+        assert!(!snap.top_pages.is_empty());
+        assert!(!snap.referrers.is_empty());
+        assert!(!snap.countries.is_empty());
+    }
+
+    #[test]
+    fn snapshot_serializes_to_valid_json() {
+        let dm = DomainMetrics::new();
+        let snap = AnalyticsSnapshot::from_metrics("empty.com", &dm);
+        let json = serde_json::to_string(&snap).expect("serialize");
+        assert!(json.contains("\"domain\":\"empty.com\""));
+        assert!(json.contains("\"page_views_1m\":0"));
+    }
+
+    #[test]
+    fn snapshot_is_immutable() {
+        let dm = DomainMetrics::new();
+        let _snap1 = AnalyticsSnapshot::from_metrics("a.com", &dm);
+        let _snap2 = AnalyticsSnapshot::from_metrics("a.com", &dm);
+    }
+}
