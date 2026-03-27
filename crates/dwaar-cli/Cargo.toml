@@ -23,6 +23,7 @@ dwaar-docker = { workspace = true }
 dwaar-geo = { workspace = true }
 dwaar-log = { workspace = true }
 arc-swap = { workspace = true }
+dashmap = { workspace = true }
 pingora = { workspace = true }
 pingora-core = { workspace = true }
 pingora-proxy = { workspace = true }
