@@ -4,14 +4,9 @@
 // This file is part of Dwaar — https://dwaar.dev
 // Licensed under the Business Source License 1.1
 
-//! dwaar-docker
+//! Docker container auto-discovery via socket API.
+//!
+//! Watches the Docker daemon for containers with `dwaar.*` labels
+//! and creates routes automatically.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_compiles() {
-        // Placeholder — replaced with real tests as features are implemented
-        let x = 1 + 1;
-        assert_eq!(x, 2);
-    }
-}
+pub mod labels;
