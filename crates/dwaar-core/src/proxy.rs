@@ -80,6 +80,8 @@ pub struct DwaarProxy {
     agg_sender: Option<AggSender>,
     /// Bot detector — classifies User-Agent strings into bot categories.
     bot_detector: Arc<dwaar_plugins::bot_detect::BotDetector>,
+    /// Per-IP rate limiter. One instance handles all routes via composite keys.
+    rate_limiter: Arc<dwaar_plugins::rate_limit::RateLimiter>,
 }
 
 impl DwaarProxy {
@@ -94,6 +96,7 @@ impl DwaarProxy {
         beacon_sender: Option<BeaconSender>,
         agg_sender: Option<AggSender>,
         bot_detector: Arc<dwaar_plugins::bot_detect::BotDetector>,
+        rate_limiter: Arc<dwaar_plugins::rate_limit::RateLimiter>,
     ) -> Self {
         Self {
             route_table,
@@ -102,6 +105,7 @@ impl DwaarProxy {
             beacon_sender,
             agg_sender,
             bot_detector,
+            rate_limiter,
         }
     }
 }
@@ -229,6 +233,7 @@ impl DwaarProxy {
 }
 
 #[async_trait]
+#[allow(clippy::too_many_lines)]
 impl ProxyHttp for DwaarProxy {
     type CTX = RequestContext;
 
@@ -283,6 +288,42 @@ impl ProxyHttp for DwaarProxy {
             path = %ctx.path,
             "request metadata extracted"
         );
+
+        // --- Rate limiting (ISSUE-031) ---
+        // Check before bot detection, analytics, or any other processing to
+        // minimize CPU spent on traffic that exceeds the configured limit.
+        if let Some(ref host) = ctx.host {
+            let host_stripped = host.split(':').next().unwrap_or(host);
+            let table = self.route_table.load();
+            if let Some(route) = table.resolve(host_stripped)
+                && let Some(limit) = route.rate_limit_rps
+                && let Some(ip) = ctx.client_ip
+            {
+                // Composite key: "{ip}:{domain}" for per-route isolation.
+                // format!() allocates on the heap — acceptable here since the rate
+                // check itself dominates (atomic CAS in Rate::observe). A stack buffer
+                // optimization can be done later if benchmarks show this matters.
+                let key = format!("{ip}:{}", route.domain);
+                if !self.rate_limiter.check(&key, limit) {
+                    debug!(
+                        request_id = %ctx.request_id,
+                        client_ip = %ip,
+                        domain = %route.domain,
+                        limit = limit,
+                        "rate limit exceeded — returning 429"
+                    );
+                    let mut resp = ResponseHeader::build(429, Some(2))?;
+                    resp.insert_header("Retry-After", "1")
+                        .map_err(|e| Error::explain(HTTPStatus(429), format!("bad header: {e}")))?;
+                    resp.insert_header("Content-Length", "0")
+                        .map_err(|e| Error::explain(HTTPStatus(429), format!("bad header: {e}")))?;
+                    session
+                        .write_response_header(Box::new(resp), true)
+                        .await?;
+                    return Ok(true);
+                }
+            }
+        }
 
         // --- Bot detection (ISSUE-030) ---
         if let Some(ua) = session.req_header().headers.get(http::header::USER_AGENT)
@@ -740,6 +781,7 @@ mod tests {
     fn make_proxy(routes: Vec<Route>) -> DwaarProxy {
         let table = RouteTable::new(routes);
         let bot_detector = Arc::new(BotDetector::new());
+        let rate_limiter = Arc::new(dwaar_plugins::rate_limit::RateLimiter::new());
         DwaarProxy::new(
             Arc::new(ArcSwap::from_pointee(table)),
             None,
@@ -747,6 +789,7 @@ mod tests {
             None,
             None,
             bot_detector,
+            rate_limiter,
         )
     }
 
