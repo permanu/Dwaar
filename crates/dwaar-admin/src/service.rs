@@ -57,9 +57,13 @@ impl AdminService {
 /// UDS connections are trusted because access is controlled by filesystem
 /// permissions on the socket file — only processes with read/write on the
 /// socket can connect.
+///
+/// Uses `server_addr()` (the local/bound address) because UDS clients
+/// connect with unnamed sockets — `client_addr()` returns `None` for
+/// them since `getpeername()` yields no path.
 fn is_trusted_transport(session: &ServerSession) -> bool {
     session
-        .client_addr()
+        .server_addr()
         .and_then(|addr| addr.as_unix())
         .is_some()
 }
