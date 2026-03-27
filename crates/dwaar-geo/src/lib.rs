@@ -96,6 +96,57 @@ impl GeoLookup {
             }
         }
     }
+
+    /// Look up city-level details for an IP address.
+    ///
+    /// Requires the `city` feature and a GeoLite2-City database (~45 MB).
+    /// Returns `None` if the IP has no city data or on any error.
+    #[cfg(feature = "city")]
+    pub fn lookup_city(&self, ip: IpAddr) -> Option<CityResult> {
+        let result = match self.reader.lookup(ip) {
+            Ok(r) => r,
+            Err(e) => {
+                debug!(ip = %ip, error = %e, "GeoIP city lookup failed");
+                return None;
+            }
+        };
+
+        if !result.has_data() {
+            return None;
+        }
+
+        match result.decode::<geoip2::City<'_>>() {
+            Ok(Some(record)) => Some(CityResult {
+                country: record.country.iso_code.map(String::from),
+                city: record.city.names.english.map(String::from),
+                subdivision: record
+                    .subdivisions
+                    .first()
+                    .and_then(|s| s.iso_code)
+                    .map(String::from),
+                postal_code: record.postal.code.map(String::from),
+                latitude: record.location.latitude,
+                longitude: record.location.longitude,
+            }),
+            Ok(None) => None,
+            Err(e) => {
+                debug!(ip = %ip, error = %e, "GeoIP city decode failed");
+                None
+            }
+        }
+    }
+}
+
+/// City-level geolocation result. Only available with the `city` feature.
+#[cfg(feature = "city")]
+#[derive(Debug, Clone)]
+pub struct CityResult {
+    pub country: Option<String>,
+    pub city: Option<String>,
+    pub subdivision: Option<String>,
+    pub postal_code: Option<String>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
 }
 
 // Compile-time assertion: GeoLookup must be Send + Sync for Arc sharing.

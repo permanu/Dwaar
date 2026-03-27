@@ -9,6 +9,12 @@ license-file = "../../LICENSE"
 repository.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+# Enable city-level GeoIP lookup (~45 MB database instead of ~5 MB country).
+# Adds city name, subdivision, postal code, and lat/lon to lookup results.
+city = []
+
 [dependencies]
 maxminddb = { workspace = true }
 thiserror = { workspace = true }
