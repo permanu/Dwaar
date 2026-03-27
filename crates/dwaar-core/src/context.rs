@@ -115,6 +115,11 @@ pub struct RequestContext {
     /// Two-letter ISO country code from `GeoIP` lookup (e.g., "US", "IN").
     /// `None` if no `GeoIP` database is loaded or the IP is private/unknown.
     pub country: Option<String>,
+
+    /// Streaming response compressor. Created in `response_filter()` when the
+    /// client supports compression and the response is compressible text.
+    /// `response_body_filter()` runs body chunks through this after analytics injection.
+    pub compressor: Option<dwaar_plugins::compress::ResponseCompressor>,
 }
 
 impl RequestContext {
@@ -137,6 +142,7 @@ impl RequestContext {
             is_bot: false,
             bot_category: None,
             country: None,
+            compressor: None,
         }
     }
 }
@@ -211,5 +217,6 @@ mod tests {
         assert!(!ctx.is_bot);
         assert!(ctx.bot_category.is_none());
         assert!(ctx.country.is_none());
+        assert!(ctx.compressor.is_none());
     }
 }

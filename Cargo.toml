@@ -99,6 +99,7 @@ openssl = { version = "0.10.72", features = ["vendored"] }
 # Compression
 flate2 = "1.1.9"
 brotli = "8.0.2"
+zstd = "0.13"
 
 # Testing
 tokio-test = "0.4.5"
