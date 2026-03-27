@@ -111,6 +111,10 @@ pub struct RequestContext {
 
     /// Bot classification category, if detected. `None` for human traffic.
     pub bot_category: Option<dwaar_plugins::bot_detect::BotCategory>,
+
+    /// Two-letter ISO country code from `GeoIP` lookup (e.g., "US", "IN").
+    /// `None` if no `GeoIP` database is loaded or the IP is private/unknown.
+    pub country: Option<String>,
 }
 
 impl RequestContext {
@@ -132,6 +136,7 @@ impl RequestContext {
             decompressor: None,
             is_bot: false,
             bot_category: None,
+            country: None,
         }
     }
 }
@@ -205,5 +210,6 @@ mod tests {
         assert!(ctx.decompressor.is_none());
         assert!(!ctx.is_bot);
         assert!(ctx.bot_category.is_none());
+        assert!(ctx.country.is_none());
     }
 }
