@@ -28,6 +28,10 @@ use dwaar_config::compile::{
 };
 use dwaar_config::watcher::{ConfigWatcher, hash_content};
 use dwaar_core::proxy::DwaarProxy;
+use dashmap::DashMap;
+use dwaar_analytics::aggregation::service::{AggregationService, RouteValidator};
+use dwaar_analytics::aggregation;
+use dwaar_analytics::beacon;
 use dwaar_log::{StdoutWriter, channel as log_channel, run_writer};
 use dwaar_tls::acme::ChallengeSolver;
 use dwaar_tls::acme::issuer::CertIssuer;
@@ -120,15 +124,18 @@ fn run_server(
     };
 
     let (log_sender, log_receiver) = log_channel();
+    let (agg_sender, agg_receiver) = aggregation::agg_channel();
+    let (beacon_sender, beacon_receiver) = beacon::beacon_channel();
 
     let route_table_for_admin = Arc::clone(&route_table);
     let route_table_for_watcher = Arc::clone(&route_table);
+    let route_table_for_agg = Arc::clone(&route_table_for_watcher);
     let proxy = DwaarProxy::new(
         route_table,
         challenge_solver.clone(),
         Some(log_sender),
-        None,
-        None, // agg_sender — wired in Task 9
+        Some(beacon_sender),
+        Some(agg_sender),
     );
 
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, proxy);
@@ -170,12 +177,16 @@ fn run_server(
         log_receiver,
         config_path,
         &route_table_for_watcher,
+        beacon_receiver,
+        agg_receiver,
+        &route_table_for_agg,
     );
 
     info!("entering run loop, waiting for connections or signals");
     server.run_forever();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn register_background_services(
     server: &mut Server,
     challenge_solver: Option<&Arc<ChallengeSolver>>,
@@ -184,6 +195,9 @@ fn register_background_services(
     log_receiver: dwaar_log::LogReceiver,
     config_path: &std::path::Path,
     route_table: &Arc<ArcSwap<dwaar_core::route::RouteTable>>,
+    beacon_receiver: tokio::sync::mpsc::Receiver<dwaar_analytics::beacon::BeaconEvent>,
+    agg_receiver: aggregation::AggReceiver,
+    route_table_for_agg: &Arc<ArcSwap<dwaar_core::route::RouteTable>>,
 ) {
     // ACME + OCSP background service
     if let Some(solver) = challenge_solver {
@@ -232,6 +246,23 @@ fn register_background_services(
         pingora_core::services::background::background_service("config watcher", config_watcher);
     server.add_service(config_bg);
     info!(path = %config_path.display(), "config watcher registered");
+
+    // Analytics aggregation service
+    let agg_metrics = Arc::new(DashMap::new());
+    let agg_service = AggregationService::new(
+        Arc::clone(&agg_metrics),
+        LiveRouteValidator(Arc::clone(route_table_for_agg)),
+        beacon_receiver,
+        agg_receiver,
+    );
+    let agg_bg = pingora_core::services::background::background_service(
+        "analytics aggregation",
+        AggServiceWrapper {
+            inner: Arc::new(agg_service),
+        },
+    );
+    server.add_service(agg_bg);
+    info!("analytics aggregation service registered");
 }
 
 fn load_config(path: &std::path::Path) -> anyhow::Result<dwaar_config::model::DwaarConfig> {
@@ -397,6 +428,32 @@ impl pingora_core::services::background::BackgroundService for LogWriterService 
         if let Some(rx) = receiver {
             run_writer(rx, Box::new(StdoutWriter)).await;
         }
+    }
+}
+
+/// Route validator that checks the live `ArcSwap<RouteTable>`.
+///
+/// Used by `AggregationService` to reject metrics for unknown hosts
+/// (Guardrail #17: treat all client input as adversarial).
+struct LiveRouteValidator(Arc<ArcSwap<dwaar_core::route::RouteTable>>);
+
+impl RouteValidator for LiveRouteValidator {
+    fn is_known_host(&self, host: &str) -> bool {
+        self.0.load().resolve(host).is_some()
+    }
+}
+
+/// Wraps `AggregationService` as a Pingora `BackgroundService`.
+struct AggServiceWrapper<RT: RouteValidator + 'static> {
+    inner: Arc<AggregationService<RT>>,
+}
+
+#[async_trait::async_trait]
+impl<RT: RouteValidator + 'static> pingora_core::services::background::BackgroundService
+    for AggServiceWrapper<RT>
+{
+    async fn start(&self, shutdown: pingora_core::server::ShutdownWatch) {
+        self.inner.run(shutdown).await;
     }
 }
 
