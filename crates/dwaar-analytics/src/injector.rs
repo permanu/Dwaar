@@ -87,17 +87,14 @@ impl HtmlInjector {
             return;
         };
 
-        self.bytes_scanned += data.len();
-        if self.bytes_scanned > MAX_SCAN_BYTES {
-            self.state = State::Skipped;
-            return;
-        }
-
+        // Check for double injection first (cheap, always valid)
         if find_case_insensitive(data, ALREADY_INJECTED_MARKER).is_some() {
             self.state = State::Skipped;
             return;
         }
 
+        // Search for </head> before checking budget — if it's in this
+        // chunk, inject regardless of cumulative bytes scanned
         if let Some(pos) = find_case_insensitive(data, b"</head>") {
             let mut buf = BytesMut::with_capacity(data.len() + SCRIPT_TAG.len());
             buf.extend_from_slice(&data[..pos]);
@@ -105,6 +102,13 @@ impl HtmlInjector {
             buf.extend_from_slice(&data[pos..]);
             *body = Some(buf.freeze());
             self.state = State::Done;
+            return;
+        }
+
+        // Update budget AFTER search — we already checked this chunk
+        self.bytes_scanned += data.len();
+        if self.bytes_scanned > MAX_SCAN_BYTES {
+            self.state = State::Skipped;
             return;
         }
 
@@ -189,13 +193,32 @@ mod tests {
 
     #[test]
     fn skips_after_scan_budget_exceeded() {
+        // Two chunks: first exceeds budget, second has </head> but is skipped
+        let mut injector = HtmlInjector::new();
+        let mut body1 = Some(Bytes::from(vec![b'x'; MAX_SCAN_BYTES + 100]));
+        injector.process(&mut body1, false);
+        assert!(!injector.is_active());
+
+        let mut body2 = Some(Bytes::from_static(b"</head>"));
+        let original = body2.clone();
+        injector.process(&mut body2, true);
+        assert_eq!(body2, original);
+    }
+
+    #[test]
+    fn injects_in_chunk_that_crosses_budget() {
+        // If </head> is in the same chunk that crosses the budget, inject anyway
         let mut big = vec![b'x'; MAX_SCAN_BYTES + 100];
         big.extend_from_slice(b"</head>");
         let mut injector = HtmlInjector::new();
         let mut body = Some(Bytes::from(big.clone()));
         injector.process(&mut body, true);
         assert!(!injector.is_active());
-        assert_eq!(body.expect("body should be Some").len(), big.len());
+        // Injection happened: body is bigger than original by SCRIPT_TAG length
+        assert_eq!(
+            body.expect("body should be Some").len(),
+            big.len() + SCRIPT_TAG.len()
+        );
     }
 
     #[test]
