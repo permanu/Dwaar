@@ -24,8 +24,8 @@
 //! use dwaar_core::route::{Route, RouteTable};
 //!
 //! let routes = vec![
-//!     Route::new("api.example.com", "127.0.0.1:3000".parse().unwrap(), false),
-//!     Route::new("*.example.com",   "127.0.0.1:8080".parse().unwrap(), false),
+//!     Route::new("api.example.com", "127.0.0.1:3000".parse().unwrap(), false, None),
+//!     Route::new("*.example.com",   "127.0.0.1:8080".parse().unwrap(), false, None),
 //! ];
 //! let table = RouteTable::new(routes);
 //!
@@ -83,15 +83,19 @@ pub struct Route {
     /// Whether this route expects TLS. When true, plaintext HTTP requests
     /// are redirected to HTTPS. When false, HTTP is served directly.
     pub tls: bool,
+
+    /// Per-IP requests-per-second limit for this route. `None` means no limit.
+    pub rate_limit_rps: Option<u32>,
 }
 
 impl Route {
     /// Create a new route mapping `domain` to `upstream`.
-    pub fn new(domain: &str, upstream: SocketAddr, tls: bool) -> Self {
+    pub fn new(domain: &str, upstream: SocketAddr, tls: bool, rate_limit_rps: Option<u32>) -> Self {
         Self {
             domain: domain.to_lowercase(),
             upstream,
             tls,
+            rate_limit_rps,
         }
     }
 }
@@ -223,8 +227,8 @@ mod tests {
     #[test]
     fn exact_match_returns_correct_route() {
         let table = RouteTable::new(vec![
-            Route::new("api.example.com", addr(3000), false),
-            Route::new("web.example.com", addr(8080), false),
+            Route::new("api.example.com", addr(3000), false, None),
+            Route::new("web.example.com", addr(8080), false, None),
         ]);
 
         let route = table.resolve("api.example.com").expect("should match");
@@ -233,7 +237,7 @@ mod tests {
 
     #[test]
     fn exact_match_is_case_insensitive() {
-        let table = RouteTable::new(vec![Route::new("API.Example.COM", addr(3000), false)]);
+        let table = RouteTable::new(vec![Route::new("API.Example.COM", addr(3000), false, None)]);
 
         // Host header arrives in mixed case — should still match
         let route = table.resolve("api.example.com").expect("should match");
@@ -247,7 +251,7 @@ mod tests {
 
     #[test]
     fn wildcard_matches_any_subdomain() {
-        let table = RouteTable::new(vec![Route::new("*.example.com", addr(9000), false)]);
+        let table = RouteTable::new(vec![Route::new("*.example.com", addr(9000), false, None)]);
 
         let route = table.resolve("api.example.com").expect("should match");
         assert_eq!(route.upstream, addr(9000));
@@ -259,8 +263,8 @@ mod tests {
     #[test]
     fn exact_match_takes_priority_over_wildcard() {
         let table = RouteTable::new(vec![
-            Route::new("api.example.com", addr(3000), false),
-            Route::new("*.example.com", addr(9000), false),
+            Route::new("api.example.com", addr(3000), false, None),
+            Route::new("*.example.com", addr(9000), false, None),
         ]);
 
         // api.example.com → exact match (port 3000), not wildcard
@@ -276,7 +280,7 @@ mod tests {
 
     #[test]
     fn no_match_returns_none() {
-        let table = RouteTable::new(vec![Route::new("api.example.com", addr(3000), false)]);
+        let table = RouteTable::new(vec![Route::new("api.example.com", addr(3000), false, None)]);
 
         assert!(table.resolve("other.dev").is_none());
     }
@@ -291,7 +295,7 @@ mod tests {
 
     #[test]
     fn bare_hostname_without_dot_has_no_wildcard() {
-        let table = RouteTable::new(vec![Route::new("*.com", addr(9000), false)]);
+        let table = RouteTable::new(vec![Route::new("*.com", addr(9000), false, None)]);
 
         // "localhost" has no dot — can't strip a label for wildcard
         assert!(table.resolve("localhost").is_none());
@@ -299,7 +303,7 @@ mod tests {
 
     #[test]
     fn wildcard_does_not_match_deeper_subdomains() {
-        let table = RouteTable::new(vec![Route::new("*.example.com", addr(9000), false)]);
+        let table = RouteTable::new(vec![Route::new("*.example.com", addr(9000), false, None)]);
 
         // *.example.com should match one level deep only
         // "deep.sub.example.com" — first dot gives "*.sub.example.com", not "*.example.com"
@@ -315,8 +319,8 @@ mod tests {
         assert_eq!(empty.len(), 0);
 
         let table = RouteTable::new(vec![
-            Route::new("a.com", addr(1000), false),
-            Route::new("b.com", addr(2000), false),
+            Route::new("a.com", addr(1000), false, None),
+            Route::new("b.com", addr(2000), false, None),
         ]);
         assert!(!table.is_empty());
         assert_eq!(table.len(), 2);
@@ -332,10 +336,10 @@ mod tests {
 
     #[test]
     fn route_tls_flag() {
-        let tls_route = Route::new("example.com", addr(3000), true);
+        let tls_route = Route::new("example.com", addr(3000), true, None);
         assert!(tls_route.tls);
 
-        let plain_route = Route::new("example.com", addr(3000), false);
+        let plain_route = Route::new("example.com", addr(3000), false, None);
         assert!(!plain_route.tls);
     }
 
@@ -344,8 +348,8 @@ mod tests {
     #[test]
     fn all_routes_returns_all_entries() {
         let table = RouteTable::new(vec![
-            Route::new("a.com", addr(1000), false),
-            Route::new("b.com", addr(2000), true),
+            Route::new("a.com", addr(1000), false, None),
+            Route::new("b.com", addr(2000), true, None),
         ]);
         let routes = table.all_routes();
         assert_eq!(routes.len(), 2);
@@ -353,9 +357,27 @@ mod tests {
 
     #[test]
     fn route_serializes_to_json() {
-        let route = Route::new("example.com", addr(3000), true);
+        let route = Route::new("example.com", addr(3000), true, None);
         let json = serde_json::to_string(&route).expect("serialize");
         assert!(json.contains("\"domain\":\"example.com\""));
         assert!(json.contains("\"tls\":true"));
+    }
+
+    // ── Rate limit field (ISSUE-031) ─────────────────────────
+
+    #[test]
+    fn route_rate_limit_field() {
+        let route = Route::new("example.com", addr(3000), false, Some(100));
+        assert_eq!(route.rate_limit_rps, Some(100));
+
+        let unlimited = Route::new("example.com", addr(3000), false, None);
+        assert_eq!(unlimited.rate_limit_rps, None);
+    }
+
+    #[test]
+    fn route_rate_limit_serializes() {
+        let route = Route::new("example.com", addr(3000), true, Some(500));
+        let json = serde_json::to_string(&route).expect("serialize");
+        assert!(json.contains("\"rate_limit_rps\":500"));
     }
 }

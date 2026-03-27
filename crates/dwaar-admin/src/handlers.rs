@@ -51,7 +51,7 @@ pub fn add_route(route_table: &ArcSwap<RouteTable>, body: &[u8]) -> Result<Strin
         .parse()
         .map_err(|e| format!("invalid upstream address: {e}"))?;
 
-    let route = Route::new(&req.domain, upstream, req.tls);
+    let route = Route::new(&req.domain, upstream, req.tls, None);
 
     route_table.rcu(|current| {
         let mut routes = current.all_routes();
@@ -128,8 +128,8 @@ mod tests {
     #[test]
     fn list_routes_returns_json_array() {
         let table = make_table(vec![
-            Route::new("a.com", addr(1000), false),
-            Route::new("b.com", addr(2000), true),
+            Route::new("a.com", addr(1000), false, None),
+            Route::new("b.com", addr(2000), true, None),
         ]);
         let json = list_routes(&table).expect("should serialize");
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).expect("parse");
@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn add_route_upserts_existing() {
-        let table = make_table(vec![Route::new("exist.com", addr(1000), false)]);
+        let table = make_table(vec![Route::new("exist.com", addr(1000), false, None)]);
         let body = br#"{"domain":"exist.com","upstream":"127.0.0.1:2000","tls":true}"#;
         add_route(&table, body).expect("upsert");
         let guard = table.load();
@@ -176,8 +176,8 @@ mod tests {
     #[test]
     fn delete_route_removes_entry() {
         let table = make_table(vec![
-            Route::new("a.com", addr(1000), false),
-            Route::new("b.com", addr(2000), false),
+            Route::new("a.com", addr(1000), false, None),
+            Route::new("b.com", addr(2000), false, None),
         ]);
         let deleted = delete_route(&table, "a.com");
         assert_eq!(deleted.as_deref(), Some("a.com"));
