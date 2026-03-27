@@ -441,8 +441,18 @@ mod tests {
                 for _ in 0..request_count {
                     let (mut stream, _) = listener.accept().expect("accept");
 
+                    // Drain the full request so no unread data remains in the
+                    // receive buffer (leftover data → TCP RST on close).
+                    stream
+                        .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+                        .ok();
                     let mut buf = [0u8; 4096];
-                    let _ = stream.read(&mut buf);
+                    loop {
+                        match stream.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
 
                     let http_response = format!(
                         "HTTP/1.1 200 OK\r\n\
@@ -455,6 +465,10 @@ mod tests {
                     let _ = stream.write_all(http_response.as_bytes());
                     let _ = stream.write_all(&response_der);
                     let _ = stream.flush();
+
+                    // Half-close the write side so the client sees a clean
+                    // EOF instead of a TCP RST when we drop the socket.
+                    let _ = stream.shutdown(std::net::Shutdown::Write);
                 }
             })
         }
