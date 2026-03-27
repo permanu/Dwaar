@@ -16,6 +16,7 @@
 /// beacon to `/_dwaar/collect` on page exit.
 pub const ANALYTICS_JS: &[u8] = include_bytes!("../assets/analytics.js");
 
+pub mod decompress;
 pub mod injector;
 
 #[cfg(test)]
