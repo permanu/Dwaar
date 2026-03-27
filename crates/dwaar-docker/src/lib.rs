@@ -9,4 +9,5 @@
 //! Watches the Docker daemon for containers with `dwaar.*` labels
 //! and creates routes automatically.
 
+pub mod client;
 pub mod labels;
