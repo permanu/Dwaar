@@ -868,7 +868,9 @@ name = "dwaar-admin"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "async-trait",
  "dwaar-core",
+ "http",
  "pingora-core",
  "serde",
  "serde_json",
@@ -961,6 +963,8 @@ dependencies = [
  "pingora-http",
  "pingora-load-balancing",
  "pingora-proxy",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio-test",
  "tracing",
