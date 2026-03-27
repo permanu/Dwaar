@@ -50,6 +50,24 @@ use std::net::SocketAddr;
 
 use ahash::RandomState;
 
+/// Validate that a string is a legal hostname or wildcard pattern.
+/// Rejects path traversal, null bytes, and non-hostname characters.
+pub fn is_valid_domain(s: &str) -> bool {
+    if s.is_empty() || s.len() > 253 {
+        return false;
+    }
+    if s.contains('/') || s.contains("..") || s.contains('\0') {
+        return false;
+    }
+    s.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'*')
+    })
+}
+
 /// A single routing entry: one domain mapped to one upstream backend.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Route {
