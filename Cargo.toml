@@ -82,6 +82,7 @@ maxminddb = "0.27.3"
 
 # Analytics data structures
 hyperloglog = "1.0.3"
+tdigest = "0.2.3"
 
 # Crypto (visitor cookies)
 aes-gcm = "0.10.3"
