@@ -505,7 +505,12 @@ impl ProxyHttp for DwaarProxy {
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|ct| ct.starts_with("text/html"));
 
-            if is_html {
+            let is_encoded = upstream_response
+                .headers
+                .get(http::header::CONTENT_ENCODING)
+                .is_some();
+
+            if is_html && !is_encoded {
                 debug!(request_id = %ctx.request_id, "HTML response detected, enabling script injection");
                 ctx.injector = Some(HtmlInjector::new());
                 upstream_response.remove_header("Content-Length");
