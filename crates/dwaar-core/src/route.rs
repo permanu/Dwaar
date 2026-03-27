@@ -51,7 +51,7 @@ use std::net::SocketAddr;
 use ahash::RandomState;
 
 /// A single routing entry: one domain mapped to one upstream backend.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Route {
     /// The domain pattern this route matches.
     ///
@@ -185,6 +185,11 @@ impl RouteTable {
     pub fn is_empty(&self) -> bool {
         self.routes.is_empty()
     }
+
+    /// Returns all routes as a Vec, for serialization and admin API mutations.
+    pub fn all_routes(&self) -> Vec<Route> {
+        self.routes.values().cloned().collect()
+    }
 }
 
 #[cfg(test)]
@@ -314,5 +319,25 @@ mod tests {
 
         let plain_route = Route::new("example.com", addr(3000), false);
         assert!(!plain_route.tls);
+    }
+
+    // ── all_routes / Serialize ────────────────────────────────
+
+    #[test]
+    fn all_routes_returns_all_entries() {
+        let table = RouteTable::new(vec![
+            Route::new("a.com", addr(1000), false),
+            Route::new("b.com", addr(2000), true),
+        ]);
+        let routes = table.all_routes();
+        assert_eq!(routes.len(), 2);
+    }
+
+    #[test]
+    fn route_serializes_to_json() {
+        let route = Route::new("example.com", addr(3000), true);
+        let json = serde_json::to_string(&route).expect("serialize");
+        assert!(json.contains("\"domain\":\"example.com\""));
+        assert!(json.contains("\"tls\":true"));
     }
 }
