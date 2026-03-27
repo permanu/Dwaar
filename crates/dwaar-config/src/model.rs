@@ -56,6 +56,9 @@ pub enum Directive {
 
     /// `encode gzip` / `encode zstd gzip`
     Encode(EncodeDirective),
+
+    /// `rate_limit 100/s`
+    RateLimit(RateLimitDirective),
 }
 
 /// `reverse_proxy` — route requests to one or more upstream backends.
@@ -114,6 +117,13 @@ pub struct EncodeDirective {
     /// Encodings to enable, in preference order.
     /// Valid: "gzip", "zstd", "br" (brotli)
     pub encodings: Vec<String>,
+}
+
+/// `rate_limit 100/s` — per-IP rate limiting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RateLimitDirective {
+    /// Maximum requests per second per IP for this route.
+    pub requests_per_second: u32,
 }
 
 impl DwaarConfig {
@@ -189,6 +199,14 @@ mod tests {
             code: 308,
         };
         assert_eq!(redir.code, 308);
+    }
+
+    #[test]
+    fn rate_limit_directive() {
+        let rl = RateLimitDirective {
+            requests_per_second: 100,
+        };
+        assert_eq!(rl.requests_per_second, 100);
     }
 
     #[test]

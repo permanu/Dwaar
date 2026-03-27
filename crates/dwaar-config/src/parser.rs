@@ -24,7 +24,7 @@
 
 use crate::error::{ParseError, ParseErrorKind, suggest_directive};
 use crate::model::{
-    Directive, DwaarConfig, EncodeDirective, HeaderDirective, RedirDirective,
+    Directive, DwaarConfig, EncodeDirective, HeaderDirective, RateLimitDirective, RedirDirective,
     ReverseProxyDirective, SiteBlock, TlsDirective, UpstreamAddr,
 };
 use crate::token::{TokenKind, Tokenizer};
@@ -155,6 +155,7 @@ fn parse_directive(t: &mut Tokenizer<'_>) -> Result<Directive, ParseError> {
         "header" => Ok(Directive::Header(parse_header(t)?)),
         "redir" => Ok(Directive::Redir(parse_redir(t)?)),
         "encode" => Ok(Directive::Encode(parse_encode(t)?)),
+        "rate_limit" => Ok(Directive::RateLimit(parse_rate_limit(t)?)),
 
         // Known Caddyfile directives that aren't implemented yet
         "basicauth" => Err(unsupported(&name_tok, &name, "ISSUE-046")),
@@ -422,6 +423,62 @@ fn parse_encode(t: &mut Tokenizer<'_>) -> Result<EncodeDirective, ParseError> {
     Ok(EncodeDirective { encodings })
 }
 
+/// `rate_limit 100/s`
+fn parse_rate_limit(t: &mut Tokenizer<'_>) -> Result<RateLimitDirective, ParseError> {
+    let tok = t.peek();
+    let TokenKind::Word(ref value) = tok.kind else {
+        let (line, col) = t.position();
+        return Err(ParseError {
+            line,
+            col,
+            kind: ParseErrorKind::InvalidValue {
+                directive: "rate_limit".to_string(),
+                message: "expected value like '100/s'".to_string(),
+            },
+        });
+    };
+
+    let value = value.clone();
+    let tok = t.next_token();
+
+    let Some(rps_str) = value.strip_suffix("/s") else {
+        return Err(ParseError {
+            line: tok.line,
+            col: tok.col,
+            kind: ParseErrorKind::InvalidValue {
+                directive: "rate_limit".to_string(),
+                message: format!(
+                    "expected '<number>/s' (e.g., '100/s'), got '{value}' — only per-second rates are supported"
+                ),
+            },
+        });
+    };
+
+    let rps: u32 = rps_str.parse().map_err(|_| ParseError {
+        line: tok.line,
+        col: tok.col,
+        kind: ParseErrorKind::InvalidValue {
+            directive: "rate_limit".to_string(),
+            message: format!("'{rps_str}' is not a valid number"),
+        },
+    })?;
+
+    if rps == 0 {
+        return Err(ParseError {
+            line: tok.line,
+            col: tok.col,
+            kind: ParseErrorKind::InvalidValue {
+                directive: "rate_limit".to_string(),
+                message: "rate limit must be greater than zero".to_string(),
+            },
+        });
+    }
+
+    Ok(RateLimitDirective {
+        requests_per_second: rps,
+    })
+}
+
 /// Parse an upstream address — try socket addr first, fall back to host:port string.
 fn parse_upstream_addr(s: &str) -> UpstreamAddr {
     // Handle Caddyfile shorthand: ":8080" means "localhost:8080"
@@ -450,6 +507,7 @@ fn is_directive_name(w: &str) -> bool {
             | "header"
             | "redir"
             | "encode"
+            | "rate_limit"
             | "basicauth"
             | "forward_auth"
             | "file_server"
@@ -730,6 +788,79 @@ mod tests {
     fn error_includes_line_and_column() {
         let err = parse("a.com {\n    badstuff\n}").expect_err("should fail");
         assert_eq!(err.line, 2);
+    }
+
+    // ── Real-world Caddyfile samples ──────────────────────
+
+    // ── rate_limit directive (ISSUE-031) ─────────────────
+
+    #[test]
+    fn parse_rate_limit() {
+        let config = parse("a.com { rate_limit 100/s }").expect("parse");
+        if let Directive::RateLimit(rl) = &config.sites[0].directives[0] {
+            assert_eq!(rl.requests_per_second, 100);
+        } else {
+            panic!("expected RateLimit directive");
+        }
+    }
+
+    #[test]
+    fn parse_rate_limit_large_value() {
+        let config = parse("a.com { rate_limit 10000/s }").expect("parse");
+        if let Directive::RateLimit(rl) = &config.sites[0].directives[0] {
+            assert_eq!(rl.requests_per_second, 10000);
+        } else {
+            panic!("expected RateLimit directive");
+        }
+    }
+
+    #[test]
+    fn error_rate_limit_no_arg() {
+        let err = parse("a.com { rate_limit }").expect_err("should fail");
+        assert!(matches!(err.kind, ParseErrorKind::InvalidValue { .. }));
+    }
+
+    #[test]
+    fn error_rate_limit_non_numeric() {
+        let err = parse("a.com { rate_limit abc/s }").expect_err("should fail");
+        assert!(matches!(err.kind, ParseErrorKind::InvalidValue { .. }));
+    }
+
+    #[test]
+    fn error_rate_limit_wrong_unit() {
+        let err = parse("a.com { rate_limit 100/m }").expect_err("should fail");
+        assert!(matches!(err.kind, ParseErrorKind::InvalidValue { .. }));
+    }
+
+    #[test]
+    fn error_rate_limit_zero() {
+        let err = parse("a.com { rate_limit 0/s }").expect_err("should fail");
+        assert!(matches!(err.kind, ParseErrorKind::InvalidValue { .. }));
+    }
+
+    #[test]
+    fn parse_rate_limit_with_other_directives() {
+        let config = parse(
+            "a.com {
+            reverse_proxy 127.0.0.1:8080
+            rate_limit 200/s
+            tls auto
+        }",
+        )
+        .expect("parse");
+        assert_eq!(config.sites[0].directives.len(), 3);
+        assert!(matches!(
+            &config.sites[0].directives[1],
+            Directive::RateLimit(rl) if rl.requests_per_second == 200
+        ));
+    }
+
+    #[test]
+    fn format_roundtrip_rate_limit() {
+        let input = "a.com {\n    rate_limit 100/s\n}\n";
+        let config = parse(input).expect("parse");
+        let formatted = crate::format::format_config(&config);
+        assert_eq!(formatted, input);
     }
 
     // ── Real-world Caddyfile samples ──────────────────────

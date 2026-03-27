@@ -11,7 +11,7 @@
 //! blank line between site blocks.
 
 use crate::model::{
-    Directive, DwaarConfig, EncodeDirective, HeaderDirective, RedirDirective,
+    Directive, DwaarConfig, EncodeDirective, HeaderDirective, RateLimitDirective, RedirDirective,
     ReverseProxyDirective, TlsDirective, UpstreamAddr,
 };
 
@@ -45,6 +45,7 @@ fn format_directive(out: &mut String, directive: &Directive) {
         Directive::Header(h) => format_header(out, h),
         Directive::Redir(r) => format_redir(out, r),
         Directive::Encode(e) => format_encode(out, e),
+        Directive::RateLimit(rl) => format_rate_limit(out, rl),
     }
 }
 
@@ -110,6 +111,12 @@ fn format_encode(out: &mut String, e: &EncodeDirective) {
         out.push(' ');
         out.push_str(encoding);
     }
+}
+
+fn format_rate_limit(out: &mut String, rl: &RateLimitDirective) {
+    out.push_str("rate_limit ");
+    out.push_str(&rl.requests_per_second.to_string());
+    out.push_str("/s");
 }
 
 #[cfg(test)]
