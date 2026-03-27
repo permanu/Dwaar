@@ -317,9 +317,7 @@ impl ProxyHttp for DwaarProxy {
                         .map_err(|e| Error::explain(HTTPStatus(429), format!("bad header: {e}")))?;
                     resp.insert_header("Content-Length", "0")
                         .map_err(|e| Error::explain(HTTPStatus(429), format!("bad header: {e}")))?;
-                    session
-                        .write_response_header(Box::new(resp), true)
-                        .await?;
+                    session.write_response_header(Box::new(resp), true).await?;
                     return Ok(true);
                 }
             }
