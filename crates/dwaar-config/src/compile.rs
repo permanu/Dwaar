@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 
-use dwaar_core::route::{Route, RouteTable};
+use dwaar_core::route::{is_valid_domain, Route, RouteTable};
 use tracing::warn;
 
 use crate::model::{Directive, DwaarConfig, ReverseProxyDirective, TlsDirective, UpstreamAddr};
@@ -122,25 +122,6 @@ pub fn compile_acme_domains(config: &DwaarConfig) -> Vec<String> {
         })
         .map(|site| site.address.to_lowercase())
         .collect()
-}
-
-/// Validate that a site address is a legal hostname or wildcard pattern.
-/// Rejects path traversal, null bytes, and other non-hostname characters.
-fn is_valid_domain(s: &str) -> bool {
-    if s.is_empty() || s.len() > 253 {
-        return false;
-    }
-    // Must not contain path separators or parent-directory references
-    if s.contains('/') || s.contains("..") || s.contains('\0') {
-        return false;
-    }
-    s.split('.').all(|label| {
-        !label.is_empty()
-            && label.len() <= 63
-            && label
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'*')
-    })
 }
 
 /// Returns true if a site's directives include a TLS config that
