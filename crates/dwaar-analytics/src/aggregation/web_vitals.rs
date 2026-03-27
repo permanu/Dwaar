@@ -124,7 +124,12 @@ impl WebVitals {
 
     fn query(digest: &mut BufferedDigest) -> Percentiles {
         if digest.is_empty() {
-            return Percentiles { p50: 0.0, p75: 0.0, p95: 0.0, p99: 0.0 };
+            return Percentiles {
+                p50: 0.0,
+                p75: 0.0,
+                p95: 0.0,
+                p99: 0.0,
+            };
         }
         Percentiles {
             p50: digest.estimate_quantile(0.50),
@@ -208,7 +213,10 @@ mod tests {
             bd.record(f64::from(i as u32));
         }
         // Buffer should have auto-flushed at BATCH_SIZE
-        assert!(bd.buffer.is_empty(), "buffer should be empty after reaching batch size");
+        assert!(
+            bd.buffer.is_empty(),
+            "buffer should be empty after reaching batch size"
+        );
         assert!(!bd.digest.is_empty(), "digest should have data after flush");
     }
 

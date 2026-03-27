@@ -911,6 +911,7 @@ dependencies = [
  "assert_cmd",
  "async-trait",
  "clap",
+ "dashmap",
  "dwaar-admin",
  "dwaar-analytics",
  "dwaar-config",

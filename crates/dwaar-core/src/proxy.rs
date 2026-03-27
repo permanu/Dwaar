@@ -720,7 +720,13 @@ mod tests {
 
     fn make_proxy(routes: Vec<Route>) -> DwaarProxy {
         let table = RouteTable::new(routes);
-        DwaarProxy::new(Arc::new(ArcSwap::from_pointee(table)), None, None, None, None)
+        DwaarProxy::new(
+            Arc::new(ArcSwap::from_pointee(table)),
+            None,
+            None,
+            None,
+            None,
+        )
     }
 
     #[test]
