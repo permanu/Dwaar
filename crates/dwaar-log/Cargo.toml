@@ -3,6 +3,7 @@ name = "dwaar-log"
 version = "0.1.0"
 description = "Request logging — structured log types, batch writer, output destinations"
 edition.workspace = true
+publish = false
 rust-version.workspace = true
 license-file = "../../LICENSE"
 repository.workspace = true

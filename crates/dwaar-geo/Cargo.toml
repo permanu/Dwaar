@@ -3,6 +3,7 @@ name = "dwaar-geo"
 version = "0.1.0"
 description = "GeoIP lookup — IP to country/city via MaxMind GeoLite2"
 edition.workspace = true
+publish = false
 rust-version.workspace = true
 license-file = "../../LICENSE"
 repository.workspace = true

@@ -3,6 +3,7 @@ name = "dwaar-core"
 version = "0.1.0"
 description = "Core proxy engine — ProxyHttp implementation, route table, request context"
 edition.workspace = true
+publish = false
 rust-version.workspace = true
 license-file = "../../LICENSE"
 repository.workspace = true
