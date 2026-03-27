@@ -75,6 +75,15 @@ impl BufferedDigest {
         self.flush();
         self.digest.is_empty()
     }
+
+    /// Read percentile without flushing the buffer.
+    /// Returns the current digest state — may lag by up to `BATCH_SIZE` values.
+    fn peek_quantile(&self, q: f64) -> f64 {
+        if self.digest.is_empty() {
+            return 0.0;
+        }
+        self.digest.estimate_quantile(q)
+    }
 }
 
 /// Streaming Web Vitals percentile tracker.
@@ -136,6 +145,29 @@ impl WebVitals {
             p75: digest.estimate_quantile(0.75),
             p95: digest.estimate_quantile(0.95),
             p99: digest.estimate_quantile(0.99),
+        }
+    }
+
+    /// Immutable percentile read — does not flush the pending buffer.
+    /// Used by the Admin API where mutation is not acceptable on a GET.
+    pub fn peek_lcp_percentiles(&self) -> Percentiles {
+        Self::peek_query(&self.lcp)
+    }
+
+    pub fn peek_cls_percentiles(&self) -> Percentiles {
+        Self::peek_query(&self.cls)
+    }
+
+    pub fn peek_inp_percentiles(&self) -> Percentiles {
+        Self::peek_query(&self.inp)
+    }
+
+    fn peek_query(digest: &BufferedDigest) -> Percentiles {
+        Percentiles {
+            p50: digest.peek_quantile(0.50),
+            p75: digest.peek_quantile(0.75),
+            p95: digest.peek_quantile(0.95),
+            p99: digest.peek_quantile(0.99),
         }
     }
 }
@@ -230,5 +262,37 @@ mod tests {
         let p50 = bd.estimate_quantile(0.5);
         assert!(bd.buffer.is_empty(), "query should flush buffer");
         assert!((p50 - 63.0).abs() < 25.0, "p50={p50}");
+    }
+
+    #[test]
+    fn peek_percentiles_does_not_flush_buffer() {
+        let mut wv = WebVitals::new();
+        for i in 0..50 {
+            wv.record_lcp(f64::from(i));
+        }
+        // 50 values < BATCH_SIZE (100), so buffer is not auto-flushed
+        let p = wv.peek_lcp_percentiles();
+        // peek reads digest only (empty), not the unflushed buffer
+        assert!(
+            p.p50.abs() < f64::EPSILON,
+            "peek should read digest only, not buffer"
+        );
+    }
+
+    #[test]
+    fn peek_percentiles_reads_flushed_data() {
+        let mut wv = WebVitals::new();
+        // Record enough to trigger an auto-flush (>= BATCH_SIZE=100)
+        for i in 0..150 {
+            wv.record_lcp(f64::from(i));
+        }
+        // First 100 auto-flushed into digest, 50 still in buffer
+        let p = wv.peek_lcp_percentiles();
+        // Should reflect the 100 values in the digest (not the 50 in buffer)
+        assert!(
+            p.p50 > 0.0,
+            "peek should read flushed digest data: p50={}",
+            p.p50
+        );
     }
 }
