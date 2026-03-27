@@ -146,6 +146,11 @@ fn run_server(
     let route_table_for_agg = Arc::clone(&route_table);
     let bot_detector = Arc::new(dwaar_plugins::bot_detect::BotDetector::new());
     let rate_limiter = Arc::new(dwaar_plugins::rate_limit::RateLimiter::new());
+
+    // GeoIP — load the MaxMind database if present. Not a hard requirement;
+    // country enrichment simply won't happen without it.
+    let geo_lookup = load_geoip_database();
+
     let proxy = DwaarProxy::new(
         route_table,
         challenge_solver.clone(),
@@ -154,6 +159,7 @@ fn run_server(
         Some(agg_sender),
         bot_detector,
         rate_limiter,
+        geo_lookup,
     );
 
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, proxy);
@@ -526,6 +532,30 @@ impl<RT: RouteValidator + 'static> pingora_core::services::background::Backgroun
     async fn start(&self, shutdown: pingora_core::server::ShutdownWatch) {
         self.inner.run(shutdown).await;
     }
+}
+
+/// Try to load a `GeoIP` database from standard paths.
+/// Returns `None` if no database is found — country enrichment simply
+/// won't happen, which is fine for development or minimal setups.
+fn load_geoip_database() -> Option<Arc<dwaar_geo::GeoLookup>> {
+    let paths = [
+        std::path::PathBuf::from("/etc/dwaar/geoip/GeoLite2-Country.mmdb"),
+        std::path::PathBuf::from("/usr/share/GeoIP/GeoLite2-Country.mmdb"),
+    ];
+
+    for path in &paths {
+        if path.exists() {
+            match dwaar_geo::GeoLookup::open(path) {
+                Ok(geo) => return Some(Arc::new(geo)),
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "failed to load GeoIP database");
+                }
+            }
+        }
+    }
+
+    info!("no GeoIP database found — country enrichment disabled");
+    None
 }
 
 fn init_logging(cli: &Cli) {

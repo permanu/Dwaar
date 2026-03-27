@@ -79,7 +79,7 @@ regex = "1.12.3"
 notify = { version = "8.2.0", default-features = false, features = ["macos_kqueue"] }
 
 # GeoIP
-maxminddb = "0.27.3"
+maxminddb = { version = "0.27.3", features = ["mmap"] }
 
 # Analytics data structures
 hyperloglog = "1.0.3"

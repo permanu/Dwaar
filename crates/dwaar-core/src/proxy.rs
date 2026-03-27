@@ -82,8 +82,11 @@ pub struct DwaarProxy {
     bot_detector: Arc<dwaar_plugins::bot_detect::BotDetector>,
     /// Per-IP rate limiter. One instance handles all routes via composite keys.
     rate_limiter: Arc<dwaar_plugins::rate_limit::RateLimiter>,
+    /// `GeoIP` lookup for IP → country code. `None` if no database loaded.
+    geo_lookup: Option<Arc<dwaar_geo::GeoLookup>>,
 }
 
+#[allow(clippy::too_many_arguments)]
 impl DwaarProxy {
     /// Create a new proxy backed by the given route table.
     ///
@@ -97,6 +100,7 @@ impl DwaarProxy {
         agg_sender: Option<AggSender>,
         bot_detector: Arc<dwaar_plugins::bot_detect::BotDetector>,
         rate_limiter: Arc<dwaar_plugins::rate_limit::RateLimiter>,
+        geo_lookup: Option<Arc<dwaar_geo::GeoLookup>>,
     ) -> Self {
         Self {
             route_table,
@@ -106,6 +110,7 @@ impl DwaarProxy {
             agg_sender,
             bot_detector,
             rate_limiter,
+            geo_lookup,
         }
     }
 }
@@ -261,6 +266,13 @@ impl ProxyHttp for DwaarProxy {
             .client_addr()
             .and_then(|addr| addr.as_inet())
             .map(std::net::SocketAddr::ip);
+
+        // --- GeoIP lookup ---
+        if let Some(ref geo) = self.geo_lookup
+            && let Some(ip) = ctx.client_ip
+        {
+            ctx.country = geo.lookup_country(ip);
+        }
 
         // --- HTTP headers ---
         let header = session.req_header();
@@ -748,7 +760,7 @@ impl ProxyHttp for DwaarProxy {
                 .map(|ssl| ssl.version.to_string()),
             http_version: format!("{:?}", session.req_header().version),
             is_bot: ctx.is_bot,
-            country: None,
+            country: ctx.country.clone(),
             upstream_addr: ctx
                 .route_upstream
                 .map_or_else(String::new, |a| a.to_string()),
@@ -788,6 +800,7 @@ mod tests {
             None,
             bot_detector,
             rate_limiter,
+            None,
         )
     }
 
