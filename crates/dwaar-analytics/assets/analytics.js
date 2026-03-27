@@ -3,7 +3,7 @@
 
   var d = {
     u: location.href,
-    r: document.referrer || null,
+    r: document.referrer || undefined,
     sw: screen.width,
     sh: screen.height,
     lg: navigator.language
@@ -30,6 +30,7 @@
   } catch(_) {}
 
   // INP (Interaction to Next Paint)
+  // simplified: tracks worst interaction, not p98
   try {
     var maxInp = 0;
     new PerformanceObserver(function(l) {
@@ -43,7 +44,10 @@
 
   var t0 = performance.now();
 
+  var sent = false;
   function send() {
+    if (sent) return;
+    sent = true;
     d.tp = Math.round(performance.now() - t0);
     var url = "/_dwaar/collect";
     var body = JSON.stringify(d);
