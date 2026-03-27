@@ -32,6 +32,7 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
 use tracing::{debug, warn};
 
+use dwaar_analytics::ANALYTICS_JS;
 use dwaar_log::{LogSender, RequestLog};
 use dwaar_tls::acme::ChallengeSolver;
 
@@ -222,6 +223,26 @@ impl ProxyHttp for DwaarProxy {
             path = %ctx.path,
             "request metadata extracted"
         );
+
+        // --- Analytics JS serving (ISSUE-024) ---
+        // Serve the compiled-in analytics script from memory. Same-origin
+        // serving avoids ad-blockers and CSP issues. The script is compiled
+        // into the binary via include_bytes!() so there's no filesystem I/O.
+        if ctx.path == "/_dwaar/a.js" {
+            debug!(request_id = %ctx.request_id, "serving analytics JS from memory");
+            let mut resp = ResponseHeader::build(200, Some(3))?;
+            resp.insert_header("Content-Type", "application/javascript")
+                .map_err(|e| Error::explain(HTTPStatus(500), format!("bad header: {e}")))?;
+            resp.insert_header("Cache-Control", "public, max-age=86400")
+                .map_err(|e| Error::explain(HTTPStatus(500), format!("bad header: {e}")))?;
+            resp.insert_header("Content-Length", ANALYTICS_JS.len().to_string())
+                .map_err(|e| Error::explain(HTTPStatus(500), format!("bad header: {e}")))?;
+            session.write_response_header(Box::new(resp), false).await?;
+            session
+                .write_response_body(Some(bytes::Bytes::from_static(ANALYTICS_JS)), true)
+                .await?;
+            return Ok(true);
+        }
 
         // --- ACME HTTP-01 challenge response ---
         // Must happen before HTTPS redirect — challenges arrive on port 80.

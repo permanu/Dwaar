@@ -15,6 +15,7 @@ pingora-proxy = { workspace = true }
 pingora-http = { workspace = true }
 pingora-load-balancing = { workspace = true }
 pingora-error = { workspace = true }
+dwaar-analytics = { workspace = true }
 dwaar-plugins = { workspace = true }
 dwaar-tls = { workspace = true }
 dwaar-log = { workspace = true }
