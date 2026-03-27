@@ -34,6 +34,7 @@ use tracing::{debug, warn};
 
 use bytes::Bytes;
 use dwaar_analytics::ANALYTICS_JS;
+use dwaar_analytics::decompress::{Decompressor, Encoding};
 use dwaar_analytics::injector::HtmlInjector;
 use dwaar_log::{LogSender, RequestLog};
 use dwaar_tls::acme::ChallengeSolver;
@@ -493,10 +494,11 @@ impl ProxyHttp for DwaarProxy {
             .insert_header("X-Request-Id", &ctx.request_id)
             .expect("UUID is valid header value");
 
-        // --- Analytics injection setup (ISSUE-026a) ---
-        // Detect 2xx HTML responses and prepare the injector. We remove
-        // Content-Length because injection changes the body size — Pingora
-        // will use chunked transfer encoding instead.
+        // --- Analytics injection setup (ISSUE-026a + 026c) ---
+        // Detect 2xx HTML responses and prepare the injector. For compressed
+        // responses, create a decompressor and strip Content-Encoding so the
+        // client receives uncompressed HTML. We remove Content-Length because
+        // injection (and decompression) changes the body size.
         let status = upstream_response.status.as_u16();
         if (200..300).contains(&status) {
             let is_html = upstream_response
@@ -505,13 +507,26 @@ impl ProxyHttp for DwaarProxy {
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|ct| ct.starts_with("text/html"));
 
-            let is_encoded = upstream_response
-                .headers
-                .get(http::header::CONTENT_ENCODING)
-                .is_some();
+            if is_html {
+                // Check for Content-Encoding (gzip, br, deflate)
+                let encoding = upstream_response
+                    .headers
+                    .get(http::header::CONTENT_ENCODING)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(Encoding::from_header);
 
-            if is_html && !is_encoded {
-                debug!(request_id = %ctx.request_id, "HTML response detected, enabling script injection");
+                if let Some(enc) = encoding {
+                    debug!(
+                        request_id = %ctx.request_id,
+                        encoding = ?enc,
+                        "compressed HTML detected, enabling decompression + injection"
+                    );
+                    ctx.decompressor = Some(Decompressor::new(enc));
+                    upstream_response.remove_header("Content-Encoding");
+                } else {
+                    debug!(request_id = %ctx.request_id, "HTML response detected, enabling script injection");
+                }
+
                 ctx.injector = Some(HtmlInjector::new());
                 upstream_response.remove_header("Content-Length");
             }
@@ -538,9 +553,16 @@ impl ProxyHttp for DwaarProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // Decompress first (if compressed response)
+        if let Some(ref mut decompressor) = ctx.decompressor {
+            decompressor.decompress(body, end_of_stream);
+        }
+
+        // Then inject into the decompressed HTML
         if let Some(ref mut injector) = ctx.injector {
             injector.process(body, end_of_stream);
         }
+
         Ok(None)
     }
 
@@ -658,6 +680,7 @@ mod tests {
         assert!(ctx.path.is_empty());
         assert!(ctx.route_upstream.is_none());
         assert!(ctx.injector.is_none());
+        assert!(ctx.decompressor.is_none());
     }
 
     #[test]

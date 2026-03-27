@@ -31,6 +31,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 
+use dwaar_analytics::decompress::Decompressor;
 use dwaar_analytics::injector::HtmlInjector;
 use uuid::Uuid;
 
@@ -98,6 +99,11 @@ pub struct RequestContext {
     /// the response is 2xx text/html. `response_body_filter()` passes body
     /// chunks through this. `None` for non-HTML or non-2xx responses.
     pub injector: Option<HtmlInjector>,
+
+    /// Streaming decompressor for compressed HTML responses. Created in
+    /// `response_filter()` when Content-Encoding is detected on HTML responses.
+    /// `response_body_filter()` decompresses each chunk before passing to the injector.
+    pub decompressor: Option<Decompressor>,
 }
 
 impl RequestContext {
@@ -116,6 +122,7 @@ impl RequestContext {
             path: String::new(),
             route_upstream: None,
             injector: None,
+            decompressor: None,
         }
     }
 }
@@ -186,5 +193,6 @@ mod tests {
         assert!(ctx.path.is_empty());
         assert!(ctx.route_upstream.is_none());
         assert!(ctx.injector.is_none());
+        assert!(ctx.decompressor.is_none());
     }
 }
