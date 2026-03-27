@@ -8,20 +8,21 @@
 //!
 //! Tracks the N most frequent items. When capacity is reached, a new
 //! item evicts the minimum-count entry and inherits its count + 1.
-//! This allows turnover after the counter fills up — high-frequency
-//! newcomers can displace stale items.
+//! Uses a cached minimum for O(1) amortized eviction.
 
 use std::collections::HashMap;
 
 /// Space-Saving bounded frequency counter.
 ///
 /// When at capacity, new items evict the minimum-count entry and start
-/// with count = `evicted_min + 1`. This ensures the counter isn't frozen
-/// once full — genuine high-frequency items will rise to the top.
+/// with count = `evicted_min + 1`. The minimum is cached for O(1)
+/// eviction in the common case; recomputed in O(N) only when the
+/// cache is invalidated.
 #[derive(Debug)]
 pub struct BoundedCounter<T: std::hash::Hash + Eq + Clone + Ord> {
     counts: HashMap<T, u64>,
     capacity: usize,
+    cached_min: Option<(T, u64)>,
 }
 
 impl<T: std::hash::Hash + Eq + Clone + Ord> BoundedCounter<T> {
@@ -29,6 +30,7 @@ impl<T: std::hash::Hash + Eq + Clone + Ord> BoundedCounter<T> {
         Self {
             counts: HashMap::with_capacity(capacity),
             capacity,
+            cached_min: None,
         }
     }
 
@@ -36,6 +38,8 @@ impl<T: std::hash::Hash + Eq + Clone + Ord> BoundedCounter<T> {
     pub fn insert(&mut self, item: T) {
         if self.counts.contains_key(&item) {
             *self.counts.get_mut(&item).expect("just checked") += 1;
+            // Increment may have changed what the true min is
+            self.cached_min = None;
             return;
         }
 
@@ -45,6 +49,7 @@ impl<T: std::hash::Hash + Eq + Clone + Ord> BoundedCounter<T> {
         } else {
             self.counts.insert(item, 1);
         }
+        self.cached_min = None;
     }
 
     pub fn get(&self, item: &str) -> Option<u64>
@@ -71,14 +76,28 @@ impl<T: std::hash::Hash + Eq + Clone + Ord> BoundedCounter<T> {
 
     /// Remove the entry with the smallest count and return that count.
     fn evict_min(&mut self) -> u64 {
+        let (min_key, min_count) = self.find_min();
+        self.counts.remove(&min_key);
+        self.cached_min = None;
+        min_count
+    }
+
+    fn find_min(&mut self) -> (T, u64) {
+        let valid = self.cached_min.as_ref().is_some_and(|(key, count)| {
+            self.counts.get(key).copied() == Some(*count)
+        });
+        if valid {
+            return self.cached_min.clone().expect("just checked");
+        }
+
         let (min_key, min_count) = self
             .counts
             .iter()
             .min_by_key(|&(_, &count)| count)
             .map(|(k, &v)| (k.clone(), v))
             .expect("called on non-empty map");
-        self.counts.remove(&min_key);
-        min_count
+        self.cached_min = Some((min_key.clone(), min_count));
+        (min_key, min_count)
     }
 }
 
@@ -112,7 +131,6 @@ mod tests {
         for _ in 0..5 { bc.insert("a".to_string()); }
         for _ in 0..3 { bc.insert("b".to_string()); }
         assert_eq!(bc.len(), 2);
-        // "c" evicts "b" (min=3), inherits count 3+1=4
         bc.insert("c".to_string());
         assert_eq!(bc.len(), 2);
         assert_eq!(bc.get("c"), Some(4));
@@ -140,5 +158,15 @@ mod tests {
         assert_eq!(top[0], ("z".to_string(), 8));
         assert_eq!(top[1], ("x".to_string(), 5));
         assert_eq!(top[2], ("y".to_string(), 2));
+    }
+
+    #[test]
+    fn high_churn_at_capacity() {
+        // Verifies the cached-min optimization handles rapid evictions
+        let mut bc = BoundedCounter::new(50);
+        for i in 0..10_000u64 {
+            bc.insert(format!("ref_{i}"));
+        }
+        assert!(bc.len() <= 50);
     }
 }

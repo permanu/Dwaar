@@ -43,6 +43,11 @@ impl Encoding {
     }
 }
 
+/// Max compressed buffer before giving up — prevents OOM from
+/// adversarial or unexpectedly large compressed responses.
+/// 10 MB is generous for HTML responses (injection only applies to HTML).
+const MAX_BUFFER_SIZE: usize = 10 * 1024 * 1024;
+
 /// Streaming decompressor for response body chunks.
 ///
 /// Buffers compressed data internally and attempts decompression on each
@@ -50,6 +55,9 @@ impl Encoding {
 ///
 /// On decompression error, passes through the raw bytes and stops trying —
 /// better to serve garbled content than to silently drop the response.
+///
+/// Buffer is bounded at [`MAX_BUFFER_SIZE`] (10 MB) to prevent
+/// unbounded memory growth from adversarial inputs (Guardrail #19).
 #[derive(Debug)]
 pub struct Decompressor {
     encoding: Encoding,
@@ -82,6 +90,19 @@ impl Decompressor {
         };
 
         if data.is_empty() && !end_of_stream {
+            return;
+        }
+
+        // Bound buffer to prevent OOM from adversarial compressed responses
+        if self.buffer.len() + data.len() > MAX_BUFFER_SIZE {
+            tracing::warn!(
+                buffered = self.buffer.len(),
+                chunk = data.len(),
+                limit = MAX_BUFFER_SIZE,
+                "compressed response exceeded buffer limit, passing through raw"
+            );
+            self.failed = true;
+            *body = Some(Bytes::from(std::mem::take(&mut self.buffer)));
             return;
         }
 
