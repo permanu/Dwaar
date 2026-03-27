@@ -23,7 +23,10 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+openssl-sys = "0.9"
+libc = { workspace = true }
+foreign-types-shared = "0.1"
 
 [lints]
 workspace = true

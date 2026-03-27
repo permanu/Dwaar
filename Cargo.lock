@@ -1037,9 +1037,12 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "dashmap",
+ "foreign-types-shared",
  "instant-acme",
+ "libc",
  "lru",
  "openssl",
+ "openssl-sys",
  "pingora-core",
  "serde",
  "serde_json",
