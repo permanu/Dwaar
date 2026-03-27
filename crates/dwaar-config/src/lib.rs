@@ -31,3 +31,7 @@ pub mod format;
 pub mod model;
 pub mod parser;
 mod token;
+
+/// Maximum config file size (10 MB) to prevent OOM on crafted input.
+/// Shared between CLI startup and the config watcher.
+pub const MAX_CONFIG_SIZE: u64 = 10 * 1024 * 1024;

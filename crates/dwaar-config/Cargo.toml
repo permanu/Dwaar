@@ -15,6 +15,11 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 notify = { workspace = true }
+pingora-core = { workspace = true }
+async-trait = { workspace = true }
+arc-swap = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
+openssl = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
