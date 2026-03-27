@@ -38,6 +38,11 @@ pub(crate) struct Cli {
     #[arg(short, long)]
     pub upgrade: bool,
 
+    /// Enable Docker container auto-discovery via socket API.
+    /// Optionally specify the socket path (default: /var/run/docker.sock).
+    #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "/var/run/docker.sock")]
+    pub docker_socket: Option<PathBuf>,
+
     /// Subcommand to execute
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -194,5 +199,30 @@ mod tests {
     fn unknown_flag_fails() {
         let result = Cli::try_parse_from(["dwaar", "--unknown"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn docker_socket_disabled_by_default() {
+        let cli = Cli::try_parse_from(["dwaar"]).expect("parse");
+        assert!(cli.docker_socket.is_none());
+    }
+
+    #[test]
+    fn docker_socket_default_path() {
+        let cli = Cli::try_parse_from(["dwaar", "--docker-socket"]).expect("parse");
+        assert_eq!(
+            cli.docker_socket,
+            Some(PathBuf::from("/var/run/docker.sock"))
+        );
+    }
+
+    #[test]
+    fn docker_socket_custom_path() {
+        let cli = Cli::try_parse_from(["dwaar", "--docker-socket", "/custom/docker.sock"])
+            .expect("parse");
+        assert_eq!(
+            cli.docker_socket,
+            Some(PathBuf::from("/custom/docker.sock"))
+        );
     }
 }
