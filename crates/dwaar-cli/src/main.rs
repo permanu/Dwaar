@@ -25,6 +25,7 @@ use dwaar_admin::AdminService;
 use dwaar_config::compile::{
     compile_acme_domains, compile_routes, compile_tls_configs, has_tls_sites,
 };
+use dwaar_config::watcher::{ConfigWatcher, hash_content};
 use dwaar_config::MAX_CONFIG_SIZE;
 use dwaar_core::proxy::DwaarProxy;
 use dwaar_log::{StdoutWriter, channel as log_channel, run_writer};
@@ -70,6 +71,14 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    run_server(&cli, &dwaar_config, config_path)
+}
+
+fn run_server(
+    cli: &Cli,
+    dwaar_config: &dwaar_config::model::DwaarConfig,
+    config_path: &std::path::Path,
+) -> anyhow::Result<()> {
     let pingora_opt = PingoraOpt {
         upgrade: cli.upgrade,
         daemon: cli.daemon,
@@ -95,7 +104,7 @@ fn main() -> anyhow::Result<()> {
     );
 
     // Compile routes
-    let route_table = compile_routes(&dwaar_config);
+    let route_table = compile_routes(dwaar_config);
     if route_table.is_empty() {
         bail!("no valid routes found in config — nothing to proxy");
     }
@@ -103,7 +112,7 @@ fn main() -> anyhow::Result<()> {
 
     let route_table = Arc::new(ArcSwap::from_pointee(route_table));
 
-    let acme_domains = compile_acme_domains(&dwaar_config);
+    let acme_domains = compile_acme_domains(dwaar_config);
     let challenge_solver = if acme_domains.is_empty() {
         None
     } else {
@@ -113,22 +122,19 @@ fn main() -> anyhow::Result<()> {
     let (log_sender, log_receiver) = log_channel();
 
     let route_table_for_admin = Arc::clone(&route_table);
+    let route_table_for_watcher = Arc::clone(&route_table);
     let proxy = DwaarProxy::new(route_table, challenge_solver.clone(), Some(log_sender));
 
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, proxy);
 
     // Always listen on HTTP
     proxy_service.add_tcp("0.0.0.0:6188");
-    info!(
-        listen = "0.0.0.0:6188",
-        protocol = "http",
-        "listener registered"
-    );
+    info!(listen = "0.0.0.0:6188", protocol = "http", "listener registered");
 
     let cert_store = Arc::new(CertStore::new("/etc/dwaar/certs", 1000));
 
-    if has_tls_sites(&dwaar_config) {
-        setup_tls_listener(&dwaar_config, &mut proxy_service, &cert_store)?;
+    if has_tls_sites(dwaar_config) {
+        setup_tls_listener(dwaar_config, &mut proxy_service, &cert_store)?;
     }
 
     server.add_service(proxy_service);
@@ -154,6 +160,8 @@ fn main() -> anyhow::Result<()> {
         &acme_domains,
         &cert_store,
         log_receiver,
+        config_path,
+        &route_table_for_watcher,
     );
 
     info!("entering run loop, waiting for connections or signals");
@@ -166,6 +174,8 @@ fn register_background_services(
     acme_domains: &[String],
     cert_store: &Arc<CertStore>,
     log_receiver: dwaar_log::LogReceiver,
+    config_path: &std::path::Path,
+    route_table: &Arc<ArcSwap<dwaar_core::route::RouteTable>>,
 ) {
     // ACME + OCSP background service
     if let Some(solver) = challenge_solver {
@@ -199,6 +209,22 @@ fn register_background_services(
     );
     server.add_service(log_bg);
     info!("log writer registered (JSON lines to stdout)");
+
+    // Config file watcher for hot-reload
+    let initial_hash = hash_content(
+        &std::fs::read(config_path).unwrap_or_default(),
+    );
+    let config_watcher = ConfigWatcher::new(
+        config_path.to_path_buf(),
+        Arc::clone(route_table),
+        initial_hash,
+    );
+    let config_bg = pingora_core::services::background::background_service(
+        "config watcher",
+        config_watcher,
+    );
+    server.add_service(config_bg);
+    info!(path = %config_path.display(), "config watcher registered");
 }
 
 fn load_config(path: &std::path::Path) -> anyhow::Result<dwaar_config::model::DwaarConfig> {
