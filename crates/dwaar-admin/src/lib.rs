@@ -4,14 +4,10 @@
 // This file is part of Dwaar — https://dwaar.dev
 // Licensed under the Business Source License 1.1
 
-//! dwaar-admin
+//! dwaar-admin — REST API for runtime route management.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_compiles() {
-        // Placeholder — replaced with real tests as features are implemented
-        let x = 1 + 1;
-        assert_eq!(x, 2);
-    }
-}
+pub mod auth;
+pub mod handlers;
+pub mod service;
+
+pub use service::AdminService;

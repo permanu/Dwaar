@@ -71,9 +71,7 @@ pub fn delete_route(
     let domain_lower = domain.to_lowercase();
     let table = route_table.load();
 
-    if table.resolve(&domain_lower).is_none() {
-        return None;
-    }
+    table.resolve(&domain_lower)?;
 
     route_table.rcu(|current| {
         let routes: Vec<Route> = current
@@ -134,7 +132,8 @@ mod tests {
         let table = make_table(vec![Route::new("exist.com", addr(1000), false)]);
         let body = br#"{"domain":"exist.com","upstream":"127.0.0.1:2000","tls":true}"#;
         add_route(&table, body).expect("upsert");
-        let route = table.load().resolve("exist.com").expect("should exist");
+        let guard = table.load();
+        let route = guard.resolve("exist.com").expect("should exist");
         assert_eq!(route.upstream.port(), 2000);
         assert!(route.tls);
     }
