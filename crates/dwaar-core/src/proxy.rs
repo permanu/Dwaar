@@ -756,6 +756,7 @@ mod tests {
             "example.com",
             "127.0.0.1:8080".parse().expect("valid"),
             false,
+            None,
         )]);
         let table = proxy.route_table.load();
         assert_eq!(table.len(), 1);
@@ -782,14 +783,14 @@ mod tests {
         let addr1: SocketAddr = "127.0.0.1:3000".parse().expect("valid");
         let addr2: SocketAddr = "127.0.0.1:4000".parse().expect("valid");
 
-        let proxy = make_proxy(vec![Route::new("v1.example.com", addr1, false)]);
+        let proxy = make_proxy(vec![Route::new("v1.example.com", addr1, false, None)]);
 
         // Initial table has v1
         assert!(proxy.route_table.load().resolve("v1.example.com").is_some());
         assert!(proxy.route_table.load().resolve("v2.example.com").is_none());
 
         // Swap in a new table with v2 instead — simulates config reload
-        let new_table = RouteTable::new(vec![Route::new("v2.example.com", addr2, false)]);
+        let new_table = RouteTable::new(vec![Route::new("v2.example.com", addr2, false, None)]);
         proxy.route_table.store(Arc::new(new_table));
 
         // Old route gone, new route available

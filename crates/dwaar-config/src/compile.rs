@@ -58,7 +58,7 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
         };
 
         let tls = site_has_tls(&site.directives);
-        routes.push(Route::new(&site.address, addr, tls));
+        routes.push(Route::new(&site.address, addr, tls, None));
     }
 
     RouteTable::new(routes)

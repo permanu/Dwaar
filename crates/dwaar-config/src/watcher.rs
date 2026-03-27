@@ -303,10 +303,10 @@ mod tests {
 
     #[test]
     fn route_diff_detects_added() {
-        let old = RouteTable::new(vec![Route::new("a.com", addr(1000), false)]);
+        let old = RouteTable::new(vec![Route::new("a.com", addr(1000), false, None)]);
         let new = RouteTable::new(vec![
-            Route::new("a.com", addr(1000), false),
-            Route::new("b.com", addr(2000), false),
+            Route::new("a.com", addr(1000), false, None),
+            Route::new("b.com", addr(2000), false, None),
         ]);
         // Just verify it doesn't panic — log output is tested via tracing-test in integration
         log_route_diff(&old, &new);
@@ -315,10 +315,10 @@ mod tests {
     #[test]
     fn route_diff_detects_removed() {
         let old = RouteTable::new(vec![
-            Route::new("a.com", addr(1000), false),
-            Route::new("b.com", addr(2000), false),
+            Route::new("a.com", addr(1000), false, None),
+            Route::new("b.com", addr(2000), false, None),
         ]);
-        let new = RouteTable::new(vec![Route::new("a.com", addr(1000), false)]);
+        let new = RouteTable::new(vec![Route::new("a.com", addr(1000), false, None)]);
         log_route_diff(&old, &new);
     }
 
@@ -339,6 +339,7 @@ mod tests {
             "a.com",
             addr(8080),
             false,
+            None,
         )])));
 
         let watcher = ConfigWatcher::new(config_path.clone(), Arc::clone(&table), initial_hash);
