@@ -156,10 +156,16 @@ fn run_server(
 
     server.add_service(proxy_service);
 
+    // Shared analytics metrics — created here so both AdminService and
+    // AggregationService reference the same DashMap instance.
+    let agg_metrics: Arc<DashMap<String, dwaar_analytics::aggregation::DomainMetrics>> =
+        Arc::new(DashMap::new());
+
     // Admin API service
     let admin_token = std::env::var("DWAAR_ADMIN_TOKEN").ok();
     let admin_service = AdminService::new(
         route_table_for_admin,
+        Arc::clone(&agg_metrics),
         std::time::Instant::now(),
         admin_token,
     );
@@ -180,6 +186,7 @@ fn run_server(
         beacon_receiver,
         agg_receiver,
         &route_table_for_agg,
+        &agg_metrics,
     );
 
     info!("entering run loop, waiting for connections or signals");
@@ -198,6 +205,7 @@ fn register_background_services(
     beacon_receiver: tokio::sync::mpsc::Receiver<dwaar_analytics::beacon::BeaconEvent>,
     agg_receiver: aggregation::AggReceiver,
     route_table_for_agg: &Arc<ArcSwap<dwaar_core::route::RouteTable>>,
+    agg_metrics: &Arc<DashMap<String, dwaar_analytics::aggregation::DomainMetrics>>,
 ) {
     // ACME + OCSP background service
     if let Some(solver) = challenge_solver {
@@ -248,9 +256,8 @@ fn register_background_services(
     info!(path = %config_path.display(), "config watcher registered");
 
     // Analytics aggregation service
-    let agg_metrics = Arc::new(DashMap::new());
     let agg_service = AggregationService::new(
-        Arc::clone(&agg_metrics),
+        Arc::clone(agg_metrics),
         LiveRouteValidator(Arc::clone(route_table_for_agg)),
         beacon_receiver,
         agg_receiver,
