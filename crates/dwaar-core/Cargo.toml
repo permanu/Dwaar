@@ -27,10 +27,12 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }
 criterion = { workspace = true }
+serde_json = { workspace = true }
 
 [[bench]]
 name = "route_lookup"
