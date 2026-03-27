@@ -23,6 +23,10 @@ use bytes::{Bytes, BytesMut};
 /// Maximum bytes to scan before giving up on finding `</head>`.
 const MAX_SCAN_BYTES: usize = 256 * 1024;
 
+/// Carryover buffer size: longest needle (12 bytes) minus 1.
+/// Covers both `</head>` (7 bytes) and `/_dwaar/a.js` (12 bytes).
+const CARRYOVER_SIZE: usize = 11;
+
 /// The script tag injected before `</head>`.
 const SCRIPT_TAG: &[u8] = b"<script src=\"/_dwaar/a.js\" defer></script>";
 
@@ -48,6 +52,9 @@ enum State {
 pub struct HtmlInjector {
     state: State,
     bytes_scanned: usize,
+    /// Last `CARRYOVER_SIZE` bytes from the previous chunk, held back so we can
+    /// detect `</head>` tags split across chunk boundaries without duplicating data.
+    carryover: BytesMut,
 }
 
 impl Default for HtmlInjector {
@@ -62,6 +69,7 @@ impl HtmlInjector {
         Self {
             state: State::Scanning,
             bytes_scanned: 0,
+            carryover: BytesMut::new(),
         }
     }
 
@@ -81,25 +89,35 @@ impl HtmlInjector {
         }
 
         let Some(ref data) = *body else {
+            // Flush any held carryover on end of stream
             if end_of_stream {
+                if !self.carryover.is_empty() {
+                    *body = Some(self.carryover.split().freeze());
+                }
                 self.state = State::Skipped;
             }
             return;
         };
 
-        // Check for double injection first (cheap, always valid)
-        if find_case_insensitive(data, ALREADY_INJECTED_MARKER).is_some() {
+        // Build search window: held-back carryover bytes + current chunk.
+        // The carryover wasn't sent yet, so the combined buffer owns all the data.
+        let mut search_buf = std::mem::take(&mut self.carryover);
+        search_buf.extend_from_slice(data);
+
+        // Check for double injection
+        if find_case_insensitive(&search_buf, ALREADY_INJECTED_MARKER).is_some() {
+            *body = Some(search_buf.freeze());
             self.state = State::Skipped;
             return;
         }
 
         // Search for </head> before checking budget — if it's in this
-        // chunk, inject regardless of cumulative bytes scanned
-        if let Some(pos) = find_case_insensitive(data, b"</head>") {
-            let mut buf = BytesMut::with_capacity(data.len() + SCRIPT_TAG.len());
-            buf.extend_from_slice(&data[..pos]);
+        // combined buffer, inject regardless of cumulative bytes scanned
+        if let Some(pos) = find_case_insensitive(&search_buf, b"</head>") {
+            let mut buf = BytesMut::with_capacity(search_buf.len() + SCRIPT_TAG.len());
+            buf.extend_from_slice(&search_buf[..pos]);
             buf.extend_from_slice(SCRIPT_TAG);
-            buf.extend_from_slice(&data[pos..]);
+            buf.extend_from_slice(&search_buf[pos..]);
             *body = Some(buf.freeze());
             self.state = State::Done;
             return;
@@ -108,11 +126,37 @@ impl HtmlInjector {
         // Update budget AFTER search — we already checked this chunk
         self.bytes_scanned += data.len();
         if self.bytes_scanned > MAX_SCAN_BYTES {
+            *body = Some(search_buf.freeze());
             self.state = State::Skipped;
             return;
         }
 
+        // Hold back last CARRYOVER_SIZE bytes for boundary detection.
+        // They'll be prepended to the next chunk's search window.
+        let total_len = search_buf.len();
+        if total_len > CARRYOVER_SIZE {
+            let split_at = total_len - CARRYOVER_SIZE;
+            self.carryover = BytesMut::from(&search_buf[split_at..]);
+            *body = Some(search_buf.freeze().slice(..split_at));
+        } else {
+            // Everything fits in carryover — hold it all, emit empty body
+            self.carryover = search_buf;
+            *body = Some(Bytes::new());
+        }
+
         if end_of_stream {
+            // Flush held carryover alongside any already-emitted bytes
+            if !self.carryover.is_empty() {
+                let flush = std::mem::take(&mut self.carryover);
+                if let Some(existing) = body.take() {
+                    let mut combined = BytesMut::with_capacity(existing.len() + flush.len());
+                    combined.extend_from_slice(&existing);
+                    combined.extend_from_slice(&flush);
+                    *body = Some(combined.freeze());
+                } else {
+                    *body = Some(flush.freeze());
+                }
+            }
             self.state = State::Skipped;
         }
     }
@@ -251,6 +295,114 @@ mod tests {
         let original = body2.clone();
         injector.process(&mut body2, true);
         assert_eq!(body2, original);
+    }
+
+    #[test]
+    fn cross_chunk_head_tag_boundary() {
+        // </head> split: chunk1 ends with "</he", chunk2 starts with "ad>"
+        let mut injector = HtmlInjector::new();
+
+        let mut body1 = Some(Bytes::from_static(b"<html><head><title>T</title></he"));
+        injector.process(&mut body1, false);
+
+        let mut body2 = Some(Bytes::from_static(b"ad><body>content</body></html>"));
+        injector.process(&mut body2, false);
+
+        let mut output = Vec::new();
+        if let Some(b) = body1 {
+            output.extend_from_slice(&b);
+        }
+        if let Some(b) = body2 {
+            output.extend_from_slice(&b);
+        }
+        let result = std::str::from_utf8(&output).expect("valid UTF-8");
+        assert!(
+            result.contains("<script src=\"/_dwaar/a.js\" defer></script></head>"),
+            "Expected injection, got: {result}"
+        );
+        assert!(!injector.is_active());
+    }
+
+    #[test]
+    fn cross_chunk_head_tag_split_at_every_position() {
+        let html = b"<html><head></head><body></body></html>";
+        let head_start = html
+            .windows(7)
+            .position(|w| w.eq_ignore_ascii_case(b"</head>"))
+            .expect("test HTML must contain </head>");
+
+        for split in head_start + 1..head_start + 7 {
+            let mut injector = HtmlInjector::new();
+            let mut body1 = Some(Bytes::from(html[..split].to_vec()));
+            injector.process(&mut body1, false);
+
+            let mut body2 = Some(Bytes::from(html[split..].to_vec()));
+            injector.process(&mut body2, true);
+
+            let mut output = Vec::new();
+            if let Some(b) = body1 {
+                output.extend_from_slice(&b);
+            }
+            if let Some(b) = body2 {
+                output.extend_from_slice(&b);
+            }
+            let result = std::str::from_utf8(&output).expect("valid UTF-8");
+            assert!(
+                result.contains("<script src=\"/_dwaar/a.js\" defer></script></head>"),
+                "Failed at split position {split}: {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_chunk_no_head_flushes_everything() {
+        let mut injector = HtmlInjector::new();
+        let mut total_output = 0;
+
+        let mut body1 = Some(Bytes::from_static(b"<html><body>"));
+        injector.process(&mut body1, false);
+        if let Some(ref b) = body1 {
+            total_output += b.len();
+        }
+
+        let mut body2 = Some(Bytes::from_static(b"content here"));
+        injector.process(&mut body2, false);
+        if let Some(ref b) = body2 {
+            total_output += b.len();
+        }
+
+        let mut body3 = Some(Bytes::from_static(b"</body></html>"));
+        injector.process(&mut body3, true);
+        if let Some(ref b) = body3 {
+            total_output += b.len();
+        }
+
+        let total_input = b"<html><body>content here</body></html>".len();
+        assert_eq!(
+            total_output, total_input,
+            "data lost in multi-chunk pass-through"
+        );
+    }
+
+    #[test]
+    fn head_in_second_chunk_no_split() {
+        let mut injector = HtmlInjector::new();
+
+        let mut body1 = Some(Bytes::from_static(b"<html><head><title>Title</title>"));
+        injector.process(&mut body1, false);
+
+        let mut body2 = Some(Bytes::from_static(b"</head><body></body></html>"));
+        injector.process(&mut body2, true);
+
+        let mut output = Vec::new();
+        if let Some(b) = body1 {
+            output.extend_from_slice(&b);
+        }
+        if let Some(b) = body2 {
+            output.extend_from_slice(&b);
+        }
+        let result = std::str::from_utf8(&output).expect("valid UTF-8");
+        assert!(result.contains("<script src=\"/_dwaar/a.js\" defer></script></head>"));
     }
 
     #[test]
