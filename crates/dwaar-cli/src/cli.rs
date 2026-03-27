@@ -43,6 +43,11 @@ pub(crate) struct Cli {
     #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "/var/run/docker.sock")]
     pub docker_socket: Option<PathBuf>,
 
+    /// Enable Admin API on a Unix domain socket for Deploy Agent integration.
+    /// Optionally specify the socket path (default: /var/run/dwaar-admin.sock).
+    #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "/var/run/dwaar-admin.sock")]
+    pub admin_socket: Option<PathBuf>,
+
     /// Subcommand to execute
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -224,5 +229,27 @@ mod tests {
             cli.docker_socket,
             Some(PathBuf::from("/custom/docker.sock"))
         );
+    }
+
+    #[test]
+    fn admin_socket_disabled_by_default() {
+        let cli = Cli::try_parse_from(["dwaar"]).expect("parse");
+        assert!(cli.admin_socket.is_none());
+    }
+
+    #[test]
+    fn admin_socket_default_path() {
+        let cli = Cli::try_parse_from(["dwaar", "--admin-socket"]).expect("parse");
+        assert_eq!(
+            cli.admin_socket,
+            Some(PathBuf::from("/var/run/dwaar-admin.sock"))
+        );
+    }
+
+    #[test]
+    fn admin_socket_custom_path() {
+        let cli =
+            Cli::try_parse_from(["dwaar", "--admin-socket", "/tmp/custom.sock"]).expect("parse");
+        assert_eq!(cli.admin_socket, Some(PathBuf::from("/tmp/custom.sock")));
     }
 }
