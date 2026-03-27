@@ -25,6 +25,7 @@ use dwaar_admin::AdminService;
 use dwaar_config::compile::{
     compile_acme_domains, compile_routes, compile_tls_configs, has_tls_sites,
 };
+use dwaar_config::MAX_CONFIG_SIZE;
 use dwaar_core::proxy::DwaarProxy;
 use dwaar_log::{StdoutWriter, channel as log_channel, run_writer};
 use dwaar_tls::acme::ChallengeSolver;
@@ -32,9 +33,6 @@ use dwaar_tls::acme::issuer::CertIssuer;
 use dwaar_tls::acme::service::TlsBackgroundService;
 use dwaar_tls::cert_store::CertStore;
 use dwaar_tls::sni::{DomainTlsConfig, SniResolver};
-
-/// Maximum config file size (10 MB) to prevent OOM on crafted input.
-const MAX_CONFIG_SIZE: u64 = 10 * 1024 * 1024;
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse_args();
