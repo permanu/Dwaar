@@ -11,3 +11,4 @@
 
 pub mod client;
 pub mod labels;
+pub mod watcher;
