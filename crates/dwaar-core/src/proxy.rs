@@ -34,6 +34,7 @@ use tracing::{debug, warn};
 
 use bytes::Bytes;
 use dwaar_analytics::ANALYTICS_JS;
+use dwaar_analytics::aggregation::AggSender;
 use dwaar_analytics::beacon::{self, BeaconEvent, BeaconSender};
 use dwaar_analytics::decompress::{Decompressor, Encoding};
 use dwaar_analytics::injector::HtmlInjector;
@@ -75,6 +76,8 @@ pub struct DwaarProxy {
     log_sender: Option<LogSender>,
     /// Non-blocking sender for beacon events. `None` disables beacon collection.
     beacon_sender: Option<BeaconSender>,
+    /// Non-blocking sender for request log aggregation. `None` disables.
+    agg_sender: Option<AggSender>,
 }
 
 impl DwaarProxy {
@@ -87,12 +90,14 @@ impl DwaarProxy {
         challenge_solver: Option<Arc<ChallengeSolver>>,
         log_sender: Option<LogSender>,
         beacon_sender: Option<BeaconSender>,
+        agg_sender: Option<AggSender>,
     ) -> Self {
         Self {
             route_table,
             challenge_solver,
             log_sender,
             beacon_sender,
+            agg_sender,
         }
     }
 }
@@ -695,7 +700,14 @@ impl ProxyHttp for DwaarProxy {
             compression: None,
         };
 
-        sender.send(log);
+        // Fan-out: send to log writer and aggregation independently.
+        // Clone only when aggregation is enabled to avoid the cost otherwise.
+        if let Some(ref agg) = self.agg_sender {
+            sender.send(log.clone());
+            agg.send(log);
+        } else {
+            sender.send(log);
+        }
     }
 }
 
@@ -708,7 +720,7 @@ mod tests {
 
     fn make_proxy(routes: Vec<Route>) -> DwaarProxy {
         let table = RouteTable::new(routes);
-        DwaarProxy::new(Arc::new(ArcSwap::from_pointee(table)), None, None, None)
+        DwaarProxy::new(Arc::new(ArcSwap::from_pointee(table)), None, None, None, None)
     }
 
     #[test]

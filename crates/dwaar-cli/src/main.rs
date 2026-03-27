@@ -128,6 +128,7 @@ fn run_server(
         challenge_solver.clone(),
         Some(log_sender),
         None,
+        None, // agg_sender — wired in Task 9
     );
 
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, proxy);
