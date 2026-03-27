@@ -21,17 +21,17 @@ use pingora_core::server::configuration::{Opt as PingoraOpt, ServerConf};
 use tracing::info;
 
 use cli::{Cli, Commands};
+use dashmap::DashMap;
 use dwaar_admin::AdminService;
+use dwaar_analytics::aggregation;
+use dwaar_analytics::aggregation::service::{AggregationService, RouteValidator};
+use dwaar_analytics::beacon;
 use dwaar_config::MAX_CONFIG_SIZE;
 use dwaar_config::compile::{
     compile_acme_domains, compile_routes, compile_tls_configs, has_tls_sites,
 };
 use dwaar_config::watcher::{ConfigWatcher, hash_content};
 use dwaar_core::proxy::DwaarProxy;
-use dashmap::DashMap;
-use dwaar_analytics::aggregation::service::{AggregationService, RouteValidator};
-use dwaar_analytics::aggregation;
-use dwaar_analytics::beacon;
 use dwaar_log::{StdoutWriter, channel as log_channel, run_writer};
 use dwaar_tls::acme::ChallengeSolver;
 use dwaar_tls::acme::issuer::CertIssuer;

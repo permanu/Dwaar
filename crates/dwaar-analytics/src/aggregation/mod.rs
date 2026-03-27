@@ -123,7 +123,11 @@ fn extract_domain(url: &str) -> Option<String> {
         .unwrap_or(url);
     let domain = without_scheme.split('/').next()?;
     let domain = domain.split(':').next()?; // strip port
-    if domain.is_empty() { None } else { Some(domain.to_lowercase()) }
+    if domain.is_empty() {
+        None
+    } else {
+        Some(domain.to_lowercase())
+    }
 }
 
 /// Extract path from a full URL (e.g., `https://example.com/about?q=1` → `/about`).
@@ -236,15 +240,27 @@ mod tests {
         }
         let estimate = hll.len() as u64;
         let error = (estimate as f64 - 100_000.0).abs() / 100_000.0;
-        assert!(error < 0.05, "HLL error {error:.4} exceeds 5% (estimate={estimate})");
+        assert!(
+            error < 0.05,
+            "HLL error {error:.4} exceeds 5% (estimate={estimate})"
+        );
     }
 
     #[test]
     fn extract_domain_from_urls() {
-        assert_eq!(extract_domain("https://google.com/search"), Some("google.com".into()));
-        assert_eq!(extract_domain("http://example.com:8080/path"), Some("example.com".into()));
+        assert_eq!(
+            extract_domain("https://google.com/search"),
+            Some("google.com".into())
+        );
+        assert_eq!(
+            extract_domain("http://example.com:8080/path"),
+            Some("example.com".into())
+        );
         assert_eq!(extract_domain("https://"), None);
-        assert_eq!(extract_domain("bare-domain.com/path"), Some("bare-domain.com".into()));
+        assert_eq!(
+            extract_domain("bare-domain.com/path"),
+            Some("bare-domain.com".into())
+        );
     }
 
     #[test]

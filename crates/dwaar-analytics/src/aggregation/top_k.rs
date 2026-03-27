@@ -136,7 +136,10 @@ mod tests {
         let top = tk.top();
         assert!(top.iter().any(|(k, _)| k == "c"));
         assert_eq!(
-            top.iter().find(|(k, _)| k == "c").expect("c should be present").1,
+            top.iter()
+                .find(|(k, _)| k == "c")
+                .expect("c should be present")
+                .1,
             5
         );
     }
@@ -144,9 +147,15 @@ mod tests {
     #[test]
     fn top_returns_sorted_descending() {
         let mut tk = TopK::new(10);
-        for _ in 0..5 { tk.insert("x".to_string()); }
-        for _ in 0..3 { tk.insert("y".to_string()); }
-        for _ in 0..8 { tk.insert("z".to_string()); }
+        for _ in 0..5 {
+            tk.insert("x".to_string());
+        }
+        for _ in 0..3 {
+            tk.insert("y".to_string());
+        }
+        for _ in 0..8 {
+            tk.insert("z".to_string());
+        }
         let top = tk.top();
         assert_eq!(top[0].0, "z");
         assert_eq!(top[1].0, "x");

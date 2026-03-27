@@ -83,9 +83,10 @@ impl<T: std::hash::Hash + Eq + Clone + Ord> BoundedCounter<T> {
     }
 
     fn find_min(&mut self) -> (T, u64) {
-        let valid = self.cached_min.as_ref().is_some_and(|(key, count)| {
-            self.counts.get(key).copied() == Some(*count)
-        });
+        let valid = self
+            .cached_min
+            .as_ref()
+            .is_some_and(|(key, count)| self.counts.get(key).copied() == Some(*count));
         if valid {
             return self.cached_min.clone().expect("just checked");
         }
@@ -128,8 +129,12 @@ mod tests {
     #[test]
     fn new_item_inherits_evicted_count_plus_one() {
         let mut bc = BoundedCounter::new(2);
-        for _ in 0..5 { bc.insert("a".to_string()); }
-        for _ in 0..3 { bc.insert("b".to_string()); }
+        for _ in 0..5 {
+            bc.insert("a".to_string());
+        }
+        for _ in 0..3 {
+            bc.insert("b".to_string());
+        }
         assert_eq!(bc.len(), 2);
         bc.insert("c".to_string());
         assert_eq!(bc.len(), 2);
@@ -151,9 +156,15 @@ mod tests {
     #[test]
     fn top_returns_sorted() {
         let mut bc = BoundedCounter::new(10);
-        for _ in 0..5 { bc.insert("x".to_string()); }
-        for _ in 0..2 { bc.insert("y".to_string()); }
-        for _ in 0..8 { bc.insert("z".to_string()); }
+        for _ in 0..5 {
+            bc.insert("x".to_string());
+        }
+        for _ in 0..2 {
+            bc.insert("y".to_string());
+        }
+        for _ in 0..8 {
+            bc.insert("z".to_string());
+        }
         let top = bc.top();
         assert_eq!(top[0], ("z".to_string(), 8));
         assert_eq!(top[1], ("x".to_string(), 5));

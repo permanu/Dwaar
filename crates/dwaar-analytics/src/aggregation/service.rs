@@ -389,8 +389,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_processes_logs_and_shuts_down() {
-        let (_svc, _beacon_tx, log_tx, shutdown_tx, metrics) =
-            make_service(&["app.io"]);
+        let (_svc, _beacon_tx, log_tx, shutdown_tx, metrics) = make_service(&["app.io"]);
 
         for _ in 0..10 {
             log_tx
@@ -413,8 +412,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_ingest_no_corruption() {
-        let (_svc, _beacon_tx, log_tx, shutdown_tx, metrics) =
-            make_service(&["stress.io"]);
+        let (_svc, _beacon_tx, log_tx, shutdown_tx, metrics) = make_service(&["stress.io"]);
 
         // Blast 1000 logs from 4 concurrent tasks
         let mut senders = Vec::new();
@@ -440,8 +438,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_host_does_not_grow_dashmap() {
-        let (_svc, _beacon_tx, log_tx, shutdown_tx, metrics) =
-            make_service(&["legit.com"]);
+        let (_svc, _beacon_tx, log_tx, shutdown_tx, metrics) = make_service(&["legit.com"]);
 
         // Send 100 logs with random unknown hosts
         for i in 0..100 {
