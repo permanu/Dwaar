@@ -11,7 +11,7 @@
 //! uses a Count-Min Sketch internally — one instance handles thousands
 //! of unique keys with bounded memory.
 
-use pingora_limits::rate::{Rate, PROPORTIONAL_RATE_ESTIMATE_CALC_FN};
+use pingora_limits::rate::{PROPORTIONAL_RATE_ESTIMATE_CALC_FN, Rate};
 use std::time::Duration;
 
 /// Rate limiter backed by a sliding-window estimator.
