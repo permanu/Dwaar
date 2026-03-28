@@ -144,12 +144,29 @@ fn run_server(
     let route_table_for_watcher = Arc::clone(&route_table);
     let route_table_for_docker = Arc::clone(&route_table);
     let route_table_for_agg = Arc::clone(&route_table);
-    let bot_detector = Arc::new(dwaar_plugins::bot_detect::BotDetector::new());
-    let rate_limiter = Arc::new(dwaar_plugins::rate_limit::RateLimiter::new());
 
     // GeoIP — load the MaxMind database if present. Not a hard requirement;
     // country enrichment simply won't happen without it.
     let geo_lookup = load_geoip_database();
+
+    // Build the plugin chain with all built-in plugins, sorted by priority.
+    // Under Attack Mode uses a random secret — in production this should
+    // come from config or environment for persistence across restarts.
+    let under_attack_secret: Vec<u8> = {
+        use rand::Rng;
+        let mut buf = vec![0u8; 32];
+        rand::rng().fill_bytes(&mut buf);
+        buf
+    };
+    let plugin_chain = Arc::new(dwaar_plugins::plugin::PluginChain::new(vec![
+        Box::new(dwaar_plugins::bot_detect::BotDetectPlugin::new()),
+        Box::new(dwaar_plugins::under_attack::UnderAttackPlugin::new(
+            under_attack_secret,
+        )),
+        Box::new(dwaar_plugins::rate_limit::RateLimitPlugin::new()),
+        Box::new(dwaar_plugins::compress::CompressionPlugin::new()),
+        Box::new(dwaar_plugins::security_headers::SecurityHeadersPlugin::new()),
+    ]));
 
     let proxy = DwaarProxy::new(
         route_table,
@@ -157,9 +174,8 @@ fn run_server(
         Some(log_sender),
         Some(beacon_sender),
         Some(agg_sender),
-        bot_detector,
-        rate_limiter,
         geo_lookup,
+        plugin_chain,
     );
 
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, proxy);

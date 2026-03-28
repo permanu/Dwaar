@@ -10,7 +10,10 @@
 //! tested in a single pass — O(n) in input length regardless of pattern count.
 //! This matters because `classify()` runs on every proxied request.
 
+use pingora_http::RequestHeader;
 use regex::RegexSet;
+
+use crate::plugin::{DwaarPlugin, PluginAction, PluginCtx};
 
 /// Broad category of the detected bot. Kept coarse intentionally — callers
 /// decide what to do (block, rate-limit, tag, log) based on category.
@@ -158,6 +161,50 @@ impl std::fmt::Debug for BotDetector {
         f.debug_struct("BotDetector")
             .field("pattern_count", &self.categories.len())
             .finish_non_exhaustive()
+    }
+}
+
+/// Plugin wrapper that runs bot detection on every request.
+///
+/// Priority 10 — runs first so other plugins (rate limiter) can use
+/// the `is_bot` flag for differentiated behavior.
+#[derive(Debug)]
+pub struct BotDetectPlugin {
+    detector: BotDetector,
+}
+
+impl BotDetectPlugin {
+    pub fn new() -> Self {
+        Self {
+            detector: BotDetector::new(),
+        }
+    }
+}
+
+impl Default for BotDetectPlugin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DwaarPlugin for BotDetectPlugin {
+    fn name(&self) -> &'static str {
+        "bot-detect"
+    }
+
+    fn priority(&self) -> u16 {
+        10
+    }
+
+    fn on_request(&self, req: &RequestHeader, ctx: &mut PluginCtx) -> PluginAction {
+        if let Some(ua) = req.headers.get(http::header::USER_AGENT)
+            && let Ok(ua_str) = ua.to_str()
+            && let Some(category) = self.detector.classify(ua_str)
+        {
+            ctx.is_bot = true;
+            ctx.bot_category = Some(category);
+        }
+        PluginAction::Continue
     }
 }
 

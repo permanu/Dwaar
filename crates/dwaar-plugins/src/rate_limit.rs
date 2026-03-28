@@ -11,8 +11,12 @@
 //! uses a Count-Min Sketch internally — one instance handles thousands
 //! of unique keys with bounded memory.
 
-use pingora_limits::rate::{PROPORTIONAL_RATE_ESTIMATE_CALC_FN, Rate};
 use std::time::Duration;
+
+use bytes::Bytes;
+use pingora_limits::rate::{PROPORTIONAL_RATE_ESTIMATE_CALC_FN, Rate};
+
+use crate::plugin::{DwaarPlugin, PluginAction, PluginCtx, PluginResponse};
 
 /// Rate limiter backed by a sliding-window estimator.
 ///
@@ -61,6 +65,67 @@ impl std::fmt::Debug for RateLimiter {
         f.debug_struct("RateLimiter")
             .field("interval", &"1s")
             .finish_non_exhaustive()
+    }
+}
+
+/// Plugin wrapper that enforces per-IP, per-route rate limits.
+///
+/// Priority 20 — runs after bot detection so the bot flag is available.
+/// Reads `rate_limit_rps` and `route_domain` from `PluginCtx` (populated
+/// by the proxy engine before the chain runs).
+#[derive(Debug)]
+pub struct RateLimitPlugin {
+    limiter: RateLimiter,
+}
+
+impl RateLimitPlugin {
+    pub fn new() -> Self {
+        Self {
+            limiter: RateLimiter::new(),
+        }
+    }
+}
+
+impl Default for RateLimitPlugin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DwaarPlugin for RateLimitPlugin {
+    fn name(&self) -> &'static str {
+        "rate-limit"
+    }
+
+    fn priority(&self) -> u16 {
+        20
+    }
+
+    fn on_request(&self, _req: &pingora_http::RequestHeader, ctx: &mut PluginCtx) -> PluginAction {
+        let Some(limit) = ctx.rate_limit_rps else {
+            return PluginAction::Continue;
+        };
+        let Some(ip) = ctx.client_ip else {
+            return PluginAction::Continue;
+        };
+        let Some(ref domain) = ctx.route_domain else {
+            return PluginAction::Continue;
+        };
+
+        // Composite key: "{ip}:{domain}" for per-route isolation
+        let key = format!("{ip}:{domain}");
+        if self.limiter.check(&key, limit) {
+            return PluginAction::Continue;
+        }
+
+        PluginAction::Respond(PluginResponse {
+            status: 429,
+            headers: vec![
+                ("Retry-After", "1".to_string()),
+                ("Content-Length", "0".to_string()),
+            ],
+            body: Bytes::new(),
+        })
     }
 }
 

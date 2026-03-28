@@ -86,6 +86,10 @@ pub struct Route {
 
     /// Per-IP requests-per-second limit for this route. `None` means no limit.
     pub rate_limit_rps: Option<u32>,
+
+    /// Whether Under Attack Mode is active for this route. When true, the
+    /// `UnderAttackPlugin` serves a JS challenge to unverified clients.
+    pub under_attack: bool,
 }
 
 impl Route {
@@ -96,6 +100,7 @@ impl Route {
             upstream,
             tls,
             rate_limit_rps,
+            under_attack: false,
         }
     }
 }

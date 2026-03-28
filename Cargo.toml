@@ -85,8 +85,11 @@ maxminddb = { version = "0.27.3", features = ["mmap"] }
 hyperloglog = "1.0.3"
 tdigest = "0.2.3"
 
-# Crypto (visitor cookies)
+# Crypto (visitor cookies, HMAC challenge signing)
 aes-gcm = "0.10.3"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
 rand = "0.10.0"
 base64 = "0.22.1"
 

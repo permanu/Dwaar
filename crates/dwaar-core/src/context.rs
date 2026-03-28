@@ -22,17 +22,22 @@
 //! ```text
 //! new_ctx()           → start_time + request_id set (Instant::now, UUID v7)
 //! request_filter()    → client_ip, host, method, path extracted from Session
+//!                       plugin chain runs (bot detect, rate limit, under attack)
 //! upstream_peer()     → reads host for routing (ISSUE-010)
-//! response_filter()   → reads request_id, writes X-Request-Id header
+//! response_filter()   → plugin chain runs (security headers, compression setup)
+//!                       analytics injection setup
+//! response_body_filter() → plugin chain runs (compression)
+//!                          decompression + analytics injection (core)
 //! logging()           → reads start_time to compute duration (ISSUE-019)
 //! [drop]              → context freed, request complete
 //! ```
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::time::Instant;
 
 use dwaar_analytics::decompress::Decompressor;
 use dwaar_analytics::injector::HtmlInjector;
+use dwaar_plugins::plugin::PluginCtx;
 use uuid::Uuid;
 
 /// Per-request state shared across all Pingora lifecycle hooks.
@@ -40,110 +45,45 @@ use uuid::Uuid;
 /// Created once per request by [`DwaarProxy::new_ctx()`], dropped when the
 /// request completes.
 ///
-/// # Populated in two phases
+/// # Layout
 ///
-/// **Phase 1 — `new_ctx()`:** Sets `start_time` and `request_id`. These are
-/// independent of the HTTP request itself (we generate them before headers
-/// are parsed).
-///
-/// **Phase 2 — `request_filter()`:** Reads the HTTP headers and connection
-/// info to fill `client_ip`, `host`, `method`, and `path`.
-///
-/// # Thread safety
-///
-/// All fields are owned types (`String`, `Instant`, `Option<IpAddr>`), so
-/// `RequestContext` is automatically `Send + Sync`. Pingora requires this
-/// because async tasks may move across threads between lifecycle hooks.
+/// Plugin-related state lives in [`PluginCtx`] (identity, bot classification,
+/// compressor). Core proxy state (timing, analytics, routing) lives here directly.
 #[derive(Debug)]
 pub struct RequestContext {
-    /// When this request started processing. Used to compute request duration
-    /// in the `logging()` hook. Uses `Instant` (monotonic clock) — not
-    /// `SystemTime` — because we need elapsed time, not wall-clock time.
-    /// NTP adjustments can make `SystemTime` go backwards; `Instant` never does.
+    /// When this request started processing. Uses `Instant` (monotonic clock)
+    /// because we need elapsed time, not wall-clock time.
     pub start_time: Instant,
 
-    /// Unique identifier for this request. UUID v7 format: the first 48 bits
-    /// are a millisecond timestamp, so IDs are **time-sortable**. Sorting
-    /// request IDs alphabetically gives chronological order — useful for log
-    /// analysis without needing a separate timestamp column.
-    pub request_id: String,
-
-    /// The client's IP address, extracted from the TCP socket's peer address.
-    /// `None` if the connection has no IP (e.g., Unix domain socket).
-    ///
-    /// This is the **direct connection IP** — if Dwaar is behind a load
-    /// balancer, this will be the LB's IP. ISSUE-007 adds `X-Forwarded-For`
-    /// support for the real client IP.
-    pub client_ip: Option<IpAddr>,
-
-    /// The `Host` header value from the HTTP request. Used for routing
-    /// (ISSUE-010: match host → upstream) and TLS SNI (ISSUE-015).
-    /// `None` if the client didn't send a Host header (technically invalid
-    /// for HTTP/1.1, but we handle it gracefully).
-    pub host: Option<String>,
-
-    /// HTTP method: GET, POST, PUT, DELETE, etc. Stored as a string because
-    /// we only need it for logging and analytics, not for branching logic.
-    pub method: String,
-
-    /// Request path including query string (e.g., `/api/users?page=2`).
-    /// Used for logging, analytics, and URL-based routing.
-    pub path: String,
+    /// Plugin context — carries per-request state that plugins read and write.
+    /// Also holds the `request_id` (UUID v7, time-sortable).
+    pub plugin_ctx: PluginCtx,
 
     /// The upstream address selected by route resolution in `upstream_peer()`.
-    /// `None` until routing completes. Later phases (logging, analytics) use
-    /// this to know which backend handled the request.
     pub route_upstream: Option<SocketAddr>,
 
-    /// HTML script injector for analytics. Created in `response_filter()` when
-    /// the response is 2xx text/html. `response_body_filter()` passes body
-    /// chunks through this. `None` for non-HTML or non-2xx responses.
+    /// HTML script injector for analytics (core, not a plugin).
     pub injector: Option<HtmlInjector>,
 
-    /// Streaming decompressor for compressed HTML responses. Created in
-    /// `response_filter()` when Content-Encoding is detected on HTML responses.
-    /// `response_body_filter()` decompresses each chunk before passing to the injector.
+    /// Streaming decompressor for compressed HTML responses (core, not a plugin).
     pub decompressor: Option<Decompressor>,
-
-    /// Whether this request was classified as a bot by the `BotDetector`.
-    /// Set in `request_filter()`, read in `logging()`.
-    pub is_bot: bool,
-
-    /// Bot classification category, if detected. `None` for human traffic.
-    pub bot_category: Option<dwaar_plugins::bot_detect::BotCategory>,
-
-    /// Two-letter ISO country code from `GeoIP` lookup (e.g., "US", "IN").
-    /// `None` if no `GeoIP` database is loaded or the IP is private/unknown.
-    pub country: Option<String>,
-
-    /// Streaming response compressor. Created in `response_filter()` when the
-    /// client supports compression and the response is compressible text.
-    /// `response_body_filter()` runs body chunks through this after analytics injection.
-    pub compressor: Option<dwaar_plugins::compress::ResponseCompressor>,
 }
 
 impl RequestContext {
     /// Create a new context with timing and identity set.
-    ///
-    /// Called by `DwaarProxy::new_ctx()` for every incoming request.
-    /// The remaining fields (`client_ip`, `host`, `method`, `path`) are
-    /// populated later in `request_filter()` once the HTTP headers are available.
     pub fn new() -> Self {
         Self {
             start_time: Instant::now(),
-            request_id: Uuid::now_v7().to_string(),
-            client_ip: None,
-            host: None,
-            method: String::new(),
-            path: String::new(),
+            plugin_ctx: PluginCtx::new(Uuid::now_v7().to_string()),
             route_upstream: None,
             injector: None,
             decompressor: None,
-            is_bot: false,
-            bot_category: None,
-            country: None,
-            compressor: None,
         }
+    }
+
+    /// Convenience accessor for the request ID (lives in `plugin_ctx`).
+    pub fn request_id(&self) -> &str {
+        &self.plugin_ctx.request_id
     }
 }
 
@@ -169,16 +109,13 @@ mod tests {
         let ctx = RequestContext::new();
         let after = Instant::now();
 
-        // start_time should be between before and after
         assert!(ctx.start_time >= before);
         assert!(ctx.start_time <= after);
 
-        // request_id should be a valid UUID v7 (36 chars: 8-4-4-4-12)
-        assert_eq!(ctx.request_id.len(), 36);
-
-        // UUID v7 starts with a timestamp — first char is a hex digit
+        // UUID v7: 36 chars (8-4-4-4-12)
+        assert_eq!(ctx.request_id().len(), 36);
         assert!(
-            ctx.request_id
+            ctx.request_id()
                 .chars()
                 .next()
                 .unwrap_or(' ')
@@ -190,33 +127,30 @@ mod tests {
     fn request_ids_are_unique() {
         let ctx1 = RequestContext::new();
         let ctx2 = RequestContext::new();
-        assert_ne!(ctx1.request_id, ctx2.request_id);
+        assert_ne!(ctx1.request_id(), ctx2.request_id());
     }
 
     #[test]
     fn request_ids_are_time_sortable() {
-        // UUID v7 encodes millisecond timestamp in the first 48 bits.
-        // Two IDs created in sequence should sort chronologically.
         let ctx1 = RequestContext::new();
-        // Small sleep to ensure different millisecond
         std::thread::sleep(std::time::Duration::from_millis(2));
         let ctx2 = RequestContext::new();
-        assert!(ctx2.request_id > ctx1.request_id);
+        assert!(ctx2.request_id() > ctx1.request_id());
     }
 
     #[test]
     fn metadata_fields_start_empty() {
         let ctx = RequestContext::new();
-        assert!(ctx.client_ip.is_none());
-        assert!(ctx.host.is_none());
-        assert!(ctx.method.is_empty());
-        assert!(ctx.path.is_empty());
+        assert!(ctx.plugin_ctx.client_ip.is_none());
+        assert!(ctx.plugin_ctx.host.is_none());
+        assert!(ctx.plugin_ctx.method.is_empty());
+        assert!(ctx.plugin_ctx.path.is_empty());
         assert!(ctx.route_upstream.is_none());
         assert!(ctx.injector.is_none());
         assert!(ctx.decompressor.is_none());
-        assert!(!ctx.is_bot);
-        assert!(ctx.bot_category.is_none());
-        assert!(ctx.country.is_none());
-        assert!(ctx.compressor.is_none());
+        assert!(!ctx.plugin_ctx.is_bot);
+        assert!(ctx.plugin_ctx.bot_category.is_none());
+        assert!(ctx.plugin_ctx.country.is_none());
+        assert!(ctx.plugin_ctx.compressor.is_none());
     }
 }

@@ -12,16 +12,21 @@ authors.workspace = true
 [dependencies]
 pingora-http = { workspace = true }
 pingora-limits = { workspace = true }
+http = { workspace = true }
 bytes = { workspace = true }
 regex = { workspace = true }
 flate2 = { workspace = true }
 brotli = { workspace = true }
 zstd = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+proptest = { workspace = true }
 
 [lints]
 workspace = true
