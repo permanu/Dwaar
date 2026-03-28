@@ -23,7 +23,10 @@
 use std::io::Write;
 
 use bytes::Bytes;
+use pingora_http::ResponseHeader;
 use tracing::debug;
+
+use crate::plugin::{DwaarPlugin, PluginAction, PluginCtx};
 
 /// Minimum response body size worth compressing. Below this threshold,
 /// compression overhead (headers, framing) can actually increase size.
@@ -347,6 +350,96 @@ impl ResponseCompressor {
                 }
             }
         }
+    }
+}
+
+/// Plugin wrapper that negotiates and applies response compression.
+///
+/// Priority 90 — runs late in the response phase (after analytics injection
+/// setup by the core proxy), and runs in body phase to compress chunks.
+///
+/// In `on_response`: checks Accept-Encoding (from `PluginCtx`), Content-Type,
+/// Content-Encoding, Content-Length from the response, creates a compressor
+/// if appropriate, and sets the Content-Encoding header.
+///
+/// In `on_body`: compresses each chunk using the compressor set in `on_response`.
+#[derive(Debug)]
+pub struct CompressionPlugin;
+
+impl CompressionPlugin {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for CompressionPlugin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DwaarPlugin for CompressionPlugin {
+    fn name(&self) -> &'static str {
+        "compression"
+    }
+
+    fn priority(&self) -> u16 {
+        90
+    }
+
+    fn on_response(&self, resp: &mut ResponseHeader, ctx: &mut PluginCtx) -> PluginAction {
+        if ctx.accept_encoding.is_empty() {
+            return PluginAction::Continue;
+        }
+
+        let content_type = resp
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok());
+
+        let content_encoding = resp
+            .headers
+            .get(http::header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok());
+
+        let content_length = resp
+            .headers
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+
+        if !should_compress(content_type, content_encoding, content_length) {
+            return PluginAction::Continue;
+        }
+
+        let Some(enc) = negotiate_encoding(&ctx.accept_encoding) else {
+            return PluginAction::Continue;
+        };
+
+        ctx.compressor = Some(ResponseCompressor::new(enc));
+        resp.insert_header("Content-Encoding", enc.header_value())
+            .expect("static header value");
+        resp.remove_header("Content-Length");
+
+        debug!(
+            request_id = %ctx.request_id,
+            encoding = enc.header_value(),
+            "compression plugin: encoding negotiated"
+        );
+
+        PluginAction::Continue
+    }
+
+    fn on_body(
+        &self,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        ctx: &mut PluginCtx,
+    ) -> PluginAction {
+        if let Some(ref mut compressor) = ctx.compressor {
+            compressor.compress(body, end_of_stream);
+        }
+        PluginAction::Continue
     }
 }
 
