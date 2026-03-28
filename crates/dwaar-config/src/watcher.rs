@@ -68,6 +68,13 @@ impl ConfigWatcher {
         }
     }
 
+    /// Set a `Notify` that triggers an immediate config reload (for `POST /reload`).
+    #[must_use]
+    pub fn with_reload_notify(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
+        self.config_notify = Some(notify);
+        self
+    }
+
     /// Enable Docker mode: compiled routes go into the shared snapshot
     /// instead of the route table, and a `Notify` wakes `DockerWatcher`
     /// to re-merge Dwaarfile + Docker routes.
@@ -211,6 +218,16 @@ impl BackgroundService for ConfigWatcher {
 
                     // Phase 2: drain events that arrived during processing
                     while rx.try_recv().is_ok() {}
+                }
+                // Admin API reload trigger (POST /reload)
+                () = async {
+                    match &self.config_notify {
+                        Some(n) => n.notified().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    info!("config reload triggered via admin API");
+                    self.try_reload(&shutdown);
                 }
                 () = shutdown_signal(&shutdown) => {
                     info!("config watcher shutting down");
