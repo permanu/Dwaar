@@ -253,13 +253,16 @@ impl DwaarPlugin for UnderAttackPlugin {
             return PluginAction::Continue;
         }
 
-        let Some(ip) = ctx.client_ip else { return PluginAction::Continue };
+        let Some(ip) = ctx.client_ip else {
+            return PluginAction::Continue;
+        };
 
         // Check for existing valid clearance cookie
         if let Some(cookie_header) = req.headers.get(http::header::COOKIE)
             && let Ok(cookies) = cookie_header.to_str()
             && let Some(value) = extract_cookie(cookies, CLEARANCE_COOKIE)
-            && self.verify_cookie(value, ip) {
+            && self.verify_cookie(value, ip)
+        {
             return PluginAction::Continue;
         }
 
@@ -356,7 +359,8 @@ fn extract_cookie<'a>(cookies: &'a str, name: &str) -> Option<&'a str> {
     for pair in cookies.split(';') {
         let pair = pair.trim();
         if let Some(value) = pair.strip_prefix(name)
-            && let Some(value) = value.strip_prefix('=') {
+            && let Some(value) = value.strip_prefix('=')
+        {
             return Some(value);
         }
     }
@@ -374,7 +378,8 @@ fn has_param(query: &str, name: &str) -> bool {
 fn get_param(query: &str, name: &str) -> Option<String> {
     for pair in query.split('&') {
         if let Some((key, value)) = pair.split_once('=')
-            && key == name {
+            && key == name
+        {
             // Basic URL-decode (percent-encoded)
             return Some(url_decode(value));
         }

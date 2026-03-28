@@ -49,14 +49,23 @@ use uuid::Uuid;
 ///
 /// Plugin-related state lives in [`PluginCtx`] (identity, bot classification,
 /// compressor). Core proxy state (timing, analytics, routing) lives here directly.
+///
+/// # Allocation budget
+///
+/// This struct is allocated per-request. Every heap allocation here runs on the
+/// hot path. Fields use stack-friendly types where possible:
+/// - `request_id`: inline `[u8; 36]` instead of `String` (avoids 1 heap alloc)
+/// - `plugin_ctx` fields are populated from request headers (unavoidable allocs)
 #[derive(Debug)]
 pub struct RequestContext {
     /// When this request started processing. Uses `Instant` (monotonic clock)
     /// because we need elapsed time, not wall-clock time.
     pub start_time: Instant,
 
+    /// UUID v7 request ID stored inline (36 ASCII bytes, no heap allocation).
+    request_id_buf: [u8; 36],
+
     /// Plugin context — carries per-request state that plugins read and write.
-    /// Also holds the `request_id` (UUID v7, time-sortable).
     pub plugin_ctx: PluginCtx,
 
     /// The upstream address selected by route resolution in `upstream_peer()`.
@@ -72,18 +81,25 @@ pub struct RequestContext {
 impl RequestContext {
     /// Create a new context with timing and identity set.
     pub fn new() -> Self {
+        // Generate UUID v7 directly into a stack buffer — zero heap allocation.
+        let uuid = Uuid::now_v7();
+        let mut buf = [0u8; 36];
+        uuid.as_hyphenated().encode_lower(&mut buf);
+
         Self {
             start_time: Instant::now(),
-            plugin_ctx: PluginCtx::new(Uuid::now_v7().to_string()),
+            request_id_buf: buf,
+            plugin_ctx: PluginCtx::default(),
             route_upstream: None,
             injector: None,
             decompressor: None,
         }
     }
 
-    /// Convenience accessor for the request ID (lives in `plugin_ctx`).
+    /// The request ID as a `&str` (zero-copy from inline buffer).
     pub fn request_id(&self) -> &str {
-        &self.plugin_ctx.request_id
+        // SAFETY: UUID hyphenated encoding is always valid ASCII/UTF-8
+        std::str::from_utf8(&self.request_id_buf).expect("UUID is valid UTF-8")
     }
 }
 

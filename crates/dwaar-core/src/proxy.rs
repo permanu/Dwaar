@@ -556,22 +556,23 @@ impl ProxyHttp for DwaarProxy {
         let response_time_us = ctx.start_time.elapsed().as_micros() as u64;
         let status = session.response_written().map_or(0, |r| r.status.as_u16());
 
-        let (path, query) = if let Some(qmark) = ctx.plugin_ctx.path.find('?') {
-            (
-                ctx.plugin_ctx.path[..qmark].to_string(),
-                Some(ctx.plugin_ctx.path[qmark + 1..].to_string()),
-            )
+        // Split path and query without allocating when there's no query string.
+        // std::mem::take moves the String out of ctx, avoiding clone.
+        let full_path = std::mem::take(&mut ctx.plugin_ctx.path);
+        let (path, query) = if let Some(qmark) = full_path.find('?') {
+            let (p, q) = full_path.split_at(qmark);
+            (p.to_string(), Some(q[1..].to_string()))
         } else {
-            (ctx.plugin_ctx.path.clone(), None)
+            (full_path, None)
         };
 
         let log = RequestLog {
             timestamp: Utc::now(),
             request_id: ctx.request_id().to_string(),
-            method: ctx.plugin_ctx.method.clone(),
+            method: std::mem::take(&mut ctx.plugin_ctx.method),
             path,
             query,
-            host: ctx.plugin_ctx.host.clone().unwrap_or_default(),
+            host: ctx.plugin_ctx.host.take().unwrap_or_default(),
             status,
             response_time_us,
             client_ip: ctx
@@ -599,7 +600,7 @@ impl ProxyHttp for DwaarProxy {
                 .map(|ssl| ssl.version.to_string()),
             http_version: format!("{:?}", session.req_header().version),
             is_bot: ctx.plugin_ctx.is_bot,
-            country: ctx.plugin_ctx.country.clone(),
+            country: ctx.plugin_ctx.country.take(),
             upstream_addr: ctx
                 .route_upstream
                 .map_or_else(String::new, |a| a.to_string()),
@@ -609,11 +610,12 @@ impl ProxyHttp for DwaarProxy {
         };
 
         if let Some(ref agg) = self.agg_sender {
-            sender.send(log.clone());
-            agg.send(log);
-        } else {
-            sender.send(log);
+            // Clone once for the aggregation channel — unavoidable since both
+            // channels take ownership. But we moved Strings out of ctx above
+            // to avoid double-cloning.
+            agg.send(log.clone());
         }
+        sender.send(log);
     }
 }
 

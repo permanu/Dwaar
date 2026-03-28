@@ -28,5 +28,13 @@ thiserror = { workspace = true }
 criterion = { workspace = true }
 proptest = { workspace = true }
 
+[[bench]]
+name = "bot_detect"
+harness = false
+
+[[bench]]
+name = "compress"
+harness = false
+
 [lints]
 workspace = true

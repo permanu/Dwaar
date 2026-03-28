@@ -1,0 +1,15 @@
+# Build Dwaar from source in release mode
+FROM rust:1.86-bookworm AS builder
+WORKDIR /build
+COPY . .
+RUN cargo build --release -p dwaar-cli && \
+    strip target/release/dwaar
+
+# Minimal runtime image
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends libssl3 ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+COPY --from=builder /build/target/release/dwaar /usr/local/bin/dwaar
+COPY benchmarks/docker/Dwaarfile.bench /etc/dwaar/Dwaarfile
+EXPOSE 6188
+CMD ["dwaar", "--config", "/etc/dwaar/Dwaarfile"]
