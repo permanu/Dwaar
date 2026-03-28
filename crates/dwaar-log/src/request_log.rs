@@ -13,32 +13,37 @@
 use std::net::IpAddr;
 
 use chrono::{DateTime, Utc};
+use compact_str::CompactString;
 use serde::Serialize;
 
 /// A complete log entry for one proxied HTTP request.
 ///
 /// Built in the `logging()` callback after the response is sent.
 /// All timing is in microseconds for sub-millisecond precision.
+///
+/// String fields use `CompactString` — stores ≤24 bytes inline without
+/// heap allocation. HTTP methods, short paths, hostnames, country codes,
+/// TLS versions, and upstream addresses all fit inline.
 #[derive(Debug, Clone, Serialize)]
 pub struct RequestLog {
     /// When the request arrived (UTC)
     pub timestamp: DateTime<Utc>,
 
     /// Unique request identifier (UUID v7, time-sortable)
-    pub request_id: String,
+    pub request_id: CompactString,
 
     /// HTTP method (GET, POST, etc.)
-    pub method: String,
+    pub method: CompactString,
 
     /// Request path (without query string)
-    pub path: String,
+    pub path: CompactString,
 
     /// Query string, if present
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub query: Option<String>,
+    pub query: Option<CompactString>,
 
     /// Host header value (or :authority for HTTP/2)
-    pub host: String,
+    pub host: CompactString,
 
     /// HTTP response status code
     pub status: u16,
@@ -51,11 +56,11 @@ pub struct RequestLog {
 
     /// User-Agent header
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub user_agent: Option<String>,
+    pub user_agent: Option<CompactString>,
 
     /// Referer header
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub referer: Option<String>,
+    pub referer: Option<CompactString>,
 
     /// Response body size in bytes
     pub bytes_sent: u64,
@@ -65,31 +70,31 @@ pub struct RequestLog {
 
     /// TLS version (e.g., "TLSv1.3"), None for plaintext
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tls_version: Option<String>,
+    pub tls_version: Option<CompactString>,
 
     /// HTTP version (e.g., "HTTP/1.1", "HTTP/2")
-    pub http_version: String,
+    pub http_version: CompactString,
 
     /// Whether the request was classified as a bot
     pub is_bot: bool,
 
     /// Country code from `GeoIP` lookup (e.g., "US", "IN")
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub country: Option<String>,
+    pub country: Option<CompactString>,
 
     /// Upstream backend address (e.g., "127.0.0.1:8080")
-    pub upstream_addr: String,
+    pub upstream_addr: CompactString,
 
     /// Time the upstream took to respond (microseconds)
     pub upstream_response_time_us: u64,
 
     /// Cache status if applicable (e.g., "HIT", "MISS")
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_status: Option<String>,
+    pub cache_status: Option<CompactString>,
 
     /// Compression algorithm applied (e.g., "gzip", "br")
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub compression: Option<String>,
+    pub compression: Option<CompactString>,
 }
 
 #[cfg(test)]
@@ -100,26 +105,26 @@ mod tests {
     fn sample_log() -> RequestLog {
         RequestLog {
             timestamp: Utc::now(),
-            request_id: "01924f5c-7e2a-7d00-b3f4-deadbeef1234".to_string(),
-            method: "GET".to_string(),
-            path: "/api/users".to_string(),
-            query: Some("page=1&limit=20".to_string()),
-            host: "api.example.com".to_string(),
+            request_id: "01924f5c-7e2a-7d00-b3f4-deadbeef1234".into(),
+            method: "GET".into(),
+            path: "/api/users".into(),
+            query: Some("page=1&limit=20".into()),
+            host: "api.example.com".into(),
             status: 200,
             response_time_us: 1234,
             client_ip: IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100)),
-            user_agent: Some("Mozilla/5.0".to_string()),
-            referer: Some("https://example.com".to_string()),
+            user_agent: Some("Mozilla/5.0".into()),
+            referer: Some("https://example.com".into()),
             bytes_sent: 4096,
             bytes_received: 256,
-            tls_version: Some("TLSv1.3".to_string()),
-            http_version: "HTTP/2".to_string(),
+            tls_version: Some("TLSv1.3".into()),
+            http_version: "HTTP/2".into(),
             is_bot: false,
-            country: Some("US".to_string()),
-            upstream_addr: "127.0.0.1:8080".to_string(),
+            country: Some("US".into()),
+            upstream_addr: "127.0.0.1:8080".into(),
             upstream_response_time_us: 980,
             cache_status: None,
-            compression: Some("gzip".to_string()),
+            compression: Some("gzip".into()),
         }
     }
 

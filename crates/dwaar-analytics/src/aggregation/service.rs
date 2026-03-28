@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use super::web_vitals::Percentiles;
-use super::{AggReceiver, DomainMetrics};
+use super::{AggEvent, AggReceiver, DomainMetrics};
 use crate::beacon::BeaconEvent;
 
 /// Flush aggregates every 60 seconds.
@@ -80,12 +80,12 @@ impl<RT: RouteValidator> AggregationService<RT> {
         &self.metrics
     }
 
-    fn ingest_log(&self, log: &dwaar_log::RequestLog) {
-        if !self.route_validator.is_known_host(&log.host) {
+    fn ingest_log(&self, event: &AggEvent) {
+        if !self.route_validator.is_known_host(&event.host) {
             return;
         }
-        let mut entry = self.metrics.entry(log.host.clone()).or_default();
-        entry.ingest_log(log);
+        let mut entry = self.metrics.entry(event.host.to_string()).or_default();
+        entry.ingest_log(event);
     }
 
     fn ingest_beacon(&self, beacon: &BeaconEvent) {
@@ -279,36 +279,22 @@ mod tests {
         }
     }
 
-    fn test_log(host: &str, path: &str, status: u16) -> dwaar_log::RequestLog {
-        dwaar_log::RequestLog {
-            timestamp: chrono::Utc::now(),
-            request_id: String::new(),
-            method: "GET".into(),
-            path: path.into(),
-            query: None,
+    fn test_event(host: &str, path: &str, status: u16) -> AggEvent {
+        AggEvent {
             host: host.into(),
+            path: path.into(),
             status,
-            response_time_us: 100,
-            client_ip: std::net::IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-            user_agent: None,
-            referer: Some("https://google.com/search".into()),
             bytes_sent: 1024,
-            bytes_received: 0,
-            tls_version: None,
-            http_version: "HTTP/1.1".into(),
-            is_bot: false,
+            client_ip: std::net::IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             country: Some("US".into()),
-            upstream_addr: "127.0.0.1:8080".into(),
-            upstream_response_time_us: 50,
-            cache_status: None,
-            compression: None,
+            referer: Some("https://google.com/search".into()),
         }
     }
 
     type ServiceHandles = (
         Arc<AggregationService<TestValidator>>,
         mpsc::Sender<BeaconEvent>,
-        mpsc::Sender<dwaar_log::RequestLog>,
+        mpsc::Sender<AggEvent>,
         tokio::sync::watch::Sender<bool>,
         Arc<DashMap<String, DomainMetrics>>,
     );
@@ -347,7 +333,7 @@ mod tests {
             beacon_rx,
             AggReceiver { rx: log_rx },
         );
-        svc.ingest_log(&test_log("example.com", "/home", 200));
+        svc.ingest_log(&test_event("example.com", "/home", 200));
         assert_eq!(metrics.len(), 1);
         let entry = metrics.get("example.com").expect("domain should exist");
         assert_eq!(entry.status_codes[1], 1); // 2xx
@@ -366,7 +352,7 @@ mod tests {
             beacon_rx,
             AggReceiver { rx: log_rx },
         );
-        svc.ingest_log(&test_log("evil.com", "/hack", 200));
+        svc.ingest_log(&test_event("evil.com", "/hack", 200));
         assert_eq!(metrics.len(), 0, "unknown host must not create entry");
     }
 
@@ -382,7 +368,7 @@ mod tests {
             beacon_rx,
             AggReceiver { rx: log_rx },
         );
-        svc.ingest_log(&test_log("test.dev", "/", 200));
+        svc.ingest_log(&test_event("test.dev", "/", 200));
         // flush writes to stdout — verify it doesn't panic
         svc.flush();
     }
@@ -393,7 +379,7 @@ mod tests {
 
         for _ in 0..10 {
             log_tx
-                .send(test_log("app.io", "/api", 200))
+                .send(test_event("app.io", "/api", 200))
                 .await
                 .expect("send should succeed");
         }
@@ -420,7 +406,7 @@ mod tests {
             let tx = log_tx.clone();
             senders.push(tokio::spawn(async move {
                 for _ in 0..250 {
-                    let _ = tx.send(test_log("stress.io", "/api", 200)).await;
+                    let _ = tx.send(test_event("stress.io", "/api", 200)).await;
                 }
             }));
         }
@@ -443,13 +429,13 @@ mod tests {
         // Send 100 logs with random unknown hosts
         for i in 0..100 {
             log_tx
-                .send(test_log(&format!("evil-{i}.com"), "/hack", 200))
+                .send(test_event(&format!("evil-{i}.com"), "/hack", 200))
                 .await
                 .expect("send");
         }
         // One legit log
         log_tx
-            .send(test_log("legit.com", "/", 200))
+            .send(test_event("legit.com", "/", 200))
             .await
             .expect("send");
 

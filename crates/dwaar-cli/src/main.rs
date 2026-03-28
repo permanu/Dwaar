@@ -9,6 +9,12 @@
 //! Reads a Dwaarfile, parses it, compiles routes and TLS config,
 //! and starts the Pingora proxy server with HTTP and optional TLS listeners.
 
+// Use jemalloc globally — eliminates heap fragmentation from per-request
+// String alloc/free churn and removes allocator lock contention that
+// causes tail latency spikes under high concurrency.
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod admin_client;
 mod cli;
 

@@ -422,7 +422,6 @@ impl DwaarPlugin for CompressionPlugin {
         resp.remove_header("Content-Length");
 
         debug!(
-            request_id = %ctx.request_id,
             encoding = enc.header_value(),
             "compression plugin: encoding negotiated"
         );

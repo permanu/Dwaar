@@ -457,11 +457,12 @@ mod tests {
     }
 
     fn make_ctx(ip: IpAddr, under_attack: bool) -> PluginCtx {
-        let mut ctx = PluginCtx::new("test-req".to_string());
-        ctx.client_ip = Some(ip);
-        ctx.under_attack = under_attack;
-        ctx.path = "/test".to_string();
-        ctx
+        PluginCtx {
+            client_ip: Some(ip),
+            under_attack,
+            path: "/test".into(),
+            ..PluginCtx::default()
+        }
     }
 
     fn test_ip() -> IpAddr {

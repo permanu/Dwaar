@@ -20,6 +20,7 @@
 use std::net::IpAddr;
 
 use bytes::Bytes;
+use compact_str::CompactString;
 use pingora_http::{RequestHeader, ResponseHeader};
 
 use crate::bot_detect::BotCategory;
@@ -31,21 +32,21 @@ use crate::compress::ResponseCompressor;
 /// can read and write fields to communicate (e.g., `BotDetectPlugin` sets
 /// `is_bot`, and `RateLimitPlugin` reads it to apply different limits).
 ///
-/// The `request_id` lives in `RequestContext` (inline `[u8; 36]`, zero-alloc).
-/// Plugins that need it receive it via method parameters, not by storing a copy.
+/// String fields use `CompactString` — stores ≤24 bytes inline on the
+/// stack with zero heap allocation. HTTP methods, hostnames, country codes,
+/// and most header values fit inline, eliminating per-request malloc churn.
 #[derive(Debug, Default)]
 pub struct PluginCtx {
-    pub request_id: String,
     pub client_ip: Option<IpAddr>,
-    pub host: Option<String>,
-    pub method: String,
-    pub path: String,
+    pub host: Option<CompactString>,
+    pub method: CompactString,
+    pub path: CompactString,
 
     /// Whether the downstream connection used TLS.
     pub is_tls: bool,
 
     /// Client's Accept-Encoding header value, for compression negotiation.
-    pub accept_encoding: String,
+    pub accept_encoding: CompactString,
 
     /// Per-route rate limit (requests/second). Populated from `RouteTable`
     /// before the plugin chain runs. `None` means no limit configured.
@@ -53,7 +54,7 @@ pub struct PluginCtx {
 
     /// The canonical domain from the matched route. Used as the rate
     /// limiter key (not the raw Host header, which may have a port suffix).
-    pub route_domain: Option<String>,
+    pub route_domain: Option<CompactString>,
 
     /// Whether Under Attack Mode is enabled for this route.
     pub under_attack: bool,
@@ -61,17 +62,8 @@ pub struct PluginCtx {
     // -- Fields written by plugins --
     pub is_bot: bool,
     pub bot_category: Option<BotCategory>,
-    pub country: Option<String>,
+    pub country: Option<CompactString>,
     pub compressor: Option<ResponseCompressor>,
-}
-
-impl PluginCtx {
-    pub fn new(request_id: String) -> Self {
-        Self {
-            request_id,
-            ..Self::default()
-        }
-    }
 }
 
 /// Data for a short-circuit response produced by a plugin.
@@ -258,7 +250,7 @@ mod tests {
     }
 
     fn make_ctx() -> PluginCtx {
-        PluginCtx::new("test-id".to_string())
+        PluginCtx::default()
     }
 
     // -- Execution order --
@@ -410,8 +402,7 @@ mod tests {
 
     #[test]
     fn plugin_ctx_defaults() {
-        let ctx = PluginCtx::new("abc-123".to_string());
-        assert_eq!(ctx.request_id, "abc-123");
+        let ctx = PluginCtx::default();
         assert!(ctx.client_ip.is_none());
         assert!(ctx.host.is_none());
         assert!(!ctx.is_bot);

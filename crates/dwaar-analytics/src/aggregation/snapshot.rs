@@ -143,32 +143,18 @@ impl AnalyticsSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::aggregation::DomainMetrics;
+    use crate::aggregation::{AggEvent, DomainMetrics};
     use std::net::{IpAddr, Ipv4Addr};
 
-    fn test_log(path: &str, status: u16) -> dwaar_log::RequestLog {
-        dwaar_log::RequestLog {
-            timestamp: chrono::Utc::now(),
-            request_id: String::new(),
-            method: "GET".into(),
-            path: path.into(),
-            query: None,
+    fn test_event(path: &str, status: u16) -> AggEvent {
+        AggEvent {
             host: "test.example.com".into(),
+            path: path.into(),
             status,
-            response_time_us: 100,
-            client_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-            user_agent: None,
-            referer: Some("https://google.com/search".into()),
             bytes_sent: 1024,
-            bytes_received: 0,
-            tls_version: None,
-            http_version: "HTTP/1.1".into(),
-            is_bot: false,
+            client_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             country: Some("US".into()),
-            upstream_addr: "127.0.0.1:8080".into(),
-            upstream_response_time_us: 50,
-            cache_status: None,
-            compression: None,
+            referer: Some("https://google.com/search".into()),
         }
     }
 
@@ -176,9 +162,9 @@ mod tests {
     fn snapshot_reflects_ingested_logs() {
         let mut dm = DomainMetrics::new();
         for _ in 0..5 {
-            dm.ingest_log(&test_log("/home", 200));
+            dm.ingest_log(&test_event("/home", 200));
         }
-        dm.ingest_log(&test_log("/about", 404));
+        dm.ingest_log(&test_event("/about", 404));
 
         let snap = AnalyticsSnapshot::from_metrics("test.example.com", &dm);
 

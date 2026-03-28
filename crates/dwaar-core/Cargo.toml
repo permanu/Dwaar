@@ -21,6 +21,7 @@ dwaar-plugins = { workspace = true }
 dwaar-tls = { workspace = true }
 dwaar-geo = { workspace = true }
 dwaar-log = { workspace = true }
+compact_str = { workspace = true }
 ahash = { workspace = true }
 arc-swap = { workspace = true }
 bytes = { workspace = true }

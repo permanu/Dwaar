@@ -10,11 +10,12 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+compact_str = { workspace = true }
 pingora-http = { workspace = true }
 pingora-limits = { workspace = true }
 http = { workspace = true }
 bytes = { workspace = true }
-regex = { workspace = true }
+daachorse = { workspace = true }
 flate2 = { workspace = true }
 brotli = { workspace = true }
 zstd = { workspace = true }

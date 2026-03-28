@@ -25,8 +25,9 @@ use pingora_proxy::{ProxyHttp, Session};
 use tracing::{debug, warn};
 
 use bytes::Bytes;
+use compact_str::CompactString;
 use dwaar_analytics::ANALYTICS_JS;
-use dwaar_analytics::aggregation::AggSender;
+use dwaar_analytics::aggregation::{AggEvent, AggSender};
 use dwaar_analytics::beacon::{self, BeaconEvent, BeaconSender};
 use dwaar_analytics::decompress::{Decompressor, Encoding};
 use dwaar_analytics::injector::HtmlInjector;
@@ -168,7 +169,7 @@ impl DwaarProxy {
                         .client_ip
                         .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
                     let host = ctx.plugin_ctx.host.clone().unwrap_or_default();
-                    let event = BeaconEvent::from_raw(raw, client_ip, host);
+                    let event = BeaconEvent::from_raw(raw, client_ip, host.to_string());
                     let _ = sender.try_send(event);
                     debug!(request_id = %ctx.request_id(), "beacon collected");
                 }
@@ -238,7 +239,7 @@ impl ProxyHttp for DwaarProxy {
         if let Some(ref geo) = self.geo_lookup
             && let Some(ip) = ctx.plugin_ctx.client_ip
         {
-            ctx.plugin_ctx.country = geo.lookup_country(ip);
+            ctx.plugin_ctx.country = geo.lookup_country(ip).map(CompactString::from);
         }
 
         // --- HTTP headers ---
@@ -248,22 +249,26 @@ impl ProxyHttp for DwaarProxy {
             .headers
             .get(http::header::HOST)
             .and_then(|v| v.to_str().ok())
-            .map(ToString::to_string)
-            .or_else(|| header.uri.authority().map(|a| a.as_str().to_string()));
+            .map(CompactString::from)
+            .or_else(|| {
+                header
+                    .uri
+                    .authority()
+                    .map(|a| CompactString::from(a.as_str()))
+            });
 
-        ctx.plugin_ctx.method = header.method.as_str().to_string();
+        ctx.plugin_ctx.method = CompactString::from(header.method.as_str());
 
-        ctx.plugin_ctx.path = header
-            .uri
-            .path_and_query()
-            .map_or_else(|| "/".to_string(), |pq| pq.as_str().to_string());
+        ctx.plugin_ctx.path = header.uri.path_and_query().map_or_else(
+            || CompactString::from("/"),
+            |pq| CompactString::from(pq.as_str()),
+        );
 
         ctx.plugin_ctx.accept_encoding = header
             .headers
             .get(http::header::ACCEPT_ENCODING)
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
+            .map_or_else(CompactString::default, CompactString::from);
 
         debug!(
             request_id = %ctx.request_id(),
@@ -282,7 +287,7 @@ impl ProxyHttp for DwaarProxy {
             let table = self.route_table.load();
             if let Some(route) = table.resolve(host_stripped) {
                 ctx.plugin_ctx.rate_limit_rps = route.rate_limit_rps;
-                ctx.plugin_ctx.route_domain = Some(route.domain.clone());
+                ctx.plugin_ctx.route_domain = Some(CompactString::from(route.domain.as_str()));
                 ctx.plugin_ctx.under_attack = route.under_attack;
             }
         }
@@ -557,18 +562,28 @@ impl ProxyHttp for DwaarProxy {
         let status = session.response_written().map_or(0, |r| r.status.as_u16());
 
         // Split path and query without allocating when there's no query string.
-        // std::mem::take moves the String out of ctx, avoiding clone.
+        // std::mem::take moves the CompactString out of ctx, avoiding clone.
         let full_path = std::mem::take(&mut ctx.plugin_ctx.path);
         let (path, query) = if let Some(qmark) = full_path.find('?') {
             let (p, q) = full_path.split_at(qmark);
-            (p.to_string(), Some(q[1..].to_string()))
+            (CompactString::from(p), Some(CompactString::from(&q[1..])))
         } else {
             (full_path, None)
         };
 
+        // Map HTTP version to &'static str — avoids format!() allocation
+        let http_version = match session.req_header().version {
+            http::Version::HTTP_09 => "HTTP/0.9",
+            http::Version::HTTP_10 => "HTTP/1.0",
+            http::Version::HTTP_11 => "HTTP/1.1",
+            http::Version::HTTP_2 => "HTTP/2",
+            http::Version::HTTP_3 => "HTTP/3",
+            _ => "HTTP/unknown",
+        };
+
         let log = RequestLog {
             timestamp: Utc::now(),
-            request_id: ctx.request_id().to_string(),
+            request_id: CompactString::from(ctx.request_id()),
             method: std::mem::take(&mut ctx.plugin_ctx.method),
             path,
             query,
@@ -584,36 +599,44 @@ impl ProxyHttp for DwaarProxy {
                 .headers
                 .get("user-agent")
                 .and_then(|v| v.to_str().ok())
-                .map(ToString::to_string),
+                .map(CompactString::from),
             referer: session
                 .req_header()
                 .headers
                 .get("referer")
                 .and_then(|v| v.to_str().ok())
-                .map(ToString::to_string),
+                .map(CompactString::from),
             bytes_sent: session.body_bytes_sent() as u64,
             bytes_received: session.body_bytes_read() as u64,
             tls_version: session
                 .downstream_session
                 .digest()
                 .and_then(|d| d.ssl_digest.as_ref())
-                .map(|ssl| ssl.version.to_string()),
-            http_version: format!("{:?}", session.req_header().version),
+                .map(|ssl| CompactString::from(format!("{}", ssl.version))),
+            http_version: CompactString::from(http_version),
             is_bot: ctx.plugin_ctx.is_bot,
             country: ctx.plugin_ctx.country.take(),
-            upstream_addr: ctx
-                .route_upstream
-                .map_or_else(String::new, |a| a.to_string()),
+            upstream_addr: ctx.route_upstream.map_or_else(CompactString::default, |a| {
+                CompactString::from(a.to_string())
+            }),
             upstream_response_time_us: 0,
             cache_status: None,
             compression: None,
         };
 
         if let Some(ref agg) = self.agg_sender {
-            // Clone once for the aggregation channel — unavoidable since both
-            // channels take ownership. But we moved Strings out of ctx above
-            // to avoid double-cloning.
-            agg.send(log.clone());
+            // Build a slim AggEvent with only the 7 fields aggregation needs,
+            // avoiding a full RequestLog clone (20+ fields).
+            let event = AggEvent {
+                host: log.host.clone(),
+                path: log.path.clone(),
+                status: log.status,
+                bytes_sent: log.bytes_sent,
+                client_ip: log.client_ip,
+                country: log.country.clone(),
+                referer: log.referer.clone(),
+            };
+            agg.send(event);
         }
         sender.send(log);
     }

@@ -48,8 +48,13 @@ impl LogOutput for StdoutWriter {
         use std::io::Write;
         let stdout = std::io::stdout();
         let mut handle = stdout.lock();
+        // sonic-rs serializes into a Vec<u8> buffer (SIMD-accelerated, 2.5-3x
+        // faster than serde_json). Buffer is allocated once and reused per entry.
+        let mut buf = Vec::with_capacity(512);
         for entry in entries {
-            serde_json::to_writer(&mut handle, entry).map_err(std::io::Error::other)?;
+            buf.clear();
+            sonic_rs::to_writer(&mut buf, entry).map_err(std::io::Error::other)?;
+            handle.write_all(&buf)?;
             handle.write_all(b"\n")?;
         }
         handle.flush()?;
@@ -163,11 +168,11 @@ mod tests {
     fn dummy_log() -> RequestLog {
         RequestLog {
             timestamp: Utc::now(),
-            request_id: "test-id".to_string(),
-            method: "GET".to_string(),
-            path: "/test".to_string(),
+            request_id: "test-id".into(),
+            method: "GET".into(),
+            path: "/test".into(),
             query: None,
-            host: "test.example.com".to_string(),
+            host: "test.example.com".into(),
             status: 200,
             response_time_us: 100,
             client_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -176,10 +181,10 @@ mod tests {
             bytes_sent: 0,
             bytes_received: 0,
             tls_version: None,
-            http_version: "HTTP/1.1".to_string(),
+            http_version: "HTTP/1.1".into(),
             is_bot: false,
             country: None,
-            upstream_addr: "127.0.0.1:8080".to_string(),
+            upstream_addr: "127.0.0.1:8080".into(),
             upstream_response_time_us: 50,
             cache_status: None,
             compression: None,
