@@ -73,6 +73,35 @@ pub(crate) enum Commands {
         #[arg(long)]
         check: bool,
     },
+    /// Display active routes from the running Dwaar instance
+    Routes {
+        /// Admin API address (default: 127.0.0.1:6190)
+        #[arg(long, default_value = "127.0.0.1:6190")]
+        admin: String,
+    },
+    /// List managed TLS certificates with expiry info
+    Certs {
+        /// Path to certificate store directory
+        #[arg(long, default_value = "/etc/dwaar/certs")]
+        cert_dir: PathBuf,
+    },
+    /// Trigger config reload on the running Dwaar instance
+    Reload {
+        /// Admin API address (default: 127.0.0.1:6190)
+        #[arg(long, default_value = "127.0.0.1:6190")]
+        admin: String,
+    },
+    /// Perform a zero-downtime binary upgrade using Pingora's FD transfer.
+    /// Starts a new Dwaar process with --upgrade, then gracefully shuts down
+    /// the old one. Active connections are not dropped.
+    Upgrade {
+        /// Path to the new Dwaar binary (defaults to the current executable)
+        #[arg(long)]
+        binary: Option<PathBuf>,
+        /// PID file of the running Dwaar instance
+        #[arg(long, default_value = "/tmp/dwaar.pid")]
+        pid_file: PathBuf,
+    },
 }
 
 impl Cli {
@@ -251,5 +280,65 @@ mod tests {
         let cli =
             Cli::try_parse_from(["dwaar", "--admin-socket", "/tmp/custom.sock"]).expect("parse");
         assert_eq!(cli.admin_socket, Some(PathBuf::from("/tmp/custom.sock")));
+    }
+
+    #[test]
+    fn routes_subcommand() {
+        let cli = Cli::try_parse_from(["dwaar", "routes"]).expect("parse");
+        assert!(matches!(cli.command, Some(Commands::Routes { .. })));
+    }
+
+    #[test]
+    fn routes_custom_admin() {
+        let cli =
+            Cli::try_parse_from(["dwaar", "routes", "--admin", "10.0.0.1:9000"]).expect("parse");
+        if let Some(Commands::Routes { admin }) = &cli.command {
+            assert_eq!(admin, "10.0.0.1:9000");
+        } else {
+            panic!("expected Routes command");
+        }
+    }
+
+    #[test]
+    fn certs_subcommand() {
+        let cli = Cli::try_parse_from(["dwaar", "certs"]).expect("parse");
+        assert!(matches!(cli.command, Some(Commands::Certs { .. })));
+    }
+
+    #[test]
+    fn certs_custom_dir() {
+        let cli =
+            Cli::try_parse_from(["dwaar", "certs", "--cert-dir", "/tmp/certs"]).expect("parse");
+        if let Some(Commands::Certs { cert_dir }) = &cli.command {
+            assert_eq!(cert_dir, &PathBuf::from("/tmp/certs"));
+        } else {
+            panic!("expected Certs command");
+        }
+    }
+
+    #[test]
+    fn reload_subcommand() {
+        let cli = Cli::try_parse_from(["dwaar", "reload"]).expect("parse");
+        assert!(matches!(cli.command, Some(Commands::Reload { .. })));
+    }
+
+    #[test]
+    fn upgrade_subcommand() {
+        let cli = Cli::try_parse_from(["dwaar", "upgrade"]).expect("parse");
+        assert!(matches!(cli.command, Some(Commands::Upgrade { .. })));
+    }
+
+    #[test]
+    fn upgrade_custom_binary() {
+        let cli = Cli::try_parse_from(["dwaar", "upgrade", "--binary", "/usr/bin/dwaar-new"])
+            .expect("parse");
+        if let Some(Commands::Upgrade { binary, .. }) = &cli.command {
+            assert_eq!(
+                binary.as_deref(),
+                Some(std::path::Path::new("/usr/bin/dwaar-new"))
+            );
+        } else {
+            panic!("expected Upgrade command");
+        }
     }
 }

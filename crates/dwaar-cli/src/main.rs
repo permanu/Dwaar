@@ -9,6 +9,7 @@
 //! Reads a Dwaarfile, parses it, compiles routes and TLS config,
 //! and starts the Pingora proxy server with HTTP and optional TLS listeners.
 
+mod admin_client;
 mod cli;
 
 use std::fs::Permissions;
@@ -57,6 +58,18 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Fmt { config, check }) => {
             let path = config.as_ref().unwrap_or(&cli.config);
             return fmt_config(path, *check);
+        }
+        Some(Commands::Routes { admin }) => {
+            return cmd_routes(admin);
+        }
+        Some(Commands::Certs { cert_dir }) => {
+            return cmd_certs(cert_dir);
+        }
+        Some(Commands::Reload { admin }) => {
+            return cmd_reload(admin);
+        }
+        Some(Commands::Upgrade { binary, pid_file }) => {
+            return cmd_upgrade(binary.as_deref(), pid_file);
         }
         None => {}
     }
@@ -208,7 +221,8 @@ fn run_server(
         Arc::clone(&agg_metrics),
         std::time::Instant::now(),
         admin_token,
-    );
+    )
+    .with_reload_notify(Arc::clone(&config_notify));
     let mut admin_listening =
         pingora_core::services::listening::Service::new("admin API".to_string(), admin_service);
     admin_listening.add_tcp("127.0.0.1:6190");
@@ -314,7 +328,8 @@ fn register_background_services(
         config_path.to_path_buf(),
         Arc::clone(route_table),
         initial_hash,
-    );
+    )
+    .with_reload_notify(Arc::clone(config_notify));
     let config_watcher = if cli.docker_socket.is_some() {
         config_watcher.with_docker_mode(Arc::clone(dwaarfile_snapshot), Arc::clone(config_notify))
     } else {
@@ -490,6 +505,272 @@ fn validate_config(path: &std::path::Path) -> anyhow::Result<()> {
         path = %path.display(),
         "config valid"
     );
+    Ok(())
+}
+
+// ── CLI subcommands (Phase 12) ──────────────────────────────────────
+
+/// `dwaar routes` — query the admin API and display active routes as a table.
+fn cmd_routes(admin_addr: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let resp = admin_client::get(admin_addr, "/routes")?;
+    if resp.status != 200 {
+        bail!("admin API returned {}: {}", resp.status, resp.body);
+    }
+
+    let routes: Vec<serde_json::Value> =
+        serde_json::from_str(&resp.body).context("failed to parse routes JSON")?;
+
+    if routes.is_empty() {
+        writeln!(std::io::stderr(), "no routes configured")?;
+        return Ok(());
+    }
+
+    let mut out = std::io::stdout().lock();
+    writeln!(
+        out,
+        "{:<40} {:<25} {:<6} {:<12} {:<8}",
+        "DOMAIN", "UPSTREAM", "TLS", "RATE LIMIT", "UAM"
+    )?;
+    writeln!(out, "{}", "-".repeat(95))?;
+
+    for route in &routes {
+        let domain = route["domain"].as_str().unwrap_or("-");
+        let upstream = route["upstream"].as_str().unwrap_or("-");
+        let tls = if route["tls"].as_bool().unwrap_or(false) {
+            "yes"
+        } else {
+            "no"
+        };
+        let rate_limit = route["rate_limit_rps"]
+            .as_u64()
+            .map_or_else(|| "-".to_string(), |r| format!("{r}/s"));
+        let uam = if route["under_attack"].as_bool().unwrap_or(false) {
+            "on"
+        } else {
+            "off"
+        };
+
+        writeln!(
+            out,
+            "{domain:<40} {upstream:<25} {tls:<6} {rate_limit:<12} {uam:<8}"
+        )?;
+    }
+
+    Ok(())
+}
+
+/// `dwaar certs` — list managed TLS certificates from the cert store directory.
+fn cmd_certs(cert_dir: &std::path::Path) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    if !cert_dir.exists() {
+        bail!(
+            "cert directory not found: {}\nIs Dwaar configured with TLS?",
+            cert_dir.display()
+        );
+    }
+
+    let mut certs = Vec::new();
+
+    for entry in std::fs::read_dir(cert_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "pem" || e == "crt")
+            && let Ok(pem_data) = std::fs::read(&path)
+            && let Ok(cert_info) = parse_cert_info(&pem_data, &path)
+        {
+            certs.push(cert_info);
+        }
+    }
+
+    if certs.is_empty() {
+        use std::io::Write;
+        writeln!(
+            std::io::stderr(),
+            "no certificates found in {}",
+            cert_dir.display()
+        )?;
+        return Ok(());
+    }
+
+    certs.sort_by(|a, b| a.domain.cmp(&b.domain));
+
+    let mut out = std::io::stdout().lock();
+    writeln!(
+        out,
+        "{:<40} {:<30} {:<12} {:<15}",
+        "DOMAIN", "ISSUER", "EXPIRES", "DAYS LEFT"
+    )?;
+    writeln!(out, "{}", "-".repeat(100))?;
+
+    for cert in &certs {
+        let days_str = if cert.days_remaining < 0 {
+            "EXPIRED".to_string()
+        } else {
+            cert.days_remaining.to_string()
+        };
+        writeln!(
+            out,
+            "{:<40} {:<30} {:<12} {:<15}",
+            cert.domain, cert.issuer, cert.expiry_date, days_str
+        )?;
+    }
+
+    Ok(())
+}
+
+struct CertInfo {
+    domain: String,
+    issuer: String,
+    expiry_date: String,
+    days_remaining: i64,
+}
+
+/// Parse X.509 info from a PEM file using OpenSSL.
+fn parse_cert_info(pem_data: &[u8], path: &std::path::Path) -> anyhow::Result<CertInfo> {
+    let cert =
+        openssl::x509::X509::from_pem(pem_data).context("failed to parse PEM certificate")?;
+
+    let domain = cert
+        .subject_name()
+        .entries_by_nid(openssl::nid::Nid::COMMONNAME)
+        .next()
+        .and_then(|e| e.data().as_utf8().ok())
+        .map_or_else(
+            || {
+                // Fall back to filename
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string()
+            },
+            |cn| cn.to_string(),
+        );
+
+    let issuer = cert
+        .issuer_name()
+        .entries_by_nid(openssl::nid::Nid::ORGANIZATIONNAME)
+        .next()
+        .and_then(|e| e.data().as_utf8().ok())
+        .map_or_else(|| "unknown".to_string(), |o| o.to_string());
+
+    // Parse expiry using OpenSSL's ASN1_TIME
+    let not_after = cert.not_after();
+    let expiry_date = not_after.to_string();
+
+    // Compute days remaining by comparing with current time
+    let now = openssl::asn1::Asn1Time::days_from_now(0).context("failed to get current time")?;
+    let diff = now.diff(not_after).context("failed to compute time diff")?;
+    let days_remaining = i64::from(diff.days);
+
+    Ok(CertInfo {
+        domain,
+        issuer,
+        expiry_date,
+        days_remaining,
+    })
+}
+
+/// `dwaar reload` — trigger config reload on the running instance.
+fn cmd_reload(admin_addr: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let resp = admin_client::post(admin_addr, "/reload", "")?;
+
+    match resp.status {
+        200 => {
+            let body: serde_json::Value =
+                serde_json::from_str(&resp.body).unwrap_or(serde_json::Value::Null);
+            let mut out = std::io::stdout().lock();
+            if let Some(msg) = body["message"].as_str() {
+                writeln!(out, "{msg}")?;
+            } else {
+                writeln!(out, "config reloaded successfully")?;
+            }
+            Ok(())
+        }
+        _ => bail!("reload failed ({}): {}", resp.status, resp.body),
+    }
+}
+
+/// `dwaar upgrade` — zero-downtime binary upgrade via Pingora's FD transfer.
+///
+/// 1. Reads the PID of the running instance from the PID file
+/// 2. Starts a new Dwaar process with `--upgrade` (inherits listeners via FD transfer)
+/// 3. Sends SIGQUIT to the old process for graceful shutdown
+fn cmd_upgrade(binary: Option<&std::path::Path>, pid_file: &std::path::Path) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+
+    // Resolve the binary to use
+    let binary_path = match binary {
+        Some(p) => p.to_path_buf(),
+        None => std::env::current_exe().context("cannot determine current executable path")?,
+    };
+
+    if !binary_path.exists() {
+        bail!("binary not found: {}", binary_path.display());
+    }
+
+    // Read the PID of the old process
+    let pid_str = std::fs::read_to_string(pid_file)
+        .with_context(|| format!("cannot read PID file: {}", pid_file.display()))?;
+    let old_pid: i32 = pid_str
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid PID in {}: {pid_str:?}", pid_file.display()))?;
+
+    writeln!(out, "upgrading dwaar (old PID: {old_pid})")?;
+
+    // Collect the arguments the new process should use — same config as old
+    // but with --upgrade to trigger Pingora's FD transfer.
+    let mut args: Vec<String> = std::env::args().collect();
+    // Remove "upgrade" subcommand and its arguments from the args
+    // The new process should run in server mode with --upgrade
+    args.truncate(1); // Keep just the binary name placeholder
+    args[0] = binary_path.display().to_string();
+    args.push("--upgrade".to_string());
+
+    writeln!(
+        out,
+        "starting new process: {} --upgrade",
+        binary_path.display()
+    )?;
+
+    let child = std::process::Command::new(&binary_path)
+        .arg("--upgrade")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("failed to start new process: {}", binary_path.display()))?;
+
+    writeln!(out, "new process started (PID: {})", child.id())?;
+
+    // Give the new process time to connect to the upgrade socket and
+    // receive file descriptors before we signal the old process.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Send SIGQUIT to the old process for graceful shutdown.
+    // SIGQUIT triggers Pingora's graceful drain — it stops accepting new
+    // connections and waits for in-flight requests to complete.
+    writeln!(out, "sending SIGQUIT to old process (PID: {old_pid})")?;
+
+    // SAFETY: libc::kill sends a signal to a process. The PID was read from
+    // a file controlled by the user (the PID file). Sending SIGQUIT to a
+    // non-Dwaar process is the user's responsibility (wrong PID file).
+    #[allow(unsafe_code)]
+    let result = unsafe { libc::kill(old_pid, libc::SIGQUIT) };
+
+    if result != 0 {
+        let err = std::io::Error::last_os_error();
+        bail!("failed to send SIGQUIT to PID {old_pid}: {err}");
+    }
+
+    writeln!(out, "upgrade complete — old process will drain and exit")?;
+
     Ok(())
 }
 

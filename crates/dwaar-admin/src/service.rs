@@ -17,6 +17,7 @@ use dwaar_core::route::RouteTable;
 use http::Response;
 use pingora_core::apps::http_app::ServeHttp;
 use pingora_core::protocols::http::ServerSession;
+use tokio::sync::Notify;
 use tracing::{debug, info, warn};
 
 use crate::auth::Auth;
@@ -32,6 +33,9 @@ pub struct AdminService {
     metrics: Arc<DashMap<String, DomainMetrics>>,
     start_time: Instant,
     auth: Auth,
+    /// Notifier to trigger config reload. When signaled, the `ConfigWatcher`
+    /// re-reads the Dwaarfile and updates the route table.
+    reload_notify: Option<Arc<Notify>>,
 }
 
 impl AdminService {
@@ -49,7 +53,15 @@ impl AdminService {
             metrics,
             start_time,
             auth: Auth::new(admin_token),
+            reload_notify: None,
         }
+    }
+
+    /// Set the reload notifier for `POST /reload` support.
+    #[must_use]
+    pub fn with_reload_notify(mut self, notify: Arc<Notify>) -> Self {
+        self.reload_notify = Some(notify);
+        self
     }
 }
 
@@ -152,6 +164,17 @@ impl ServeHttp for AdminService {
                     None => json_response(404, r#"{"error":"no analytics for domain"}"#),
                 }
             }
+            ("POST", "/reload") => match &self.reload_notify {
+                Some(notify) => {
+                    notify.notify_one();
+                    info!(source, "config reload triggered via admin API");
+                    json_response(200, r#"{"message":"config reload triggered"}"#)
+                }
+                None => json_response(
+                    501,
+                    r#"{"error":"reload not supported — config watcher not active"}"#,
+                ),
+            },
             _ => json_response(405, r#"{"error":"method not allowed"}"#),
         }
     }
