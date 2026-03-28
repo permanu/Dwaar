@@ -17,6 +17,9 @@ pub mod snapshot;
 pub mod top_k;
 pub mod web_vitals;
 
+use std::net::IpAddr;
+
+use compact_str::CompactString;
 use hyperloglog::HyperLogLog;
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -27,6 +30,20 @@ use self::top_k::TopK;
 use self::web_vitals::WebVitals;
 
 const CHANNEL_CAPACITY: usize = 8192;
+
+/// Slim event for analytics aggregation — only the fields the aggregation
+/// service actually reads. Avoids cloning the full `RequestLog` (20+ fields)
+/// on every request when only 7 are needed.
+#[derive(Debug, Clone)]
+pub struct AggEvent {
+    pub host: CompactString,
+    pub path: CompactString,
+    pub status: u16,
+    pub bytes_sent: u64,
+    pub client_ip: IpAddr,
+    pub country: Option<CompactString>,
+    pub referer: Option<CompactString>,
+}
 const TOP_PAGES_K: usize = 100;
 const TOP_REFERRERS_N: usize = 50;
 const TOP_COUNTRIES_N: usize = 250;
@@ -61,19 +78,19 @@ impl DomainMetrics {
         }
     }
 
-    /// Update from a server-side request log entry.
-    pub fn ingest_log(&mut self, log: &dwaar_log::RequestLog) {
+    /// Update from a server-side aggregation event.
+    pub fn ingest_log(&mut self, event: &AggEvent) {
         self.page_views.increment();
-        self.unique_visitors.insert(&log.client_ip);
-        self.top_pages.insert(log.path.clone());
-        self.status_codes[status_bucket(log.status)] += 1;
-        self.bytes_sent += log.bytes_sent;
+        self.unique_visitors.insert(&event.client_ip);
+        self.top_pages.insert(event.path.to_string());
+        self.status_codes[status_bucket(event.status)] += 1;
+        self.bytes_sent += event.bytes_sent;
 
-        if let Some(domain) = log.referer.as_deref().and_then(extract_domain) {
+        if let Some(domain) = event.referer.as_deref().and_then(extract_domain) {
             self.referrers.insert(domain);
         }
-        if let Some(ref country) = log.country {
-            self.countries.insert(country.clone());
+        if let Some(ref country) = event.country {
+            self.countries.insert(country.to_string());
         }
     }
 
@@ -143,15 +160,15 @@ fn extract_path(url: &str) -> String {
     path.to_string()
 }
 
-/// Sender handle for request log entries going to aggregation.
+/// Sender handle for aggregation events.
 #[derive(Debug, Clone)]
 pub struct AggSender {
-    tx: mpsc::Sender<dwaar_log::RequestLog>,
+    tx: mpsc::Sender<AggEvent>,
 }
 
 impl AggSender {
     /// Non-blocking send. Drops the entry if the channel is full.
-    pub fn send(&self, entry: dwaar_log::RequestLog) {
+    pub fn send(&self, entry: AggEvent) {
         if self.tx.try_send(entry).is_err() {
             warn!("aggregation channel full, dropping entry");
         }
@@ -160,11 +177,10 @@ impl AggSender {
 
 /// Receiver end of the aggregation channel.
 ///
-/// Consumed by [`service::AggregationService`] in its `run()`  method.
+/// Consumed by [`service::AggregationService`] in its `run()` method.
 #[derive(Debug)]
 pub struct AggReceiver {
-    /// Read by `AggregationService::run()` — currently unused until Task 7.
-    pub rx: mpsc::Receiver<dwaar_log::RequestLog>,
+    pub rx: mpsc::Receiver<AggEvent>,
 }
 
 /// Create a bounded aggregation channel.
@@ -202,28 +218,14 @@ mod tests {
     #[test]
     fn agg_channel_bounded() {
         let (sender, _rx) = agg_channel();
-        let dummy = dwaar_log::RequestLog {
-            timestamp: chrono::Utc::now(),
-            request_id: String::new(),
-            method: "GET".into(),
-            path: "/".into(),
-            query: None,
+        let dummy = AggEvent {
             host: "test.com".into(),
+            path: "/".into(),
             status: 200,
-            response_time_us: 0,
-            client_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            user_agent: None,
-            referer: None,
             bytes_sent: 0,
-            bytes_received: 0,
-            tls_version: None,
-            http_version: "HTTP/1.1".into(),
-            is_bot: false,
+            client_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             country: None,
-            upstream_addr: String::new(),
-            upstream_response_time_us: 0,
-            cache_status: None,
-            compression: None,
+            referer: None,
         };
         // Should not panic — drops silently when full
         for _ in 0..10_000 {
@@ -274,30 +276,16 @@ mod tests {
     #[test]
     fn ingest_log_updates_all_fields() {
         let mut dm = DomainMetrics::new();
-        let log = dwaar_log::RequestLog {
-            timestamp: chrono::Utc::now(),
-            request_id: String::new(),
-            method: "GET".into(),
-            path: "/home".into(),
-            query: None,
+        let event = AggEvent {
             host: "example.com".into(),
+            path: "/home".into(),
             status: 200,
-            response_time_us: 100,
-            client_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-            user_agent: None,
-            referer: Some("https://google.com/search".into()),
             bytes_sent: 1024,
-            bytes_received: 0,
-            tls_version: None,
-            http_version: "HTTP/1.1".into(),
-            is_bot: false,
+            client_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             country: Some("US".into()),
-            upstream_addr: "127.0.0.1:8080".into(),
-            upstream_response_time_us: 50,
-            cache_status: None,
-            compression: None,
+            referer: Some("https://google.com/search".into()),
         };
-        dm.ingest_log(&log);
+        dm.ingest_log(&event);
 
         assert_eq!(dm.status_codes[1], 1); // 2xx
         assert_eq!(dm.bytes_sent, 1024);

@@ -72,8 +72,8 @@ uuid = { version = "1.22.0", features = ["v7"] }
 # Time
 chrono = { version = "0.4.44", default-features = false, features = ["clock", "serde"] }
 
-# Regex (bot detection)
-regex = "1.12.3"
+# Pattern matching (bot detection)
+daachorse = "1.0"
 
 # File watching
 notify = { version = "8.2.0", default-features = false, features = ["macos_kqueue"] }
@@ -98,6 +98,15 @@ instant-acme = "0.7"
 
 # OpenSSL (for TLS cert handling in dwaar-tls)
 openssl = { version = "0.10.72", features = ["vendored"] }
+
+# Memory allocator
+tikv-jemallocator = "0.6"
+
+# Inline strings (≤24 bytes stored on stack, no heap allocation)
+compact_str = { version = "0.8", features = ["serde"] }
+
+# Fast JSON serialization (SIMD-accelerated)
+sonic-rs = "0.3"
 
 # Compression
 flate2 = "1.1.9"
@@ -152,7 +161,7 @@ codegen-units = 256    # maximum parallelism for dev builds
 
 [profile.release]
 opt-level = 3
-lto = "thin"           # good balance of speed vs compile time
+lto = "fat"            # cross-crate inlining across 10 workspace crates
 codegen-units = 1      # maximum optimization
 strip = "symbols"      # smaller binary
 panic = "abort"        # smaller binary, no unwinding overhead

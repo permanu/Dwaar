@@ -79,9 +79,10 @@ mod tests {
     use crate::plugin::PluginCtx;
 
     fn make_ctx(is_tls: bool) -> PluginCtx {
-        let mut ctx = PluginCtx::new("test".to_string());
-        ctx.is_tls = is_tls;
-        ctx
+        PluginCtx {
+            is_tls,
+            ..PluginCtx::default()
+        }
     }
 
     #[test]

@@ -194,28 +194,14 @@ mod tests {
     fn make_metrics() -> Arc<DashMap<String, DomainMetrics>> {
         let map = Arc::new(DashMap::new());
         let mut dm = DomainMetrics::new();
-        dm.ingest_log(&dwaar_log::RequestLog {
-            timestamp: chrono::Utc::now(),
-            request_id: String::new(),
-            method: "GET".into(),
-            path: "/home".into(),
-            query: None,
+        dm.ingest_log(&dwaar_analytics::aggregation::AggEvent {
             host: "test.example.com".into(),
+            path: "/home".into(),
             status: 200,
-            response_time_us: 100,
-            client_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
-            user_agent: None,
-            referer: None,
             bytes_sent: 1024,
-            bytes_received: 0,
-            tls_version: None,
-            http_version: "HTTP/1.1".into(),
-            is_bot: false,
+            client_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
             country: None,
-            upstream_addr: "127.0.0.1:8080".into(),
-            upstream_response_time_us: 50,
-            cache_status: None,
-            compression: None,
+            referer: None,
         });
         map.insert("test.example.com".to_string(), dm);
         map

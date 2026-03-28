@@ -6,12 +6,13 @@
 
 //! Bot detection via User-Agent classification.
 //!
-//! Uses a compiled `RegexSet` (Aho-Corasick internally) so all patterns are
-//! tested in a single pass — O(n) in input length regardless of pattern count.
-//! This matters because `classify()` runs on every proxied request.
+//! Uses `daachorse::DoubleArrayAhoCorasick` for multi-pattern substring matching
+//! in a single O(n) pass over the input. All patterns are pre-lowercased and the
+//! input UA is lowercased once before matching, replacing the old `(?i)` regex
+//! approach with zero backtracking risk.
 
+use daachorse::DoubleArrayAhoCorasick;
 use pingora_http::RequestHeader;
-use regex::RegexSet;
 
 use crate::plugin::{DwaarPlugin, PluginAction, PluginCtx};
 
@@ -42,87 +43,97 @@ impl BotCategory {
 
 // Patterns are ordered by priority: malicious tools first so a UA that
 // matches both "sqlmap" and (hypothetically) a search engine string gets
-// classified as Malicious. RegexSet returns all matching indices; we take
-// the lowest index, which corresponds to the highest-priority pattern.
+// classified as Malicious. We take the lowest index, which corresponds
+// to the highest-priority pattern.
 //
 // Within each category order doesn't matter — we just need any match.
-const PATTERNS: &[(&str, BotCategory)] = &[
+//
+// The boolean flag indicates whether the pattern must appear at position 0
+// (i.e., the original regex used a `^` anchor). This prevents false positives
+// like "obscurlity" matching the "curl/" pattern.
+const PATTERNS: &[(&str, BotCategory, bool)] = &[
     // --- Malicious ---
     // Security scanners and exploit tools; block or heavily rate-limit these.
-    (r"(?i)sqlmap", BotCategory::Malicious),
-    (r"(?i)nikto", BotCategory::Malicious),
-    (r"(?i)masscan", BotCategory::Malicious),
-    (r"(?i)zgrab", BotCategory::Malicious),
-    (r"(?i)nuclei", BotCategory::Malicious),
-    (r"(?i)nmap", BotCategory::Malicious),
-    (r"(?i)dirbuster", BotCategory::Malicious),
-    (r"(?i)gobuster", BotCategory::Malicious),
-    (r"(?i)wpscan", BotCategory::Malicious),
+    ("sqlmap", BotCategory::Malicious, false),
+    ("nikto", BotCategory::Malicious, false),
+    ("masscan", BotCategory::Malicious, false),
+    ("zgrab", BotCategory::Malicious, false),
+    ("nuclei", BotCategory::Malicious, false),
+    ("nmap", BotCategory::Malicious, false),
+    ("dirbuster", BotCategory::Malicious, false),
+    ("gobuster", BotCategory::Malicious, false),
+    ("wpscan", BotCategory::Malicious, false),
     // --- SearchEngine ---
     // Legitimate crawlers worth allowing; may still want to rate-limit.
-    (r"(?i)googlebot", BotCategory::SearchEngine),
-    (r"(?i)bingbot", BotCategory::SearchEngine),
-    (r"(?i)yandexbot", BotCategory::SearchEngine),
-    (r"(?i)baiduspider", BotCategory::SearchEngine),
-    (r"(?i)duckduckbot", BotCategory::SearchEngine),
-    (r"(?i)slurp", BotCategory::SearchEngine),
-    (r"(?i)applebot", BotCategory::SearchEngine),
-    (r"(?i)ahrefsbot", BotCategory::SearchEngine),
-    (r"(?i)semrushbot", BotCategory::SearchEngine),
-    (r"(?i)mj12bot", BotCategory::SearchEngine),
+    ("googlebot", BotCategory::SearchEngine, false),
+    ("bingbot", BotCategory::SearchEngine, false),
+    ("yandexbot", BotCategory::SearchEngine, false),
+    ("baiduspider", BotCategory::SearchEngine, false),
+    ("duckduckbot", BotCategory::SearchEngine, false),
+    ("slurp", BotCategory::SearchEngine, false),
+    ("applebot", BotCategory::SearchEngine, false),
+    ("ahrefsbot", BotCategory::SearchEngine, false),
+    ("semrushbot", BotCategory::SearchEngine, false),
+    ("mj12bot", BotCategory::SearchEngine, false),
     // --- SocialCrawler ---
     // Link-preview fetchers from social platforms.
-    (r"(?i)twitterbot", BotCategory::SocialCrawler),
-    (r"(?i)facebookexternalhit", BotCategory::SocialCrawler),
-    (r"(?i)linkedinbot", BotCategory::SocialCrawler),
-    (r"(?i)slackbot", BotCategory::SocialCrawler),
-    (r"(?i)discordbot", BotCategory::SocialCrawler),
-    (r"(?i)whatsapp", BotCategory::SocialCrawler),
-    (r"(?i)telegrambot", BotCategory::SocialCrawler),
+    ("twitterbot", BotCategory::SocialCrawler, false),
+    ("facebookexternalhit", BotCategory::SocialCrawler, false),
+    ("linkedinbot", BotCategory::SocialCrawler, false),
+    ("slackbot", BotCategory::SocialCrawler, false),
+    ("discordbot", BotCategory::SocialCrawler, false),
+    ("whatsapp", BotCategory::SocialCrawler, false),
+    ("telegrambot", BotCategory::SocialCrawler, false),
     // --- Monitoring ---
     // Uptime checkers; typically benign but worth tagging separately.
-    (r"(?i)uptimerobot", BotCategory::Monitoring),
-    (r"(?i)pingdom", BotCategory::Monitoring),
-    (r"(?i)site24x7", BotCategory::Monitoring),
-    (r"(?i)statuscake", BotCategory::Monitoring),
-    (r"(?i)betteruptime", BotCategory::Monitoring),
+    ("uptimerobot", BotCategory::Monitoring, false),
+    ("pingdom", BotCategory::Monitoring, false),
+    ("site24x7", BotCategory::Monitoring, false),
+    ("statuscake", BotCategory::Monitoring, false),
+    ("betteruptime", BotCategory::Monitoring, false),
     // --- Generic ---
-    // Scripted HTTP clients. Anchored with `^` to avoid false positives —
-    // e.g. `^curl/` won't match "obscurlity" or "procurement".
-    (r"(?i)^curl/", BotCategory::Generic),
-    (r"(?i)^wget/", BotCategory::Generic),
-    (r"(?i)python-requests", BotCategory::Generic),
-    (r"(?i)go-http-client", BotCategory::Generic),
-    (r"(?i)^libwww", BotCategory::Generic),
-    (r"(?i)java/", BotCategory::Generic),
-    (r"(?i)scrapy", BotCategory::Generic),
-    (r"(?i)^php/", BotCategory::Generic),
+    // Scripted HTTP clients. Anchored to start-of-string to avoid false
+    // positives — e.g. "curl/" won't match "obscurlity" or "procurement".
+    ("curl/", BotCategory::Generic, true),
+    ("wget/", BotCategory::Generic, true),
+    ("python-requests", BotCategory::Generic, false),
+    ("go-http-client", BotCategory::Generic, false),
+    ("libwww", BotCategory::Generic, true),
+    ("java/", BotCategory::Generic, false),
+    ("scrapy", BotCategory::Generic, false),
+    ("php/", BotCategory::Generic, true),
 ];
 
-/// Classifies User-Agent strings using a single compiled `RegexSet`.
+/// Classifies User-Agent strings using Aho-Corasick multi-pattern matching.
 ///
-/// Construct once at startup and reuse — compilation is the expensive part.
+/// Construct once at startup and reuse — construction is the expensive part.
 pub struct BotDetector {
-    patterns: RegexSet,
+    automaton: DoubleArrayAhoCorasick<usize>,
     /// Parallel to the pattern list: index i gives the category for pattern i.
     categories: Vec<BotCategory>,
+    /// Parallel flag: true if pattern i must match at position 0 (start-anchored).
+    anchored: Vec<bool>,
 }
 
 impl BotDetector {
-    /// Compiles all bot patterns into a single `RegexSet`.
+    /// Builds the Aho-Corasick automaton from all bot patterns.
     ///
-    /// Panics if any hardcoded pattern fails to compile — these are static
-    /// strings so a compile failure means a programmer error, not bad input.
+    /// Panics if construction fails — these are static strings so a failure
+    /// means a programmer error, not bad input.
     pub fn new() -> Self {
-        let (raw_patterns, categories): (Vec<&str>, Vec<BotCategory>) =
-            PATTERNS.iter().map(|(p, c)| (*p, *c)).unzip();
+        let patterns: Vec<&str> = PATTERNS.iter().map(|(p, _, _)| *p).collect();
+        let categories: Vec<BotCategory> = PATTERNS.iter().map(|(_, c, _)| *c).collect();
+        let anchored: Vec<bool> = PATTERNS.iter().map(|(_, _, a)| *a).collect();
 
-        let patterns =
-            RegexSet::new(&raw_patterns).expect("hardcoded bot detection patterns must compile");
+        // Build with pattern indices as values so we can map matches back
+        // to their category. Patterns are already lowercase.
+        let automaton = DoubleArrayAhoCorasick::with_values(patterns.iter().zip(0usize..))
+            .expect("hardcoded bot detection patterns must build");
 
         Self {
-            patterns,
+            automaton,
             categories,
+            anchored,
         }
     }
 
@@ -137,12 +148,19 @@ impl BotDetector {
             return None;
         }
 
-        // `matches()` returns all matching pattern indices. We take the
-        // minimum because PATTERNS is ordered highest-priority-first, so the
-        // lowest index wins when multiple patterns fire.
-        self.patterns
-            .matches(user_agent)
-            .into_iter()
+        // Lowercase once — all stored patterns are already lowercase.
+        // ASCII-safe for User-Agent headers which are always ASCII.
+        let ua_lower = user_agent.to_ascii_lowercase();
+
+        // Find all overlapping matches and take the lowest pattern index
+        // (highest priority). Anchored patterns must start at position 0.
+        self.automaton
+            .find_overlapping_iter(&ua_lower)
+            .filter(|m| {
+                let idx = m.value();
+                !self.anchored[idx] || m.start() == 0
+            })
+            .map(|m| m.value())
             .min()
             .map(|idx| self.categories[idx])
     }
@@ -156,8 +174,6 @@ impl Default for BotDetector {
 
 impl std::fmt::Debug for BotDetector {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `patterns` (RegexSet) is intentionally excluded — its Debug output is
-        // verbose compiled automaton internals, not useful to callers.
         f.debug_struct("BotDetector")
             .field("pattern_count", &self.categories.len())
             .finish_non_exhaustive()
@@ -297,5 +313,23 @@ mod tests {
         assert_eq!(BotCategory::Monitoring.as_str(), "monitoring");
         assert_eq!(BotCategory::Malicious.as_str(), "malicious");
         assert_eq!(BotCategory::Generic.as_str(), "generic");
+    }
+
+    #[test]
+    fn anchored_pattern_rejects_mid_string_match() {
+        let detector = BotDetector::new();
+        assert_eq!(detector.classify("something curl/7.0"), None);
+        assert_eq!(detector.classify("obscurlity"), None);
+    }
+
+    #[test]
+    fn anchored_pattern_accepts_start_of_string() {
+        let detector = BotDetector::new();
+        assert_eq!(detector.classify("wget/1.21"), Some(BotCategory::Generic));
+        assert_eq!(
+            detector.classify("libwww-perl/6.72"),
+            Some(BotCategory::Generic)
+        );
+        assert_eq!(detector.classify("PHP/8.2.0"), Some(BotCategory::Generic));
     }
 }
