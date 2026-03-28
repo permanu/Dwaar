@@ -1,0 +1,55 @@
+services:
+  # ── Upstream backend (nginx serving static JSON) ──────────────
+  # This is the "application" both proxies forward to.
+  # Tuned for max throughput so it's never the bottleneck.
+  backend:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx-backend.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "9090:80"
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 256M
+    networks:
+      - bench
+
+  # ── Dwaar (our proxy) ────────────────────────────────────────
+  dwaar:
+    build:
+      context: ../..
+      dockerfile: benchmarks/docker/Dockerfile.dwaar
+    depends_on:
+      - backend
+    ports:
+      - "6188:6188"
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 256M
+    networks:
+      - bench
+
+  # ── nginx (competitor proxy) ──────────────────────────────────
+  nginx-proxy:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx-proxy.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - backend
+    ports:
+      - "8080:8080"
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 256M
+    networks:
+      - bench
+
+networks:
+  bench:
+    driver: bridge

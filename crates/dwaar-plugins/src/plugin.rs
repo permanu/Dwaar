@@ -30,7 +30,10 @@ use crate::compress::ResponseCompressor;
 /// Populated by the proxy engine before the plugin chain runs. Plugins
 /// can read and write fields to communicate (e.g., `BotDetectPlugin` sets
 /// `is_bot`, and `RateLimitPlugin` reads it to apply different limits).
-#[derive(Debug)]
+///
+/// The `request_id` lives in `RequestContext` (inline `[u8; 36]`, zero-alloc).
+/// Plugins that need it receive it via method parameters, not by storing a copy.
+#[derive(Debug, Default)]
 pub struct PluginCtx {
     pub request_id: String,
     pub client_ip: Option<IpAddr>,
@@ -66,19 +69,7 @@ impl PluginCtx {
     pub fn new(request_id: String) -> Self {
         Self {
             request_id,
-            client_ip: None,
-            host: None,
-            method: String::new(),
-            path: String::new(),
-            is_tls: false,
-            accept_encoding: String::new(),
-            rate_limit_rps: None,
-            route_domain: None,
-            under_attack: false,
-            is_bot: false,
-            bot_category: None,
-            country: None,
-            compressor: None,
+            ..Self::default()
         }
     }
 }

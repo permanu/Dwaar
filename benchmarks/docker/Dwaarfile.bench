@@ -1,0 +1,3 @@
+backend {
+    reverse_proxy backend:80
+}

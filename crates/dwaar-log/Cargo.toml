@@ -18,5 +18,12 @@ tracing = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "request_log"
+harness = false
+
 [lints]
 workspace = true

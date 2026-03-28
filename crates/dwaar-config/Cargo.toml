@@ -23,8 +23,13 @@ tokio = { workspace = true, features = ["sync", "time"] }
 openssl = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 tempfile = { workspace = true }
 proptest = { workspace = true }
+
+[[bench]]
+name = "parser"
+harness = false
 
 [lints]
 workspace = true

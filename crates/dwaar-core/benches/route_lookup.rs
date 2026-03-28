@@ -37,22 +37,25 @@ fn build_table(n: usize) -> RouteTable {
 }
 
 fn bench_route_lookup(c: &mut Criterion) {
-    let table = build_table(1000);
+    // Test at three scales to prove O(1) amortized lookup holds
+    for &n in &[1_000, 10_000, 100_000] {
+        let table = build_table(n);
+        let mid = n / 2;
 
-    // Exact match — best case, single HashMap lookup
-    c.bench_function("resolve/exact_hit_1000_routes", |b| {
-        b.iter(|| table.resolve(black_box("app-500.example.com")));
-    });
+        c.bench_function(&format!("resolve/exact_hit_{n}_routes"), |b| {
+            let host = format!("app-{mid}.example.com");
+            b.iter(|| table.resolve(black_box(&host)));
+        });
 
-    // Wildcard match — worst case for a hit: exact miss + wildcard lookup
-    c.bench_function("resolve/wildcard_hit_1000_routes", |b| {
-        b.iter(|| table.resolve(black_box("anything.base-50.example.com")));
-    });
+        c.bench_function(&format!("resolve/wildcard_hit_{n}_routes"), |b| {
+            let host = format!("anything.base-{}.example.com", n / 20);
+            b.iter(|| table.resolve(black_box(&host)));
+        });
 
-    // Total miss — worst case overall: exact miss + wildcard miss
-    c.bench_function("resolve/miss_1000_routes", |b| {
-        b.iter(|| table.resolve(black_box("nonexistent.unknown.dev")));
-    });
+        c.bench_function(&format!("resolve/miss_{n}_routes"), |b| {
+            b.iter(|| table.resolve(black_box("nonexistent.unknown.dev")));
+        });
+    }
 }
 
 criterion_group!(benches, bench_route_lookup);

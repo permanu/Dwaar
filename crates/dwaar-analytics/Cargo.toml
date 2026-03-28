@@ -28,7 +28,13 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]
+chrono = { workspace = true }
 criterion = { workspace = true }
+hyperloglog = { workspace = true }
+
+[[bench]]
+name = "aggregation"
+harness = false
 
 [lints]
 workspace = true

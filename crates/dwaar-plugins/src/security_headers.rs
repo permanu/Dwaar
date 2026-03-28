@@ -94,10 +94,17 @@ mod tests {
 
         assert!(resp.headers.get("Strict-Transport-Security").is_some());
         assert_eq!(
-            resp.headers.get("X-Content-Type-Options").expect("X-Content-Type-Options header"),
+            resp.headers
+                .get("X-Content-Type-Options")
+                .expect("X-Content-Type-Options header"),
             "nosniff"
         );
-        assert_eq!(resp.headers.get("X-Frame-Options").expect("X-Frame-Options header"), "SAMEORIGIN");
+        assert_eq!(
+            resp.headers
+                .get("X-Frame-Options")
+                .expect("X-Frame-Options header"),
+            "SAMEORIGIN"
+        );
         assert_eq!(resp.headers.get("Server").expect("Server header"), "Dwaar");
     }
 
@@ -112,7 +119,9 @@ mod tests {
         assert!(resp.headers.get("Strict-Transport-Security").is_none());
         // Other headers still present
         assert_eq!(
-            resp.headers.get("X-Content-Type-Options").expect("X-Content-Type-Options header"),
+            resp.headers
+                .get("X-Content-Type-Options")
+                .expect("X-Content-Type-Options header"),
             "nosniff"
         );
     }

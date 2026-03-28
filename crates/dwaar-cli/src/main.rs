@@ -107,7 +107,16 @@ fn run_server(
         conf: None,
     };
 
+    // Match nginx's `worker_processes auto` — use all available CPU cores.
+    // Pingora defaults to 1 thread which severely limits throughput.
+    let cpu_count = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+
     let conf = ServerConf {
+        threads: cpu_count,
+        work_stealing: true,
+        upstream_keepalive_pool_size: 256,
         grace_period_seconds: Some(5),
         graceful_shutdown_timeout_seconds: Some(5),
         ..ServerConf::default()
