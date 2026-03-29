@@ -82,6 +82,16 @@ impl fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+impl From<crate::import::ImportError> for ParseError {
+    fn from(err: crate::import::ImportError) -> Self {
+        Self {
+            line: 0,
+            col: 0,
+            kind: ParseErrorKind::Other(format!("import error: {err}")),
+        }
+    }
+}
+
 /// Suggest a known directive name for a typo.
 ///
 /// Uses simple edit distance — if a known directive is within 2
@@ -95,6 +105,7 @@ pub fn suggest_directive(input: &str) -> Option<&'static str> {
         "encode",
         "rate_limit",
         "basicauth",
+        "basic_auth",
         "forward_auth",
         "file_server",
         "rewrite",

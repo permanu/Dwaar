@@ -14,32 +14,30 @@ use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 
-use dwaar_core::route::{Route, RouteTable, is_valid_domain};
+use bytes::Bytes;
+use compact_str::CompactString;
+use dwaar_core::route::{
+    BlockKind, Handler, HandlerBlock, PathMatcher, RewriteRule, Route, RouteTable, is_valid_domain,
+};
 use tracing::warn;
 
-use crate::model::{Directive, DwaarConfig, ReverseProxyDirective, TlsDirective, UpstreamAddr};
+use crate::model::{
+    Directive, DwaarConfig, FileServerDirective, PhpFastcgiDirective, RespondDirective,
+    ReverseProxyDirective, RootDirective, TlsDirective, UpstreamAddr, UriOperation,
+};
+use dwaar_plugins::basic_auth::BasicAuthConfig;
+use dwaar_plugins::forward_auth::ForwardAuthConfig;
 
 /// Compile a parsed config into a route table for the proxy engine.
 ///
-/// Extracts the first `reverse_proxy` upstream from each site block
-/// and builds a `RouteTable`. Sites without `reverse_proxy` are
-/// skipped with a warning (they might be file_server-only sites later).
-///
-/// `HostPort` upstreams are resolved via DNS at compile time. If
-/// resolution fails, the site is skipped with a warning.
+/// Each site block produces one `Route`. Sites with `reverse_proxy` get a
+/// `Handler::ReverseProxy`; sites with `respond` get a `Handler::StaticResponse`.
+/// Sites without a handler directive are skipped with a warning.
+#[allow(clippy::too_many_lines)]
 pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
     let mut routes = Vec::with_capacity(config.sites.len());
 
     for site in &config.sites {
-        // Find the first reverse_proxy directive in this site block
-        let Some(rp) = find_reverse_proxy(&site.directives) else {
-            warn!(
-                address = %site.address,
-                "site has no reverse_proxy directive, skipping"
-            );
-            continue;
-        };
-
         if !is_valid_domain(&site.address) {
             warn!(
                 address = %site.address,
@@ -48,18 +46,118 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
             continue;
         }
 
-        // Use the first upstream (load balancing comes later)
-        let Some(addr) = resolve_upstream(&rp.upstreams) else {
-            warn!(
-                address = %site.address,
-                "could not resolve any upstream address, skipping"
-            );
-            continue;
-        };
-
         let tls = site_has_tls(&site.directives);
+
+        // Check for handle/handle_path/route blocks first — these create multi-handler routes
+        let handle_blocks = compile_handle_blocks(&site.directives);
+        if !handle_blocks.is_empty() {
+            routes.push(Route::with_handlers(&site.address, tls, handle_blocks));
+            continue;
+        }
+
+        // Flat site (no handle blocks) — extract single handler + site-level middleware
         let rate_limit_rps = find_rate_limit(&site.directives);
-        routes.push(Route::new(&site.address, addr, tls, rate_limit_rps));
+        let rewrites = collect_rewrites(&site.directives);
+        let basic_auth = compile_basic_auth(&site.directives);
+        let forward_auth = compile_forward_auth(&site.directives);
+
+        // Try reverse_proxy first (most common)
+        if let Some(rp) = find_reverse_proxy(&site.directives) {
+            let Some(addr) = resolve_upstream(&rp.upstreams) else {
+                warn!(
+                    address = %site.address,
+                    "could not resolve any upstream address, skipping"
+                );
+                continue;
+            };
+            let handler = HandlerBlock {
+                kind: BlockKind::Handle,
+                matcher: PathMatcher::Any,
+                rate_limit_rps,
+                under_attack: false,
+                rewrites,
+                basic_auth,
+                forward_auth,
+                handler: Handler::ReverseProxy { upstream: addr },
+            };
+            routes.push(Route::with_handlers(&site.address, tls, vec![handler]));
+            continue;
+        }
+
+        // Try respond (static response, no upstream)
+        if let Some(resp) = find_respond(&site.directives) {
+            let handler = HandlerBlock {
+                kind: BlockKind::Handle,
+                matcher: PathMatcher::Any,
+                rate_limit_rps,
+                under_attack: false,
+                rewrites,
+                basic_auth,
+                forward_auth,
+                handler: Handler::StaticResponse {
+                    status: resp.status,
+                    body: Bytes::from(resp.body.clone()),
+                },
+            };
+            routes.push(Route::with_handlers(&site.address, tls, vec![handler]));
+            continue;
+        }
+
+        // Try file_server (static file serving, no upstream)
+        if let Some(fs_directive) = find_file_server(&site.directives) {
+            let root_path = find_root(&site.directives).map_or_else(
+                || {
+                    warn!(address = %site.address, "file_server without root directive, using '.'");
+                    PathBuf::from(".")
+                },
+                |r| PathBuf::from(&r.path),
+            );
+            let handler = HandlerBlock {
+                kind: BlockKind::Handle,
+                matcher: PathMatcher::Any,
+                rate_limit_rps,
+                under_attack: false,
+                rewrites,
+                basic_auth,
+                forward_auth,
+                handler: Handler::FileServer {
+                    root: root_path,
+                    browse: fs_directive.browse,
+                },
+            };
+            routes.push(Route::with_handlers(&site.address, tls, vec![handler]));
+            continue;
+        }
+
+        // Try php_fastcgi
+        if let Some(fcgi) = find_php_fastcgi(&site.directives) {
+            let Some(addr) = resolve_upstream(std::slice::from_ref(&fcgi.upstream)) else {
+                warn!(address = %site.address, "could not resolve FastCGI upstream, skipping");
+                continue;
+            };
+            let root_path = find_root(&site.directives)
+                .map_or_else(|| PathBuf::from("."), |r| PathBuf::from(&r.path));
+            let handler = HandlerBlock {
+                kind: BlockKind::Handle,
+                matcher: PathMatcher::Any,
+                rate_limit_rps,
+                under_attack: false,
+                rewrites,
+                basic_auth,
+                forward_auth,
+                handler: Handler::FastCgi {
+                    upstream: addr,
+                    root: root_path,
+                },
+            };
+            routes.push(Route::with_handlers(&site.address, tls, vec![handler]));
+            continue;
+        }
+
+        warn!(
+            address = %site.address,
+            "site has no handler directive (reverse_proxy, respond, file_server, php_fastcgi), skipping"
+        );
     }
 
     RouteTable::new(routes)
@@ -143,6 +241,229 @@ fn find_reverse_proxy(directives: &[Directive]) -> Option<&ReverseProxyDirective
     })
 }
 
+/// Compile `handle`/`handle_path`/`route` blocks into `HandlerBlock`s.
+/// Returns empty Vec if the site has no handle blocks (flat site).
+fn compile_handle_blocks(directives: &[Directive]) -> Vec<HandlerBlock> {
+    let mut blocks = Vec::new();
+
+    for d in directives {
+        match d {
+            Directive::Handle(h) => {
+                let matcher = compile_path_matcher(h.matcher.as_ref());
+                if let Some(block) = compile_single_block(BlockKind::Handle, matcher, &h.directives)
+                {
+                    blocks.push(block);
+                }
+            }
+            Directive::HandlePath(hp) => {
+                let matcher = compile_path_matcher(Some(&hp.path_prefix));
+                if let Some(block) =
+                    compile_single_block(BlockKind::HandlePath, matcher, &hp.directives)
+                {
+                    blocks.push(block);
+                }
+            }
+            Directive::Route(r) => {
+                let matcher = compile_path_matcher(r.matcher.as_ref());
+                if let Some(block) = compile_single_block(BlockKind::Route, matcher, &r.directives)
+                {
+                    blocks.push(block);
+                }
+            }
+            _ => {} // site-level directives outside handle blocks (tls, encode, etc.)
+        }
+    }
+
+    blocks
+}
+
+/// Compile a path pattern string into a `PathMatcher`.
+fn compile_path_matcher(pattern: Option<&String>) -> PathMatcher {
+    match pattern {
+        None => PathMatcher::Any,
+        Some(p) if p == "*" => PathMatcher::Any,
+        Some(p) if p.ends_with('*') => PathMatcher::Prefix(CompactString::from(&p[..p.len() - 1])),
+        Some(p) if p.starts_with('*') => PathMatcher::Suffix(CompactString::from(&p[1..])),
+        Some(p) => PathMatcher::Exact(CompactString::from(p.as_str())),
+    }
+}
+
+/// Compile a single `handle`/`handle_path`/`route` block's inner directives into a `HandlerBlock`.
+fn compile_single_block(
+    kind: BlockKind,
+    matcher: PathMatcher,
+    inner_directives: &[Directive],
+) -> Option<HandlerBlock> {
+    let rate_limit_rps = find_rate_limit(inner_directives);
+    let rewrites = collect_rewrites(inner_directives);
+    let basic_auth = compile_basic_auth(inner_directives);
+    let forward_auth = compile_forward_auth(inner_directives);
+
+    // Find the handler directive inside the block
+    let handler = if let Some(rp) = find_reverse_proxy(inner_directives) {
+        let addr = resolve_upstream(&rp.upstreams)?;
+        Handler::ReverseProxy { upstream: addr }
+    } else if let Some(resp) = find_respond(inner_directives) {
+        Handler::StaticResponse {
+            status: resp.status,
+            body: Bytes::from(resp.body.clone()),
+        }
+    } else if let Some(fs) = find_file_server(inner_directives) {
+        let root_path = find_root(inner_directives)
+            .map_or_else(|| PathBuf::from("."), |r| PathBuf::from(&r.path));
+        Handler::FileServer {
+            root: root_path,
+            browse: fs.browse,
+        }
+    } else if let Some(fcgi) = find_php_fastcgi(inner_directives) {
+        let addr = resolve_upstream(std::slice::from_ref(&fcgi.upstream))?;
+        let root_path = find_root(inner_directives)
+            .map_or_else(|| PathBuf::from("."), |r| PathBuf::from(&r.path));
+        Handler::FastCgi {
+            upstream: addr,
+            root: root_path,
+        }
+    } else {
+        warn!("handle block has no handler directive, skipping");
+        return None;
+    };
+
+    Some(HandlerBlock {
+        kind,
+        matcher,
+        rate_limit_rps,
+        under_attack: false,
+        rewrites,
+        basic_auth,
+        forward_auth,
+        handler,
+    })
+}
+
+fn compile_forward_auth(directives: &[Directive]) -> Option<std::sync::Arc<ForwardAuthConfig>> {
+    let fa = directives.iter().find_map(|d| match d {
+        Directive::ForwardAuth(fa) => Some(fa),
+        _ => None,
+    })?;
+
+    let upstream = resolve_upstream(std::slice::from_ref(&fa.upstream))?;
+    let auth_uri = fa
+        .uri
+        .as_deref()
+        .map_or_else(|| CompactString::from("/"), CompactString::from);
+    let copy_headers = fa
+        .copy_headers
+        .iter()
+        .map(|h| CompactString::from(h.as_str()))
+        .collect();
+
+    Some(std::sync::Arc::new(ForwardAuthConfig {
+        upstream,
+        auth_uri,
+        copy_headers,
+    }))
+}
+
+/// Minimum recommended bcrypt cost. Hashes below this get a warning at config load.
+const MIN_RECOMMENDED_BCRYPT_COST: u32 = 10;
+
+fn compile_basic_auth(directives: &[Directive]) -> Option<std::sync::Arc<BasicAuthConfig>> {
+    let ba = directives.iter().find_map(|d| match d {
+        Directive::BasicAuth(ba) => Some(ba),
+        _ => None,
+    })?;
+
+    // Validate bcrypt cost at compile time — weak hashes get a warning
+    for cred in &ba.credentials {
+        if let Ok(parts) = cred.password_hash.parse::<bcrypt::HashParts>() {
+            if parts.get_cost() < MIN_RECOMMENDED_BCRYPT_COST {
+                warn!(
+                    username = %cred.username,
+                    cost = parts.get_cost(),
+                    min_recommended = MIN_RECOMMENDED_BCRYPT_COST,
+                    "bcrypt hash cost is below recommended minimum"
+                );
+            }
+        } else {
+            warn!(
+                username = %cred.username,
+                "password hash does not appear to be valid bcrypt"
+            );
+        }
+    }
+
+    let credentials = ba.credentials.iter().map(|c| {
+        (
+            CompactString::from(c.username.as_str()),
+            CompactString::from(c.password_hash.as_str()),
+        )
+    });
+    let realm = ba
+        .realm
+        .as_deref()
+        .map_or_else(CompactString::default, CompactString::from);
+
+    Some(std::sync::Arc::new(BasicAuthConfig::new(
+        credentials,
+        &realm,
+    )))
+}
+
+fn collect_rewrites(directives: &[Directive]) -> Vec<RewriteRule> {
+    let mut rules = Vec::new();
+    for d in directives {
+        match d {
+            Directive::Rewrite(r) => {
+                rules.push(RewriteRule::Replace(CompactString::from(r.to.as_str())));
+            }
+            Directive::Uri(u) => match &u.operation {
+                UriOperation::StripPrefix(p) => {
+                    rules.push(RewriteRule::StripPrefix(CompactString::from(p.as_str())));
+                }
+                UriOperation::StripSuffix(s) => {
+                    rules.push(RewriteRule::StripSuffix(CompactString::from(s.as_str())));
+                }
+                UriOperation::Replace { find, replace } => {
+                    rules.push(RewriteRule::SubstringReplace {
+                        find: CompactString::from(find.as_str()),
+                        replace: CompactString::from(replace.as_str()),
+                    });
+                }
+            },
+            _ => {}
+        }
+    }
+    rules
+}
+
+fn find_file_server(directives: &[Directive]) -> Option<&FileServerDirective> {
+    directives.iter().find_map(|d| match d {
+        Directive::FileServer(fs) => Some(fs),
+        _ => None,
+    })
+}
+
+fn find_root(directives: &[Directive]) -> Option<&RootDirective> {
+    directives.iter().find_map(|d| match d {
+        Directive::Root(r) => Some(r),
+        _ => None,
+    })
+}
+
+fn find_php_fastcgi(directives: &[Directive]) -> Option<&PhpFastcgiDirective> {
+    directives.iter().find_map(|d| match d {
+        Directive::PhpFastcgi(f) => Some(f),
+        _ => None,
+    })
+}
+
+fn find_respond(directives: &[Directive]) -> Option<&RespondDirective> {
+    directives.iter().find_map(|d| match d {
+        Directive::Respond(r) => Some(r),
+        _ => None,
+    })
+}
+
 fn find_rate_limit(directives: &[Directive]) -> Option<u32> {
     directives.iter().find_map(|d| match d {
         Directive::RateLimit(rl) => Some(rl.requests_per_second),
@@ -193,7 +514,7 @@ mod tests {
         assert_eq!(table.len(), 1);
         let route = table.resolve("example.com").expect("should resolve");
         assert_eq!(
-            route.upstream,
+            route.upstream().expect("has upstream"),
             "127.0.0.1:8080".parse::<SocketAddr>().expect("valid")
         );
     }
@@ -252,7 +573,7 @@ mod tests {
         assert_eq!(table.len(), 1);
         let route = table.resolve("example.com").expect("should resolve");
         // localhost resolves to 127.0.0.1 (or ::1 on some systems)
-        assert!(route.upstream.port() == 8080);
+        assert!(route.upstream().expect("has upstream").port() == 8080);
     }
 
     #[test]
@@ -273,10 +594,10 @@ mod tests {
         assert_eq!(table.len(), 2);
 
         let api = table.resolve("api.example.com").expect("api route");
-        assert_eq!(api.upstream.port(), 3000);
+        assert_eq!(api.upstream().expect("has upstream").port(), 3000);
 
         let web = table.resolve("web.example.com").expect("web route");
-        assert_eq!(web.upstream.port(), 8080);
+        assert_eq!(web.upstream().expect("has upstream").port(), 8080);
     }
 
     // ── TLS flag propagation (ISSUE-016) ─────────────────────
@@ -433,7 +754,7 @@ mod tests {
         };
         let table = compile_routes(&config);
         let route = table.resolve("api.example.com").expect("should resolve");
-        assert_eq!(route.rate_limit_rps, Some(100));
+        assert_eq!(route.rate_limit_rps(), Some(100));
     }
 
     #[test]
@@ -446,7 +767,7 @@ mod tests {
         };
         let table = compile_routes(&config);
         let route = table.resolve("example.com").expect("should resolve");
-        assert_eq!(route.rate_limit_rps, None);
+        assert_eq!(route.rate_limit_rps(), None);
     }
 
     #[test]
@@ -462,6 +783,106 @@ mod tests {
         .expect("should parse");
         let table = compile_routes(&config);
         let route = table.resolve("api.example.com").expect("api route");
-        assert_eq!(route.rate_limit_rps, Some(500));
+        assert_eq!(route.rate_limit_rps(), Some(500));
+    }
+
+    // ── respond directive (ISSUE-051) ─────────────────────
+
+    #[test]
+    fn compile_respond_site() {
+        let config = crate::parser::parse(
+            r#"
+            health.example.com {
+                respond "ok" 200
+            }
+            "#,
+        )
+        .expect("should parse");
+        let table = compile_routes(&config);
+        assert_eq!(table.len(), 1);
+        let route = table.resolve("health.example.com").expect("should resolve");
+        // respond-only site has no upstream
+        assert!(route.upstream().is_none());
+        // Handler is StaticResponse
+        let block = route.handlers.first().expect("has handler");
+        assert!(matches!(
+            block.handler,
+            Handler::StaticResponse { status: 200, .. }
+        ));
+    }
+
+    #[test]
+    fn compile_respond_with_404() {
+        let config = crate::parser::parse(
+            r#"
+            blocked.example.com {
+                respond "Forbidden" 403
+            }
+            "#,
+        )
+        .expect("should parse");
+        let table = compile_routes(&config);
+        let route = table
+            .resolve("blocked.example.com")
+            .expect("should resolve");
+        let block = route.handlers.first().expect("has handler");
+        if let Handler::StaticResponse { status, ref body } = block.handler {
+            assert_eq!(status, 403);
+            assert_eq!(body.as_ref(), b"Forbidden");
+        } else {
+            panic!("expected StaticResponse handler");
+        }
+    }
+
+    #[test]
+    fn compile_site_without_handler_skipped() {
+        let config = DwaarConfig {
+            sites: vec![SiteBlock {
+                address: "no-handler.example.com".to_string(),
+                directives: vec![Directive::Tls(TlsDirective::Auto)],
+            }],
+        };
+        let table = compile_routes(&config);
+        assert!(table.is_empty());
+    }
+
+    // ── rewrite/uri directives (ISSUE-049) ────────────────
+
+    #[test]
+    fn compile_rewrite_rule() {
+        let config = crate::parser::parse(
+            "a.com {\n    reverse_proxy 127.0.0.1:8080\n    rewrite /new\n}\n",
+        )
+        .expect("should parse");
+        let table = compile_routes(&config);
+        let route = table.resolve("a.com").expect("should resolve");
+        let block = route.handlers.first().expect("has handler");
+        assert_eq!(block.rewrites.len(), 1);
+        assert!(matches!(&block.rewrites[0], RewriteRule::Replace(p) if p == "/new"));
+    }
+
+    #[test]
+    fn compile_uri_strip_prefix() {
+        let config = crate::parser::parse(
+            "a.com {\n    reverse_proxy 127.0.0.1:8080\n    uri strip_prefix /api\n}\n",
+        )
+        .expect("should parse");
+        let table = compile_routes(&config);
+        let route = table.resolve("a.com").expect("should resolve");
+        let block = route.handlers.first().expect("has handler");
+        assert_eq!(block.rewrites.len(), 1);
+        assert!(matches!(&block.rewrites[0], RewriteRule::StripPrefix(p) if p == "/api"));
+    }
+
+    #[test]
+    fn compile_multiple_rewrites() {
+        let config = crate::parser::parse(
+            "a.com {\n    reverse_proxy 127.0.0.1:8080\n    uri strip_prefix /api\n    uri replace /v1 /v2\n}\n",
+        )
+        .expect("should parse");
+        let table = compile_routes(&config);
+        let route = table.resolve("a.com").expect("should resolve");
+        let block = route.handlers.first().expect("has handler");
+        assert_eq!(block.rewrites.len(), 2);
     }
 }

@@ -1,0 +1,152 @@
+// Copyright (C) 2026 Permanu
+// SPDX-License-Identifier: BSL-1.1
+//
+// This file is part of Dwaar — https://dwaar.dev
+// Licensed under the Business Source License 1.1
+
+//! Forward auth middleware — subrequest to external auth service.
+//!
+//! Sends a GET request to an auth endpoint (Authelia, Authentik, etc.) with
+//! the original request's `X-Forwarded-Method` and `X-Forwarded-Uri` headers.
+//! On 2xx → allow (copy selected headers to upstream). On 4xx → block.
+//!
+//! ## Security (CVE-2026-30851 mitigation)
+//!
+//! Client-supplied values for `copy_headers` fields are **always stripped**
+//! from the upstream request before copying the auth service's values. This
+//! prevents a client from injecting headers like `Remote-User` to impersonate
+//! authenticated users when the auth service doesn't return them.
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use compact_str::CompactString;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+
+/// Pre-compiled forward auth configuration.
+#[derive(Debug, Clone)]
+pub struct ForwardAuthConfig {
+    /// Resolved address of the auth service.
+    pub upstream: SocketAddr,
+    /// URI path sent to the auth service (e.g., `/api/authz/forward-auth`).
+    pub auth_uri: CompactString,
+    /// Headers to copy from auth response → upstream request.
+    pub copy_headers: Vec<CompactString>,
+}
+
+/// Result of an auth subrequest.
+#[derive(Debug)]
+pub enum AuthResult {
+    /// Auth succeeded (2xx). Contains headers to copy to upstream.
+    Allowed(HashMap<CompactString, CompactString>),
+    /// Auth denied (4xx). Contains status code and response body for the client.
+    Denied { status: u16, body: Vec<u8> },
+    /// Auth service unreachable or errored.
+    Error(String),
+}
+
+const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_AUTH_RESPONSE: u64 = 65_536;
+
+impl ForwardAuthConfig {
+    /// Make the auth subrequest. Returns whether to allow or deny.
+    pub async fn check(
+        &self,
+        method: &str,
+        original_uri: &str,
+        client_ip: Option<&str>,
+    ) -> AuthResult {
+        match self.do_request(method, original_uri, client_ip).await {
+            Ok(result) => result,
+            Err(e) => AuthResult::Error(e),
+        }
+    }
+
+    async fn do_request(
+        &self,
+        method: &str,
+        original_uri: &str,
+        client_ip: Option<&str>,
+    ) -> Result<AuthResult, String> {
+        // Connect with timeout
+        let mut stream = tokio::time::timeout(AUTH_TIMEOUT, TcpStream::connect(self.upstream))
+            .await
+            .map_err(|_| "auth service connection timed out".to_string())?
+            .map_err(|e| format!("auth service connect failed: {e}"))?;
+
+        // Build GET request with forwarded metadata
+        let ip_header =
+            client_ip.map_or_else(String::new, |ip| format!("X-Forwarded-For: {ip}\r\n"));
+        let request = format!(
+            "GET {} HTTP/1.1\r\n\
+             Host: {}\r\n\
+             X-Forwarded-Method: {method}\r\n\
+             X-Forwarded-Uri: {original_uri}\r\n\
+             {ip_header}\
+             Connection: close\r\n\
+             \r\n",
+            self.auth_uri, self.upstream
+        );
+
+        // Write with timeout
+        tokio::time::timeout(AUTH_TIMEOUT, async {
+            stream.write_all(request.as_bytes()).await?;
+            stream.flush().await?;
+            Ok::<_, std::io::Error>(())
+        })
+        .await
+        .map_err(|_| "auth service write timed out".to_string())?
+        .map_err(|e| format!("auth service write failed: {e}"))?;
+
+        // Read response with size limit
+        let mut buf = Vec::with_capacity(4096);
+        tokio::time::timeout(
+            AUTH_TIMEOUT,
+            stream.take(MAX_AUTH_RESPONSE).read_to_end(&mut buf),
+        )
+        .await
+        .map_err(|_| "auth service read timed out".to_string())?
+        .map_err(|e| format!("auth service read failed: {e}"))?;
+
+        // Parse status line
+        let header_end = buf
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .ok_or_else(|| "malformed auth response".to_string())?;
+
+        let header_bytes = &buf[..header_end];
+        let header_str = std::str::from_utf8(header_bytes)
+            .map_err(|_| "invalid UTF-8 in auth response headers".to_string())?;
+
+        let status = header_str
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|s| s.parse::<u16>().ok())
+            .ok_or_else(|| "cannot parse auth response status".to_string())?;
+
+        let body = buf[header_end + 4..].to_vec();
+
+        if (200..300).contains(&status) {
+            // Parse response headers we need to copy
+            let mut copied = HashMap::new();
+            for line in header_str.lines().skip(1) {
+                if let Some((name, value)) = line.split_once(':') {
+                    let name_trimmed = name.trim();
+                    let value_trimmed = value.trim();
+                    // Only copy headers that are in the copy_headers list
+                    for wanted in &self.copy_headers {
+                        if name_trimmed.eq_ignore_ascii_case(wanted) {
+                            copied.insert(wanted.clone(), CompactString::from(value_trimmed));
+                        }
+                    }
+                }
+            }
+            Ok(AuthResult::Allowed(copied))
+        } else {
+            Ok(AuthResult::Denied { status, body })
+        }
+    }
+}

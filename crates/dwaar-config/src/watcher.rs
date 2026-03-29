@@ -296,12 +296,12 @@ fn log_route_diff(old: &RouteTable, new: &RouteTable) {
     // Check for modifications (same domain, different config)
     for new_route in &new_routes {
         if let Some(old_route) = old_routes.iter().find(|r| r.domain == new_route.domain)
-            && (old_route.upstream != new_route.upstream || old_route.tls != new_route.tls)
+            && (old_route.upstream() != new_route.upstream() || old_route.tls != new_route.tls)
         {
             info!(
                 domain = %new_route.domain,
-                old_upstream = %old_route.upstream,
-                new_upstream = %new_route.upstream,
+                old_upstream = ?old_route.upstream(),
+                new_upstream = ?new_route.upstream(),
                 "route modified"
             );
         }

@@ -4,18 +4,22 @@
 // This file is part of Dwaar — https://dwaar.dev
 // Licensed under the Business Source License 1.1
 
-//! Domain-to-upstream routing table with wildcard support.
+//! Domain-to-upstream routing table with path-based handler dispatch.
 //!
 //! The [`RouteTable`] is the hottest data structure in Dwaar — every single
 //! HTTP request reads it to determine which backend should handle the request.
-//! It wraps a [`HashMap`] for O(1) amortized lookups and is designed to be
-//! held behind an [`ArcSwap`](arc_swap::ArcSwap) for lock-free concurrent reads.
+//! It wraps a [`HashMap`] for O(1) amortized domain lookups and is designed to
+//! be held behind an [`ArcSwap`](arc_swap::ArcSwap) for lock-free concurrent reads.
 //!
 //! ## Resolution order
 //!
-//! Exact match first (`"api.example.com"`), then wildcard fallback
-//! (strip the first DNS label, try `"*.example.com"`). If neither
-//! matches, returns `None` and the caller returns 502 Bad Gateway.
+//! 1. **Domain resolution** (O(1)): Exact match first (`"api.example.com"`),
+//!    then wildcard fallback (strip the first DNS label, try `"*.example.com"`).
+//!    If neither matches, returns `None` and the caller returns 502 Bad Gateway.
+//!
+//! 2. **Path resolution** (O(n), n = handler blocks per domain): Iterate
+//!    handler blocks in config order. For `handle`/`handle_path`, first match
+//!    wins. For `route`, all matching blocks execute.
 //!
 //! ## Example
 //!
@@ -31,13 +35,13 @@
 //!
 //! // Exact match wins
 //! assert_eq!(
-//!     table.resolve("api.example.com").unwrap().upstream.to_string(),
+//!     table.resolve("api.example.com").unwrap().upstream().expect("has upstream").to_string(),
 //!     "127.0.0.1:3000"
 //! );
 //!
 //! // Wildcard catches the rest
 //! assert_eq!(
-//!     table.resolve("web.example.com").unwrap().upstream.to_string(),
+//!     table.resolve("web.example.com").unwrap().upstream().expect("has upstream").to_string(),
 //!     "127.0.0.1:8080"
 //! );
 //!
@@ -49,6 +53,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use ahash::RandomState;
+use compact_str::CompactString;
 
 /// Validate that a string is a legal hostname or wildcard pattern.
 /// Rejects path traversal, null bytes, and non-hostname characters.
@@ -68,44 +73,297 @@ pub fn is_valid_domain(s: &str) -> bool {
     })
 }
 
-/// A single routing entry: one domain mapped to one upstream backend.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct Route {
-    /// The domain pattern this route matches.
-    ///
-    /// - Exact: `"api.example.com"`
-    /// - Wildcard: `"*.example.com"` (matches any single subdomain label)
-    pub domain: String,
+// ── Handler types ────────────────────────────────────────────
 
-    /// The backend address to forward matching requests to.
-    pub upstream: SocketAddr,
-
-    /// Whether this route expects TLS. When true, plaintext HTTP requests
-    /// are redirected to HTTPS. When false, HTTP is served directly.
-    pub tls: bool,
-
-    /// Per-IP requests-per-second limit for this route. `None` means no limit.
-    pub rate_limit_rps: Option<u32>,
-
-    /// Whether Under Attack Mode is active for this route. When true, the
-    /// `UnderAttackPlugin` serves a JS challenge to unverified clients.
-    pub under_attack: bool,
+/// What produces the response — the terminal action for a matched request.
+///
+/// Each handler block resolves to exactly one `Handler`. The proxy dispatches
+/// based on this: `ReverseProxy` continues to `upstream_peer()`, while future
+/// variants like `StaticResponse` and `FileServer` short-circuit in
+/// `request_filter()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Handler {
+    /// Forward the request to an upstream backend.
+    ReverseProxy { upstream: SocketAddr },
+    /// Return a fixed response — no upstream contacted. Used by `respond` directive.
+    StaticResponse { status: u16, body: bytes::Bytes },
+    /// Serve static files from disk. Used by `file_server` directive.
+    FileServer {
+        root: std::path::PathBuf,
+        browse: bool,
+    },
+    /// Proxy to a `FastCGI` backend (`php-fpm`). Used by `php_fastcgi` directive.
+    FastCgi {
+        upstream: SocketAddr,
+        root: std::path::PathBuf,
+    },
 }
 
-impl Route {
-    /// Create a new route mapping `domain` to `upstream`.
-    pub fn new(domain: &str, upstream: SocketAddr, tls: bool, rate_limit_rps: Option<u32>) -> Self {
-        Self {
-            domain: domain.to_lowercase(),
-            upstream,
-            tls,
-            rate_limit_rps,
-            under_attack: false,
+/// How a handler block was declared, controlling execution semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockKind {
+    /// First match wins; path NOT stripped. (Caddy `handle`)
+    Handle,
+    /// First match wins; matched prefix IS stripped. (Caddy `handle_path`)
+    HandlePath,
+    /// All matching blocks execute in declaration order. (Caddy `route`)
+    Route,
+}
+
+/// Compiled path matcher — zero allocation at match time.
+///
+/// Patterns are compiled from Dwaarfile config at load time.
+/// Runtime matching uses only stack operations (`starts_with`, `==`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathMatcher {
+    /// Matches any path. Used for catch-all blocks and simple (flat) sites.
+    Any,
+    /// Exact path match: `/health` matches only `/health`.
+    Exact(CompactString),
+    /// Prefix match: `/api/` matches `/api/foo`, `/api/bar/baz`.
+    /// Stored without the trailing `*` from config syntax.
+    Prefix(CompactString),
+    /// Suffix match: `*.php` matches `/index.php`, `/admin/login.php`.
+    Suffix(CompactString),
+}
+
+impl PathMatcher {
+    /// Test whether the request path matches this matcher.
+    ///
+    /// Returns `Some(prefix_len)` on match — the number of bytes of the
+    /// path that the matcher consumed. Used by `handle_path` to strip
+    /// the prefix. Returns `None` on no match.
+    #[inline]
+    pub fn matches(&self, path: &str) -> Option<usize> {
+        match self {
+            PathMatcher::Any => Some(0),
+            PathMatcher::Exact(p) => {
+                if path == p.as_str() {
+                    Some(p.len())
+                } else {
+                    None
+                }
+            }
+            PathMatcher::Prefix(prefix) => {
+                if path.starts_with(prefix.as_str()) {
+                    Some(prefix.len())
+                } else {
+                    None
+                }
+            }
+            PathMatcher::Suffix(suffix) => {
+                if path.ends_with(suffix.as_str()) {
+                    Some(0)
+                } else {
+                    None
+                }
+            }
         }
     }
 }
 
-/// Fast domain→upstream lookup table with wildcard fallback.
+/// One handler block inside a site: a path matcher + middleware + terminal handler.
+///
+/// Conceptually maps to `handle /api/* { basicauth ...; reverse_proxy ... }`.
+/// For flat sites (no explicit handle blocks), there's a single `HandlerBlock`
+/// with `PathMatcher::Any` and `BlockKind::Handle`.
+/// A URI rewrite rule — compiled from `rewrite` or `uri` directives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RewriteRule {
+    /// `rewrite /new-path` — replace the entire URI.
+    Replace(CompactString),
+    /// `uri strip_prefix /api` — remove prefix from path.
+    StripPrefix(CompactString),
+    /// `uri strip_suffix .html` — remove suffix from path.
+    StripSuffix(CompactString),
+    /// `uri replace /old /new` — substring replacement.
+    SubstringReplace {
+        find: CompactString,
+        replace: CompactString,
+    },
+}
+
+impl RewriteRule {
+    /// Apply this rule to a path, returning the transformed path.
+    /// Returns `None` if the rule doesn't match (prefix/suffix not present).
+    #[inline]
+    pub fn apply(&self, path: &str) -> Option<CompactString> {
+        match self {
+            RewriteRule::Replace(to) => Some(to.clone()),
+            RewriteRule::StripPrefix(prefix) => path.strip_prefix(prefix.as_str()).map(|rest| {
+                if rest.is_empty() {
+                    CompactString::from("/")
+                } else {
+                    CompactString::from(rest)
+                }
+            }),
+            RewriteRule::StripSuffix(suffix) => path.strip_suffix(suffix.as_str()).map(|rest| {
+                if rest.is_empty() {
+                    CompactString::from("/")
+                } else {
+                    CompactString::from(rest)
+                }
+            }),
+            RewriteRule::SubstringReplace { find, replace } => {
+                if path.contains(find.as_str()) {
+                    Some(CompactString::from(
+                        path.replace(find.as_str(), replace.as_str()),
+                    ))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HandlerBlock {
+    pub kind: BlockKind,
+    pub matcher: PathMatcher,
+    /// Per-IP rate limit for this block. `None` inherits from site-level.
+    pub rate_limit_rps: Option<u32>,
+    /// Under Attack Mode for this block.
+    pub under_attack: bool,
+    /// URI rewrite rules — applied in order before the handler.
+    pub rewrites: Vec<RewriteRule>,
+    /// HTTP Basic Auth config — pre-compiled credential table.
+    pub basic_auth: Option<std::sync::Arc<dwaar_plugins::basic_auth::BasicAuthConfig>>,
+    /// Forward auth config — subrequest to external auth service.
+    pub forward_auth: Option<std::sync::Arc<dwaar_plugins::forward_auth::ForwardAuthConfig>>,
+    pub handler: Handler,
+}
+
+// ── Route ────────────────────────────────────────────────────
+
+/// A site: one domain with its handler blocks.
+///
+/// Replaces the old flat `{ domain, upstream, tls }` model. A domain can
+/// now have multiple handler blocks for path-based routing. For backward
+/// compatibility, `Route::new()` creates a single catch-all handler block.
+///
+/// ## Hot-path optimization
+///
+/// The common case (flat Dwaarfile, single upstream) is optimized: `default_upstream`,
+/// `default_rate_limit_rps`, and `default_under_attack` are cached inline to avoid
+/// a Vec pointer chase on every request. These are populated at construction time
+/// from the first handler block.
+#[derive(Debug, Clone)]
+pub struct Route {
+    /// The domain pattern this route matches.
+    pub domain: String,
+
+    /// Whether this route expects TLS.
+    pub tls: bool,
+
+    /// Inline cache of the first handler's upstream — avoids a Vec deref on
+    /// every request for the common single-handler case. `None` for
+    /// file_server-only or respond-only sites.
+    default_upstream: Option<SocketAddr>,
+
+    /// Inline cache of the first handler's rate limit.
+    default_rate_limit_rps: Option<u32>,
+
+    /// Inline cache of the first handler's `under_attack` flag.
+    default_under_attack: bool,
+
+    /// Handler blocks, checked in config-file order. For `handle`/`handle_path`,
+    /// first match wins. For `route`, all matching blocks execute.
+    ///
+    /// Flat sites (no explicit handle blocks) have exactly one entry with
+    /// `PathMatcher::Any`.
+    pub handlers: Vec<HandlerBlock>,
+}
+
+impl Route {
+    /// Create a simple single-upstream route (backward-compatible constructor).
+    ///
+    /// Wraps the upstream in a single `HandlerBlock { Any, ReverseProxy }`.
+    /// This is the common case for flat Dwaarfiles with no `handle` blocks.
+    pub fn new(domain: &str, upstream: SocketAddr, tls: bool, rate_limit_rps: Option<u32>) -> Self {
+        Self {
+            domain: domain.to_lowercase(),
+            tls,
+            default_upstream: Some(upstream),
+            default_rate_limit_rps: rate_limit_rps,
+            default_under_attack: false,
+            handlers: vec![HandlerBlock {
+                kind: BlockKind::Handle,
+                matcher: PathMatcher::Any,
+                rate_limit_rps,
+                under_attack: false,
+                rewrites: vec![],
+                basic_auth: None,
+                forward_auth: None,
+                handler: Handler::ReverseProxy { upstream },
+            }],
+        }
+    }
+
+    /// Build a route from pre-compiled handler blocks (for multi-handler sites).
+    ///
+    /// Scans handlers for the first `ReverseProxy` to populate `default_upstream`.
+    /// Rate limit and under-attack are taken from the first handler block (site-level).
+    pub fn with_handlers(domain: &str, tls: bool, handlers: Vec<HandlerBlock>) -> Self {
+        let default_upstream = handlers.iter().find_map(|b| match &b.handler {
+            Handler::ReverseProxy { upstream } | Handler::FastCgi { upstream, .. } => {
+                Some(*upstream)
+            }
+            Handler::StaticResponse { .. } | Handler::FileServer { .. } => None,
+        });
+        let first = handlers.first();
+        let default_rate_limit_rps = first.and_then(|b| b.rate_limit_rps);
+        let default_under_attack = first.is_some_and(|b| b.under_attack);
+
+        Self {
+            domain: domain.to_lowercase(),
+            tls,
+            default_upstream,
+            default_rate_limit_rps,
+            default_under_attack,
+            handlers,
+        }
+    }
+
+    /// The default upstream address — zero-cost inline read for flat routes.
+    ///
+    /// Returns `None` for sites with no `ReverseProxy` handler (file_server-only).
+    #[inline]
+    pub fn upstream(&self) -> Option<SocketAddr> {
+        self.default_upstream
+    }
+
+    /// Site-level rate limit — zero-cost inline read.
+    #[inline]
+    pub fn rate_limit_rps(&self) -> Option<u32> {
+        self.default_rate_limit_rps
+    }
+
+    /// Whether Under Attack Mode is enabled — zero-cost inline read.
+    #[inline]
+    pub fn under_attack(&self) -> bool {
+        self.default_under_attack
+    }
+}
+
+/// Custom serialization to keep admin API JSON output stable.
+/// Flattens the handler structure for simple (single-handler) routes.
+impl serde::Serialize for Route {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("Route", 5)?;
+        s.serialize_field("domain", &self.domain)?;
+        s.serialize_field("upstream", &self.upstream().map(|a| a.to_string()))?;
+        s.serialize_field("tls", &self.tls)?;
+        s.serialize_field("rate_limit_rps", &self.rate_limit_rps())?;
+        s.serialize_field("under_attack", &self.under_attack())?;
+        s.end()
+    }
+}
+
+// ── RouteTable ───────────────────────────────────────────────
+
+/// Fast domain→route lookup table with wildcard fallback.
 ///
 /// Internally a `HashMap<String, Route>` keyed by the domain pattern.
 /// Exact domains and wildcard patterns (`*.example.com`) live in the
@@ -237,7 +495,7 @@ mod tests {
         ]);
 
         let route = table.resolve("api.example.com").expect("should match");
-        assert_eq!(route.upstream, addr(3000));
+        assert_eq!(route.upstream().expect("has upstream"), addr(3000));
     }
 
     #[test]
@@ -246,10 +504,10 @@ mod tests {
 
         // Host header arrives in mixed case — should still match
         let route = table.resolve("api.example.com").expect("should match");
-        assert_eq!(route.upstream, addr(3000));
+        assert_eq!(route.upstream().expect("has upstream"), addr(3000));
 
         let route = table.resolve("Api.Example.Com").expect("should match");
-        assert_eq!(route.upstream, addr(3000));
+        assert_eq!(route.upstream().expect("has upstream"), addr(3000));
     }
 
     // ── Wildcard match ───────────────────────────────────────
@@ -259,10 +517,10 @@ mod tests {
         let table = RouteTable::new(vec![Route::new("*.example.com", addr(9000), false, None)]);
 
         let route = table.resolve("api.example.com").expect("should match");
-        assert_eq!(route.upstream, addr(9000));
+        assert_eq!(route.upstream().expect("has upstream"), addr(9000));
 
         let route = table.resolve("web.example.com").expect("should match");
-        assert_eq!(route.upstream, addr(9000));
+        assert_eq!(route.upstream().expect("has upstream"), addr(9000));
     }
 
     #[test]
@@ -274,11 +532,11 @@ mod tests {
 
         // api.example.com → exact match (port 3000), not wildcard
         let route = table.resolve("api.example.com").expect("should match");
-        assert_eq!(route.upstream, addr(3000));
+        assert_eq!(route.upstream().expect("has upstream"), addr(3000));
 
         // web.example.com → no exact match, falls to wildcard (port 9000)
         let route = table.resolve("web.example.com").expect("should match");
-        assert_eq!(route.upstream, addr(9000));
+        assert_eq!(route.upstream().expect("has upstream"), addr(9000));
     }
 
     // ── No match ─────────────────────────────────────────────
@@ -373,10 +631,10 @@ mod tests {
     #[test]
     fn route_rate_limit_field() {
         let route = Route::new("example.com", addr(3000), false, Some(100));
-        assert_eq!(route.rate_limit_rps, Some(100));
+        assert_eq!(route.rate_limit_rps(), Some(100));
 
         let unlimited = Route::new("example.com", addr(3000), false, None);
-        assert_eq!(unlimited.rate_limit_rps, None);
+        assert_eq!(unlimited.rate_limit_rps(), None);
     }
 
     #[test]
@@ -384,5 +642,119 @@ mod tests {
         let route = Route::new("example.com", addr(3000), true, Some(500));
         let json = serde_json::to_string(&route).expect("serialize");
         assert!(json.contains("\"rate_limit_rps\":500"));
+    }
+
+    // ── Under Attack Mode field ──────────────────────────────
+
+    #[test]
+    fn under_attack_default_false() {
+        let route = Route::new("example.com", addr(3000), false, None);
+        assert!(!route.under_attack());
+    }
+
+    // ── Handler block accessors ──────────────────────────────
+
+    #[test]
+    fn upstream_returns_reverse_proxy_addr() {
+        let route = Route::new("example.com", addr(3000), false, None);
+        assert_eq!(route.upstream().expect("has upstream"), addr(3000));
+    }
+
+    // ── PathMatcher ──────────────────────────────────────────
+
+    #[test]
+    fn path_matcher_any_matches_everything() {
+        let m = PathMatcher::Any;
+        assert!(m.matches("/").is_some());
+        assert!(m.matches("/api/foo").is_some());
+        assert!(m.matches("").is_some());
+    }
+
+    #[test]
+    fn path_matcher_exact() {
+        let m = PathMatcher::Exact(CompactString::from("/health"));
+        assert!(m.matches("/health").is_some());
+        assert!(m.matches("/health/").is_none());
+        assert!(m.matches("/other").is_none());
+    }
+
+    #[test]
+    fn path_matcher_prefix() {
+        let m = PathMatcher::Prefix(CompactString::from("/api/"));
+        assert!(m.matches("/api/foo").is_some());
+        assert!(m.matches("/api/bar/baz").is_some());
+        assert!(m.matches("/api/").is_some());
+        assert!(m.matches("/other").is_none());
+        assert!(m.matches("/apifoo").is_none());
+    }
+
+    #[test]
+    fn path_matcher_prefix_returns_matched_length() {
+        let m = PathMatcher::Prefix(CompactString::from("/api/"));
+        assert_eq!(m.matches("/api/foo"), Some(5)); // "/api/" is 5 bytes
+    }
+
+    #[test]
+    fn path_matcher_suffix() {
+        let m = PathMatcher::Suffix(CompactString::from(".php"));
+        assert!(m.matches("/index.php").is_some());
+        assert!(m.matches("/admin/login.php").is_some());
+        assert!(m.matches("/style.css").is_none());
+    }
+
+    // ── RewriteRule ──────────────────────────────────────
+
+    #[test]
+    fn rewrite_replace() {
+        let r = RewriteRule::Replace(CompactString::from("/new"));
+        assert_eq!(r.apply("/anything").expect("matches"), "/new");
+    }
+
+    #[test]
+    fn rewrite_strip_prefix_matches() {
+        let r = RewriteRule::StripPrefix(CompactString::from("/api"));
+        assert_eq!(r.apply("/api/users").expect("matches"), "/users");
+    }
+
+    #[test]
+    fn rewrite_strip_prefix_no_match() {
+        let r = RewriteRule::StripPrefix(CompactString::from("/api"));
+        assert!(r.apply("/other/path").is_none());
+    }
+
+    #[test]
+    fn rewrite_strip_prefix_exact_gives_root() {
+        let r = RewriteRule::StripPrefix(CompactString::from("/api"));
+        assert_eq!(r.apply("/api").expect("matches"), "/");
+    }
+
+    #[test]
+    fn rewrite_strip_suffix() {
+        let r = RewriteRule::StripSuffix(CompactString::from(".html"));
+        assert_eq!(r.apply("/page.html").expect("matches"), "/page");
+    }
+
+    #[test]
+    fn rewrite_strip_suffix_no_match() {
+        let r = RewriteRule::StripSuffix(CompactString::from(".html"));
+        assert!(r.apply("/page.css").is_none());
+    }
+
+    #[test]
+    fn rewrite_substring_replace() {
+        let r = RewriteRule::SubstringReplace {
+            find: CompactString::from("/v1"),
+            replace: CompactString::from("/v2"),
+        };
+        assert_eq!(r.apply("/api/v1/users").expect("matches"), "/api/v2/users");
+    }
+
+    #[test]
+    fn rewrite_substring_replace_no_match() {
+        let r = RewriteRule::SubstringReplace {
+            find: CompactString::from("/v1"),
+            replace: CompactString::from("/v2"),
+        };
+        assert!(r.apply("/api/v3/users").is_none());
     }
 }

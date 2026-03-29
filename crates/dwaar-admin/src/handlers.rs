@@ -153,7 +153,7 @@ mod tests {
         add_route(&table, body).expect("upsert");
         let guard = table.load();
         let route = guard.resolve("exist.com").expect("should exist");
-        assert_eq!(route.upstream.port(), 2000);
+        assert_eq!(route.upstream().expect("has upstream").port(), 2000);
         assert!(route.tls);
     }
 

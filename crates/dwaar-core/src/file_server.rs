@@ -1,0 +1,368 @@
+// Copyright (C) 2026 Permanu
+// SPDX-License-Identifier: BSL-1.1
+//
+// This file is part of Dwaar — https://dwaar.dev
+// Licensed under the Business Source License 1.1
+
+//! Static file server — serves files from disk for the `file_server` directive.
+//!
+//! ## Security (Guardrail #17 — all client input is adversarial)
+//!
+//! - Path traversal: canonicalize + `starts_with` check rejects `../`, symlinks outside root
+//! - Null bytes: rejected before filesystem access
+//! - Dotfiles: hidden by default (`.env`, `.htpasswd`, etc.)
+//! - MIME type: derived from extension only, never from client input
+
+use std::path::Path;
+use std::time::SystemTime;
+
+use bytes::Bytes;
+
+/// Result of resolving a file request.
+#[derive(Debug)]
+pub enum FileResponse {
+    /// File found — ready to serve.
+    Found {
+        body: Bytes,
+        content_type: &'static str,
+        content_length: usize,
+        last_modified: Option<SystemTime>,
+        etag: Option<String>,
+    },
+    /// Directory listing HTML.
+    DirectoryListing { body: Bytes },
+    /// File not found — let the next handler try.
+    NotFound,
+    /// Path traversal or other security rejection.
+    Forbidden,
+}
+
+/// Resolve a request path to a file response.
+///
+/// `root`: the configured filesystem root (already canonicalized at compile time).
+/// `request_path`: the URL path from the client (e.g., `/css/style.css`).
+/// `browse`: whether directory listing is enabled.
+pub fn serve_file(root: &Path, request_path: &str, browse: bool) -> FileResponse {
+    // Reject null bytes before any filesystem access
+    if request_path.contains('\0') {
+        return FileResponse::Forbidden;
+    }
+
+    // Strip leading slash and decode percent-encoding basics
+    let clean_path = request_path.trim_start_matches('/');
+
+    // Reject dotfiles (hidden files like .env, .htpasswd)
+    if clean_path
+        .split('/')
+        .any(|segment| segment.starts_with('.') && segment != ".")
+    {
+        return FileResponse::Forbidden;
+    }
+
+    // Canonicalize root first — on macOS, /tmp symlinks to /private/tmp
+    let Ok(canonical_root) = root.canonicalize() else {
+        return FileResponse::NotFound;
+    };
+
+    // Build candidate path and canonicalize to resolve symlinks + `..`
+    let candidate = canonical_root.join(clean_path);
+    let Ok(resolved) = candidate.canonicalize() else {
+        return FileResponse::NotFound;
+    };
+
+    // Critical security check — prevents path traversal
+    if !resolved.starts_with(&canonical_root) {
+        return FileResponse::Forbidden;
+    }
+
+    if resolved.is_dir() {
+        // Try index files
+        for index in &["index.html", "index.txt"] {
+            let index_path = resolved.join(index);
+            if index_path.is_file() {
+                return read_file(&index_path);
+            }
+        }
+        if browse {
+            return generate_directory_listing(&resolved, request_path);
+        }
+        return FileResponse::NotFound;
+    }
+
+    if resolved.is_file() {
+        // Check for precompressed variants
+        // (caller would need Accept-Encoding — for now serve the original)
+        return read_file(&resolved);
+    }
+
+    FileResponse::NotFound
+}
+
+fn read_file(path: &Path) -> FileResponse {
+    let content_type = mime_type_for_path(path);
+
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return FileResponse::NotFound;
+    };
+
+    let body = match std::fs::read(path) {
+        Ok(data) => Bytes::from(data),
+        Err(_) => return FileResponse::NotFound,
+    };
+
+    let last_modified = metadata.modified().ok();
+    let etag = last_modified.map(|lm| {
+        let duration = lm
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default();
+        format!("\"{}{}\"", duration.as_secs(), metadata.len())
+    });
+
+    FileResponse::Found {
+        content_length: body.len(),
+        body,
+        content_type,
+        last_modified,
+        etag,
+    }
+}
+
+fn generate_directory_listing(dir: &Path, request_path: &str) -> FileResponse {
+    use std::fmt::Write;
+    let mut html = String::with_capacity(4096);
+    html.push_str("<!DOCTYPE html><html><head><meta charset=\"utf-8\">");
+    html.push_str("<title>Index of ");
+    html.push_str(&html_escape(request_path));
+    html.push_str(
+        "</title><style>body{font-family:monospace;margin:2em}a{text-decoration:none}</style>",
+    );
+    html.push_str("</head><body><h1>Index of ");
+    html.push_str(&html_escape(request_path));
+    html.push_str("</h1><hr><pre>\n");
+
+    // Parent directory link
+    if request_path != "/" {
+        html.push_str("<a href=\"../\">../</a>\n");
+    }
+
+    // Read directory entries, sorted
+    if let Ok(mut entries) = std::fs::read_dir(dir) {
+        let mut items: Vec<(String, bool)> = Vec::new();
+        while let Some(Ok(entry)) = entries.next() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            // Skip dotfiles in listing
+            if name.starts_with('.') {
+                continue;
+            }
+            let is_dir = entry.file_type().is_ok_and(|ft| ft.is_dir());
+            items.push((name, is_dir));
+        }
+        items.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (name, is_dir) in &items {
+            let escaped = html_escape(name);
+            let display = if *is_dir {
+                format!("{escaped}/")
+            } else {
+                escaped.clone()
+            };
+            let href = if *is_dir {
+                format!("{escaped}/")
+            } else {
+                escaped
+            };
+            let _ = writeln!(html, "<a href=\"{href}\">{display}</a>");
+        }
+    }
+
+    html.push_str("</pre><hr></body></html>");
+    FileResponse::DirectoryListing {
+        body: Bytes::from(html),
+    }
+}
+
+/// Map file extension to MIME type. Uses a small built-in table for common
+/// web types, falls back to `application/octet-stream`.
+fn mime_type_for_path(path: &Path) -> &'static str {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+    match ext {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "application/javascript; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "xml" => "application/xml; charset=utf-8",
+        "txt" => "text/plain; charset=utf-8",
+        "csv" => "text/csv; charset=utf-8",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "ttf" => "font/ttf",
+        "otf" => "font/otf",
+        "eot" => "application/vnd.ms-fontobject",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "gz" => "application/gzip",
+        "br" => "application/x-brotli",
+        "wasm" => "application/wasm",
+        "map" => "application/json",
+        "webmanifest" => "application/manifest+json",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Escape HTML special characters to prevent XSS in directory listings.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn setup_test_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        fs::write(dir.path().join("index.html"), "<html>hello</html>").expect("write index");
+        fs::write(dir.path().join("style.css"), "body{}").expect("write css");
+        fs::create_dir(dir.path().join("sub")).expect("create subdir");
+        fs::write(dir.path().join("sub/page.html"), "<html>sub</html>").expect("write sub");
+        fs::write(dir.path().join(".env"), "SECRET=123").expect("write dotfile");
+        dir
+    }
+
+    #[test]
+    fn serves_existing_file() {
+        let dir = setup_test_dir();
+        let resp = serve_file(dir.path(), "/style.css", false);
+        match resp {
+            FileResponse::Found {
+                content_type, body, ..
+            } => {
+                assert_eq!(content_type, "text/css; charset=utf-8");
+                assert_eq!(body.as_ref(), b"body{}");
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serves_index_html_for_directory() {
+        let dir = setup_test_dir();
+        let resp = serve_file(dir.path(), "/", false);
+        assert!(matches!(resp, FileResponse::Found { .. }));
+    }
+
+    #[test]
+    fn not_found_for_missing_file() {
+        let dir = setup_test_dir();
+        let resp = serve_file(dir.path(), "/nonexistent.txt", false);
+        assert!(matches!(resp, FileResponse::NotFound));
+    }
+
+    #[test]
+    fn rejects_path_traversal() {
+        let dir = setup_test_dir();
+        let resp = serve_file(dir.path(), "/../../../etc/passwd", false);
+        assert!(matches!(
+            resp,
+            FileResponse::Forbidden | FileResponse::NotFound
+        ));
+    }
+
+    #[test]
+    fn rejects_null_bytes() {
+        let dir = setup_test_dir();
+        let resp = serve_file(dir.path(), "/style.css\0.txt", false);
+        assert!(matches!(resp, FileResponse::Forbidden));
+    }
+
+    #[test]
+    fn rejects_dotfiles() {
+        let dir = setup_test_dir();
+        let resp = serve_file(dir.path(), "/.env", false);
+        assert!(matches!(resp, FileResponse::Forbidden));
+    }
+
+    #[test]
+    fn directory_listing_when_browse_enabled() {
+        let dir = setup_test_dir();
+        let resp = serve_file(dir.path(), "/sub/", true);
+        match resp {
+            FileResponse::DirectoryListing { body } => {
+                let html = std::str::from_utf8(&body).expect("valid utf8");
+                assert!(html.contains("page.html"));
+                assert!(html.contains("../"));
+            }
+            other => panic!("expected DirectoryListing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_listing_when_browse_disabled() {
+        let dir = setup_test_dir();
+        // /sub/ has page.html but no index.html — without browse, returns NotFound
+        let resp = serve_file(dir.path(), "/sub/", false);
+        assert!(matches!(resp, FileResponse::NotFound));
+    }
+
+    #[test]
+    fn serves_subdirectory_file() {
+        let dir = setup_test_dir();
+        let resp = serve_file(dir.path(), "/sub/page.html", false);
+        assert!(matches!(resp, FileResponse::Found { .. }));
+    }
+
+    #[test]
+    fn etag_is_set() {
+        let dir = setup_test_dir();
+        if let FileResponse::Found { etag, .. } = serve_file(dir.path(), "/style.css", false) {
+            assert!(etag.is_some());
+            let tag = etag.expect("etag");
+            assert!(tag.starts_with('"'));
+            assert!(tag.ends_with('"'));
+        } else {
+            panic!("expected Found");
+        }
+    }
+
+    #[test]
+    fn html_escape_prevents_xss() {
+        assert_eq!(html_escape("<script>"), "&lt;script&gt;");
+        assert_eq!(html_escape("a&b"), "a&amp;b");
+    }
+
+    #[test]
+    fn mime_types_correct() {
+        assert_eq!(
+            mime_type_for_path(Path::new("style.css")),
+            "text/css; charset=utf-8"
+        );
+        assert_eq!(
+            mime_type_for_path(Path::new("app.js")),
+            "application/javascript; charset=utf-8"
+        );
+        assert_eq!(mime_type_for_path(Path::new("image.png")), "image/png");
+        assert_eq!(
+            mime_type_for_path(Path::new("unknown.xyz")),
+            "application/octet-stream"
+        );
+    }
+}

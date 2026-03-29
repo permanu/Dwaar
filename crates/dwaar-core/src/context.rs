@@ -35,6 +35,7 @@
 use std::net::SocketAddr;
 use std::time::Instant;
 
+use compact_str::CompactString;
 use dwaar_analytics::decompress::Decompressor;
 use dwaar_analytics::injector::HtmlInjector;
 use dwaar_plugins::plugin::PluginCtx;
@@ -68,8 +69,40 @@ pub struct RequestContext {
     /// Plugin context — carries per-request state that plugins read and write.
     pub plugin_ctx: PluginCtx,
 
-    /// The upstream address selected by route resolution in `upstream_peer()`.
+    /// The upstream address selected by route resolution in `request_filter()`.
     pub route_upstream: Option<SocketAddr>,
+
+    /// Whether the matched route requires TLS. Cached here to avoid a second
+    /// `ArcSwap` load in `https_redirect_domain()`.
+    pub route_tls: bool,
+
+    /// The canonical domain from the matched route. Cached for the HTTPS redirect
+    /// Location header without needing a second route table lookup.
+    pub route_canonical_domain: Option<String>,
+
+    /// Static response cached from route lookup — for `respond` directive.
+    /// Avoids a second `ArcSwap` load (Guardrail #27).
+    pub static_response: Option<(u16, bytes::Bytes)>,
+
+    /// Rewritten request path — set by `rewrite`/`uri` directives. If `Some`,
+    /// `upstream_request_filter()` uses this instead of the original URI.
+    /// The original path stays in `plugin_ctx.path` for logging.
+    pub effective_path: Option<CompactString>,
+
+    /// Basic auth config cached from route lookup (Guardrail #27 — no second load).
+    pub basic_auth: Option<std::sync::Arc<dwaar_plugins::basic_auth::BasicAuthConfig>>,
+
+    /// Forward auth config cached from route lookup (Guardrail #27).
+    pub forward_auth: Option<std::sync::Arc<dwaar_plugins::forward_auth::ForwardAuthConfig>>,
+
+    /// File server config cached from route lookup (Guardrail #27).
+    pub file_server: Option<(std::path::PathBuf, bool)>,
+
+    /// `FastCGI` document root cached from route lookup (Guardrail #27).
+    pub fastcgi_root: Option<std::path::PathBuf>,
+
+    /// Headers copied from `forward_auth` response to forward to upstream.
+    pub forward_auth_headers: Vec<(CompactString, CompactString)>,
 
     /// HTML script injector for analytics (core, not a plugin).
     pub injector: Option<HtmlInjector>,
@@ -91,6 +124,15 @@ impl RequestContext {
             request_id_buf: buf,
             plugin_ctx: PluginCtx::default(),
             route_upstream: None,
+            route_tls: false,
+            route_canonical_domain: None,
+            static_response: None,
+            effective_path: None,
+            basic_auth: None,
+            forward_auth: None,
+            forward_auth_headers: Vec::new(),
+            file_server: None,
+            fastcgi_root: None,
             injector: None,
             decompressor: None,
         }
@@ -162,6 +204,8 @@ mod tests {
         assert!(ctx.plugin_ctx.method.is_empty());
         assert!(ctx.plugin_ctx.path.is_empty());
         assert!(ctx.route_upstream.is_none());
+        assert!(!ctx.route_tls);
+        assert!(ctx.route_canonical_domain.is_none());
         assert!(ctx.injector.is_none());
         assert!(ctx.decompressor.is_none());
         assert!(!ctx.plugin_ctx.is_bot);

@@ -272,6 +272,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "bcrypt"
+version = "0.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "abaf6da45c74385272ddf00e1ac074c7d8a6c1a1dda376902bd6a427522a8b2c"
+dependencies = [
+ "base64",
+ "blowfish",
+ "getrandom 0.3.4",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -314,6 +327,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
  "generic-array",
+]
+
+[[package]]
+name = "blowfish"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e412e2cd0f2b2d93e02543ceae7917b3c70331573df19ee046bcbc35e45e87d7"
+dependencies = [
+ "byteorder",
+ "cipher",
 ]
 
 [[package]]
@@ -958,6 +981,7 @@ dependencies = [
  "dwaar-plugins",
  "dwaar-tls",
  "libc",
+ "mimalloc",
  "openssl",
  "pingora",
  "pingora-core",
@@ -979,8 +1003,12 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "async-trait",
+ "bcrypt",
+ "bytes",
+ "compact_str",
  "criterion",
  "dwaar-core",
+ "dwaar-plugins",
  "notify",
  "openssl",
  "pingora-core",
@@ -1018,7 +1046,9 @@ dependencies = [
  "pingora-proxy",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "tokio-test",
  "tracing",
  "uuid",
@@ -1070,6 +1100,9 @@ dependencies = [
 name = "dwaar-plugins"
 version = "0.1.0"
 dependencies = [
+ "ahash",
+ "base64",
+ "bcrypt",
  "brotli 8.0.2",
  "bytes",
  "compact_str",
@@ -1084,7 +1117,9 @@ dependencies = [
  "proptest",
  "sha2",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
+ "zeroize",
  "zstd",
 ]
 
@@ -1965,6 +2000,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b5b646652bf6661599e1da8901b3b9522896f01e736bad5f723fe7a3a27f899d"
 
 [[package]]
+name = "libmimalloc-sys"
+version = "0.1.44"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "667f4fec20f29dfc6bc7357c582d91796c169ad7e2fce709468aefeb2c099870"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
 name = "libz-ng-sys"
 version = "1.1.25"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2072,6 +2117,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5aa361d4faea93603064a027415f07bd8e1d5c88c9fbf68bf56a285428fd79ce"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "mimalloc"
+version = "0.1.48"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1ee66a4b64c74f4ef288bcbb9192ad9c3feaad75193129ac8509af543894fd8"
+dependencies = [
+ "libmimalloc-sys",
 ]
 
 [[package]]
