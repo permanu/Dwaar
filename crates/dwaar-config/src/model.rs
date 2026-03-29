@@ -12,9 +12,35 @@
 
 use std::net::SocketAddr;
 
-/// A fully parsed Dwaarfile — zero or more site blocks.
+/// Global options from the bare `{ }` block at the very top of a Dwaarfile.
+///
+/// Caddyfile's global options block controls server-wide settings that
+/// aren't tied to a specific site — port assignments, ACME email, debug
+/// logging, etc. We parse these so that a valid Caddyfile is always a
+/// valid Dwaarfile, even if not all options are acted on yet.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GlobalOptions {
+    /// HTTP port (default: 80). `http_port 8080`
+    pub http_port: Option<u16>,
+    /// HTTPS port (default: 443). `https_port 8443`
+    pub https_port: Option<u16>,
+    /// Email for ACME account registration. `email admin@example.com`
+    pub email: Option<String>,
+    /// Enable debug logging. `debug` (bare flag, no value)
+    pub debug: bool,
+    /// Auto HTTPS behavior. `auto_https off` / `auto_https disable_redirects`
+    pub auto_https: Option<String>,
+    /// Options we recognized but don't act on — stored so we never error
+    /// on valid Caddyfile syntax we haven't implemented yet.
+    pub passthrough: Vec<(String, Vec<String>)>,
+}
+
+/// A fully parsed Dwaarfile — an optional global options block followed
+/// by zero or more site blocks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DwaarConfig {
+    /// Global options from the bare `{ }` block, if present.
+    pub global_options: Option<GlobalOptions>,
     pub sites: Vec<SiteBlock>,
 }
 
@@ -22,6 +48,10 @@ pub struct DwaarConfig {
 ///
 /// ```text
 /// api.example.com {
+///     @api {
+///         path /api/*
+///         method GET POST
+///     }
 ///     reverse_proxy localhost:3000
 ///     tls auto
 /// }
@@ -32,8 +62,111 @@ pub struct SiteBlock {
     /// Examples: `"api.example.com"`, `"*.example.com"`, `":8080"`
     pub address: String,
 
+    /// Named matcher definitions (`@name { ... }`) declared in this site block.
+    /// These are resolved at compile time; no per-request dynamic dispatch.
+    pub matchers: Vec<MatcherDef>,
+
     /// Directives inside the block, in source order.
     pub directives: Vec<Directive>,
+}
+
+// ── Named matcher types ───────────────────────────────────────────────────────
+
+/// A named matcher definition: `@name { conditions }` or `@name condition`.
+///
+/// All conditions use AND logic — every condition must match for the matcher
+/// to pass. This mirrors Caddy's named matcher semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatcherDef {
+    /// Name without the `@` prefix (e.g. `"api"` for `@api`).
+    pub name: String,
+    /// Matcher conditions — ALL must match (AND logic).
+    pub conditions: Vec<MatcherCondition>,
+}
+
+/// A single matcher condition inside a named matcher block.
+///
+/// Conditions correspond to Caddyfile matcher directives as documented at
+/// <https://caddyserver.com/docs/caddyfile/matchers>.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatcherCondition {
+    /// `path /foo /bar` — match URI paths, supports `*` wildcards.
+    Path(Vec<String>),
+
+    /// `path_regexp [name] pattern` — regex path match.
+    PathRegexp {
+        /// Optional capture group name for the regexp.
+        name: Option<String>,
+        /// The regular expression pattern.
+        pattern: String,
+    },
+
+    /// `host example.com other.com` — match the Host header.
+    Host(Vec<String>),
+
+    /// `method GET POST` — match HTTP method(s).
+    Method(Vec<String>),
+
+    /// `header X-Foo [value]` — match a request header, optionally by value.
+    Header {
+        /// Header field name.
+        name: String,
+        /// Required value; if absent, only presence is checked.
+        value: Option<String>,
+    },
+
+    /// `header_regexp X-Foo pattern` — regex match on a request header value.
+    HeaderRegexp {
+        /// Header field name.
+        name: String,
+        /// The regular expression pattern.
+        pattern: String,
+    },
+
+    /// `protocol https` — match by protocol (`http` or `https`).
+    Protocol(String),
+
+    /// `remote_ip 192.168.0.0/16` — match the peer IP/CIDR.
+    RemoteIp(Vec<String>),
+
+    /// `client_ip 10.0.0.0/8` — match client IP (honours X-Forwarded-For).
+    ClientIp(Vec<String>),
+
+    /// `query key=value` — match a query string parameter.
+    Query(Vec<String>),
+
+    /// `not { conditions }` — negate a set of conditions.
+    Not(Vec<MatcherCondition>),
+
+    /// `expression <cel>` — CEL expression, stored as-is (not evaluated here).
+    Expression(String),
+
+    /// `file { try_files ... }` — match if the listed files exist on disk.
+    File { try_files: Vec<String> },
+
+    /// Unknown condition keyword — stored verbatim for forward compatibility.
+    /// No parse error is raised; the keyword and its arguments are preserved.
+    Unknown {
+        /// The unrecognised keyword.
+        keyword: String,
+        /// The remaining arguments on the same line / in the same block.
+        args: Vec<String>,
+    },
+}
+
+/// How a directive references a matcher.
+///
+/// This is compile-time resolved (Guardrail #27 — no per-request dynamic
+/// dispatch). `Named` references are looked up in the site's `matchers` Vec
+/// during compilation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatcherRef {
+    /// No matcher specified — matches all requests.
+    None,
+    /// Inline path pattern like `/api/*` or `*`.
+    Inline(String),
+    /// Named matcher reference like `@api` (without the `@` prefix).
+    Named(String),
 }
 
 /// A single directive inside a site block.
@@ -92,6 +225,49 @@ pub enum Directive {
 
     /// `php_fastcgi localhost:9000` — proxy PHP requests to `FastCGI` backend
     PhpFastcgi(PhpFastcgiDirective),
+
+    /// `log { output file /var/log/access.log; format json; level INFO }`
+    Log(LogDirective),
+
+    /// `request_header X-Name "value"` / `request_header -X-Remove`
+    RequestHeader(RequestHeaderDirective),
+
+    /// `error "message" 500` or `error 404`
+    Error(ErrorDirective),
+
+    /// `abort` — drop the connection immediately
+    Abort,
+
+    /// `method GET` — override the HTTP method sent to upstream
+    Method(MethodDirective),
+
+    /// `request_body { max_size 10MB }`
+    RequestBody(RequestBodyDirective),
+
+    /// `try_files {path}.html {path} /index.html`
+    TryFiles(TryFilesDirective),
+
+    /// `handle_errors { respond ... }`
+    HandleErrors(HandleErrorsDirective),
+
+    /// `bind 0.0.0.0` or `bind 127.0.0.1 ::1`
+    Bind(BindDirective),
+
+    /// `skip_log` or `log_skip` — suppress access log for this site
+    SkipLog,
+
+    /// `vars key value`
+    Vars(VarsDirective),
+
+    /// A directive recognized as valid Caddyfile syntax but not yet implemented
+    /// by Dwaar. Parsed successfully to satisfy Guardrail #14 (every valid
+    /// Caddyfile is a valid Dwaarfile), emits a warning at compile time.
+    Passthrough {
+        /// The directive name (e.g., "templates").
+        name: String,
+        /// Whether the directive had a `{ ... }` block.
+        has_block: bool,
+    },
 }
 
 /// `handle` — path-scoped directive block. First match wins.
@@ -193,6 +369,116 @@ pub struct EncodeDirective {
 pub struct RateLimitDirective {
     /// Maximum requests per second per IP for this route.
     pub requests_per_second: u32,
+}
+
+// ── New directive types (Phase 3 + 4) ─────────────────────────────────────────
+
+/// `log` — per-site access logging configuration.
+///
+/// Without a block, enables default logging. With a block, configures
+/// output destination, format, and log level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogDirective {
+    pub output: Option<LogOutput>,
+    pub format: Option<LogFormat>,
+    /// Log level string (e.g. "INFO", "DEBUG", "WARN", "ERROR").
+    pub level: Option<String>,
+}
+
+/// Where `log` sends access log entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogOutput {
+    Stdout,
+    Stderr,
+    /// Discard all log output for this site.
+    Discard,
+    /// Write to a file at the given path.
+    File {
+        path: String,
+    },
+}
+
+/// Structured log format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogFormat {
+    Console,
+    Json,
+}
+
+/// `request_header` — modify request headers before proxying to upstream.
+///
+/// Caddy syntax:
+/// - `request_header X-Name "value"` — set
+/// - `request_header -X-Remove` — delete
+/// - `request_header +X-Append "value"` — append (add without replacing)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestHeaderDirective {
+    /// Set the named header to a fixed value, replacing any existing value.
+    Set { name: String, value: String },
+    /// Remove the header entirely before forwarding.
+    Delete { name: String },
+    /// Add the header value without removing existing values.
+    Add { name: String, value: String },
+}
+
+/// `error` — respond with an explicit error status.
+///
+/// Useful to deny specific paths with a clean error response rather
+/// than forwarding to upstream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrorDirective {
+    /// Optional human-readable error message body.
+    pub message: String,
+    /// HTTP status code to send.
+    pub status: u16,
+}
+
+/// `method` — override the HTTP method forwarded to upstream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MethodDirective {
+    /// The HTTP method to use (e.g. "GET", "POST").
+    pub method: String,
+}
+
+/// `request_body` — body size limits and policies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestBodyDirective {
+    /// Maximum allowed request body size in bytes. `None` means no limit.
+    pub max_size: Option<u64>,
+}
+
+/// `try_files` — attempt to serve static files before falling through.
+///
+/// Each entry is a file pattern. The first pattern that exists on disk
+/// is served; if none match, the final entry is used as a fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TryFilesDirective {
+    /// File patterns to try in order (e.g. `["{path}.html", "{path}", "/index.html"]`).
+    pub files: Vec<String>,
+}
+
+/// `handle_errors` — error page routing.
+///
+/// Directives inside this block run when upstream returns an error status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandleErrorsDirective {
+    pub directives: Vec<Directive>,
+}
+
+/// `bind` — listen addresses for this site.
+///
+/// By default Dwaar listens on all interfaces. `bind` restricts which
+/// addresses the listener is attached to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindDirective {
+    pub addresses: Vec<String>,
+}
+
+/// `vars` — set a named variable for use in other directives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VarsDirective {
+    pub key: String,
+    pub value: String,
 }
 
 /// `respond` — return a static response without proxying to upstream.
@@ -306,9 +592,12 @@ pub enum UriOperation {
 }
 
 impl DwaarConfig {
-    /// Create an empty config.
+    /// Create an empty config with no global options and no sites.
     pub fn new() -> Self {
-        Self { sites: Vec::new() }
+        Self {
+            global_options: None,
+            sites: Vec::new(),
+        }
     }
 }
 
@@ -332,6 +621,7 @@ mod tests {
     fn site_block_with_directives() {
         let site = SiteBlock {
             address: "api.example.com".to_string(),
+            matchers: vec![],
             directives: vec![
                 Directive::ReverseProxy(ReverseProxyDirective {
                     upstreams: vec![UpstreamAddr::SocketAddr(
@@ -392,5 +682,146 @@ mod tests {
     fn config_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<DwaarConfig>();
+    }
+
+    // ── Named matcher model types ──────────────────────────────────────────────
+
+    #[test]
+    fn matcher_def_basic() {
+        let m = MatcherDef {
+            name: "api".to_string(),
+            conditions: vec![MatcherCondition::Path(vec!["/api/*".to_string()])],
+        };
+        assert_eq!(m.name, "api");
+        assert_eq!(m.conditions.len(), 1);
+    }
+
+    #[test]
+    fn matcher_ref_variants() {
+        let none = MatcherRef::None;
+        let inline = MatcherRef::Inline("/api/*".to_string());
+        let named = MatcherRef::Named("api".to_string());
+
+        assert!(matches!(none, MatcherRef::None));
+        assert!(matches!(inline, MatcherRef::Inline(_)));
+        assert!(matches!(named, MatcherRef::Named(_)));
+    }
+
+    #[test]
+    fn matcher_condition_all_variants_constructable() {
+        // Verify every variant can be constructed without compiler error.
+        let _ = MatcherCondition::Path(vec!["/foo".to_string()]);
+        let _ = MatcherCondition::PathRegexp {
+            name: Some("re".to_string()),
+            pattern: r"\.php$".to_string(),
+        };
+        let _ = MatcherCondition::Host(vec!["example.com".to_string()]);
+        let _ = MatcherCondition::Method(vec!["GET".to_string()]);
+        let _ = MatcherCondition::Header {
+            name: "X-Foo".to_string(),
+            value: Some("bar".to_string()),
+        };
+        let _ = MatcherCondition::HeaderRegexp {
+            name: "X-Foo".to_string(),
+            pattern: "^val".to_string(),
+        };
+        let _ = MatcherCondition::Protocol("https".to_string());
+        let _ = MatcherCondition::RemoteIp(vec!["192.168.0.0/16".to_string()]);
+        let _ = MatcherCondition::ClientIp(vec!["10.0.0.0/8".to_string()]);
+        let _ = MatcherCondition::Query(vec!["foo=bar".to_string()]);
+        let _ = MatcherCondition::Not(vec![MatcherCondition::Path(vec!["/admin/*".to_string()])]);
+        let _ = MatcherCondition::Expression("{http.request.host} == 'example.com'".to_string());
+        let _ = MatcherCondition::File {
+            try_files: vec!["/public{path}".to_string()],
+        };
+        let _ = MatcherCondition::Unknown {
+            keyword: "future_thing".to_string(),
+            args: vec!["arg1".to_string()],
+        };
+    }
+
+    #[test]
+    fn site_block_matchers_field_is_separate_from_directives() {
+        let site = SiteBlock {
+            address: "example.com".to_string(),
+            matchers: vec![MatcherDef {
+                name: "api".to_string(),
+                conditions: vec![MatcherCondition::Path(vec!["/api/*".to_string()])],
+            }],
+            directives: vec![Directive::Tls(TlsDirective::Auto)],
+        };
+
+        assert_eq!(site.matchers.len(), 1);
+        assert_eq!(site.directives.len(), 1);
+        assert_eq!(site.matchers[0].name, "api");
+    }
+
+    // ── New directive model types (Phase 3 + 4) ────────────────────────────────
+
+    #[test]
+    fn log_directive_default_no_block() {
+        let d = LogDirective {
+            output: None,
+            format: None,
+            level: None,
+        };
+        assert!(d.output.is_none());
+    }
+
+    #[test]
+    fn log_directive_file_output() {
+        let d = LogDirective {
+            output: Some(LogOutput::File {
+                path: "/var/log/access.log".to_string(),
+            }),
+            format: Some(LogFormat::Json),
+            level: Some("INFO".to_string()),
+        };
+        assert!(matches!(d.output, Some(LogOutput::File { .. })));
+        assert!(matches!(d.format, Some(LogFormat::Json)));
+    }
+
+    #[test]
+    fn request_header_variants() {
+        let set = RequestHeaderDirective::Set {
+            name: "X-Custom".to_string(),
+            value: "val".to_string(),
+        };
+        let del = RequestHeaderDirective::Delete {
+            name: "X-Remove".to_string(),
+        };
+        let add = RequestHeaderDirective::Add {
+            name: "X-Extra".to_string(),
+            value: "extra".to_string(),
+        };
+        assert!(matches!(set, RequestHeaderDirective::Set { .. }));
+        assert!(matches!(del, RequestHeaderDirective::Delete { .. }));
+        assert!(matches!(add, RequestHeaderDirective::Add { .. }));
+    }
+
+    #[test]
+    fn error_directive_fields() {
+        let e = ErrorDirective {
+            message: "forbidden".to_string(),
+            status: 403,
+        };
+        assert_eq!(e.status, 403);
+        assert_eq!(e.message, "forbidden");
+    }
+
+    #[test]
+    fn request_body_max_size() {
+        let rb = RequestBodyDirective {
+            max_size: Some(10 * 1024 * 1024),
+        };
+        assert_eq!(rb.max_size, Some(10 * 1024 * 1024));
+    }
+
+    #[test]
+    fn bind_directive_multiple_addresses() {
+        let b = BindDirective {
+            addresses: vec!["0.0.0.0".to_string(), "::1".to_string()],
+        };
+        assert_eq!(b.addresses.len(), 2);
     }
 }

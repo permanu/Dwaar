@@ -11,10 +11,12 @@
 //! blank line between site blocks.
 
 use crate::model::{
-    BasicAuthDirective, Directive, DwaarConfig, EncodeDirective, FileServerDirective,
-    ForwardAuthDirective, HeaderDirective, RateLimitDirective, RedirDirective, RespondDirective,
-    ReverseProxyDirective, RewriteDirective, RootDirective, TlsDirective, UpstreamAddr,
-    UriDirective, UriOperation,
+    BasicAuthDirective, BindDirective, Directive, DwaarConfig, EncodeDirective, ErrorDirective,
+    FileServerDirective, ForwardAuthDirective, HandleErrorsDirective, HeaderDirective,
+    LogDirective, LogFormat, LogOutput, MatcherCondition, MatcherDef, MethodDirective,
+    RateLimitDirective, RedirDirective, RequestBodyDirective, RequestHeaderDirective,
+    RespondDirective, ReverseProxyDirective, RewriteDirective, RootDirective, TlsDirective,
+    TryFilesDirective, UpstreamAddr, UriDirective, UriOperation, VarsDirective,
 };
 
 /// Format a parsed config into canonical Dwaarfile text.
@@ -27,6 +29,11 @@ pub fn format_config(config: &DwaarConfig) -> String {
         }
         out.push_str(&site.address);
         out.push_str(" {\n");
+
+        // Named matcher definitions come before directives.
+        for matcher in &site.matchers {
+            format_matcher_def(&mut out, matcher);
+        }
 
         for directive in &site.directives {
             format_directive_at_depth(&mut out, directive, 1);
@@ -77,6 +84,25 @@ fn format_directive_at_depth(out: &mut String, directive: &Directive, depth: usi
                 UpstreamAddr::SocketAddr(addr) => out.push_str(&addr.to_string()),
                 UpstreamAddr::HostPort(hp) => out.push_str(hp),
             }
+        }
+        Directive::Log(ld) => format_log(out, ld, depth),
+        Directive::RequestHeader(rh) => format_request_header(out, rh),
+        Directive::Error(e) => format_error(out, e),
+        Directive::Abort => out.push_str("abort"),
+        Directive::Method(m) => format_method(out, m),
+        Directive::RequestBody(rb) => format_request_body(out, rb, depth),
+        Directive::TryFiles(tf) => format_try_files(out, tf),
+        Directive::HandleErrors(he) => format_handle_errors(out, he, depth),
+        Directive::Bind(b) => format_bind(out, b),
+        Directive::SkipLog => out.push_str("skip_log"),
+        Directive::Vars(v) => format_vars(out, v),
+        // Passthrough directives were consumed by the parser but have no
+        // structured representation — we can't round-trip them faithfully.
+        // Emit the directive name as a comment so the user knows it was here.
+        Directive::Passthrough { name, .. } => {
+            out.push_str("# ");
+            out.push_str(name);
+            out.push_str(" (not yet implemented)");
         }
     }
 }
@@ -268,6 +294,290 @@ fn format_forward_auth(out: &mut String, fa: &ForwardAuthDirective, depth: usize
     }
     out.push_str(&outer);
     out.push('}');
+}
+
+// ── Named matcher formatting ───────────────────────────────────────────────────
+
+/// Format a named matcher definition.
+///
+/// Single-condition matchers use the compact single-line form:
+/// ```text
+///     @api path /api/*
+/// ```
+/// Multi-condition matchers use a block:
+/// ```text
+///     @api {
+///         path /api/*
+///         method GET POST
+///     }
+/// ```
+fn format_matcher_def(out: &mut String, m: &MatcherDef) {
+    match m.conditions.as_slice() {
+        [] => {
+            // Empty matcher — single line, no conditions.
+            out.push_str("    @");
+            out.push_str(&m.name);
+            out.push('\n');
+        }
+        [single] => {
+            // Compact single-line form.
+            out.push_str("    @");
+            out.push_str(&m.name);
+            out.push(' ');
+            format_matcher_condition_inline(out, single);
+            out.push('\n');
+        }
+        _ => {
+            // Block form.
+            out.push_str("    @");
+            out.push_str(&m.name);
+            out.push_str(" {\n");
+            for cond in &m.conditions {
+                out.push_str("        ");
+                format_matcher_condition_inline(out, cond);
+                out.push('\n');
+            }
+            out.push_str("    }\n");
+        }
+    }
+}
+
+/// Format a single matcher condition as a single line (no leading indent).
+fn format_matcher_condition_inline(out: &mut String, cond: &MatcherCondition) {
+    match cond {
+        MatcherCondition::Path(paths) => format_word_list(out, "path", paths),
+        MatcherCondition::Host(hosts) => format_word_list(out, "host", hosts),
+        MatcherCondition::Method(methods) => format_word_list(out, "method", methods),
+        MatcherCondition::RemoteIp(cidrs) => format_word_list(out, "remote_ip", cidrs),
+        MatcherCondition::ClientIp(cidrs) => format_word_list(out, "client_ip", cidrs),
+        MatcherCondition::Query(pairs) => format_word_list(out, "query", pairs),
+        MatcherCondition::PathRegexp { name, pattern } => {
+            out.push_str("path_regexp");
+            if let Some(n) = name {
+                out.push(' ');
+                out.push_str(n);
+            }
+            out.push(' ');
+            out.push_str(pattern);
+        }
+        MatcherCondition::Header { name, value } => {
+            out.push_str("header ");
+            out.push_str(name);
+            if let Some(v) = value {
+                out.push_str(" \"");
+                out.push_str(v);
+                out.push('"');
+            }
+        }
+        MatcherCondition::HeaderRegexp { name, pattern } => {
+            out.push_str("header_regexp ");
+            out.push_str(name);
+            out.push(' ');
+            out.push_str(pattern);
+        }
+        MatcherCondition::Protocol(proto) => {
+            out.push_str("protocol ");
+            out.push_str(proto);
+        }
+        MatcherCondition::Not(inner) => format_not_condition(out, inner),
+        MatcherCondition::Expression(expr) => {
+            out.push_str("expression ");
+            out.push_str(expr);
+        }
+        MatcherCondition::File { try_files } => format_file_condition(out, try_files),
+        MatcherCondition::Unknown { keyword, args } => {
+            out.push_str(keyword);
+            for a in args {
+                out.push(' ');
+                out.push_str(a);
+            }
+        }
+    }
+}
+
+/// Format a matcher condition that is a simple keyword followed by a word list.
+fn format_word_list(out: &mut String, keyword: &str, words: &[String]) {
+    out.push_str(keyword);
+    for w in words {
+        out.push(' ');
+        out.push_str(w);
+    }
+}
+
+/// Format a `not { ... }` condition block.
+fn format_not_condition(out: &mut String, inner: &[MatcherCondition]) {
+    out.push_str("not {\n");
+    for cond in inner {
+        out.push_str("            ");
+        format_matcher_condition_inline(out, cond);
+        out.push('\n');
+    }
+    out.push_str("        }");
+}
+
+/// Format a `file { try_files ... }` condition block.
+fn format_file_condition(out: &mut String, try_files: &[String]) {
+    out.push_str("file {\n");
+    out.push_str("            try_files");
+    for f in try_files {
+        out.push(' ');
+        out.push_str(f);
+    }
+    out.push('\n');
+    out.push_str("        }");
+}
+
+// ── New directive formatters (Phase 3 + 4) ───────────────────────────────────
+
+fn format_log(out: &mut String, ld: &LogDirective, depth: usize) {
+    // If no sub-options, emit bare `log`
+    if ld.output.is_none() && ld.format.is_none() && ld.level.is_none() {
+        out.push_str("log");
+        return;
+    }
+
+    let inner = "    ".repeat(depth + 1);
+    let outer = "    ".repeat(depth);
+
+    out.push_str("log {\n");
+
+    if let Some(output) = &ld.output {
+        out.push_str(&inner);
+        out.push_str("output ");
+        match output {
+            LogOutput::Stdout => out.push_str("stdout"),
+            LogOutput::Stderr => out.push_str("stderr"),
+            LogOutput::Discard => out.push_str("discard"),
+            LogOutput::File { path } => {
+                out.push_str("file ");
+                out.push_str(path);
+            }
+        }
+        out.push('\n');
+    }
+
+    if let Some(format) = &ld.format {
+        out.push_str(&inner);
+        out.push_str("format ");
+        match format {
+            LogFormat::Console => out.push_str("console"),
+            LogFormat::Json => out.push_str("json"),
+        }
+        out.push('\n');
+    }
+
+    if let Some(level) = &ld.level {
+        out.push_str(&inner);
+        out.push_str("level ");
+        out.push_str(level);
+        out.push('\n');
+    }
+
+    out.push_str(&outer);
+    out.push('}');
+}
+
+fn format_request_header(out: &mut String, rh: &RequestHeaderDirective) {
+    match rh {
+        RequestHeaderDirective::Set { name, value } => {
+            out.push_str("request_header ");
+            out.push_str(name);
+            out.push_str(" \"");
+            out.push_str(value);
+            out.push('"');
+        }
+        RequestHeaderDirective::Delete { name } => {
+            out.push_str("request_header -");
+            out.push_str(name);
+        }
+        RequestHeaderDirective::Add { name, value } => {
+            out.push_str("request_header +");
+            out.push_str(name);
+            out.push_str(" \"");
+            out.push_str(value);
+            out.push('"');
+        }
+    }
+}
+
+fn format_error(out: &mut String, e: &ErrorDirective) {
+    out.push_str("error \"");
+    out.push_str(&e.message);
+    out.push_str("\" ");
+    out.push_str(&e.status.to_string());
+}
+
+fn format_method(out: &mut String, m: &MethodDirective) {
+    out.push_str("method ");
+    out.push_str(&m.method);
+}
+
+fn format_request_body(out: &mut String, rb: &RequestBodyDirective, depth: usize) {
+    let inner = "    ".repeat(depth + 1);
+    let outer = "    ".repeat(depth);
+    out.push_str("request_body {\n");
+    if let Some(max_size) = rb.max_size {
+        out.push_str(&inner);
+        out.push_str("max_size ");
+        out.push_str(&format_size(max_size));
+        out.push('\n');
+    }
+    out.push_str(&outer);
+    out.push('}');
+}
+
+fn format_try_files(out: &mut String, tf: &TryFilesDirective) {
+    out.push_str("try_files");
+    for file in &tf.files {
+        out.push(' ');
+        out.push_str(file);
+    }
+}
+
+fn format_handle_errors(out: &mut String, he: &HandleErrorsDirective, depth: usize) {
+    let outer = "    ".repeat(depth);
+    out.push_str("handle_errors {\n");
+    for directive in &he.directives {
+        format_directive_at_depth(out, directive, depth + 1);
+        out.push('\n');
+    }
+    out.push_str(&outer);
+    out.push('}');
+}
+
+fn format_bind(out: &mut String, b: &BindDirective) {
+    out.push_str("bind");
+    for addr in &b.addresses {
+        out.push(' ');
+        out.push_str(addr);
+    }
+}
+
+fn format_vars(out: &mut String, v: &VarsDirective) {
+    out.push_str("vars ");
+    out.push_str(&v.key);
+    out.push_str(" \"");
+    out.push_str(&v.value);
+    out.push('"');
+}
+
+/// Format a byte count back to a human-readable size string.
+///
+/// Uses the largest unit that divides evenly, falling back to bytes.
+fn format_size(bytes: u64) -> String {
+    const GB: u64 = 1024 * 1024 * 1024;
+    const MB: u64 = 1024 * 1024;
+    const KB: u64 = 1024;
+
+    if bytes.is_multiple_of(GB) {
+        format!("{}GB", bytes / GB)
+    } else if bytes.is_multiple_of(MB) {
+        format!("{}MB", bytes / MB)
+    } else if bytes.is_multiple_of(KB) {
+        format!("{}KB", bytes / KB)
+    } else {
+        bytes.to_string()
+    }
 }
 
 #[cfg(test)]

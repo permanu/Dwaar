@@ -46,6 +46,17 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
             continue;
         }
 
+        // Warn about passthrough directives so users know what's being ignored
+        for d in &site.directives {
+            if let Directive::Passthrough { name, .. } = d {
+                warn!(
+                    address = %site.address,
+                    directive = %name,
+                    "directive parsed but not yet implemented by Dwaar, ignoring"
+                );
+            }
+        }
+
         let tls = site_has_tls(&site.directives);
 
         // Check for handle/handle_path/route blocks first — these create multi-handler routes
@@ -504,8 +515,10 @@ mod tests {
     #[test]
     fn compile_single_site() {
         let config = DwaarConfig {
+            global_options: None,
             sites: vec![SiteBlock {
                 address: "example.com".to_string(),
+                matchers: vec![],
                 directives: vec![rp("127.0.0.1:8080")],
             }],
         };
@@ -522,17 +535,21 @@ mod tests {
     #[test]
     fn compile_multiple_sites() {
         let config = DwaarConfig {
+            global_options: None,
             sites: vec![
                 SiteBlock {
                     address: "api.example.com".to_string(),
+                    matchers: vec![],
                     directives: vec![rp("127.0.0.1:3000")],
                 },
                 SiteBlock {
                     address: "web.example.com".to_string(),
+                    matchers: vec![],
                     directives: vec![rp("127.0.0.1:8080")],
                 },
                 SiteBlock {
                     address: "*.staging.example.com".to_string(),
+                    matchers: vec![],
                     directives: vec![rp("127.0.0.1:9000")],
                 },
             ],
@@ -548,8 +565,10 @@ mod tests {
     #[test]
     fn compile_skips_sites_without_reverse_proxy() {
         let config = DwaarConfig {
+            global_options: None,
             sites: vec![SiteBlock {
                 address: "static.example.com".to_string(),
+                matchers: vec![],
                 directives: vec![Directive::Tls(TlsDirective::Auto)],
             }],
         };
@@ -561,8 +580,10 @@ mod tests {
     #[test]
     fn compile_resolves_localhost() {
         let config = DwaarConfig {
+            global_options: None,
             sites: vec![SiteBlock {
                 address: "example.com".to_string(),
+                matchers: vec![],
                 directives: vec![Directive::ReverseProxy(ReverseProxyDirective {
                     upstreams: vec![UpstreamAddr::HostPort("localhost:8080".to_string())],
                 })],
@@ -605,8 +626,10 @@ mod tests {
     #[test]
     fn route_tls_flag_true_for_tls_auto() {
         let config = DwaarConfig {
+            global_options: None,
             sites: vec![SiteBlock {
                 address: "secure.example.com".to_string(),
+                matchers: vec![],
                 directives: vec![rp("127.0.0.1:3000"), Directive::Tls(TlsDirective::Auto)],
             }],
         };
@@ -619,8 +642,10 @@ mod tests {
     #[test]
     fn route_tls_flag_true_for_manual_certs() {
         let config = DwaarConfig {
+            global_options: None,
             sites: vec![SiteBlock {
                 address: "manual.example.com".to_string(),
+                matchers: vec![],
                 directives: vec![
                     rp("127.0.0.1:3000"),
                     Directive::Tls(TlsDirective::Manual {
@@ -639,8 +664,10 @@ mod tests {
     #[test]
     fn route_tls_flag_false_when_tls_off() {
         let config = DwaarConfig {
+            global_options: None,
             sites: vec![SiteBlock {
                 address: "plain.example.com".to_string(),
+                matchers: vec![],
                 directives: vec![rp("127.0.0.1:3000"), Directive::Tls(TlsDirective::Off)],
             }],
         };
@@ -653,8 +680,10 @@ mod tests {
     #[test]
     fn route_tls_flag_false_when_no_tls_directive() {
         let config = DwaarConfig {
+            global_options: None,
             sites: vec![SiteBlock {
                 address: "default.example.com".to_string(),
+                matchers: vec![],
                 directives: vec![rp("127.0.0.1:3000")],
             }],
         };
@@ -669,13 +698,16 @@ mod tests {
     #[test]
     fn mixed_tls_and_non_tls_routes() {
         let config = DwaarConfig {
+            global_options: None,
             sites: vec![
                 SiteBlock {
                     address: "secure.example.com".to_string(),
+                    matchers: vec![],
                     directives: vec![rp("127.0.0.1:3000"), Directive::Tls(TlsDirective::Auto)],
                 },
                 SiteBlock {
                     address: "plain.example.com".to_string(),
+                    matchers: vec![],
                     directives: vec![rp("127.0.0.1:4000")],
                 },
             ],
@@ -692,13 +724,16 @@ mod tests {
     #[test]
     fn compile_acme_domains_extracts_auto_only() {
         let config = DwaarConfig {
+            global_options: None,
             sites: vec![
                 SiteBlock {
                     address: "auto.example.com".to_string(),
+                    matchers: vec![],
                     directives: vec![rp("127.0.0.1:3000"), Directive::Tls(TlsDirective::Auto)],
                 },
                 SiteBlock {
                     address: "manual.example.com".to_string(),
+                    matchers: vec![],
                     directives: vec![
                         rp("127.0.0.1:4000"),
                         Directive::Tls(TlsDirective::Manual {
@@ -709,6 +744,7 @@ mod tests {
                 },
                 SiteBlock {
                     address: "plain.example.com".to_string(),
+                    matchers: vec![],
                     directives: vec![rp("127.0.0.1:5000"), Directive::Tls(TlsDirective::Off)],
                 },
             ],
@@ -721,8 +757,10 @@ mod tests {
     #[test]
     fn compile_acme_domains_empty_when_no_auto() {
         let config = DwaarConfig {
+            global_options: None,
             sites: vec![SiteBlock {
                 address: "manual.example.com".to_string(),
+                matchers: vec![],
                 directives: vec![
                     rp("127.0.0.1:3000"),
                     Directive::Tls(TlsDirective::Manual {
@@ -742,8 +780,10 @@ mod tests {
     #[test]
     fn compile_route_with_rate_limit() {
         let config = DwaarConfig {
+            global_options: None,
             sites: vec![SiteBlock {
                 address: "api.example.com".to_string(),
+                matchers: vec![],
                 directives: vec![
                     rp("127.0.0.1:3000"),
                     Directive::RateLimit(RateLimitDirective {
@@ -760,8 +800,10 @@ mod tests {
     #[test]
     fn compile_route_without_rate_limit() {
         let config = DwaarConfig {
+            global_options: None,
             sites: vec![SiteBlock {
                 address: "example.com".to_string(),
+                matchers: vec![],
                 directives: vec![rp("127.0.0.1:8080")],
             }],
         };
@@ -837,8 +879,10 @@ mod tests {
     #[test]
     fn compile_site_without_handler_skipped() {
         let config = DwaarConfig {
+            global_options: None,
             sites: vec![SiteBlock {
                 address: "no-handler.example.com".to_string(),
+                matchers: vec![],
                 directives: vec![Directive::Tls(TlsDirective::Auto)],
             }],
         };
