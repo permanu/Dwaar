@@ -85,7 +85,7 @@ impl DockerWatcher {
                         debug!(
                             container_id = %cr.container_id,
                             domain = %cr.route.domain,
-                            upstream = %cr.route.upstream,
+                            upstream = ?cr.route.upstream(),
                             "discovered Docker route"
                         );
                         let mut docker = self.docker_routes.lock();
@@ -132,7 +132,7 @@ impl DockerWatcher {
         info!(
             container_id = %cr.container_id,
             domain = %cr.route.domain,
-            upstream = %cr.route.upstream,
+            upstream = ?cr.route.upstream(),
             "adding Docker route"
         );
 
@@ -373,7 +373,7 @@ mod tests {
         watcher.merge_and_store();
         let table = watcher.route_table.load();
         let route = table.resolve("example.com").expect("should resolve");
-        assert_eq!(route.upstream.port(), 3000); // Dwaarfile wins
+        assert_eq!(route.upstream().expect("has upstream").port(), 3000); // Dwaarfile wins
         assert!(route.tls);
     }
 
@@ -452,7 +452,8 @@ mod tests {
                 .load()
                 .resolve("app.com")
                 .expect("should resolve")
-                .upstream
+                .upstream()
+                .expect("has upstream")
                 .port(),
             8080
         );
@@ -477,13 +478,13 @@ mod tests {
         assert_eq!(table.len(), 2);
 
         let a = table.resolve("a.example.com").expect("a should resolve");
-        assert_eq!(a.upstream.port(), 8001);
+        assert_eq!(a.upstream().expect("has upstream").port(), 8001);
         assert!(!a.tls);
 
         let b = table.resolve("b.example.com").expect("b should resolve");
-        assert_eq!(b.upstream.port(), 8002);
+        assert_eq!(b.upstream().expect("has upstream").port(), 8002);
         assert!(b.tls);
-        assert_eq!(b.rate_limit_rps, Some(50));
+        assert_eq!(b.rate_limit_rps(), Some(50));
     }
 
     #[test]

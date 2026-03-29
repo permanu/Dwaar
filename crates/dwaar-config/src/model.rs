@@ -59,6 +59,75 @@ pub enum Directive {
 
     /// `rate_limit 100/s`
     RateLimit(RateLimitDirective),
+
+    /// `respond "body" 404` / `respond 204` / `respond "ok"`
+    Respond(RespondDirective),
+
+    /// `rewrite /new-path`
+    Rewrite(RewriteDirective),
+
+    /// `uri strip_prefix /api` / `uri strip_suffix .html` / `uri replace /old /new`
+    Uri(UriDirective),
+
+    /// `basicauth { user hash }` or `basic_auth { user hash }`
+    BasicAuth(BasicAuthDirective),
+
+    /// `forward_auth localhost:9091 { uri /api/verify; copy_headers Remote-User }`
+    ForwardAuth(ForwardAuthDirective),
+
+    /// `root * /var/www` — sets the filesystem root for `file_server`
+    Root(RootDirective),
+
+    /// `file_server` or `file_server browse`
+    FileServer(FileServerDirective),
+
+    /// `handle [pattern] { directives }` — first match wins, path NOT stripped
+    Handle(HandleDirective),
+
+    /// `handle_path <pattern> { directives }` — first match wins, prefix IS stripped
+    HandlePath(HandlePathDirective),
+
+    /// `route [pattern] { directives }` — all matching blocks execute in order
+    Route(RouteDirective),
+
+    /// `php_fastcgi localhost:9000` — proxy PHP requests to `FastCGI` backend
+    PhpFastcgi(PhpFastcgiDirective),
+}
+
+/// `handle` — path-scoped directive block. First match wins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandleDirective {
+    /// Path pattern to match. `None` = catch-all.
+    pub matcher: Option<String>,
+    /// Directives inside the block.
+    pub directives: Vec<Directive>,
+}
+
+/// `handle_path` — like handle but strips the matched prefix from the request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandlePathDirective {
+    /// Path prefix to match (required).
+    pub path_prefix: String,
+    /// Directives inside the block.
+    pub directives: Vec<Directive>,
+}
+
+/// `route` — ordered execution block. All matching blocks run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteDirective {
+    /// Path pattern to match. `None` = match all.
+    pub matcher: Option<String>,
+    /// Directives inside the block.
+    pub directives: Vec<Directive>,
+}
+
+/// `php_fastcgi` — proxy PHP requests to a `FastCGI` backend (php-fpm).
+///
+/// Caddy syntax: `php_fastcgi localhost:9000`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhpFastcgiDirective {
+    /// `FastCGI` backend address (TCP or Unix socket path).
+    pub upstream: UpstreamAddr,
 }
 
 /// `reverse_proxy` — route requests to one or more upstream backends.
@@ -124,6 +193,116 @@ pub struct EncodeDirective {
 pub struct RateLimitDirective {
     /// Maximum requests per second per IP for this route.
     pub requests_per_second: u32,
+}
+
+/// `respond` — return a static response without proxying to upstream.
+///
+/// Syntax follows Caddy: `respond [body] [status]`
+/// - `respond "Not Found" 404` — body + status
+/// - `respond 204` — status only (if single arg is a valid 3-digit code)
+/// - `respond "ok"` — body only (default status 200)
+/// - `respond` — empty body, status 200
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RespondDirective {
+    /// HTTP status code. Defaults to 200.
+    pub status: u16,
+    /// Response body. Empty string means no body.
+    pub body: String,
+}
+
+/// `basicauth` / `basic_auth` — HTTP Basic Authentication.
+///
+/// Caddy syntax: `basic_auth [<realm>] { username hash }`
+/// Dwaar also accepts `basicauth` (no underscore).
+///
+/// `Debug` is manually implemented to redact password hashes.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BasicAuthDirective {
+    /// Optional realm name for the `WWW-Authenticate` header.
+    pub realm: Option<String>,
+    /// Credentials: `(username, bcrypt_hash)` pairs.
+    pub credentials: Vec<BasicAuthCredential>,
+}
+
+impl std::fmt::Debug for BasicAuthDirective {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BasicAuthDirective")
+            .field("realm", &self.realm)
+            .field("user_count", &self.credentials.len())
+            .field("credentials", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// A single username + password hash pair.
+///
+/// `Debug` redacts the hash to prevent accidental credential exposure in logs.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BasicAuthCredential {
+    pub username: String,
+    pub password_hash: String,
+}
+
+impl std::fmt::Debug for BasicAuthCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BasicAuthCredential")
+            .field("username", &self.username)
+            .field("password_hash", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// `forward_auth` — subrequest to external auth service before proxying.
+///
+/// Caddy syntax: `forward_auth <upstream> { uri /path; copy_headers Header1 Header2 }`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardAuthDirective {
+    /// Auth service address (e.g., `authelia:9091` or `127.0.0.1:9091`).
+    pub upstream: UpstreamAddr,
+    /// URI path to send to the auth service. Defaults to the original request URI.
+    pub uri: Option<String>,
+    /// Headers to copy from auth response to upstream request.
+    pub copy_headers: Vec<String>,
+}
+
+/// `root` — set the filesystem root for `file_server`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootDirective {
+    /// Filesystem path (e.g., `/var/www/html`).
+    pub path: String,
+}
+
+/// `file_server` — serve static files from the `root` directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileServerDirective {
+    /// Enable directory listing.
+    pub browse: bool,
+}
+
+/// `rewrite` — replace the request URI sent to upstream.
+///
+/// `rewrite /new-path` replaces the full URI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RewriteDirective {
+    /// The new URI to send to upstream.
+    pub to: String,
+}
+
+/// `uri` — partial URI transformation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UriDirective {
+    pub operation: UriOperation,
+}
+
+/// The specific operation a `uri` directive performs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UriOperation {
+    /// `uri strip_prefix /api` — remove prefix from path
+    StripPrefix(String),
+    /// `uri strip_suffix .html` — remove suffix from path
+    StripSuffix(String),
+    /// `uri replace /old /new` — substring replacement
+    Replace { find: String, replace: String },
 }
 
 impl DwaarConfig {

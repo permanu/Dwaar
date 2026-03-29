@@ -10,7 +10,11 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+bcrypt = { workspace = true }
+bytes = { workspace = true }
+compact_str = { workspace = true }
 dwaar-core = { workspace = true }
+dwaar-plugins = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

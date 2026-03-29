@@ -99,7 +99,7 @@ impl DwaarProxy {
             .is_some()
     }
 
-    fn https_redirect_domain(&self, session: &Session, ctx: &RequestContext) -> Option<String> {
+    fn https_redirect_domain(session: &Session, ctx: &RequestContext) -> Option<String> {
         if Self::is_tls_connection(session) {
             return None;
         }
@@ -112,17 +112,13 @@ impl DwaarProxy {
             return None;
         }
 
-        let host = ctx
-            .plugin_ctx
-            .host
-            .as_deref()
-            .map_or("", |h| h.split(':').next().unwrap_or(h));
-
-        let table = self.route_table.load();
-        table
-            .resolve(host)
-            .filter(|route| route.tls)
-            .map(|route| route.domain.clone())
+        // Use cached route_tls and route_canonical_domain from request_filter()
+        // instead of a second ArcSwap load + hash lookup.
+        if ctx.route_tls {
+            ctx.route_canonical_domain.clone()
+        } else {
+            None
+        }
     }
 
     async fn send_https_redirect(
@@ -154,7 +150,7 @@ impl DwaarProxy {
 
     async fn handle_beacon(&self, session: &mut Session, ctx: &RequestContext) -> Result<bool> {
         if let Some(ref sender) = self.beacon_sender {
-            let mut body = Vec::new();
+            let mut body = Vec::with_capacity(1024);
             while let Ok(Some(chunk)) = session.downstream_session.read_request_body().await {
                 body.extend_from_slice(&chunk);
                 if body.len() > beacon::MAX_BEACON_SIZE {
@@ -187,6 +183,23 @@ impl DwaarProxy {
         Ok(true)
     }
 
+    /// Send a static response for the `respond` directive (ISSUE-051).
+    async fn send_static_response(session: &mut Session, status: u16, body: Bytes) -> Result<bool> {
+        let end_of_body = body.is_empty();
+        let mut resp = ResponseHeader::build(status, Some(1))?;
+        if !end_of_body {
+            resp.insert_header("Content-Length", body.len().to_string())
+                .map_err(|e| Error::explain(HTTPStatus(status), format!("bad header: {e}")))?;
+        }
+        session
+            .write_response_header(Box::new(resp), end_of_body)
+            .await?;
+        if !end_of_body {
+            session.write_response_body(Some(body), true).await?;
+        }
+        Ok(true)
+    }
+
     /// Send a plugin-generated short-circuit response to the client.
     async fn send_plugin_response(
         session: &mut Session,
@@ -194,7 +207,7 @@ impl DwaarProxy {
     ) -> Result<bool> {
         let mut resp = ResponseHeader::build(plugin_resp.status, Some(plugin_resp.headers.len()))?;
         for (name, value) in &plugin_resp.headers {
-            resp.insert_header(*name, value).map_err(|e| {
+            resp.insert_header(*name, value.as_str()).map_err(|e| {
                 Error::explain(
                     HTTPStatus(plugin_resp.status),
                     format!("plugin response header error: {e}"),
@@ -286,9 +299,74 @@ impl ProxyHttp for DwaarProxy {
             let host_stripped = host.split(':').next().unwrap_or(host);
             let table = self.route_table.load();
             if let Some(route) = table.resolve(host_stripped) {
-                ctx.plugin_ctx.rate_limit_rps = route.rate_limit_rps;
+                ctx.plugin_ctx.rate_limit_rps = route.rate_limit_rps();
                 ctx.plugin_ctx.route_domain = Some(CompactString::from(route.domain.as_str()));
-                ctx.plugin_ctx.under_attack = route.under_attack;
+                ctx.plugin_ctx.under_attack = route.under_attack();
+                ctx.route_upstream = route.upstream();
+                ctx.route_tls = route.tls;
+                ctx.route_canonical_domain = Some(route.domain.clone());
+
+                // Path-based handler resolution (ISSUE-050).
+                // Iterate handler blocks, find the first matching one (handle/handle_path)
+                // or run all matching (route). Cache matched handler data in ctx.
+                let request_path = ctx.plugin_ctx.path.clone();
+                for block in &route.handlers {
+                    let Some(prefix_len) = block.matcher.matches(&request_path) else {
+                        continue;
+                    };
+
+                    // handle_path: strip matched prefix from the effective path
+                    if block.kind == crate::route::BlockKind::HandlePath && prefix_len > 0 {
+                        let stripped = &request_path[prefix_len..];
+                        let effective = if stripped.is_empty() { "/" } else { stripped };
+                        ctx.effective_path = Some(CompactString::from(effective));
+                    }
+
+                    // Cache handler-specific data (Guardrail #27 — no second ArcSwap load)
+                    match &block.handler {
+                        crate::route::Handler::StaticResponse { status, body } => {
+                            ctx.static_response = Some((*status, body.clone()));
+                        }
+                        crate::route::Handler::FileServer { root, browse } => {
+                            ctx.file_server = Some((root.clone(), *browse));
+                        }
+                        crate::route::Handler::ReverseProxy { upstream } => {
+                            ctx.route_upstream = Some(*upstream);
+                        }
+                        crate::route::Handler::FastCgi { upstream, root } => {
+                            ctx.route_upstream = Some(*upstream);
+                            ctx.fastcgi_root = Some(root.clone());
+                        }
+                    }
+
+                    // Cache auth configs
+                    if let Some(ref auth) = block.basic_auth {
+                        ctx.basic_auth = Some(auth.clone());
+                    }
+                    if let Some(ref fwd) = block.forward_auth {
+                        ctx.forward_auth = Some(fwd.clone());
+                    }
+
+                    // Apply rewrite rules
+                    if !block.rewrites.is_empty() {
+                        let mut path = ctx
+                            .effective_path
+                            .as_deref()
+                            .unwrap_or(&request_path)
+                            .to_string();
+                        for rule in &block.rewrites {
+                            if let Some(rewritten) = rule.apply(&path) {
+                                path = rewritten.to_string();
+                            }
+                        }
+                        ctx.effective_path = Some(CompactString::from(path));
+                    }
+
+                    // For handle/handle_path: first match wins — stop iterating
+                    if block.kind != crate::route::BlockKind::Route {
+                        break;
+                    }
+                }
             }
         }
 
@@ -303,6 +381,245 @@ impl ProxyHttp for DwaarProxy {
                 "plugin chain short-circuited request"
             );
             return Self::send_plugin_response(session, plugin_resp).await;
+        }
+
+        // --- Basic auth check (ISSUE-046) ---
+        // Auth config cached from the single ArcSwap load above (Guardrail #27).
+        if let Some(ref auth_config) = ctx.basic_auth {
+            let auth_header = session
+                .req_header()
+                .headers
+                .get(http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok());
+            if auth_config.verify(auth_header).is_none() {
+                debug!(
+                    request_id = %ctx.request_id(),
+                    "basic auth failed — returning 401"
+                );
+                let mut resp = ResponseHeader::build(401, Some(2))?;
+                resp.insert_header("WWW-Authenticate", auth_config.www_authenticate().as_str())
+                    .map_err(|e| Error::explain(HTTPStatus(401), format!("bad header: {e}")))?;
+                resp.insert_header("Content-Length", "0")
+                    .map_err(|e| Error::explain(HTTPStatus(401), format!("bad header: {e}")))?;
+                session.write_response_header(Box::new(resp), true).await?;
+                return Ok(true);
+            }
+        }
+
+        // --- Forward auth check (ISSUE-047) ---
+        // Async subrequest to external auth service. Raw TCP HTTP/1.1.
+        if let Some(ref fwd_config) = ctx.forward_auth {
+            let ip_str = ctx.plugin_ctx.client_ip.map(|ip| ip.to_string());
+            let auth_result = fwd_config
+                .check(
+                    &ctx.plugin_ctx.method,
+                    &ctx.plugin_ctx.path,
+                    ip_str.as_deref(),
+                )
+                .await;
+
+            match auth_result {
+                dwaar_plugins::forward_auth::AuthResult::Allowed(headers) => {
+                    // Store copied headers — applied in upstream_request_filter
+                    ctx.forward_auth_headers = headers.into_iter().collect();
+                    debug!(
+                        request_id = %ctx.request_id(),
+                        headers_copied = ctx.forward_auth_headers.len(),
+                        "forward auth allowed"
+                    );
+                }
+                dwaar_plugins::forward_auth::AuthResult::Denied { status, body } => {
+                    debug!(
+                        request_id = %ctx.request_id(),
+                        status,
+                        "forward auth denied"
+                    );
+                    let mut resp = ResponseHeader::build(status, Some(1))?;
+                    let end_of_body = body.is_empty();
+                    if !end_of_body {
+                        resp.insert_header("Content-Length", body.len().to_string())
+                            .map_err(|e| {
+                                Error::explain(HTTPStatus(status), format!("bad header: {e}"))
+                            })?;
+                    }
+                    session
+                        .write_response_header(Box::new(resp), end_of_body)
+                        .await?;
+                    if !end_of_body {
+                        session
+                            .write_response_body(Some(Bytes::from(body)), true)
+                            .await?;
+                    }
+                    return Ok(true);
+                }
+                dwaar_plugins::forward_auth::AuthResult::Error(msg) => {
+                    warn!(
+                        request_id = %ctx.request_id(),
+                        error = %msg,
+                        "forward auth service error — returning 502"
+                    );
+                    let resp = ResponseHeader::build(502, Some(0))?;
+                    session.write_response_header(Box::new(resp), true).await?;
+                    return Ok(true);
+                }
+            }
+        }
+
+        // --- Static response handler (respond directive, ISSUE-051) ---
+        // Populated from the single ArcSwap load above — no second lookup (Guardrail #27).
+        if let Some((status, ref body)) = ctx.static_response {
+            debug!(
+                request_id = %ctx.request_id(),
+                status,
+                "serving static response"
+            );
+            return Self::send_static_response(session, status, body.clone()).await;
+        }
+
+        // --- File server handler (ISSUE-048) ---
+        if let Some((ref root, browse)) = ctx.file_server {
+            let request_path = ctx
+                .effective_path
+                .as_deref()
+                .unwrap_or(ctx.plugin_ctx.path.as_str());
+
+            match crate::file_server::serve_file(root, request_path, browse) {
+                crate::file_server::FileResponse::Found {
+                    body,
+                    content_type,
+                    content_length,
+                    etag,
+                    ..
+                } => {
+                    debug!(
+                        request_id = %ctx.request_id(),
+                        path = %request_path,
+                        content_type,
+                        "serving static file"
+                    );
+                    let mut resp = ResponseHeader::build(200, Some(4))?;
+                    resp.insert_header("Content-Type", content_type)
+                        .map_err(|e| Error::explain(HTTPStatus(200), format!("bad header: {e}")))?;
+                    resp.insert_header("Content-Length", content_length.to_string())
+                        .map_err(|e| Error::explain(HTTPStatus(200), format!("bad header: {e}")))?;
+                    resp.insert_header("Accept-Ranges", "bytes")
+                        .map_err(|e| Error::explain(HTTPStatus(200), format!("bad header: {e}")))?;
+                    if let Some(tag) = etag {
+                        resp.insert_header("ETag", &tag).map_err(|e| {
+                            Error::explain(HTTPStatus(200), format!("bad header: {e}"))
+                        })?;
+                    }
+                    session.write_response_header(Box::new(resp), false).await?;
+                    session.write_response_body(Some(body), true).await?;
+                    return Ok(true);
+                }
+                crate::file_server::FileResponse::DirectoryListing { body } => {
+                    let mut resp = ResponseHeader::build(200, Some(2))?;
+                    resp.insert_header("Content-Type", "text/html; charset=utf-8")
+                        .map_err(|e| Error::explain(HTTPStatus(200), format!("bad header: {e}")))?;
+                    resp.insert_header("Content-Length", body.len().to_string())
+                        .map_err(|e| Error::explain(HTTPStatus(200), format!("bad header: {e}")))?;
+                    session.write_response_header(Box::new(resp), false).await?;
+                    session.write_response_body(Some(body), true).await?;
+                    return Ok(true);
+                }
+                crate::file_server::FileResponse::Forbidden => {
+                    let resp = ResponseHeader::build(403, Some(0))?;
+                    session.write_response_header(Box::new(resp), true).await?;
+                    return Ok(true);
+                }
+                crate::file_server::FileResponse::NotFound => {
+                    let resp = ResponseHeader::build(404, Some(0))?;
+                    session.write_response_header(Box::new(resp), true).await?;
+                    return Ok(true);
+                }
+            }
+        }
+
+        // --- FastCGI handler (php_fastcgi directive, ISSUE-053) ---
+        // Handled entirely here — php-fpm speaks FastCGI, not HTTP, so we bypass
+        // Pingora's upstream machinery and write the response directly.
+        if let (Some(fcgi_root), Some(upstream)) = (&ctx.fastcgi_root, ctx.route_upstream) {
+            let request_path = ctx
+                .effective_path
+                .as_deref()
+                .unwrap_or(ctx.plugin_ctx.path.as_str());
+            let (path, query) = request_path.split_once('?').unwrap_or((request_path, ""));
+            let client_ip = ctx
+                .plugin_ctx
+                .client_ip
+                .map_or_else(String::new, |ip| ip.to_string());
+            let host = ctx.plugin_ctx.host.as_deref().unwrap_or("localhost");
+
+            // Read request body for POST
+            let mut body_buf = Vec::new();
+            while let Ok(Some(chunk)) = session.downstream_session.read_request_body().await {
+                body_buf.extend_from_slice(&chunk);
+                if body_buf.len() > 10 * 1024 * 1024 {
+                    break;
+                }
+            }
+
+            let fcgi_req = crate::fastcgi::FastCgiRequest {
+                upstream,
+                root: fcgi_root,
+                request_path: path,
+                query_string: query,
+                method: &ctx.plugin_ctx.method,
+                request_body: &body_buf,
+                server_name: host,
+                remote_addr: &client_ip,
+            };
+            match crate::fastcgi::execute(&fcgi_req).await {
+                Ok(fcgi_resp) => {
+                    debug!(
+                        request_id = %ctx.request_id(),
+                        status = fcgi_resp.status,
+                        "FastCGI response"
+                    );
+                    let mut resp =
+                        ResponseHeader::build(fcgi_resp.status, Some(fcgi_resp.headers.len() + 1))?;
+                    for (name, value) in &fcgi_resp.headers {
+                        if let (Ok(hn), Ok(hv)) = (
+                            http::HeaderName::from_bytes(name.as_bytes()),
+                            http::HeaderValue::from_str(value),
+                        ) {
+                            resp.append_header(hn, hv).map_err(|e| {
+                                Error::explain(
+                                    HTTPStatus(fcgi_resp.status),
+                                    format!("FastCGI header: {e}"),
+                                )
+                            })?;
+                        }
+                    }
+                    let end_of_body = fcgi_resp.body.is_empty();
+                    if !end_of_body {
+                        resp.insert_header("Content-Length", fcgi_resp.body.len().to_string())
+                            .map_err(|e| {
+                                Error::explain(HTTPStatus(fcgi_resp.status), format!("header: {e}"))
+                            })?;
+                    }
+                    session
+                        .write_response_header(Box::new(resp), end_of_body)
+                        .await?;
+                    if !end_of_body {
+                        session
+                            .write_response_body(Some(fcgi_resp.body), true)
+                            .await?;
+                    }
+                    return Ok(true);
+                }
+                Err(msg) => {
+                    warn!(
+                        request_id = %ctx.request_id(),
+                        error = %msg,
+                        "FastCGI error — returning 502"
+                    );
+                    let resp = ResponseHeader::build(502, Some(0))?;
+                    session.write_response_header(Box::new(resp), true).await?;
+                    return Ok(true);
+                }
+            }
         }
 
         // --- Analytics JS serving (ISSUE-024) ---
@@ -361,7 +678,7 @@ impl ProxyHttp for DwaarProxy {
         }
 
         // --- HTTP→HTTPS redirect (ISSUE-016) ---
-        if let Some(canonical_domain) = self.https_redirect_domain(session, ctx) {
+        if let Some(canonical_domain) = Self::https_redirect_domain(session, ctx) {
             return self
                 .send_https_redirect(session, ctx, &canonical_domain)
                 .await;
@@ -375,34 +692,61 @@ impl ProxyHttp for DwaarProxy {
         _session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        let host = ctx
-            .plugin_ctx
-            .host
-            .as_deref()
-            .map_or("", |h| h.split(':').next().unwrap_or(h));
-
-        let table = self.route_table.load();
-        let route = table.resolve(host).ok_or_else(|| {
-            warn!(host = %host, request_id = %ctx.request_id(), "no route for host");
-            Error::explain(
-                HTTPStatus(502),
-                format!("no route configured for host: {host}"),
-            )
-        })?;
-
-        ctx.route_upstream = Some(route.upstream);
+        // Use the route resolved in request_filter() to avoid a second ArcSwap load
+        let upstream = if let Some(addr) = ctx.route_upstream {
+            addr
+        } else {
+            // Defensive fallback — should not happen in normal flow
+            let host = ctx
+                .plugin_ctx
+                .host
+                .as_deref()
+                .map_or("", |h| h.split(':').next().unwrap_or(h));
+            let table = self.route_table.load();
+            let route = table.resolve(host).ok_or_else(|| {
+                warn!(host = %host, request_id = %ctx.request_id(), "no route for host");
+                Error::explain(
+                    HTTPStatus(502),
+                    format!("no route configured for host: {host}"),
+                )
+            })?;
+            let upstream = route.upstream().ok_or_else(|| {
+                Error::explain(
+                    HTTPStatus(502),
+                    format!("no upstream configured for host: {host}"),
+                )
+            })?;
+            ctx.route_upstream = Some(upstream);
+            upstream
+        };
 
         debug!(
-            host = %host,
-            upstream = %route.upstream,
+            upstream = %upstream,
             request_id = %ctx.request_id(),
             "route resolved"
         );
 
-        let mut peer = HttpPeer::new(route.upstream, false, String::new());
+        let mut peer = HttpPeer::new(upstream, false, String::new());
         peer.options.connection_timeout = Some(std::time::Duration::from_secs(10));
         peer.options.read_timeout = Some(std::time::Duration::from_secs(30));
         peer.options.write_timeout = Some(std::time::Duration::from_secs(30));
+
+        // Detect dead upstream connections via TCP keepalive probes instead of
+        // waiting for read_timeout (30s) on a silently broken connection.
+        // Probes start after 60s idle, retry every 10s, give up after 3 failures.
+        peer.options.tcp_keepalive = Some(pingora_core::protocols::TcpKeepalive {
+            idle: std::time::Duration::from_secs(60),
+            interval: std::time::Duration::from_secs(10),
+            count: 3,
+            #[cfg(target_os = "linux")]
+            user_timeout: std::time::Duration::ZERO,
+        });
+
+        // Evict idle connections from the pool before the upstream closes them.
+        // Set slightly below common upstream keepalive_timeout (nginx default: 75s)
+        // to avoid sending requests on connections the upstream is about to close.
+        peer.options.idle_timeout = Some(std::time::Duration::from_secs(60));
+
         Ok(Box::new(peer))
     }
 
@@ -416,14 +760,24 @@ impl ProxyHttp for DwaarProxy {
         Self::CTX: Send + Sync,
     {
         if let Some(ip) = &ctx.plugin_ctx.client_ip {
-            let ip_str = ip.to_string();
+            // Write IP to a stack buffer — avoids a heap allocation per request.
+            // Max IPv6 text representation is 45 bytes (e.g. with zone id).
+            let mut ip_buf = [0u8; 45];
+            let ip_str = {
+                use std::io::Write;
+                let mut cursor = std::io::Cursor::new(&mut ip_buf[..]);
+                write!(cursor, "{ip}").expect("IP fits in 45 bytes");
+                let len = cursor.position() as usize;
+                // SAFETY: IpAddr Display only emits ASCII digits, colons, and dots.
+                std::str::from_utf8(&ip_buf[..len]).expect("IP is valid UTF-8")
+            };
             upstream_request
-                .insert_header("X-Real-IP", &ip_str)
+                .insert_header("X-Real-IP", ip_str)
                 .expect("IP string is valid header value");
 
             upstream_request.remove_header("X-Forwarded-For");
             upstream_request
-                .insert_header("X-Forwarded-For", &ip_str)
+                .insert_header("X-Forwarded-For", ip_str)
                 .expect("IP string is valid header value");
         }
 
@@ -452,6 +806,47 @@ impl ProxyHttp for DwaarProxy {
             "Upgrade",
         ] {
             upstream_request.remove_header(*header_name);
+        }
+
+        // SECURITY: Strip Authorization header when Dwaar handled basic auth.
+        // Prevents plaintext credentials from reaching upstream logs/services.
+        if ctx.basic_auth.is_some() {
+            upstream_request.remove_header("Authorization");
+        }
+
+        // Forward auth headers (ISSUE-047, CVE-2026-30851 mitigation):
+        // 1. ALWAYS strip client-supplied values for copy_headers fields first
+        // 2. Then set values from auth service response (if any)
+        // This prevents clients from injecting e.g. Remote-User to impersonate users.
+        if let Some(ref fwd_config) = ctx.forward_auth {
+            for header_name in &fwd_config.copy_headers {
+                upstream_request.remove_header(header_name.as_str());
+            }
+            // Use http::HeaderName + HeaderValue for Pingora's 'static requirement
+            for (name, value) in &ctx.forward_auth_headers {
+                if let (Ok(hn), Ok(hv)) = (
+                    http::HeaderName::from_bytes(name.as_bytes()),
+                    http::HeaderValue::from_str(value),
+                ) {
+                    upstream_request.append_header(hn, hv).map_err(|e| {
+                        Error::explain(HTTPStatus(500), format!("forward_auth header error: {e}"))
+                    })?;
+                }
+            }
+        }
+
+        // Apply rewritten URI to upstream request (rewrite/uri directives, ISSUE-049)
+        if let Some(ref effective_path) = ctx.effective_path {
+            let uri: http::uri::Uri = effective_path.parse().map_err(|e| {
+                Error::explain(HTTPStatus(500), format!("invalid rewritten URI: {e}"))
+            })?;
+            upstream_request.set_uri(uri);
+            debug!(
+                request_id = %ctx.request_id(),
+                original = %ctx.plugin_ctx.path,
+                rewritten = %effective_path,
+                "URI rewritten for upstream"
+            );
         }
 
         debug!(
@@ -581,63 +976,83 @@ impl ProxyHttp for DwaarProxy {
             _ => "HTTP/unknown",
         };
 
+        // Extract shared fields once — used by both AggEvent and RequestLog.
+        // Move where possible, clone only the AggEvent (7 fields) into the
+        // log instead of the other way around (saves 4 clones per request).
+        let host = ctx.plugin_ctx.host.take().unwrap_or_default();
+        let client_ip = ctx
+            .plugin_ctx
+            .client_ip
+            .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        let country = ctx.plugin_ctx.country.take();
+        let referer: Option<CompactString> = session
+            .req_header()
+            .headers
+            .get("referer")
+            .and_then(|v| v.to_str().ok())
+            .map(CompactString::from);
+        let bytes_sent = session.body_bytes_sent() as u64;
+
+        if let Some(ref agg) = self.agg_sender {
+            let event = AggEvent {
+                host: host.clone(),
+                path: path.clone(),
+                status,
+                bytes_sent,
+                client_ip,
+                country: country.clone(),
+                referer: referer.clone(),
+            };
+            agg.send(event);
+        }
+
+        // Request ID: 36 bytes exceeds CompactString's 24-byte inline threshold.
+        // Use a stack buffer write to produce a CompactString without going
+        // through an intermediate &str → String → CompactString chain.
+        let request_id = {
+            let mut s = CompactString::with_capacity(36);
+            s.push_str(ctx.request_id());
+            s
+        };
+
         let log = RequestLog {
             timestamp: Utc::now(),
-            request_id: CompactString::from(ctx.request_id()),
+            request_id,
             method: std::mem::take(&mut ctx.plugin_ctx.method),
             path,
             query,
-            host: ctx.plugin_ctx.host.take().unwrap_or_default(),
+            host,
             status,
             response_time_us,
-            client_ip: ctx
-                .plugin_ctx
-                .client_ip
-                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+            client_ip,
             user_agent: session
                 .req_header()
                 .headers
                 .get("user-agent")
                 .and_then(|v| v.to_str().ok())
                 .map(CompactString::from),
-            referer: session
-                .req_header()
-                .headers
-                .get("referer")
-                .and_then(|v| v.to_str().ok())
-                .map(CompactString::from),
-            bytes_sent: session.body_bytes_sent() as u64,
+            referer,
+            bytes_sent,
             bytes_received: session.body_bytes_read() as u64,
             tls_version: session
                 .downstream_session
                 .digest()
                 .and_then(|d| d.ssl_digest.as_ref())
-                .map(|ssl| CompactString::from(format!("{}", ssl.version))),
+                .map(|ssl| CompactString::from(&*ssl.version)),
             http_version: CompactString::from(http_version),
             is_bot: ctx.plugin_ctx.is_bot,
-            country: ctx.plugin_ctx.country.take(),
+            country,
             upstream_addr: ctx.route_upstream.map_or_else(CompactString::default, |a| {
-                CompactString::from(a.to_string())
+                use std::fmt::Write;
+                let mut s = CompactString::default();
+                write!(s, "{a}").expect("SocketAddr is valid");
+                s
             }),
             upstream_response_time_us: 0,
             cache_status: None,
             compression: None,
         };
 
-        if let Some(ref agg) = self.agg_sender {
-            // Build a slim AggEvent with only the 7 fields aggregation needs,
-            // avoiding a full RequestLog clone (20+ fields).
-            let event = AggEvent {
-                host: log.host.clone(),
-                path: log.path.clone(),
-                status: log.status,
-                bytes_sent: log.bytes_sent,
-                client_ip: log.client_ip,
-                country: log.country.clone(),
-                referer: log.referer.clone(),
-            };
-            agg.send(event);
-        }
         sender.send(log);
     }
 }

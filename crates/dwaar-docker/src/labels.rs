@@ -143,10 +143,13 @@ mod tests {
         let inspect = make_inspect("api.example.com", "8080", "172.17.0.2");
         let cr = parse_container(&inspect).expect("should parse");
         assert_eq!(cr.route.domain, "api.example.com");
-        assert_eq!(cr.route.upstream.port(), 8080);
-        assert_eq!(cr.route.upstream.ip().to_string(), "172.17.0.2");
+        assert_eq!(cr.route.upstream().expect("has upstream").port(), 8080);
+        assert_eq!(
+            cr.route.upstream().expect("has upstream").ip().to_string(),
+            "172.17.0.2"
+        );
         assert!(!cr.route.tls);
-        assert_eq!(cr.route.rate_limit_rps, None);
+        assert_eq!(cr.route.rate_limit_rps(), None);
         assert_eq!(cr.container_id, "abc123def456");
     }
 
@@ -201,14 +204,17 @@ mod tests {
         let mut inspect = make_inspect("example.com", "8080", "172.17.0.2");
         inspect["Config"]["Labels"]["dwaar.rate_limit"] = json!("100");
         let cr = parse_container(&inspect).expect("should parse");
-        assert_eq!(cr.route.rate_limit_rps, Some(100));
+        assert_eq!(cr.route.rate_limit_rps(), Some(100));
     }
 
     #[test]
     fn empty_ip_falls_back_to_localhost() {
         let inspect = make_inspect("example.com", "8080", "");
         let cr = parse_container(&inspect).expect("should parse");
-        assert_eq!(cr.route.upstream.ip().to_string(), "127.0.0.1");
+        assert_eq!(
+            cr.route.upstream().expect("has upstream").ip().to_string(),
+            "127.0.0.1"
+        );
     }
 
     #[test]
@@ -225,6 +231,9 @@ mod tests {
             "NetworkSettings": { "Networks": {} }
         });
         let cr = parse_container(&inspect).expect("should parse");
-        assert_eq!(cr.route.upstream.ip().to_string(), "127.0.0.1");
+        assert_eq!(
+            cr.route.upstream().expect("has upstream").ip().to_string(),
+            "127.0.0.1"
+        );
     }
 }

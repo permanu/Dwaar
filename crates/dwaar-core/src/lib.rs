@@ -15,5 +15,7 @@
 //! `upstream_peer()` consults on every request.
 
 pub mod context;
+pub mod fastcgi;
+pub mod file_server;
 pub mod proxy;
 pub mod route;
