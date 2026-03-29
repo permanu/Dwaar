@@ -98,6 +98,7 @@ impl From<crate::import::ImportError> for ParseError {
 /// edits of the input, suggest it.
 pub fn suggest_directive(input: &str) -> Option<&'static str> {
     const KNOWN: &[&str] = &[
+        // Implemented
         "reverse_proxy",
         "tls",
         "header",
@@ -117,7 +118,32 @@ pub fn suggest_directive(input: &str) -> Option<&'static str> {
         "import",
         "php_fastcgi",
         "root",
+        // Passthrough (valid Caddyfile directives)
         "log",
+        "bind",
+        "abort",
+        "error",
+        "metrics",
+        "templates",
+        "request_body",
+        "request_header",
+        "method",
+        "try_files",
+        "tracing",
+        "vars",
+        "map",
+        "skip_log",
+        "log_skip",
+        "push",
+        "acme_server",
+        "handle_errors",
+        "invoke",
+        "intercept",
+        "log_append",
+        "log_name",
+        "fs",
+        "copy_response",
+        "copy_response_headers",
     ];
 
     KNOWN

@@ -24,11 +24,14 @@
 
 use crate::error::{ParseError, ParseErrorKind, suggest_directive};
 use crate::model::{
-    BasicAuthCredential, BasicAuthDirective, Directive, DwaarConfig, EncodeDirective,
-    FileServerDirective, ForwardAuthDirective, HandleDirective, HandlePathDirective,
-    HeaderDirective, PhpFastcgiDirective, RateLimitDirective, RedirDirective, RespondDirective,
-    ReverseProxyDirective, RewriteDirective, RootDirective, RouteDirective, SiteBlock,
-    TlsDirective, UpstreamAddr, UriDirective, UriOperation,
+    BasicAuthCredential, BasicAuthDirective, BindDirective, Directive, DwaarConfig,
+    EncodeDirective, ErrorDirective, FileServerDirective, ForwardAuthDirective, GlobalOptions,
+    HandleDirective, HandleErrorsDirective, HandlePathDirective, HeaderDirective, LogDirective,
+    LogFormat, LogOutput, MatcherCondition, MatcherDef, MethodDirective, PhpFastcgiDirective,
+    RateLimitDirective, RedirDirective, RequestBodyDirective, RequestHeaderDirective,
+    RespondDirective, ReverseProxyDirective, RewriteDirective, RootDirective, RouteDirective,
+    SiteBlock, TlsDirective, TryFilesDirective, UpstreamAddr, UriDirective, UriOperation,
+    VarsDirective,
 };
 use crate::token::{TokenKind, Tokenizer};
 
@@ -49,9 +52,19 @@ pub fn parse_with_base_dir(
     parse_config(&mut tokenizer)
 }
 
-/// Top-level: parse zero or more site blocks until EOF.
+/// Top-level: parse an optional global options block, then zero or more
+/// site blocks until EOF.
+///
+/// A bare `{` as the very first token means global options (Caddyfile spec).
 fn parse_config(t: &mut Tokenizer<'_>) -> Result<DwaarConfig, ParseError> {
     let mut sites = Vec::new();
+
+    // A leading bare `{` is the global options block.
+    let global_options = if t.peek().kind == TokenKind::OpenBrace {
+        Some(parse_global_options(t)?)
+    } else {
+        None
+    };
 
     loop {
         let tok = t.peek();
@@ -73,7 +86,183 @@ fn parse_config(t: &mut Tokenizer<'_>) -> Result<DwaarConfig, ParseError> {
         }
     }
 
-    Ok(DwaarConfig { sites })
+    Ok(DwaarConfig {
+        global_options,
+        sites,
+    })
+}
+
+/// Parse the global options block: `{ key [args]* ... }`.
+fn parse_global_options(t: &mut Tokenizer<'_>) -> Result<GlobalOptions, ParseError> {
+    t.next_token(); // consume opening `{`
+
+    let mut opts = GlobalOptions::default();
+
+    loop {
+        let tok = t.peek();
+        match &tok.kind {
+            TokenKind::CloseBrace => {
+                t.next_token();
+                break;
+            }
+            TokenKind::Eof => {
+                return Err(ParseError {
+                    line: tok.line,
+                    col: tok.col,
+                    kind: ParseErrorKind::UnexpectedEof {
+                        expected: "'}' to close global options block".to_string(),
+                    },
+                });
+            }
+            TokenKind::Word(_) => {
+                parse_global_option_line(t, &mut opts)?;
+            }
+            _ => {
+                t.next_token(); // skip unexpected tokens
+            }
+        }
+    }
+
+    Ok(opts)
+}
+
+/// Parse one key+args inside the global options block.
+/// Dispatches on key name to consume the right number of args.
+fn parse_global_option_line(
+    t: &mut Tokenizer<'_>,
+    opts: &mut GlobalOptions,
+) -> Result<(), ParseError> {
+    let key_tok = t.next_token();
+    let key = match key_tok.kind {
+        TokenKind::Word(ref w) => w.clone(),
+        _ => return Ok(()),
+    };
+
+    match key.as_str() {
+        "http_port" => {
+            let val = peek_consume_word_or_quoted(t);
+            let port: u16 = val.parse().map_err(|_| ParseError {
+                line: key_tok.line,
+                col: key_tok.col,
+                kind: ParseErrorKind::InvalidValue {
+                    directive: "http_port".to_string(),
+                    message: format!("'{val}' is not a valid port number"),
+                },
+            })?;
+            opts.http_port = Some(port);
+        }
+        "https_port" => {
+            let val = peek_consume_word_or_quoted(t);
+            let port: u16 = val.parse().map_err(|_| ParseError {
+                line: key_tok.line,
+                col: key_tok.col,
+                kind: ParseErrorKind::InvalidValue {
+                    directive: "https_port".to_string(),
+                    message: format!("'{val}' is not a valid port number"),
+                },
+            })?;
+            opts.https_port = Some(port);
+        }
+        "email" => {
+            opts.email = Some(peek_consume_word_or_quoted(t));
+        }
+        "auto_https" => {
+            opts.auto_https = Some(peek_consume_word_or_quoted(t));
+        }
+        "debug" => {
+            opts.debug = true;
+        }
+        // Unknown option — collect args, consume sub-blocks
+        _ => {
+            let args = collect_global_passthrough_args(t);
+            opts.passthrough.push((key, args));
+        }
+    }
+
+    Ok(())
+}
+
+/// Read the next word/quoted-string if present, else return empty string.
+fn peek_consume_word_or_quoted(t: &mut Tokenizer<'_>) -> String {
+    match t.peek().kind {
+        TokenKind::Word(_) | TokenKind::QuotedString(_) => {
+            let tok = t.next_token();
+            match tok.kind {
+                TokenKind::Word(w) => w,
+                TokenKind::QuotedString(s) => s,
+                _ => unreachable!(),
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+/// Collect passthrough args for unknown global options, stopping at known keys.
+fn collect_global_passthrough_args(t: &mut Tokenizer<'_>) -> Vec<String> {
+    let mut args = Vec::new();
+    loop {
+        match &t.peek().kind {
+            TokenKind::Word(w) if is_global_option_key(w) => break,
+            TokenKind::Word(_) | TokenKind::QuotedString(_) => {
+                let tok = t.next_token();
+                match tok.kind {
+                    TokenKind::Word(w) => args.push(w),
+                    TokenKind::QuotedString(s) => args.push(s),
+                    _ => unreachable!(),
+                }
+            }
+            TokenKind::OpenBrace => {
+                t.next_token();
+                skip_brace_block(t);
+                break;
+            }
+            _ => break,
+        }
+    }
+    args
+}
+
+/// Known global option keywords — used to stop greedy passthrough collection.
+fn is_global_option_key(w: &str) -> bool {
+    matches!(
+        w,
+        "http_port"
+            | "https_port"
+            | "email"
+            | "debug"
+            | "auto_https"
+            | "admin"
+            | "grace_period"
+            | "shutdown_delay"
+            | "log"
+            | "order"
+            | "storage"
+            | "storage_clean_interval"
+            | "persist_config"
+            | "servers"
+            | "default_bind"
+            | "metrics"
+            | "default_sni"
+            | "fallback_sni"
+            | "local_certs"
+            | "skip_install_trust"
+            | "acme_ca"
+            | "acme_ca_root"
+            | "acme_eab"
+            | "acme_dns"
+            | "dns"
+            | "ech"
+            | "on_demand_tls"
+            | "key_type"
+            | "cert_issuer"
+            | "renew_interval"
+            | "cert_lifetime"
+            | "ocsp_interval"
+            | "ocsp_stapling"
+            | "pki"
+            | "events"
+            | "filesystem"
+    )
 }
 
 /// Parse one site block: `address { directive* }`
@@ -104,7 +293,10 @@ fn parse_site_block(t: &mut Tokenizer<'_>) -> Result<SiteBlock, ParseError> {
         });
     }
 
-    // Parse directives until closing brace
+    // Parse matchers and directives until closing brace.
+    // Named matchers (`@name`) may appear anywhere before directives that
+    // reference them, but we collect them separately for compile-time lookup.
+    let mut matchers = Vec::new();
     let mut directives = Vec::new();
     loop {
         let tok = t.peek();
@@ -122,6 +314,9 @@ fn parse_site_block(t: &mut Tokenizer<'_>) -> Result<SiteBlock, ParseError> {
                     },
                 });
             }
+            TokenKind::Word(w) if w.starts_with('@') => {
+                matchers.push(parse_matcher_def(t)?);
+            }
             TokenKind::Word(_) => {
                 directives.push(parse_directive(t)?);
             }
@@ -130,7 +325,7 @@ fn parse_site_block(t: &mut Tokenizer<'_>) -> Result<SiteBlock, ParseError> {
                     line: tok.line,
                     col: tok.col,
                     kind: ParseErrorKind::Expected {
-                        expected: "directive or '}'".to_string(),
+                        expected: "directive, matcher (@name), or '}'".to_string(),
                         got: format!("{:?}", tok.kind),
                     },
                 });
@@ -140,6 +335,7 @@ fn parse_site_block(t: &mut Tokenizer<'_>) -> Result<SiteBlock, ParseError> {
 
     Ok(SiteBlock {
         address,
+        matchers,
         directives,
     })
 }
@@ -190,9 +386,38 @@ fn parse_directive(t: &mut Tokenizer<'_>) -> Result<Directive, ParseError> {
             ),
         }),
         "php_fastcgi" => Ok(Directive::PhpFastcgi(parse_php_fastcgi(t)?)),
-        "log" | "bind" | "abort" | "error" | "metrics" | "templates" | "request_body"
-        | "request_header" | "method" | "try_files" | "tracing" | "vars" | "map" | "skip_log"
-        | "push" | "acme_server" => Err(unsupported(&name_tok, &name, "not yet tracked")),
+        "log" => Ok(Directive::Log(parse_log(t)?)),
+        "request_header" => Ok(Directive::RequestHeader(parse_request_header(t)?)),
+        "error" => Ok(Directive::Error(parse_error_directive(t))),
+        "abort" => Ok(Directive::Abort),
+        "method" => Ok(Directive::Method(parse_method(t, &name_tok)?)),
+        "request_body" => Ok(Directive::RequestBody(parse_request_body(t, &name_tok)?)),
+        "try_files" => Ok(Directive::TryFiles(parse_try_files(t)?)),
+        "handle_errors" => Ok(Directive::HandleErrors(parse_handle_errors(t, &name_tok)?)),
+        "bind" => Ok(Directive::Bind(parse_bind(t, &name_tok)?)),
+        "skip_log" | "log_skip" => Ok(Directive::SkipLog),
+        "vars" => Ok(Directive::Vars(parse_vars(t, &name_tok)?)),
+
+        // Caddy directives we recognize but haven't implemented yet.
+        // Parse their full syntax (args + optional block) so the file is valid,
+        // then emit a warning at compile time. Guardrail #14: every valid
+        // Caddyfile must parse without error.
+        "metrics"
+        | "templates"
+        | "tracing"
+        | "map"
+        | "push"
+        | "acme_server"
+        | "invoke"
+        | "intercept"
+        | "log_append"
+        | "log_name"
+        | "fs"
+        | "copy_response"
+        | "copy_response_headers" => {
+            let has_block = parse_passthrough(t);
+            Ok(Directive::Passthrough { name, has_block })
+        }
 
         _ => {
             let suggestion = suggest_directive(&name);
@@ -501,6 +726,986 @@ fn parse_rate_limit(t: &mut Tokenizer<'_>) -> Result<RateLimitDirective, ParseEr
     Ok(RateLimitDirective {
         requests_per_second: rps,
     })
+}
+
+// ── New directive parsers (Phase 3 + 4) ──────────────────────────────────────
+
+/// `log` or `log { output file /path; format json; level INFO }`
+fn parse_log(t: &mut Tokenizer<'_>) -> Result<LogDirective, ParseError> {
+    // `log` with no block means "enable default logging"
+    if t.peek().kind != TokenKind::OpenBrace {
+        return Ok(LogDirective {
+            output: None,
+            format: None,
+            level: None,
+        });
+    }
+
+    t.next_token(); // consume '{'
+
+    let mut output: Option<LogOutput> = None;
+    let mut format: Option<LogFormat> = None;
+    let mut level: Option<String> = None;
+
+    loop {
+        let tok = t.peek();
+        match &tok.kind {
+            TokenKind::CloseBrace => {
+                t.next_token();
+                break;
+            }
+            TokenKind::Eof => {
+                return Err(ParseError {
+                    line: tok.line,
+                    col: tok.col,
+                    kind: ParseErrorKind::UnexpectedEof {
+                        expected: "'}' to close log block".to_string(),
+                    },
+                });
+            }
+            TokenKind::Word(w) => {
+                let w = w.clone();
+                t.next_token();
+                match w.as_str() {
+                    "output" => {
+                        output = Some(parse_log_output(t)?);
+                    }
+                    "format" => {
+                        format = Some(parse_log_format(t)?);
+                    }
+                    "level" => {
+                        let level_tok = t.next_token();
+                        let (TokenKind::Word(level_str) | TokenKind::QuotedString(level_str)) =
+                            level_tok.kind
+                        else {
+                            return Err(ParseError {
+                                line: level_tok.line,
+                                col: level_tok.col,
+                                kind: ParseErrorKind::InvalidValue {
+                                    directive: "log".to_string(),
+                                    message: "expected log level string (e.g. INFO, DEBUG)"
+                                        .to_string(),
+                                },
+                            });
+                        };
+                        level = Some(level_str.to_uppercase());
+                    }
+                    _ => {
+                        // Unknown sub-directive inside log block — skip to end of line.
+                        // Caddy supports many more log sub-directives; we skip unknown ones
+                        // rather than erroring, to preserve forward compatibility.
+                        skip_to_next_line(t);
+                    }
+                }
+            }
+            _ => {
+                return Err(ParseError {
+                    line: tok.line,
+                    col: tok.col,
+                    kind: ParseErrorKind::Expected {
+                        expected: "log sub-directive or '}'".to_string(),
+                        got: format!("{:?}", tok.kind),
+                    },
+                });
+            }
+        }
+    }
+
+    Ok(LogDirective {
+        output,
+        format,
+        level,
+    })
+}
+
+/// Parse the value after `output` inside a log block.
+fn parse_log_output(t: &mut Tokenizer<'_>) -> Result<LogOutput, ParseError> {
+    let tok = t.next_token();
+    let (line, col) = (tok.line, tok.col);
+    let TokenKind::Word(dest) = tok.kind else {
+        return Err(ParseError {
+            line,
+            col,
+            kind: ParseErrorKind::InvalidValue {
+                directive: "log".to_string(),
+                message: "expected output destination (stdout, stderr, discard, file)".to_string(),
+            },
+        });
+    };
+
+    match dest.as_str() {
+        "stdout" => Ok(LogOutput::Stdout),
+        "stderr" => Ok(LogOutput::Stderr),
+        "discard" => Ok(LogOutput::Discard),
+        "file" => {
+            let path_tok = t.next_token();
+            let (TokenKind::Word(path) | TokenKind::QuotedString(path)) = path_tok.kind else {
+                return Err(ParseError {
+                    line: path_tok.line,
+                    col: path_tok.col,
+                    kind: ParseErrorKind::InvalidValue {
+                        directive: "log".to_string(),
+                        message: "expected file path after 'output file'".to_string(),
+                    },
+                });
+            };
+            Ok(LogOutput::File { path })
+        }
+        other => Err(ParseError {
+            line,
+            col,
+            kind: ParseErrorKind::InvalidValue {
+                directive: "log".to_string(),
+                message: format!(
+                    "unknown log output '{other}' — expected stdout, stderr, discard, or file"
+                ),
+            },
+        }),
+    }
+}
+
+/// Parse the value after `format` inside a log block.
+fn parse_log_format(t: &mut Tokenizer<'_>) -> Result<LogFormat, ParseError> {
+    let tok = t.next_token();
+    let (line, col) = (tok.line, tok.col);
+    match tok.kind {
+        TokenKind::Word(w) => match w.as_str() {
+            "console" => Ok(LogFormat::Console),
+            "json" => Ok(LogFormat::Json),
+            other => Err(ParseError {
+                line,
+                col,
+                kind: ParseErrorKind::InvalidValue {
+                    directive: "log".to_string(),
+                    message: format!("unknown log format '{other}' — expected console or json"),
+                },
+            }),
+        },
+        _ => Err(ParseError {
+            line,
+            col,
+            kind: ParseErrorKind::InvalidValue {
+                directive: "log".to_string(),
+                message: "expected log format (console or json)".to_string(),
+            },
+        }),
+    }
+}
+
+/// `request_header X-Name "value"` / `request_header -X-Remove` / `request_header +X-Append "value"`
+fn parse_request_header(t: &mut Tokenizer<'_>) -> Result<RequestHeaderDirective, ParseError> {
+    let name_tok = t.next_token();
+    let raw_name = match &name_tok.kind {
+        TokenKind::Word(w) => w.clone(),
+        TokenKind::QuotedString(s) => s.clone(),
+        _ => {
+            return Err(ParseError {
+                line: name_tok.line,
+                col: name_tok.col,
+                kind: ParseErrorKind::InvalidValue {
+                    directive: "request_header".to_string(),
+                    message: "expected header name".to_string(),
+                },
+            });
+        }
+    };
+
+    // `-X-Header` means delete
+    if let Some(stripped) = raw_name.strip_prefix('-') {
+        return Ok(RequestHeaderDirective::Delete {
+            name: stripped.to_string(),
+        });
+    }
+
+    // `+X-Header` means add (append without replacing)
+    let (name, is_add) = if let Some(stripped) = raw_name.strip_prefix('+') {
+        (stripped.to_string(), true)
+    } else {
+        (raw_name, false)
+    };
+
+    let val_tok = t.next_token();
+    let value = match val_tok.kind {
+        TokenKind::Word(w) => w,
+        TokenKind::QuotedString(s) => s,
+        _ => {
+            return Err(ParseError {
+                line: val_tok.line,
+                col: val_tok.col,
+                kind: ParseErrorKind::InvalidValue {
+                    directive: "request_header".to_string(),
+                    message: "expected header value".to_string(),
+                },
+            });
+        }
+    };
+
+    if is_add {
+        Ok(RequestHeaderDirective::Add { name, value })
+    } else {
+        Ok(RequestHeaderDirective::Set { name, value })
+    }
+}
+
+/// `error "message" 500` or `error 404`
+///
+/// Arguments are order-insensitive: a 3-digit number is the status code,
+/// a quoted string or non-numeric word is the message. This matches Caddy's
+/// flexible argument ordering.
+fn parse_error_directive(t: &mut Tokenizer<'_>) -> ErrorDirective {
+    let mut message = String::new();
+    let mut status: u16 = 500; // default to 500 when only a message is given
+    let mut found_status = false;
+
+    // Read up to two arguments (message and/or status code)
+    for _ in 0..2 {
+        let tok = t.peek();
+        match &tok.kind {
+            TokenKind::Word(w) => {
+                let w = w.clone();
+                // A 3-digit number in [400, 599] is a status code
+                if let Ok(n) = w.parse::<u16>()
+                    && (400..=599).contains(&n)
+                {
+                    t.next_token();
+                    status = n;
+                    found_status = true;
+                    continue;
+                }
+                // Otherwise treat as message text if we haven't got one yet
+                if message.is_empty() {
+                    t.next_token();
+                    message = w;
+                } else {
+                    break;
+                }
+            }
+            TokenKind::QuotedString(s) => {
+                let s = s.clone();
+                if message.is_empty() {
+                    t.next_token();
+                    message = s;
+                } else {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+
+    // If only a status code was given with no message, that's fine
+    if message.is_empty() {
+        message = if found_status {
+            status.to_string()
+        } else {
+            "Internal Server Error".to_string()
+        };
+    }
+
+    ErrorDirective { message, status }
+}
+
+/// `method GET`
+fn parse_method(
+    t: &mut Tokenizer<'_>,
+    dir_tok: &crate::token::Token,
+) -> Result<MethodDirective, ParseError> {
+    let tok = t.next_token();
+    match tok.kind {
+        TokenKind::Word(m) => Ok(MethodDirective {
+            method: m.to_uppercase(),
+        }),
+        _ => Err(ParseError {
+            line: dir_tok.line,
+            col: dir_tok.col,
+            kind: ParseErrorKind::InvalidValue {
+                directive: "method".to_string(),
+                message: "expected HTTP method name (e.g. GET, POST)".to_string(),
+            },
+        }),
+    }
+}
+
+/// `request_body { max_size 10MB }`
+fn parse_request_body(
+    t: &mut Tokenizer<'_>,
+    dir_tok: &crate::token::Token,
+) -> Result<RequestBodyDirective, ParseError> {
+    if t.peek().kind != TokenKind::OpenBrace {
+        return Err(ParseError {
+            line: dir_tok.line,
+            col: dir_tok.col,
+            kind: ParseErrorKind::InvalidValue {
+                directive: "request_body".to_string(),
+                message: "expected '{' block".to_string(),
+            },
+        });
+    }
+    t.next_token(); // consume '{'
+
+    let mut max_size: Option<u64> = None;
+
+    loop {
+        let tok = t.peek();
+        match &tok.kind {
+            TokenKind::CloseBrace => {
+                t.next_token();
+                break;
+            }
+            TokenKind::Eof => {
+                return Err(ParseError {
+                    line: tok.line,
+                    col: tok.col,
+                    kind: ParseErrorKind::UnexpectedEof {
+                        expected: "'}' to close request_body block".to_string(),
+                    },
+                });
+            }
+            TokenKind::Word(w) => {
+                let w = w.clone();
+                t.next_token();
+                match w.as_str() {
+                    "max_size" => {
+                        let size_tok = t.next_token();
+                        let (line, col) = (size_tok.line, size_tok.col);
+                        let TokenKind::Word(size_str) = size_tok.kind else {
+                            return Err(ParseError {
+                                line,
+                                col,
+                                kind: ParseErrorKind::InvalidValue {
+                                    directive: "request_body".to_string(),
+                                    message: "expected size value (e.g. 10MB, 512KB)".to_string(),
+                                },
+                            });
+                        };
+                        let parsed = parse_size(&size_str).ok_or_else(|| ParseError {
+                            line,
+                            col,
+                            kind: ParseErrorKind::InvalidValue {
+                                directive: "request_body".to_string(),
+                                message: format!(
+                                    "invalid size '{size_str}' — expected a number with optional unit (KB, MB, GB)"
+                                ),
+                            },
+                        })?;
+                        max_size = Some(parsed);
+                    }
+                    _ => {
+                        skip_to_next_line(t);
+                    }
+                }
+            }
+            _ => {
+                return Err(ParseError {
+                    line: tok.line,
+                    col: tok.col,
+                    kind: ParseErrorKind::Expected {
+                        expected: "request_body sub-directive or '}'".to_string(),
+                        got: format!("{:?}", tok.kind),
+                    },
+                });
+            }
+        }
+    }
+
+    Ok(RequestBodyDirective { max_size })
+}
+
+/// `try_files /index.html /fallback.html`
+///
+/// Collects all whitespace-separated file patterns as arguments.
+fn parse_try_files(t: &mut Tokenizer<'_>) -> Result<TryFilesDirective, ParseError> {
+    let mut files = Vec::new();
+
+    loop {
+        let tok = t.peek();
+        match &tok.kind {
+            TokenKind::Word(w) => {
+                if is_directive_name(w) {
+                    break;
+                }
+                let tok = t.next_token();
+                if let TokenKind::Word(w) = tok.kind {
+                    files.push(w);
+                }
+            }
+            TokenKind::QuotedString(_) => {
+                let tok = t.next_token();
+                if let TokenKind::QuotedString(s) = tok.kind {
+                    files.push(s);
+                }
+            }
+            _ => break,
+        }
+    }
+
+    if files.is_empty() {
+        let (line, col) = t.position();
+        return Err(ParseError {
+            line,
+            col,
+            kind: ParseErrorKind::InvalidValue {
+                directive: "try_files".to_string(),
+                message: "expected at least one file pattern".to_string(),
+            },
+        });
+    }
+
+    Ok(TryFilesDirective { files })
+}
+
+/// `handle_errors { directive* }`
+fn parse_handle_errors(
+    t: &mut Tokenizer<'_>,
+    dir_tok: &crate::token::Token,
+) -> Result<HandleErrorsDirective, ParseError> {
+    if t.peek().kind != TokenKind::OpenBrace {
+        return Err(ParseError {
+            line: dir_tok.line,
+            col: dir_tok.col,
+            kind: ParseErrorKind::InvalidValue {
+                directive: "handle_errors".to_string(),
+                message: "expected '{' block".to_string(),
+            },
+        });
+    }
+    t.next_token(); // consume '{'
+
+    let mut directives = Vec::new();
+
+    loop {
+        let tok = t.peek();
+        match &tok.kind {
+            TokenKind::CloseBrace => {
+                t.next_token();
+                break;
+            }
+            TokenKind::Eof => {
+                return Err(ParseError {
+                    line: tok.line,
+                    col: tok.col,
+                    kind: ParseErrorKind::UnexpectedEof {
+                        expected: "'}' to close handle_errors block".to_string(),
+                    },
+                });
+            }
+            TokenKind::Word(_) => {
+                directives.push(parse_directive(t)?);
+            }
+            _ => {
+                return Err(ParseError {
+                    line: tok.line,
+                    col: tok.col,
+                    kind: ParseErrorKind::Expected {
+                        expected: "directive or '}'".to_string(),
+                        got: format!("{:?}", tok.kind),
+                    },
+                });
+            }
+        }
+    }
+
+    Ok(HandleErrorsDirective { directives })
+}
+
+/// `bind 0.0.0.0` or `bind 127.0.0.1 ::1`
+fn parse_bind(
+    t: &mut Tokenizer<'_>,
+    dir_tok: &crate::token::Token,
+) -> Result<BindDirective, ParseError> {
+    let mut addresses = Vec::new();
+
+    loop {
+        let tok = t.peek();
+        match &tok.kind {
+            TokenKind::Word(w) => {
+                if is_directive_name(w) {
+                    break;
+                }
+                let tok = t.next_token();
+                if let TokenKind::Word(addr) = tok.kind {
+                    addresses.push(addr);
+                }
+            }
+            _ => break,
+        }
+    }
+
+    if addresses.is_empty() {
+        return Err(ParseError {
+            line: dir_tok.line,
+            col: dir_tok.col,
+            kind: ParseErrorKind::InvalidValue {
+                directive: "bind".to_string(),
+                message: "expected at least one bind address".to_string(),
+            },
+        });
+    }
+
+    Ok(BindDirective { addresses })
+}
+
+/// `vars key value`
+fn parse_vars(
+    t: &mut Tokenizer<'_>,
+    dir_tok: &crate::token::Token,
+) -> Result<VarsDirective, ParseError> {
+    let key_tok = t.next_token();
+    let key = match key_tok.kind {
+        TokenKind::Word(w) => w,
+        TokenKind::QuotedString(s) => s,
+        _ => {
+            return Err(ParseError {
+                line: dir_tok.line,
+                col: dir_tok.col,
+                kind: ParseErrorKind::InvalidValue {
+                    directive: "vars".to_string(),
+                    message: "expected variable name".to_string(),
+                },
+            });
+        }
+    };
+
+    let val_tok = t.next_token();
+    let value = match val_tok.kind {
+        TokenKind::Word(w) => w,
+        TokenKind::QuotedString(s) => s,
+        _ => {
+            return Err(ParseError {
+                line: val_tok.line,
+                col: val_tok.col,
+                kind: ParseErrorKind::InvalidValue {
+                    directive: "vars".to_string(),
+                    message: "expected variable value".to_string(),
+                },
+            });
+        }
+    };
+
+    Ok(VarsDirective { key, value })
+}
+
+/// Parse a human-readable size string like `10MB`, `512KB`, `1GB`, or a bare byte count.
+fn parse_size(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if let Some(n) = s.strip_suffix("GB").or_else(|| s.strip_suffix("gb")) {
+        n.trim().parse::<u64>().ok().map(|n| n * 1024 * 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix("MB").or_else(|| s.strip_suffix("mb")) {
+        n.trim().parse::<u64>().ok().map(|n| n * 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix("KB").or_else(|| s.strip_suffix("kb")) {
+        n.trim().parse::<u64>().ok().map(|n| n * 1024)
+    } else {
+        s.parse().ok()
+    }
+}
+
+/// Skip tokens until the next line (used to skip unknown sub-directives).
+///
+/// This reads tokens without consuming the closing brace of the parent block.
+fn skip_to_next_line(t: &mut Tokenizer<'_>) {
+    loop {
+        let tok = t.peek();
+        match tok.kind {
+            TokenKind::CloseBrace | TokenKind::OpenBrace | TokenKind::Eof => break,
+            _ => {
+                t.next_token();
+            }
+        }
+    }
+}
+
+// ── Named matcher parsing ─────────────────────────────────────────────────────
+
+/// Parse a named matcher definition.
+///
+/// Two forms are supported:
+///
+/// Multi-line block:
+/// ```text
+/// @api {
+///     path /api/*
+///     method GET POST
+/// }
+/// ```
+///
+/// Single-line (exactly one condition):
+/// ```text
+/// @api path /api/*
+/// ```
+fn parse_matcher_def(t: &mut Tokenizer<'_>) -> Result<MatcherDef, ParseError> {
+    // Consume the `@name` token (the '@' prefix is included in the Word).
+    let name_tok = t.next_token();
+    let name = match &name_tok.kind {
+        TokenKind::Word(w) => {
+            // Strip the leading '@' — we validated the prefix in parse_site_block.
+            w.trim_start_matches('@').to_string()
+        }
+        _ => {
+            return Err(ParseError {
+                line: name_tok.line,
+                col: name_tok.col,
+                kind: ParseErrorKind::Expected {
+                    expected: "matcher name starting with '@'".to_string(),
+                    got: format!("{:?}", name_tok.kind),
+                },
+            });
+        }
+    };
+
+    let peek = t.peek();
+    let conditions = match peek.kind {
+        TokenKind::OpenBrace => {
+            // Multi-line block: `@name { condition* }`
+            t.next_token(); // consume '{'
+            let mut conds = Vec::new();
+            loop {
+                let tok = t.peek();
+                match &tok.kind {
+                    TokenKind::CloseBrace => {
+                        t.next_token(); // consume '}'
+                        break;
+                    }
+                    TokenKind::Eof => {
+                        return Err(ParseError {
+                            line: tok.line,
+                            col: tok.col,
+                            kind: ParseErrorKind::UnexpectedEof {
+                                expected: format!("'}}' to close matcher '@{name}'"),
+                            },
+                        });
+                    }
+                    TokenKind::Word(_) => {
+                        conds.push(parse_matcher_condition(t)?);
+                    }
+                    _ => {
+                        return Err(ParseError {
+                            line: tok.line,
+                            col: tok.col,
+                            kind: ParseErrorKind::Expected {
+                                expected: "matcher condition or '}'".to_string(),
+                                got: format!("{:?}", tok.kind),
+                            },
+                        });
+                    }
+                }
+            }
+            conds
+        }
+        TokenKind::Word(_) => {
+            // Single-line form: `@name condition args...`
+            vec![parse_matcher_condition(t)?]
+        }
+        _ => {
+            // `@name` alone with no body — empty matcher (matches everything).
+            Vec::new()
+        }
+    };
+
+    Ok(MatcherDef { name, conditions })
+}
+
+/// Parse one matcher condition keyword and its arguments.
+fn parse_matcher_condition(t: &mut Tokenizer<'_>) -> Result<MatcherCondition, ParseError> {
+    let kw_tok = t.next_token();
+    let keyword = match &kw_tok.kind {
+        TokenKind::Word(w) => w.clone(),
+        _ => {
+            return Err(ParseError {
+                line: kw_tok.line,
+                col: kw_tok.col,
+                kind: ParseErrorKind::Expected {
+                    expected: "matcher condition keyword".to_string(),
+                    got: format!("{:?}", kw_tok.kind),
+                },
+            });
+        }
+    };
+
+    match keyword.as_str() {
+        "path" => {
+            let paths = collect_words_until_brace_or_known(t);
+            Ok(MatcherCondition::Path(paths))
+        }
+
+        "path_regexp" => {
+            // `path_regexp [name] pattern`
+            // If two words follow, the first is a capture-group name;
+            // if only one word follows, it is the pattern (no capture name).
+            let first = next_word_or_quoted(t);
+            let second = peek_word(t);
+            let (name, pattern) = if second.is_some() {
+                // Consume the second word (peek_word doesn't consume).
+                t.next_token();
+                (first, second.unwrap_or_default())
+            } else {
+                (None, first.unwrap_or_default())
+            };
+            Ok(MatcherCondition::PathRegexp { name, pattern })
+        }
+
+        "host" => {
+            let hosts = collect_words_until_brace_or_known(t);
+            Ok(MatcherCondition::Host(hosts))
+        }
+
+        "method" => {
+            let methods = collect_words_until_brace_or_known(t);
+            Ok(MatcherCondition::Method(methods))
+        }
+
+        "header" => {
+            // `header <name> [value]`
+            let name = next_word_or_quoted(t).unwrap_or_default();
+            let value = match t.peek().kind {
+                TokenKind::Word(ref w)
+                    if !is_matcher_condition_keyword(w)
+                        && !is_directive_name(w)
+                        && !w.starts_with('@') =>
+                {
+                    let tok = t.next_token();
+                    if let TokenKind::Word(w) = tok.kind {
+                        Some(w)
+                    } else {
+                        None
+                    }
+                }
+                TokenKind::QuotedString(_) => {
+                    let tok = t.next_token();
+                    if let TokenKind::QuotedString(s) = tok.kind {
+                        Some(s)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            Ok(MatcherCondition::Header { name, value })
+        }
+
+        "header_regexp" => {
+            // `header_regexp <name> <pattern>`
+            let name = next_word_or_quoted(t).unwrap_or_default();
+            let pattern = next_word_or_quoted(t).unwrap_or_default();
+            Ok(MatcherCondition::HeaderRegexp { name, pattern })
+        }
+
+        "protocol" => {
+            let proto = next_word_or_quoted(t).unwrap_or_default();
+            Ok(MatcherCondition::Protocol(proto))
+        }
+
+        "remote_ip" => {
+            let cidrs = collect_words_until_brace_or_known(t);
+            Ok(MatcherCondition::RemoteIp(cidrs))
+        }
+
+        "client_ip" => {
+            let cidrs = collect_words_until_brace_or_known(t);
+            Ok(MatcherCondition::ClientIp(cidrs))
+        }
+
+        "query" => {
+            let pairs = collect_words_until_brace_or_known(t);
+            Ok(MatcherCondition::Query(pairs))
+        }
+
+        "not" => parse_not_condition(t),
+
+        "expression" => {
+            // `expression <cel-expr>` — collect words as a single string.
+            let parts = collect_words_until_brace_or_known(t);
+            Ok(MatcherCondition::Expression(parts.join(" ")))
+        }
+
+        "file" => parse_file_condition(t),
+
+        _ => {
+            // Unknown condition — store verbatim for forward compatibility.
+            let args = collect_words_until_brace_or_known(t);
+            Ok(MatcherCondition::Unknown { keyword, args })
+        }
+    }
+}
+
+// ── Matcher parsing helpers ───────────────────────────────────────────────────
+
+/// Parse a `not { conditions }` block.
+fn parse_not_condition(t: &mut Tokenizer<'_>) -> Result<MatcherCondition, ParseError> {
+    let brace = t.peek();
+    if brace.kind != TokenKind::OpenBrace {
+        return Err(ParseError {
+            line: brace.line,
+            col: brace.col,
+            kind: ParseErrorKind::Expected {
+                expected: "'{' after 'not'".to_string(),
+                got: format!("{:?}", brace.kind),
+            },
+        });
+    }
+    t.next_token(); // consume '{'
+    let mut inner = Vec::new();
+    loop {
+        let tok = t.peek();
+        match &tok.kind {
+            TokenKind::CloseBrace => {
+                t.next_token();
+                break;
+            }
+            TokenKind::Eof => {
+                return Err(ParseError {
+                    line: tok.line,
+                    col: tok.col,
+                    kind: ParseErrorKind::UnexpectedEof {
+                        expected: "'}' to close 'not' block".to_string(),
+                    },
+                });
+            }
+            TokenKind::Word(_) => {
+                inner.push(parse_matcher_condition(t)?);
+            }
+            _ => {
+                return Err(ParseError {
+                    line: tok.line,
+                    col: tok.col,
+                    kind: ParseErrorKind::Expected {
+                        expected: "matcher condition or '}'".to_string(),
+                        got: format!("{:?}", tok.kind),
+                    },
+                });
+            }
+        }
+    }
+    Ok(MatcherCondition::Not(inner))
+}
+
+/// Parse a `file { try_files ... }` block.
+fn parse_file_condition(t: &mut Tokenizer<'_>) -> Result<MatcherCondition, ParseError> {
+    let brace = t.peek();
+    if brace.kind != TokenKind::OpenBrace {
+        return Err(ParseError {
+            line: brace.line,
+            col: brace.col,
+            kind: ParseErrorKind::Expected {
+                expected: "'{' after 'file'".to_string(),
+                got: format!("{:?}", brace.kind),
+            },
+        });
+    }
+    t.next_token(); // consume '{'
+    let mut try_files = Vec::new();
+    loop {
+        let tok = t.peek();
+        match &tok.kind {
+            TokenKind::CloseBrace => {
+                t.next_token();
+                break;
+            }
+            TokenKind::Eof => {
+                return Err(ParseError {
+                    line: tok.line,
+                    col: tok.col,
+                    kind: ParseErrorKind::UnexpectedEof {
+                        expected: "'}' to close 'file' block".to_string(),
+                    },
+                });
+            }
+            TokenKind::Word(w) if w == "try_files" => {
+                t.next_token(); // consume 'try_files'
+                let files = collect_words_until_brace_or_known(t);
+                try_files.extend(files);
+            }
+            TokenKind::Word(_) => {
+                // Any other word inside file { } — store as a try_files path.
+                let tok = t.next_token();
+                if let TokenKind::Word(w) = tok.kind {
+                    try_files.push(w);
+                }
+            }
+            _ => {
+                return Err(ParseError {
+                    line: tok.line,
+                    col: tok.col,
+                    kind: ParseErrorKind::Expected {
+                        expected: "'try_files' or '}'".to_string(),
+                        got: format!("{:?}", tok.kind),
+                    },
+                });
+            }
+        }
+    }
+    Ok(MatcherCondition::File { try_files })
+}
+
+/// Returns true if `w` is a matcher condition keyword.
+fn is_matcher_condition_keyword(w: &str) -> bool {
+    matches!(
+        w,
+        "path"
+            | "path_regexp"
+            | "host"
+            | "method"
+            | "header"
+            | "header_regexp"
+            | "protocol"
+            | "remote_ip"
+            | "client_ip"
+            | "query"
+            | "not"
+            | "expression"
+            | "file"
+    )
+}
+
+/// Consume words/quoted-strings until we hit a stop token.
+///
+/// Stops (without consuming) at:
+/// - `{`, `}`, EOF
+/// - Any word starting with `@` (next named matcher)
+/// - Any matcher condition keyword (next condition in the same block)
+/// - Any top-level directive name (so single-line matchers don't eat directives)
+///
+/// Quoted strings are always consumed regardless of their value.
+fn collect_words_until_brace_or_known(t: &mut Tokenizer<'_>) -> Vec<String> {
+    let mut words = Vec::new();
+    loop {
+        match t.peek().kind {
+            TokenKind::OpenBrace | TokenKind::CloseBrace | TokenKind::Eof => break,
+            TokenKind::Word(ref w) if w.starts_with('@') => break,
+            TokenKind::Word(ref w) if is_matcher_condition_keyword(w) => break,
+            TokenKind::Word(ref w) if is_directive_name(w) => break,
+            TokenKind::Word(_) | TokenKind::QuotedString(_) => {
+                let tok = t.next_token();
+                match tok.kind {
+                    TokenKind::Word(w) | TokenKind::QuotedString(w) => words.push(w),
+                    _ => {}
+                }
+            }
+        }
+    }
+    words
+}
+
+/// Consume and return the next word or quoted string, or `None`.
+fn next_word_or_quoted(t: &mut Tokenizer<'_>) -> Option<String> {
+    match t.peek().kind {
+        TokenKind::Word(_) | TokenKind::QuotedString(_) => {
+            let tok = t.next_token();
+            match tok.kind {
+                TokenKind::Word(w) | TokenKind::QuotedString(w) => Some(w),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Peek at the next word without consuming it. Returns `None` if the next
+/// token is not a plain word.
+fn peek_word(t: &mut Tokenizer<'_>) -> Option<String> {
+    match t.peek().kind {
+        TokenKind::Word(w) => Some(w),
+        _ => None,
+    }
 }
 
 /// `respond "body" 404` / `respond 204` / `respond "body"` / `respond`
@@ -989,6 +2194,7 @@ fn parse_upstream_addr(s: &str) -> UpstreamAddr {
 fn is_directive_name(w: &str) -> bool {
     matches!(
         w,
+        // Implemented directives
         "reverse_proxy"
             | "proxy"
             | "tls"
@@ -1009,19 +2215,76 @@ fn is_directive_name(w: &str) -> bool {
             | "import"
             | "php_fastcgi"
             | "root"
+            // Passthrough directives (recognized Caddyfile, not yet implemented)
             | "log"
             | "bind"
+            | "abort"
+            | "error"
+            | "metrics"
+            | "templates"
+            | "request_body"
+            | "request_header"
+            | "method"
+            | "try_files"
+            | "tracing"
+            | "vars"
+            | "map"
+            | "skip_log"
+            | "log_skip"
+            | "push"
+            | "acme_server"
+            | "handle_errors"
+            | "invoke"
+            | "intercept"
+            | "log_append"
+            | "log_name"
+            | "fs"
+            | "copy_response"
+            | "copy_response_headers"
     )
 }
 
-fn unsupported(tok: &crate::token::Token, name: &str, issue: &str) -> ParseError {
-    ParseError {
-        line: tok.line,
-        col: tok.col,
-        kind: ParseErrorKind::UnsupportedDirective {
-            name: name.to_string(),
-            tracking_issue: Some(issue.to_string()),
-        },
+/// Consume a directive's arguments and optional brace block without
+/// interpreting the content. Used for Caddy directives we recognize
+/// but haven't implemented — lets the file parse successfully.
+///
+/// Returns `true` if the directive had a `{ ... }` block.
+fn parse_passthrough(t: &mut Tokenizer<'_>) -> bool {
+    // Consume tokens on the same "line" until we hit a brace, a known
+    // directive name (next directive), the parent's closing brace, or EOF.
+    loop {
+        let tok = t.peek();
+        match &tok.kind {
+            TokenKind::OpenBrace => {
+                t.next_token(); // consume '{'
+                skip_brace_block(t);
+                return true;
+            }
+            TokenKind::CloseBrace | TokenKind::Eof => return false,
+            TokenKind::Word(w) if is_directive_name(w) || w.starts_with('@') => return false,
+            _ => {
+                t.next_token(); // consume arg token
+            }
+        }
+    }
+}
+
+/// Skip tokens until the matching `}` is found, handling nested braces.
+fn skip_brace_block(t: &mut Tokenizer<'_>) {
+    let mut depth: u32 = 1;
+    loop {
+        let tok = t.next_token();
+        match tok.kind {
+            TokenKind::OpenBrace => depth += 1,
+            TokenKind::CloseBrace => {
+                depth -= 1;
+                if depth == 0 {
+                    return;
+                }
+            }
+            TokenKind::Eof => return, // unterminated block — parser will catch it
+            _ => {}
+        }
     }
 }
 
@@ -1253,18 +2516,97 @@ mod tests {
     }
 
     #[test]
-    fn error_unsupported_directive_with_tracking() {
-        // Use `log` which is a known Caddyfile directive not yet implemented in Dwaar
-        let err = parse("a.com { log }").expect_err("should fail");
-        if let ParseErrorKind::UnsupportedDirective {
-            name,
-            tracking_issue,
-        } = &err.kind
-        {
-            assert_eq!(name, "log");
-            assert_eq!(tracking_issue.as_deref(), Some("not yet tracked"));
-        } else {
-            panic!("expected UnsupportedDirective, got: {err:?}");
+    fn passthrough_directive_parses_without_error() {
+        // `log` is now a fully implemented directive — must parse as Directive::Log
+        let config = parse("a.com { log }").expect("log should parse");
+        assert!(matches!(&config.sites[0].directives[0], Directive::Log(_)));
+    }
+
+    #[test]
+    fn passthrough_directive_with_args() {
+        // `bind` is now fully implemented — parses as Directive::Bind
+        let config = parse("a.com { bind 0.0.0.0 }").expect("bind should parse");
+        assert!(matches!(&config.sites[0].directives[0], Directive::Bind(_)));
+    }
+
+    #[test]
+    fn passthrough_directive_with_block() {
+        // `log` with a block is now fully implemented — parses as Directive::Log
+        let config = parse(
+            "a.com {\n    log {\n        output file /var/log/access.log\n        format json\n    }\n}\n",
+        )
+        .expect("log with block should parse");
+        assert!(matches!(&config.sites[0].directives[0], Directive::Log(_)));
+    }
+
+    #[test]
+    fn passthrough_directive_with_nested_blocks() {
+        // `templates` remains a passthrough directive
+        let config = parse(
+            "a.com {\n    templates {\n        mime text/html {\n            charset utf-8\n        }\n    }\n}\n",
+        )
+        .expect("nested blocks should parse as passthrough");
+        assert!(matches!(
+            &config.sites[0].directives[0],
+            Directive::Passthrough { name, has_block: true } if name == "templates"
+        ));
+    }
+
+    #[test]
+    fn passthrough_does_not_affect_other_directives() {
+        // `log` is now implemented — parses as Directive::Log
+        let config = parse(
+            "a.com {\n    reverse_proxy :8080\n    log {\n        output file /var/log/a.log\n    }\n    tls auto\n}\n",
+        )
+        .expect("log mixed with real directives");
+        assert_eq!(config.sites[0].directives.len(), 3);
+        assert!(matches!(
+            config.sites[0].directives[0],
+            Directive::ReverseProxy(_)
+        ));
+        assert!(matches!(&config.sites[0].directives[1], Directive::Log(_)));
+        assert!(matches!(config.sites[0].directives[2], Directive::Tls(_)));
+    }
+
+    #[test]
+    fn all_caddy_passthrough_directives_parse() {
+        // Every known Caddy directive must parse without error.
+        // Note: placeholder syntax like {host} requires tokenizer changes
+        // (Phase 2), so we test with simple args here.
+        let directives = [
+            // Implemented directives
+            "log",
+            "bind 0.0.0.0",
+            "abort",
+            "error \"msg\" 500",
+            "request_header X-Foo bar",
+            "method GET",
+            "try_files /index.html",
+            "vars key val",
+            "skip_log",
+            "log_skip",
+            "request_body {\n        max_size 10MB\n    }",
+            "handle_errors {\n        respond 500\n    }",
+            // Passthrough directives
+            "metrics",
+            "templates",
+            "tracing",
+            "map",
+            "push",
+            "acme_server",
+            "invoke route_name",
+            "intercept",
+            "log_append",
+            "log_name",
+            "fs",
+        ];
+        for d in directives {
+            let input = format!("a.com {{\n    {d}\n}}");
+            let result = parse(&input);
+            assert!(
+                result.is_ok(),
+                "directive '{d}' should parse, got: {result:?}"
+            );
         }
     }
 
@@ -1735,5 +3077,69 @@ mod tests {
         assert_eq!(h.directives.len(), 2);
         assert!(matches!(h.directives[0], Directive::BasicAuth(_)));
         assert!(matches!(h.directives[1], Directive::ReverseProxy(_)));
+    }
+
+    // ── Global options block (Phase 1) ─────────────────────
+
+    #[test]
+    fn global_options_parses() {
+        let config = parse(
+            "{\n    http_port 8080\n    https_port 8443\n    email admin@example.com\n    debug\n}\n\na.com {\n    reverse_proxy :3000\n}\n",
+        )
+        .expect("should parse");
+        let opts = config.global_options.as_ref().expect("has global options");
+        assert_eq!(opts.http_port, Some(8080));
+        assert_eq!(opts.https_port, Some(8443));
+        assert_eq!(opts.email.as_deref(), Some("admin@example.com"));
+        assert!(opts.debug);
+        assert_eq!(config.sites.len(), 1);
+    }
+
+    #[test]
+    fn global_options_empty_block() {
+        let config = parse("{\n}\na.com {\n    reverse_proxy :3000\n}\n").expect("should parse");
+        let opts = config.global_options.as_ref().expect("has global options");
+        assert_eq!(opts.http_port, None);
+        assert!(!opts.debug);
+    }
+
+    #[test]
+    fn global_options_with_auto_https() {
+        let config = parse("{\n    auto_https off\n}\na.com {\n    reverse_proxy :3000\n}\n")
+            .expect("should parse");
+        let opts = config.global_options.as_ref().expect("has global options");
+        assert_eq!(opts.auto_https.as_deref(), Some("off"));
+    }
+
+    #[test]
+    fn global_options_unknown_stored_as_passthrough() {
+        let config = parse(
+            "{\n    storage file_system\n    admin off\n}\na.com {\n    reverse_proxy :3000\n}\n",
+        )
+        .expect("should parse");
+        let opts = config.global_options.as_ref().expect("has global options");
+        assert!(!opts.passthrough.is_empty());
+    }
+
+    #[test]
+    fn global_options_with_sub_block() {
+        let config = parse(
+            "{\n    log {\n        output file /var/log/caddy.log\n        level INFO\n    }\n}\na.com {\n    reverse_proxy :3000\n}\n",
+        )
+        .expect("sub-block in global options should parse");
+        assert!(config.global_options.is_some());
+    }
+
+    #[test]
+    fn no_global_options_returns_none() {
+        let config = parse("a.com {\n    reverse_proxy :3000\n}\n").expect("should parse");
+        assert!(config.global_options.is_none());
+    }
+
+    #[test]
+    fn global_options_only_no_sites() {
+        let config = parse("{\n    debug\n}\n").expect("global options without sites");
+        assert!(config.global_options.is_some());
+        assert!(config.sites.is_empty());
     }
 }
