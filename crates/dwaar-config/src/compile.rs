@@ -19,6 +19,7 @@ use compact_str::CompactString;
 use dwaar_core::route::{
     BlockKind, Handler, HandlerBlock, PathMatcher, RewriteRule, Route, RouteTable, is_valid_domain,
 };
+use dwaar_core::template::{CompiledTemplate, VarRegistry, VarSlots};
 use tracing::warn;
 
 use crate::model::{
@@ -59,16 +60,24 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
 
         let tls = site_has_tls(&site.directives);
 
+        // Build variable registry from vars/map directives (ISSUE-055)
+        let (var_registry, var_defaults) = compile_vars(&site.directives);
+
         // Check for handle/handle_path/route blocks first — these create multi-handler routes
-        let handle_blocks = compile_handle_blocks(&site.directives);
+        let handle_blocks = compile_handle_blocks(&site.directives, &var_registry);
         if !handle_blocks.is_empty() {
-            routes.push(Route::with_handlers(&site.address, tls, handle_blocks));
+            routes.push(Route::with_handlers(
+                &site.address,
+                tls,
+                handle_blocks,
+                var_defaults,
+            ));
             continue;
         }
 
         // Flat site (no handle blocks) — extract single handler + site-level middleware
         let rate_limit_rps = find_rate_limit(&site.directives);
-        let rewrites = collect_rewrites(&site.directives);
+        let rewrites = collect_rewrites(&site.directives, &var_registry);
         let basic_auth = compile_basic_auth(&site.directives);
         let forward_auth = compile_forward_auth(&site.directives);
 
@@ -91,7 +100,12 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
                 forward_auth,
                 handler: Handler::ReverseProxy { upstream: addr },
             };
-            routes.push(Route::with_handlers(&site.address, tls, vec![handler]));
+            routes.push(Route::with_handlers(
+                &site.address,
+                tls,
+                vec![handler],
+                var_defaults,
+            ));
             continue;
         }
 
@@ -110,7 +124,12 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
                     body: Bytes::from(resp.body.clone()),
                 },
             };
-            routes.push(Route::with_handlers(&site.address, tls, vec![handler]));
+            routes.push(Route::with_handlers(
+                &site.address,
+                tls,
+                vec![handler],
+                var_defaults,
+            ));
             continue;
         }
 
@@ -136,7 +155,12 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
                     browse: fs_directive.browse,
                 },
             };
-            routes.push(Route::with_handlers(&site.address, tls, vec![handler]));
+            routes.push(Route::with_handlers(
+                &site.address,
+                tls,
+                vec![handler],
+                var_defaults,
+            ));
             continue;
         }
 
@@ -161,7 +185,12 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
                     root: root_path,
                 },
             };
-            routes.push(Route::with_handlers(&site.address, tls, vec![handler]));
+            routes.push(Route::with_handlers(
+                &site.address,
+                tls,
+                vec![handler],
+                var_defaults,
+            ));
             continue;
         }
 
@@ -254,14 +283,15 @@ fn find_reverse_proxy(directives: &[Directive]) -> Option<&ReverseProxyDirective
 
 /// Compile `handle`/`handle_path`/`route` blocks into `HandlerBlock`s.
 /// Returns empty Vec if the site has no handle blocks (flat site).
-fn compile_handle_blocks(directives: &[Directive]) -> Vec<HandlerBlock> {
+fn compile_handle_blocks(directives: &[Directive], registry: &VarRegistry) -> Vec<HandlerBlock> {
     let mut blocks = Vec::new();
 
     for d in directives {
         match d {
             Directive::Handle(h) => {
                 let matcher = compile_path_matcher(h.matcher.as_ref());
-                if let Some(block) = compile_single_block(BlockKind::Handle, matcher, &h.directives)
+                if let Some(block) =
+                    compile_single_block(BlockKind::Handle, matcher, &h.directives, registry)
                 {
                     blocks.push(block);
                 }
@@ -269,14 +299,15 @@ fn compile_handle_blocks(directives: &[Directive]) -> Vec<HandlerBlock> {
             Directive::HandlePath(hp) => {
                 let matcher = compile_path_matcher(Some(&hp.path_prefix));
                 if let Some(block) =
-                    compile_single_block(BlockKind::HandlePath, matcher, &hp.directives)
+                    compile_single_block(BlockKind::HandlePath, matcher, &hp.directives, registry)
                 {
                     blocks.push(block);
                 }
             }
             Directive::Route(r) => {
                 let matcher = compile_path_matcher(r.matcher.as_ref());
-                if let Some(block) = compile_single_block(BlockKind::Route, matcher, &r.directives)
+                if let Some(block) =
+                    compile_single_block(BlockKind::Route, matcher, &r.directives, registry)
                 {
                     blocks.push(block);
                 }
@@ -304,9 +335,10 @@ fn compile_single_block(
     kind: BlockKind,
     matcher: PathMatcher,
     inner_directives: &[Directive],
+    registry: &VarRegistry,
 ) -> Option<HandlerBlock> {
     let rate_limit_rps = find_rate_limit(inner_directives);
-    let rewrites = collect_rewrites(inner_directives);
+    let rewrites = collect_rewrites(inner_directives, registry);
     let basic_auth = compile_basic_auth(inner_directives);
     let forward_auth = compile_forward_auth(inner_directives);
 
@@ -420,12 +452,13 @@ fn compile_basic_auth(directives: &[Directive]) -> Option<std::sync::Arc<BasicAu
     )))
 }
 
-fn collect_rewrites(directives: &[Directive]) -> Vec<RewriteRule> {
+fn collect_rewrites(directives: &[Directive], registry: &VarRegistry) -> Vec<RewriteRule> {
     let mut rules = Vec::new();
     for d in directives {
         match d {
             Directive::Rewrite(r) => {
-                rules.push(RewriteRule::Replace(CompactString::from(r.to.as_str())));
+                let tmpl = compile_template(&r.to, registry);
+                rules.push(RewriteRule::Replace(tmpl));
             }
             Directive::Uri(u) => match &u.operation {
                 UriOperation::StripPrefix(p) => {
@@ -499,6 +532,102 @@ fn resolve_upstream(upstreams: &[UpstreamAddr]) -> Option<SocketAddr> {
         }
     }
     None
+}
+
+// ── Variable compilation (ISSUE-055) ─────────────────────────
+
+/// Collect `vars` directives from a site and build a `VarRegistry` + default `VarSlots`.
+///
+/// Returns `(registry, slots)` where:
+/// - `registry` maps variable names → slot indices (used during template compilation)
+/// - `slots` holds the static default values (stored on the `Route` for per-request cloning)
+///
+/// Variables from `map` output parameters are NOT registered here — that's ISSUE-056.
+fn compile_vars(directives: &[Directive]) -> (VarRegistry, VarSlots) {
+    let mut registry = VarRegistry::new();
+
+    // First pass: register all variable names to assign slots
+    for d in directives {
+        if let Directive::Vars(v) = d {
+            registry.register(&v.key);
+        }
+    }
+
+    // Also check inside handle/handle_path/route blocks for nested vars
+    for d in directives {
+        match d {
+            Directive::Handle(h) => {
+                for inner in &h.directives {
+                    if let Directive::Vars(v) = inner {
+                        registry.register(&v.key);
+                    }
+                }
+            }
+            Directive::HandlePath(hp) => {
+                for inner in &hp.directives {
+                    if let Directive::Vars(v) = inner {
+                        registry.register(&v.key);
+                    }
+                }
+            }
+            Directive::Route(r) => {
+                for inner in &r.directives {
+                    if let Directive::Vars(v) = inner {
+                        registry.register(&v.key);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Second pass: populate default values (both top-level and nested in handle blocks)
+    let mut slots = VarSlots::with_capacity(registry.len());
+    let mut populate_from = |ds: &[Directive]| {
+        for d in ds {
+            if let Directive::Vars(v) = d
+                && let Some(slot) = registry.get(&v.key)
+            {
+                slots.set(slot, CompactString::from(v.value.as_str()));
+            }
+        }
+    };
+    populate_from(directives);
+    for d in directives {
+        match d {
+            Directive::Handle(h) => populate_from(&h.directives),
+            Directive::HandlePath(hp) => populate_from(&hp.directives),
+            Directive::Route(r) => populate_from(&r.directives),
+            _ => {}
+        }
+    }
+
+    (registry, slots)
+}
+
+/// Compile a template with optional variable registry support.
+///
+/// If the registry has registered variables, uses `compile_with_registry` so
+/// that `{my_var}` resolves to a `UserVar(slot)` segment. Otherwise, falls
+/// back to `CompiledTemplate::compile` for zero-overhead when no variables exist.
+fn compile_template(input: &str, registry: &VarRegistry) -> CompiledTemplate {
+    if registry.is_empty() {
+        match CompiledTemplate::compile(input) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("invalid template '{input}': {e}");
+                CompiledTemplate::compile("/").expect("fallback template")
+            }
+        }
+    } else {
+        match CompiledTemplate::compile_with_registry(input, registry) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("invalid template '{input}': {e}");
+                CompiledTemplate::compile("/").expect("fallback template")
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -902,7 +1031,11 @@ mod tests {
         let route = table.resolve("a.com").expect("should resolve");
         let block = route.handlers.first().expect("has handler");
         assert_eq!(block.rewrites.len(), 1);
-        assert!(matches!(&block.rewrites[0], RewriteRule::Replace(p) if p == "/new"));
+        // Verify the Replace rule evaluates to "/new" (literal-only template)
+        let result = block.rewrites[0]
+            .apply("/anything", None)
+            .expect("should match");
+        assert_eq!(result, CompactString::from("/new"));
     }
 
     #[test]
@@ -928,5 +1061,182 @@ mod tests {
         let route = table.resolve("a.com").expect("should resolve");
         let block = route.handlers.first().expect("has handler");
         assert_eq!(block.rewrites.len(), 2);
+    }
+
+    // ── Variable compilation (ISSUE-055) ─────────────────────
+
+    #[test]
+    fn compile_vars_directive_creates_slots() {
+        let config = DwaarConfig {
+            global_options: None,
+            sites: vec![SiteBlock {
+                address: "example.com".to_string(),
+                matchers: vec![],
+                directives: vec![
+                    rp("127.0.0.1:8080"),
+                    Directive::Vars(VarsDirective {
+                        key: "env".to_string(),
+                        value: "production".to_string(),
+                    }),
+                ],
+            }],
+        };
+        let table = compile_routes(&config);
+        let route = table.resolve("example.com").expect("should resolve");
+        assert_eq!(route.var_defaults.len(), 1);
+        assert_eq!(route.var_defaults.get(0), Some("production"));
+    }
+
+    #[test]
+    fn compile_multiple_vars() {
+        let config = DwaarConfig {
+            global_options: None,
+            sites: vec![SiteBlock {
+                address: "example.com".to_string(),
+                matchers: vec![],
+                directives: vec![
+                    rp("127.0.0.1:8080"),
+                    Directive::Vars(VarsDirective {
+                        key: "env".to_string(),
+                        value: "staging".to_string(),
+                    }),
+                    Directive::Vars(VarsDirective {
+                        key: "version".to_string(),
+                        value: "2".to_string(),
+                    }),
+                ],
+            }],
+        };
+        let table = compile_routes(&config);
+        let route = table.resolve("example.com").expect("should resolve");
+        assert_eq!(route.var_defaults.len(), 2);
+        // Both slots should have values (order depends on registration)
+        assert!(route.var_defaults.get(0).is_some());
+        assert!(route.var_defaults.get(1).is_some());
+    }
+
+    #[test]
+    fn compile_no_vars_gives_empty_slots() {
+        let config = DwaarConfig {
+            global_options: None,
+            sites: vec![SiteBlock {
+                address: "example.com".to_string(),
+                matchers: vec![],
+                directives: vec![rp("127.0.0.1:8080")],
+            }],
+        };
+        let table = compile_routes(&config);
+        let route = table.resolve("example.com").expect("should resolve");
+        assert!(route.var_defaults.is_empty());
+    }
+
+    #[test]
+    fn compile_vars_deduplicates_same_key() {
+        // Two vars with the same key — last value should win
+        let config = DwaarConfig {
+            global_options: None,
+            sites: vec![SiteBlock {
+                address: "example.com".to_string(),
+                matchers: vec![],
+                directives: vec![
+                    rp("127.0.0.1:8080"),
+                    Directive::Vars(VarsDirective {
+                        key: "env".to_string(),
+                        value: "staging".to_string(),
+                    }),
+                    Directive::Vars(VarsDirective {
+                        key: "env".to_string(),
+                        value: "production".to_string(),
+                    }),
+                ],
+            }],
+        };
+        let table = compile_routes(&config);
+        let route = table.resolve("example.com").expect("should resolve");
+        // Only one slot (deduplicated), last value wins
+        assert_eq!(route.var_defaults.len(), 1);
+        assert_eq!(route.var_defaults.get(0), Some("production"));
+    }
+
+    #[test]
+    fn compile_vars_inside_handle_block() {
+        let config = crate::parser::parse(
+            "a.com {\n    handle /api/* {\n        vars env production\n        reverse_proxy 127.0.0.1:8080\n    }\n    handle {\n        reverse_proxy 127.0.0.1:9090\n    }\n}\n",
+        )
+        .expect("should parse");
+        let table = compile_routes(&config);
+        let route = table.resolve("a.com").expect("should resolve");
+        // The var should be registered even though it's inside a handle block
+        assert_eq!(route.var_defaults.len(), 1);
+        assert_eq!(route.var_defaults.get(0), Some("production"));
+    }
+
+    #[test]
+    fn compile_rewrite_with_user_var() {
+        // rewrite target references a user variable
+        let config = DwaarConfig {
+            global_options: None,
+            sites: vec![SiteBlock {
+                address: "example.com".to_string(),
+                matchers: vec![],
+                directives: vec![
+                    rp("127.0.0.1:8080"),
+                    Directive::Vars(VarsDirective {
+                        key: "backend_path".to_string(),
+                        value: "/internal/api".to_string(),
+                    }),
+                    Directive::Rewrite(RewriteDirective {
+                        to: "{backend_path}".to_string(),
+                    }),
+                ],
+            }],
+        };
+        let table = compile_routes(&config);
+        let route = table.resolve("example.com").expect("should resolve");
+        let block = route.handlers.first().expect("has handler");
+        assert_eq!(block.rewrites.len(), 1);
+
+        // Evaluate the rewrite with var defaults
+        let ctx = dwaar_core::template::TemplateContext {
+            host: "example.com",
+            method: "GET",
+            path: "/anything",
+            uri: "/anything",
+            query: "",
+            scheme: "https",
+            remote_host: "10.0.0.1",
+            remote_port: 0,
+            request_id: "test-id",
+            upstream_host: "",
+            upstream_port: 0,
+            tls_server_name: "",
+            vars: Some(&route.var_defaults),
+        };
+        let result = block.rewrites[0]
+            .apply("/anything", Some(&ctx))
+            .expect("should match");
+        assert_eq!(result, CompactString::from("/internal/api"));
+    }
+
+    #[test]
+    fn compile_unknown_var_in_rewrite_is_error() {
+        // When no registry, unknown placeholders in rewrite targets should
+        // produce warnings and use a fallback (not crash)
+        let config = DwaarConfig {
+            global_options: None,
+            sites: vec![SiteBlock {
+                address: "example.com".to_string(),
+                matchers: vec![],
+                directives: vec![
+                    rp("127.0.0.1:8080"),
+                    Directive::Rewrite(RewriteDirective {
+                        to: "{nonexistent_var}".to_string(),
+                    }),
+                ],
+            }],
+        };
+        // Should compile without panic — the unknown var produces a warning
+        let table = compile_routes(&config);
+        assert_eq!(table.len(), 1);
     }
 }

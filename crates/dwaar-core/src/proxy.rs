@@ -37,6 +37,7 @@ use dwaar_tls::acme::ChallengeSolver;
 
 use crate::context::RequestContext;
 use crate::route::RouteTable;
+use crate::template::TemplateContext;
 
 /// Sanitize a request path for use in a redirect Location header.
 /// Prevents CRLF injection and protocol-relative open redirects.
@@ -347,16 +348,35 @@ impl ProxyHttp for DwaarProxy {
                         ctx.forward_auth = Some(fwd.clone());
                     }
 
-                    // Apply rewrite rules
+                    // Apply rewrite rules (with template evaluation)
                     if !block.rewrites.is_empty() {
                         let mut path = ctx
                             .effective_path
                             .as_deref()
                             .unwrap_or(&request_path)
                             .to_string();
+
                         for rule in &block.rewrites {
-                            if let Some(rewritten) = rule.apply(&path) {
-                                path = rewritten.to_string();
+                            // Build template context from current path state.
+                            // Rebuilt per-iteration so the path reference stays valid
+                            // after rewrites mutate it.
+                            let tmpl_ctx = TemplateContext {
+                                host: ctx.plugin_ctx.host.as_deref().unwrap_or(""),
+                                method: ctx.plugin_ctx.method.as_str(),
+                                path: &path,
+                                uri: &path,
+                                query: "",
+                                scheme: if ctx.route_tls { "https" } else { "http" },
+                                remote_host: "",
+                                remote_port: 0,
+                                request_id: ctx.request_id(),
+                                upstream_host: "",
+                                upstream_port: 0,
+                                tls_server_name: "",
+                                vars: None, // ISSUE-056: wire to route.var_defaults for map/vars
+                            };
+                            if let Some(rewritten) = rule.apply(&path, Some(&tmpl_ctx)) {
+                                path = rewritten.into_string();
                             }
                         }
                         ctx.effective_path = Some(CompactString::from(path));

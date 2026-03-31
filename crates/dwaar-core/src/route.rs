@@ -55,6 +55,8 @@ use std::net::SocketAddr;
 use ahash::RandomState;
 use compact_str::CompactString;
 
+use crate::template::{CompiledTemplate, TemplateContext, VarSlots};
+
 /// Validate that a string is a legal hostname or wildcard pattern.
 /// Rejects path traversal, null bytes, and non-hostname characters.
 pub fn is_valid_domain(s: &str) -> bool {
@@ -171,7 +173,9 @@ impl PathMatcher {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RewriteRule {
     /// `rewrite /new-path` — replace the entire URI.
-    Replace(CompactString),
+    /// Can contain placeholders like `{path}`, `{uri}`, `{host}` that are
+    /// resolved at request time from [`TemplateContext`].
+    Replace(CompiledTemplate),
     /// `uri strip_prefix /api` — remove prefix from path.
     StripPrefix(CompactString),
     /// `uri strip_suffix .html` — remove suffix from path.
@@ -186,10 +190,19 @@ pub enum RewriteRule {
 impl RewriteRule {
     /// Apply this rule to a path, returning the transformed path.
     /// Returns `None` if the rule doesn't match (prefix/suffix not present).
+    ///
+    /// `ctx` provides request-scoped values for template evaluation.
+    /// Pass `None` for rules that don't use templates.
     #[inline]
-    pub fn apply(&self, path: &str) -> Option<CompactString> {
+    pub fn apply(&self, path: &str, ctx: Option<&TemplateContext<'_>>) -> Option<CompactString> {
         match self {
-            RewriteRule::Replace(to) => Some(to.clone()),
+            RewriteRule::Replace(tmpl) => {
+                let result = match ctx {
+                    Some(c) => tmpl.evaluate_sanitized(c),
+                    None => tmpl.evaluate_literals(),
+                };
+                Some(CompactString::from(result))
+            }
             RewriteRule::StripPrefix(prefix) => path.strip_prefix(prefix.as_str()).map(|rest| {
                 if rest.is_empty() {
                     CompactString::from("/")
@@ -273,6 +286,11 @@ pub struct Route {
     /// Flat sites (no explicit handle blocks) have exactly one entry with
     /// `PathMatcher::Any`.
     pub handlers: Vec<HandlerBlock>,
+
+    /// Default values for user-declared variables (from `vars` directives).
+    /// At request time, clone this and populate dynamic vars (from `map`).
+    /// Empty when no `vars` or `map` directives are present.
+    pub var_defaults: VarSlots,
 }
 
 impl Route {
@@ -297,6 +315,7 @@ impl Route {
                 forward_auth: None,
                 handler: Handler::ReverseProxy { upstream },
             }],
+            var_defaults: VarSlots::default(),
         }
     }
 
@@ -304,7 +323,12 @@ impl Route {
     ///
     /// Scans handlers for the first `ReverseProxy` to populate `default_upstream`.
     /// Rate limit and under-attack are taken from the first handler block (site-level).
-    pub fn with_handlers(domain: &str, tls: bool, handlers: Vec<HandlerBlock>) -> Self {
+    pub fn with_handlers(
+        domain: &str,
+        tls: bool,
+        handlers: Vec<HandlerBlock>,
+        var_defaults: VarSlots,
+    ) -> Self {
         let default_upstream = handlers.iter().find_map(|b| match &b.handler {
             Handler::ReverseProxy { upstream } | Handler::FastCgi { upstream, .. } => {
                 Some(*upstream)
@@ -322,6 +346,7 @@ impl Route {
             default_rate_limit_rps,
             default_under_attack,
             handlers,
+            var_defaults,
         }
     }
 
@@ -706,38 +731,76 @@ mod tests {
 
     #[test]
     fn rewrite_replace() {
-        let r = RewriteRule::Replace(CompactString::from("/new"));
-        assert_eq!(r.apply("/anything").expect("matches"), "/new");
+        let tmpl = CompiledTemplate::compile("/new").expect("compile");
+        let r = RewriteRule::Replace(tmpl);
+        assert_eq!(
+            r.apply("/anything", None).expect("matches"),
+            CompactString::from("/new")
+        );
+    }
+
+    #[test]
+    fn rewrite_replace_with_placeholder() {
+        let tmpl = CompiledTemplate::compile("/api{path}").expect("compile");
+        let r = RewriteRule::Replace(tmpl);
+        let ctx = TemplateContext {
+            host: "example.com",
+            method: "GET",
+            path: "/v2/users",
+            uri: "/v2/users",
+            query: "",
+            scheme: "https",
+            remote_host: "10.0.0.1",
+            remote_port: 0,
+            request_id: "test-id",
+            upstream_host: "",
+            upstream_port: 0,
+            tls_server_name: "",
+            vars: None,
+        };
+        assert_eq!(
+            r.apply("/anything", Some(&ctx)).expect("matches"),
+            CompactString::from("/api/v2/users")
+        );
     }
 
     #[test]
     fn rewrite_strip_prefix_matches() {
         let r = RewriteRule::StripPrefix(CompactString::from("/api"));
-        assert_eq!(r.apply("/api/users").expect("matches"), "/users");
+        assert_eq!(
+            r.apply("/api/users", None).expect("matches"),
+            CompactString::from("/users")
+        );
     }
 
     #[test]
     fn rewrite_strip_prefix_no_match() {
         let r = RewriteRule::StripPrefix(CompactString::from("/api"));
-        assert!(r.apply("/other/path").is_none());
+        assert!(r.apply("/other/path", None).is_none());
     }
 
     #[test]
     fn rewrite_strip_prefix_exact_gives_root() {
         let r = RewriteRule::StripPrefix(CompactString::from("/api"));
-        assert_eq!(r.apply("/api").expect("matches"), "/");
+        assert_eq!(
+            r.apply("/api", None).expect("matches"),
+            CompactString::from("/")
+        );
     }
 
     #[test]
     fn rewrite_strip_suffix() {
         let r = RewriteRule::StripSuffix(CompactString::from(".html"));
-        assert_eq!(r.apply("/page.html").expect("matches"), "/page");
+        assert_eq!(
+            r.apply("/page.html", None).expect("matches"),
+            CompactString::from("/page")
+        );
     }
 
     #[test]
     fn rewrite_strip_suffix_no_match() {
         let r = RewriteRule::StripSuffix(CompactString::from(".html"));
-        assert!(r.apply("/page.css").is_none());
+        assert!(r.apply("/page.css", None).is_none());
     }
 
     #[test]
@@ -746,7 +809,10 @@ mod tests {
             find: CompactString::from("/v1"),
             replace: CompactString::from("/v2"),
         };
-        assert_eq!(r.apply("/api/v1/users").expect("matches"), "/api/v2/users");
+        assert_eq!(
+            r.apply("/api/v1/users", None).expect("matches"),
+            CompactString::from("/api/v2/users")
+        );
     }
 
     #[test]
@@ -755,6 +821,6 @@ mod tests {
             find: CompactString::from("/v1"),
             replace: CompactString::from("/v2"),
         };
-        assert!(r.apply("/api/v3/users").is_none());
+        assert!(r.apply("/api/v3/users", None).is_none());
     }
 }
