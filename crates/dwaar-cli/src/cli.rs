@@ -12,8 +12,39 @@
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::str::FromStr;
+
+/// How many worker processes to spawn.
+///
+/// "auto" maps to all available CPU cores; a positive integer spawns exactly
+/// that many. Zero is rejected — at least one worker must handle requests.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum WorkerCount {
+    Auto,
+    Count(usize),
+}
+
+impl FromStr for WorkerCount {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s == "auto" {
+            return Ok(WorkerCount::Auto);
+        }
+        match s.parse::<usize>() {
+            Ok(0) => Err("worker count must be at least 1".to_string()),
+            Ok(n) => Ok(WorkerCount::Count(n)),
+            Err(_) => Err(format!(
+                "invalid worker count '{s}': expected 'auto' or a positive integer"
+            )),
+        }
+    }
+}
 
 /// The gateway for your applications.
+// CLI flag structs naturally contain many bool fields — one per flag. Refactoring
+// into enums would harm ergonomics without improving clarity.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Parser, Debug)]
 #[command(
     name = "dwaar",
@@ -47,6 +78,32 @@ pub(crate) struct Cli {
     /// Optionally specify the socket path (default: /var/run/dwaar-admin.sock).
     #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "/var/run/dwaar-admin.sock")]
     pub admin_socket: Option<PathBuf>,
+
+    /// Bare mode — disable all optional features (logging, plugins, analytics, geoip).
+    /// Use for maximum throughput in CDN edge nodes.
+    #[arg(long)]
+    pub bare: bool,
+
+    /// Disable request logging (log writer not started, no log channel overhead)
+    #[arg(long)]
+    pub no_logging: bool,
+
+    /// Disable plugin chain (bot detection, rate limiting, compression, security headers)
+    #[arg(long)]
+    pub no_plugins: bool,
+
+    /// Disable analytics subsystem (beacon, aggregation, JS injection)
+    #[arg(long)]
+    pub no_analytics: bool,
+
+    /// Disable `GeoIP` lookups (skip loading `MaxMind` database)
+    #[arg(long)]
+    pub no_geoip: bool,
+
+    /// Number of worker processes to spawn. "auto" uses all available CPU cores.
+    /// Each worker gets its own Pingora server and binds independently via `SO_REUSEPORT`.
+    #[arg(long, default_value = "auto")]
+    pub workers: WorkerCount,
 
     /// Subcommand to execute
     #[command(subcommand)]
@@ -111,6 +168,23 @@ impl Cli {
     /// the import isolated to this module.
     pub(crate) fn parse_args() -> Self {
         <Self as Parser>::parse()
+    }
+
+    /// --bare implies all individual --no-* flags.
+    pub(crate) fn logging_enabled(&self) -> bool {
+        !self.bare && !self.no_logging
+    }
+
+    pub(crate) fn plugins_enabled(&self) -> bool {
+        !self.bare && !self.no_plugins
+    }
+
+    pub(crate) fn analytics_enabled(&self) -> bool {
+        !self.bare && !self.no_analytics
+    }
+
+    pub(crate) fn geoip_enabled(&self) -> bool {
+        !self.bare && !self.no_geoip
     }
 }
 
@@ -340,5 +414,86 @@ mod tests {
         } else {
             panic!("expected Upgrade command");
         }
+    }
+
+    #[test]
+    fn workers_auto_default() {
+        let cli = Cli::try_parse_from(["dwaar"]).expect("parse");
+        assert!(matches!(cli.workers, WorkerCount::Auto));
+    }
+
+    #[test]
+    fn workers_explicit_count() {
+        let cli = Cli::try_parse_from(["dwaar", "--workers", "4"]).expect("parse");
+        assert!(matches!(cli.workers, WorkerCount::Count(4)));
+    }
+
+    #[test]
+    fn workers_auto_explicit() {
+        let cli = Cli::try_parse_from(["dwaar", "--workers", "auto"]).expect("parse");
+        assert!(matches!(cli.workers, WorkerCount::Auto));
+    }
+
+    #[test]
+    fn workers_zero_rejected() {
+        let result = Cli::try_parse_from(["dwaar", "--workers", "0"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn bare_flag() {
+        let cli = Cli::try_parse_from(["dwaar", "--bare"]).expect("parse");
+        assert!(cli.bare);
+        assert!(!cli.logging_enabled());
+        assert!(!cli.plugins_enabled());
+        assert!(!cli.analytics_enabled());
+        assert!(!cli.geoip_enabled());
+    }
+
+    #[test]
+    fn no_logging_flag() {
+        let cli = Cli::try_parse_from(["dwaar", "--no-logging"]).expect("parse");
+        assert!(!cli.bare);
+        assert!(!cli.logging_enabled());
+        assert!(cli.plugins_enabled());
+    }
+
+    #[test]
+    fn no_plugins_flag() {
+        let cli = Cli::try_parse_from(["dwaar", "--no-plugins"]).expect("parse");
+        assert!(!cli.plugins_enabled());
+        assert!(cli.logging_enabled());
+    }
+
+    #[test]
+    fn no_analytics_flag() {
+        let cli = Cli::try_parse_from(["dwaar", "--no-analytics"]).expect("parse");
+        assert!(!cli.analytics_enabled());
+        assert!(cli.logging_enabled());
+    }
+
+    #[test]
+    fn no_geoip_flag() {
+        let cli = Cli::try_parse_from(["dwaar", "--no-geoip"]).expect("parse");
+        assert!(!cli.geoip_enabled());
+        assert!(cli.logging_enabled());
+    }
+
+    #[test]
+    fn individual_flags_independent() {
+        let cli = Cli::try_parse_from(["dwaar", "--no-logging", "--no-geoip"]).expect("parse");
+        assert!(!cli.logging_enabled());
+        assert!(!cli.geoip_enabled());
+        assert!(cli.plugins_enabled());
+        assert!(cli.analytics_enabled());
+    }
+
+    #[test]
+    fn all_features_enabled_by_default() {
+        let cli = Cli::try_parse_from(["dwaar"]).expect("parse");
+        assert!(cli.logging_enabled());
+        assert!(cli.plugins_enabled());
+        assert!(cli.analytics_enabled());
+        assert!(cli.geoip_enabled());
     }
 }
