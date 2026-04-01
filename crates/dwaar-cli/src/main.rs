@@ -24,12 +24,13 @@ use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use arc_swap::ArcSwap;
+use pingora_core::listeners::TcpSocketOptions;
 use pingora_core::listeners::tls::TlsSettings;
 use pingora_core::server::Server;
 use pingora_core::server::configuration::{Opt as PingoraOpt, ServerConf};
 use tracing::info;
 
-use cli::{Cli, Commands};
+use cli::{Cli, Commands, WorkerCount};
 use dashmap::DashMap;
 use dwaar_admin::AdminService;
 use dwaar_analytics::aggregation;
@@ -47,6 +48,101 @@ use dwaar_tls::acme::issuer::CertIssuer;
 use dwaar_tls::acme::service::TlsBackgroundService;
 use dwaar_tls::cert_store::CertStore;
 use dwaar_tls::sni::{DomainTlsConfig, SniResolver};
+
+/// Returned by `fork_workers` to tell the caller whether it is the supervisor
+/// or one of the worker children.
+enum WorkerRole {
+    Supervisor,
+    Worker(usize),
+}
+
+/// Fork `count` worker processes and supervise them.
+///
+/// The supervisor never calls `run_server()`. It loops waiting for children
+/// to exit and restarts any that do, so worker crashes don't take the whole
+/// process tree down.
+///
+/// Fork happens before Pingora or tokio are initialized — each child builds
+/// its own server from scratch. This is safe because no shared state exists
+/// yet.
+///
+/// # Safety
+/// `fork()` must be called before any tokio runtime is created. Forking a
+/// multi-threaded process is undefined behaviour; forking here (before Pingora's
+/// `run_forever()`) guarantees we are still single-threaded.
+#[allow(unsafe_code)]
+fn fork_workers(count: usize) -> anyhow::Result<WorkerRole> {
+    let mut children: Vec<libc::pid_t> = Vec::with_capacity(count);
+
+    for id in 0..count {
+        // SAFETY: fork() before any tokio/Pingora initialisation — single-threaded.
+        let pid = unsafe { libc::fork() };
+        match pid {
+            -1 => {
+                let err = std::io::Error::last_os_error();
+                tracing::error!(worker = id, error = %err, "fork failed");
+                anyhow::bail!("fork failed for worker {id}: {err}");
+            }
+            0 => {
+                // Child — each worker returns immediately and starts its own server.
+                return Ok(WorkerRole::Worker(id));
+            }
+            child_pid => {
+                children.push(child_pid);
+            }
+        }
+    }
+
+    info!(workers = count, "supervisor: all worker processes started");
+
+    // Supervisor loop — restart any worker that exits.
+    loop {
+        let mut status: libc::c_int = 0;
+        // SAFETY: standard waitpid call; -1 means "any child".
+        let exited_pid = unsafe { libc::waitpid(-1, &raw mut status, 0) };
+
+        if exited_pid <= 0 {
+            // No more children left to wait for — all workers must have exited.
+            break;
+        }
+
+        let reason = if libc::WIFEXITED(status) {
+            format!("exit code {}", libc::WEXITSTATUS(status))
+        } else if libc::WIFSIGNALED(status) {
+            format!("signal {}", libc::WTERMSIG(status))
+        } else {
+            "unknown".to_string()
+        };
+
+        tracing::warn!(
+            pid = exited_pid,
+            reason,
+            "supervisor: worker exited — restarting"
+        );
+
+        // Remove the dead PID so we can track the new child.
+        children.retain(|&p| p != exited_pid);
+
+        // Restart with a new worker ID derived from slot position.
+        let id = children.len(); // rough slot index for log labelling
+        // SAFETY: same single-threaded fork guarantee as above.
+        let pid = unsafe { libc::fork() };
+        match pid {
+            -1 => {
+                let err = std::io::Error::last_os_error();
+                tracing::error!(error = %err, "supervisor: restart fork failed");
+            }
+            0 => {
+                return Ok(WorkerRole::Worker(id));
+            }
+            child_pid => {
+                children.push(child_pid);
+            }
+        }
+    }
+
+    Ok(WorkerRole::Supervisor)
+}
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse_args();
@@ -96,7 +192,24 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    run_server(&cli, &dwaar_config, config_path)
+    let cpu_count = std::thread::available_parallelism()
+        .map(std::num::NonZero::get)
+        .unwrap_or(1);
+
+    let worker_count = match cli.workers {
+        WorkerCount::Auto => cpu_count,
+        WorkerCount::Count(n) => n,
+    };
+
+    // Single-process mode skips forking — same behavior as before.
+    if worker_count <= 1 {
+        return run_server(&cli, &dwaar_config, config_path, 0, 1);
+    }
+
+    match fork_workers(worker_count)? {
+        WorkerRole::Supervisor => Ok(()),
+        WorkerRole::Worker(id) => run_server(&cli, &dwaar_config, config_path, id, worker_count),
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -104,6 +217,8 @@ fn run_server(
     cli: &Cli,
     dwaar_config: &dwaar_config::model::DwaarConfig,
     config_path: &std::path::Path,
+    worker_id: usize,
+    worker_count: usize,
 ) -> anyhow::Result<()> {
     let pingora_opt = PingoraOpt {
         upgrade: cli.upgrade,
@@ -113,14 +228,15 @@ fn run_server(
         conf: None,
     };
 
-    // Match nginx's `worker_processes auto` — use all available CPU cores.
-    // Pingora defaults to 1 thread which severely limits throughput.
+    // Divide CPU threads across workers to avoid oversubscription.
+    // Single-process mode gets the full core count (same as before).
     let cpu_count = std::thread::available_parallelism()
         .map(std::num::NonZero::get)
         .unwrap_or(1);
+    let threads = (cpu_count / worker_count).max(1);
 
     let conf = ServerConf {
-        threads: cpu_count,
+        threads,
         work_stealing: true,
         upstream_keepalive_pool_size: 256,
         grace_period_seconds: Some(5),
@@ -132,6 +248,8 @@ fn run_server(
     server.bootstrap();
 
     info!(
+        worker_id,
+        worker_count,
         threads = server.configuration.threads,
         work_stealing = server.configuration.work_stealing,
         grace_period = server.configuration.grace_period_seconds,
@@ -164,9 +282,22 @@ fn run_server(
         Some(Arc::new(ChallengeSolver::new()))
     };
 
-    let (log_sender, log_receiver) = log_channel();
-    let (agg_sender, agg_receiver) = aggregation::agg_channel();
-    let (beacon_sender, beacon_receiver) = beacon::beacon_channel();
+    let (log_sender, log_receiver) = if cli.logging_enabled() {
+        let (s, r) = log_channel();
+        (Some(s), Some(r))
+    } else {
+        info!("request logging disabled via CLI flag");
+        (None, None)
+    };
+
+    let (beacon_sender, beacon_receiver, agg_sender, agg_receiver) = if cli.analytics_enabled() {
+        let (bs, br) = beacon::beacon_channel();
+        let (as_, ar) = aggregation::agg_channel();
+        (Some(bs), Some(br), Some(as_), Some(ar))
+    } else {
+        info!("analytics disabled via CLI flag");
+        (None, None, None, None)
+    };
 
     let route_table_for_admin = Arc::clone(&route_table);
     let route_table_for_watcher = Arc::clone(&route_table);
@@ -175,41 +306,67 @@ fn run_server(
 
     // GeoIP — load the MaxMind database if present. Not a hard requirement;
     // country enrichment simply won't happen without it.
-    let geo_lookup = load_geoip_database();
+    let geo_lookup = if cli.geoip_enabled() {
+        load_geoip_database()
+    } else {
+        info!("GeoIP disabled via CLI flag");
+        None
+    };
 
     // Build the plugin chain with all built-in plugins, sorted by priority.
     // Under Attack Mode uses a random secret — in production this should
     // come from config or environment for persistence across restarts.
-    let under_attack_secret: Vec<u8> = {
-        use rand::Rng;
-        let mut buf = vec![0u8; 32];
-        rand::rng().fill_bytes(&mut buf);
-        buf
+    let plugin_chain = if cli.plugins_enabled() {
+        let under_attack_secret: Vec<u8> = {
+            use rand::Rng;
+            let mut buf = vec![0u8; 32];
+            rand::rng().fill_bytes(&mut buf);
+            buf
+        };
+        Arc::new(dwaar_plugins::plugin::PluginChain::new(vec![
+            Box::new(dwaar_plugins::bot_detect::BotDetectPlugin::new()),
+            Box::new(dwaar_plugins::under_attack::UnderAttackPlugin::new(
+                under_attack_secret,
+            )),
+            Box::new(dwaar_plugins::rate_limit::RateLimitPlugin::new()),
+            Box::new(dwaar_plugins::compress::CompressionPlugin::new()),
+            Box::new(dwaar_plugins::security_headers::SecurityHeadersPlugin::new()),
+        ]))
+    } else {
+        info!("plugins disabled via CLI flag");
+        Arc::new(dwaar_plugins::plugin::PluginChain::new(vec![]))
     };
-    let plugin_chain = Arc::new(dwaar_plugins::plugin::PluginChain::new(vec![
-        Box::new(dwaar_plugins::bot_detect::BotDetectPlugin::new()),
-        Box::new(dwaar_plugins::under_attack::UnderAttackPlugin::new(
-            under_attack_secret,
-        )),
-        Box::new(dwaar_plugins::rate_limit::RateLimitPlugin::new()),
-        Box::new(dwaar_plugins::compress::CompressionPlugin::new()),
-        Box::new(dwaar_plugins::security_headers::SecurityHeadersPlugin::new()),
-    ]));
+
+    info!(
+        logging = cli.logging_enabled(),
+        plugins = cli.plugins_enabled(),
+        analytics = cli.analytics_enabled(),
+        geoip = cli.geoip_enabled(),
+        "feature flags resolved"
+    );
 
     let proxy = DwaarProxy::new(
         route_table,
         challenge_solver.clone(),
-        Some(log_sender),
-        Some(beacon_sender),
-        Some(agg_sender),
+        log_sender,
+        beacon_sender,
+        agg_sender,
         geo_lookup,
         plugin_chain,
     );
 
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, proxy);
 
-    // Always listen on HTTP
-    proxy_service.add_tcp("0.0.0.0:6188");
+    // Multiple workers each bind the same port independently via SO_REUSEPORT.
+    // The kernel distributes incoming connections across workers, providing
+    // CPU-affinity benefits and eliminating the accept() bottleneck.
+    if worker_count > 1 {
+        let mut sock_opt = TcpSocketOptions::default();
+        sock_opt.so_reuseport = Some(true);
+        proxy_service.add_tcp_with_settings("0.0.0.0:6188", sock_opt);
+    } else {
+        proxy_service.add_tcp("0.0.0.0:6188");
+    }
     info!(
         listen = "0.0.0.0:6188",
         protocol = "http",
@@ -219,7 +376,12 @@ fn run_server(
     let cert_store = Arc::new(CertStore::new("/etc/dwaar/certs", 1000));
 
     if has_tls_sites(dwaar_config) {
-        setup_tls_listener(dwaar_config, &mut proxy_service, &cert_store)?;
+        setup_tls_listener(
+            dwaar_config,
+            &mut proxy_service,
+            &cert_store,
+            worker_count > 1,
+        )?;
     }
 
     server.add_service(proxy_service);
@@ -290,14 +452,14 @@ fn register_background_services(
     challenge_solver: Option<&Arc<ChallengeSolver>>,
     acme_domains: &[String],
     cert_store: &Arc<CertStore>,
-    log_receiver: dwaar_log::LogReceiver,
+    log_receiver: Option<dwaar_log::LogReceiver>,
     config_path: &std::path::Path,
     route_table: &Arc<ArcSwap<dwaar_core::route::RouteTable>>,
     main_route_table: &Arc<ArcSwap<dwaar_core::route::RouteTable>>,
     dwaarfile_snapshot: &Arc<ArcSwap<Vec<dwaar_core::route::Route>>>,
     config_notify: &Arc<tokio::sync::Notify>,
-    beacon_receiver: tokio::sync::mpsc::Receiver<dwaar_analytics::beacon::BeaconEvent>,
-    agg_receiver: aggregation::AggReceiver,
+    beacon_receiver: Option<tokio::sync::mpsc::Receiver<dwaar_analytics::beacon::BeaconEvent>>,
+    agg_receiver: Option<aggregation::AggReceiver>,
     route_table_for_agg: &Arc<ArcSwap<dwaar_core::route::RouteTable>>,
     agg_metrics: &Arc<DashMap<String, dwaar_analytics::aggregation::DomainMetrics>>,
 ) {
@@ -327,15 +489,17 @@ fn register_background_services(
         );
     }
 
-    // Log batch writer
-    let log_bg = pingora_core::services::background::background_service(
-        "log writer",
-        LogWriterService {
-            receiver: std::sync::Mutex::new(Some(log_receiver)),
-        },
-    );
-    server.add_service(log_bg);
-    info!("log writer registered (JSON lines to stdout)");
+    // Log batch writer — only registered when logging is enabled
+    if let Some(receiver) = log_receiver {
+        let log_bg = pingora_core::services::background::background_service(
+            "log writer",
+            LogWriterService {
+                receiver: std::sync::Mutex::new(Some(receiver)),
+            },
+        );
+        server.add_service(log_bg);
+        info!("log writer registered (JSON lines to stdout)");
+    }
 
     // Config file watcher for hot-reload
     let initial_hash = hash_content(&std::fs::read(config_path).unwrap_or_default());
@@ -371,21 +535,23 @@ fn register_background_services(
         info!(socket = %socket_path.display(), "Docker watcher registered");
     }
 
-    // Analytics aggregation service
-    let agg_service = AggregationService::new(
-        Arc::clone(agg_metrics),
-        LiveRouteValidator(Arc::clone(route_table_for_agg)),
-        beacon_receiver,
-        agg_receiver,
-    );
-    let agg_bg = pingora_core::services::background::background_service(
-        "analytics aggregation",
-        AggServiceWrapper {
-            inner: Arc::new(agg_service),
-        },
-    );
-    server.add_service(agg_bg);
-    info!("analytics aggregation service registered");
+    // Analytics aggregation service — only registered when analytics is enabled
+    if let (Some(br), Some(ar)) = (beacon_receiver, agg_receiver) {
+        let agg_service = AggregationService::new(
+            Arc::clone(agg_metrics),
+            LiveRouteValidator(Arc::clone(route_table_for_agg)),
+            br,
+            ar,
+        );
+        let agg_bg = pingora_core::services::background::background_service(
+            "analytics aggregation",
+            AggServiceWrapper {
+                inner: Arc::new(agg_service),
+            },
+        );
+        server.add_service(agg_bg);
+        info!("analytics aggregation service registered");
+    }
 }
 
 fn load_config(path: &std::path::Path) -> anyhow::Result<dwaar_config::model::DwaarConfig> {
@@ -419,6 +585,7 @@ fn setup_tls_listener(
         pingora_proxy::HttpProxy<DwaarProxy>,
     >,
     cert_store: &Arc<CertStore>,
+    use_reuseport: bool,
 ) -> anyhow::Result<()> {
     let tls_configs = compile_tls_configs(config);
 
@@ -455,7 +622,15 @@ fn setup_tls_listener(
         .set_status_callback(|ssl| Ok(ssl.ocsp_status().is_some()))
         .expect("set OCSP status callback");
 
-    proxy_service.add_tls_with_settings("0.0.0.0:6189", None, tls_settings);
+    let tcp_opt = if use_reuseport {
+        let mut opt = TcpSocketOptions::default();
+        opt.so_reuseport = Some(true);
+        Some(opt)
+    } else {
+        None
+    };
+
+    proxy_service.add_tls_with_settings("0.0.0.0:6189", tcp_opt, tls_settings);
     info!(
         listen = "0.0.0.0:6189",
         protocol = "https",
