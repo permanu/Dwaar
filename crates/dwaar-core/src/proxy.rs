@@ -348,6 +348,34 @@ impl ProxyHttp for DwaarProxy {
                         ctx.forward_auth = Some(fwd.clone());
                     }
 
+                    // Evaluate map directives to populate VarSlots (ISSUE-056)
+                    if !block.maps.is_empty() || !route.var_defaults.is_empty() {
+                        let mut slots = route.var_defaults.clone();
+                        if !block.maps.is_empty() {
+                            let map_tmpl_ctx = TemplateContext {
+                                host: ctx.plugin_ctx.host.as_deref().unwrap_or(""),
+                                method: ctx.plugin_ctx.method.as_str(),
+                                path: &request_path,
+                                uri: &request_path,
+                                query: "",
+                                scheme: if ctx.route_tls { "https" } else { "http" },
+                                remote_host: "",
+                                remote_port: 0,
+                                request_id: ctx.request_id(),
+                                upstream_host: "",
+                                upstream_port: 0,
+                                tls_server_name: "",
+                                vars: None,
+                            };
+                            for map in &block.maps {
+                                if let Some(val) = map.evaluate(&map_tmpl_ctx) {
+                                    slots.set(map.dest_slot, CompactString::from(val));
+                                }
+                            }
+                        }
+                        ctx.var_slots = Some(slots);
+                    }
+
                     // Apply rewrite rules (with template evaluation)
                     if !block.rewrites.is_empty() {
                         let mut path = ctx
@@ -373,7 +401,7 @@ impl ProxyHttp for DwaarProxy {
                                 upstream_host: "",
                                 upstream_port: 0,
                                 tls_server_name: "",
-                                vars: None, // ISSUE-056: wire to route.var_defaults for map/vars
+                                vars: ctx.var_slots.as_ref(),
                             };
                             if let Some(rewritten) = rule.apply(&path, Some(&tmpl_ctx)) {
                                 path = rewritten.into_string();

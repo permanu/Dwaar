@@ -24,6 +24,7 @@ dwaar-log = { workspace = true }
 compact_str = { workspace = true }
 ahash = { workspace = true }
 arc-swap = { workspace = true }
+regex = "1"
 bytes = { workspace = true }
 http = { workspace = true }
 uuid = { workspace = true }
