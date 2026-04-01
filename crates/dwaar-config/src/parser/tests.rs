@@ -1,0 +1,855 @@
+// Copyright (C) 2026 Permanu
+// SPDX-License-Identifier: BSL-1.1
+//
+// This file is part of Dwaar — https://dwaar.dev
+// Licensed under the Business Source License 1.1
+
+//! Parser tests — all 69 tests covering happy paths, error cases, and real-world configs.
+
+use super::*;
+use crate::model::*;
+
+// ── Happy path ────────────────────────────────────────
+
+#[test]
+fn parse_single_site_with_reverse_proxy() {
+    let config = parse(
+        "example.com {
+            reverse_proxy localhost:8080
+        }",
+    )
+    .expect("should parse");
+
+    assert_eq!(config.sites.len(), 1);
+    assert_eq!(config.sites[0].address, "example.com");
+    assert_eq!(config.sites[0].directives.len(), 1);
+    assert!(matches!(
+        &config.sites[0].directives[0],
+        Directive::ReverseProxy(_)
+    ));
+}
+
+#[test]
+fn parse_multiple_sites() {
+    let config = parse(
+        "api.example.com {
+            reverse_proxy localhost:3000
+        }
+
+        web.example.com {
+            reverse_proxy localhost:8080
+        }",
+    )
+    .expect("should parse");
+
+    assert_eq!(config.sites.len(), 2);
+    assert_eq!(config.sites[0].address, "api.example.com");
+    assert_eq!(config.sites[1].address, "web.example.com");
+}
+
+#[test]
+fn parse_wildcard_domain() {
+    let config = parse(
+        "*.example.com {
+            reverse_proxy localhost:9000
+        }",
+    )
+    .expect("should parse");
+
+    assert_eq!(config.sites[0].address, "*.example.com");
+}
+
+#[test]
+fn parse_port_shorthand() {
+    let config = parse(
+        "example.com {
+            reverse_proxy :3000
+        }",
+    )
+    .expect("should parse");
+
+    if let Directive::ReverseProxy(rp) = &config.sites[0].directives[0] {
+        assert_eq!(
+            rp.upstreams[0],
+            UpstreamAddr::SocketAddr("127.0.0.1:3000".parse().expect("valid"))
+        );
+    } else {
+        panic!("expected ReverseProxy directive");
+    }
+}
+
+#[test]
+fn parse_multiple_upstreams() {
+    let config = parse(
+        "example.com {
+            reverse_proxy 10.0.0.1:8080 10.0.0.2:8080
+        }",
+    )
+    .expect("should parse");
+
+    if let Directive::ReverseProxy(rp) = &config.sites[0].directives[0] {
+        assert_eq!(rp.upstreams.len(), 2);
+    } else {
+        panic!("expected ReverseProxy directive");
+    }
+}
+
+#[test]
+fn parse_tls_variants() {
+    let auto = parse("a.com { tls auto }").expect("parse");
+    let off = parse("a.com { tls off }").expect("parse");
+    let internal = parse("a.com { tls internal }").expect("parse");
+    let manual = parse("a.com { tls /cert.pem /key.pem }").expect("parse");
+
+    assert!(matches!(
+        auto.sites[0].directives[0],
+        Directive::Tls(TlsDirective::Auto)
+    ));
+    assert!(matches!(
+        off.sites[0].directives[0],
+        Directive::Tls(TlsDirective::Off)
+    ));
+    assert!(matches!(
+        internal.sites[0].directives[0],
+        Directive::Tls(TlsDirective::Internal)
+    ));
+    if let Directive::Tls(TlsDirective::Manual {
+        ref cert_path,
+        ref key_path,
+    }) = manual.sites[0].directives[0]
+    {
+        assert_eq!(cert_path, "/cert.pem");
+        assert_eq!(key_path, "/key.pem");
+    } else {
+        panic!("expected Manual TLS");
+    }
+}
+
+#[test]
+fn parse_header_set_and_delete() {
+    let config = parse(
+        r#"a.com {
+            header X-Custom "my value"
+            header -Server
+        }"#,
+    )
+    .expect("parse");
+
+    assert!(matches!(
+        &config.sites[0].directives[0],
+        Directive::Header(HeaderDirective::Set { name, value })
+            if name == "X-Custom" && value == "my value"
+    ));
+    assert!(matches!(
+        &config.sites[0].directives[1],
+        Directive::Header(HeaderDirective::Delete { name })
+            if name == "Server"
+    ));
+}
+
+#[test]
+fn parse_redir_with_and_without_code() {
+    let with_code = parse("a.com { redir /old /new 301 }").expect("parse");
+    let default_code = parse("a.com { redir /old /new }").expect("parse");
+
+    if let Directive::Redir(r) = &with_code.sites[0].directives[0] {
+        assert_eq!(r.code, 301);
+    }
+    if let Directive::Redir(r) = &default_code.sites[0].directives[0] {
+        assert_eq!(r.code, 308); // Caddy default
+    }
+}
+
+#[test]
+fn parse_encode() {
+    let config = parse("a.com { encode gzip zstd }").expect("parse");
+    if let Directive::Encode(e) = &config.sites[0].directives[0] {
+        assert_eq!(e.encodings, vec!["gzip", "zstd"]);
+    } else {
+        panic!("expected Encode directive");
+    }
+}
+
+#[test]
+fn parse_multiple_directives() {
+    let config = parse(
+        r#"example.com {
+            reverse_proxy localhost:8080
+            tls auto
+            header X-Powered-By "Dwaar"
+            encode gzip
+        }"#,
+    )
+    .expect("parse");
+
+    assert_eq!(config.sites[0].directives.len(), 4);
+}
+
+#[test]
+fn parse_comments_ignored() {
+    let config = parse(
+        "# Main site
+        example.com {
+            # Backend
+            reverse_proxy localhost:8080
+        }",
+    )
+    .expect("parse");
+
+    assert_eq!(config.sites.len(), 1);
+}
+
+#[test]
+fn parse_empty_config() {
+    let config = parse("").expect("parse");
+    assert!(config.sites.is_empty());
+}
+
+#[test]
+fn parse_whitespace_only() {
+    let config = parse("   \n\n  \t  \n").expect("parse");
+    assert!(config.sites.is_empty());
+}
+
+// ── Error cases ───────────────────────────────────────
+
+#[test]
+fn error_missing_closing_brace() {
+    let err = parse("example.com {\n    reverse_proxy localhost:8080\n").expect_err("should fail");
+    assert!(matches!(err.kind, ParseErrorKind::UnexpectedEof { .. }));
+}
+
+#[test]
+fn error_unknown_directive_with_suggestion() {
+    let err = parse("a.com { reverse_proxi localhost:8080 }").expect_err("should fail");
+    if let ParseErrorKind::UnknownDirective { name, suggestion } = &err.kind {
+        assert_eq!(name, "reverse_proxi");
+        assert_eq!(suggestion.as_deref(), Some("reverse_proxy"));
+    } else {
+        panic!("expected UnknownDirective, got: {err:?}");
+    }
+}
+
+#[test]
+fn passthrough_directive_parses_without_error() {
+    // `log` is now a fully implemented directive — must parse as Directive::Log
+    let config = parse("a.com { log }").expect("log should parse");
+    assert!(matches!(&config.sites[0].directives[0], Directive::Log(_)));
+}
+
+#[test]
+fn passthrough_directive_with_args() {
+    // `bind` is now fully implemented — parses as Directive::Bind
+    let config = parse("a.com { bind 0.0.0.0 }").expect("bind should parse");
+    assert!(matches!(&config.sites[0].directives[0], Directive::Bind(_)));
+}
+
+#[test]
+fn passthrough_directive_with_block() {
+    // `log` with a block is now fully implemented — parses as Directive::Log
+    let config = parse(
+        "a.com {\n    log {\n        output file /var/log/access.log\n        format json\n    }\n}\n",
+    )
+    .expect("log with block should parse");
+    assert!(matches!(&config.sites[0].directives[0], Directive::Log(_)));
+}
+
+#[test]
+fn recognized_directive_with_nested_blocks() {
+    // `templates` is a recognized Caddyfile directive parsed with parse_recognized
+    let config = parse(
+        "a.com {\n    templates {\n        mime text/html {\n            charset utf-8\n        }\n    }\n}\n",
+    )
+    .expect("nested blocks should parse as recognized directive");
+    assert!(matches!(
+        &config.sites[0].directives[0],
+        Directive::Templates(RecognizedDirective { .. })
+    ));
+}
+
+#[test]
+fn passthrough_does_not_affect_other_directives() {
+    // `log` is now implemented — parses as Directive::Log
+    let config = parse(
+        "a.com {\n    reverse_proxy :8080\n    log {\n        output file /var/log/a.log\n    }\n    tls auto\n}\n",
+    )
+    .expect("log mixed with real directives");
+    assert_eq!(config.sites[0].directives.len(), 3);
+    assert!(matches!(
+        config.sites[0].directives[0],
+        Directive::ReverseProxy(_)
+    ));
+    assert!(matches!(&config.sites[0].directives[1], Directive::Log(_)));
+    assert!(matches!(config.sites[0].directives[2], Directive::Tls(_)));
+}
+
+#[test]
+fn all_caddy_typed_directives_parse() {
+    // Every known Caddy directive must parse without error.
+    // Note: placeholder syntax like {host} requires tokenizer changes
+    // (Phase 2), so we test with simple args here.
+    let directives = [
+        // Implemented directives
+        "log",
+        "bind 0.0.0.0",
+        "abort",
+        "error \"msg\" 500",
+        "request_header X-Foo bar",
+        "method GET",
+        "try_files /index.html",
+        "vars key val",
+        "skip_log",
+        "log_skip",
+        "request_body {\n        max_size 10MB\n    }",
+        "handle_errors {\n        respond 500\n    }",
+        // Typed directives (ISSUE-056)
+        "metrics",
+        "templates",
+        "tracing",
+        "map host_label server_name {~.* backend1 default backend2}",
+        "push",
+        "acme_server",
+        "invoke route_name",
+        "intercept 500 {\n        respond 502\n    }",
+        "log_append X-Real True",
+        "log_name my_logger",
+        "fs",
+    ];
+    for d in directives {
+        let input = format!("a.com {{\n    {d}\n}}");
+        let result = parse(&input);
+        assert!(
+            result.is_ok(),
+            "directive '{d}' should parse, got: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn error_reverse_proxy_no_upstream() {
+    let err = parse("a.com { reverse_proxy }").expect_err("should fail");
+    assert!(matches!(err.kind, ParseErrorKind::InvalidValue { .. }));
+}
+
+#[test]
+fn error_includes_line_and_column() {
+    let err = parse("a.com {\n    badstuff\n}").expect_err("should fail");
+    assert_eq!(err.line, 2);
+}
+
+// ── Real-world Caddyfile samples ──────────────────────
+
+// ── rate_limit directive (ISSUE-031) ─────────────────
+
+#[test]
+fn parse_rate_limit() {
+    let config = parse("a.com { rate_limit 100/s }").expect("parse");
+    if let Directive::RateLimit(rl) = &config.sites[0].directives[0] {
+        assert_eq!(rl.requests_per_second, 100);
+    } else {
+        panic!("expected RateLimit directive");
+    }
+}
+
+#[test]
+fn parse_rate_limit_large_value() {
+    let config = parse("a.com { rate_limit 10000/s }").expect("parse");
+    if let Directive::RateLimit(rl) = &config.sites[0].directives[0] {
+        assert_eq!(rl.requests_per_second, 10000);
+    } else {
+        panic!("expected RateLimit directive");
+    }
+}
+
+#[test]
+fn error_rate_limit_no_arg() {
+    let err = parse("a.com { rate_limit }").expect_err("should fail");
+    assert!(matches!(err.kind, ParseErrorKind::InvalidValue { .. }));
+}
+
+#[test]
+fn error_rate_limit_non_numeric() {
+    let err = parse("a.com { rate_limit abc/s }").expect_err("should fail");
+    assert!(matches!(err.kind, ParseErrorKind::InvalidValue { .. }));
+}
+
+#[test]
+fn error_rate_limit_wrong_unit() {
+    let err = parse("a.com { rate_limit 100/m }").expect_err("should fail");
+    assert!(matches!(err.kind, ParseErrorKind::InvalidValue { .. }));
+}
+
+#[test]
+fn error_rate_limit_zero() {
+    let err = parse("a.com { rate_limit 0/s }").expect_err("should fail");
+    assert!(matches!(err.kind, ParseErrorKind::InvalidValue { .. }));
+}
+
+#[test]
+fn parse_rate_limit_with_other_directives() {
+    let config = parse(
+        "a.com {
+        reverse_proxy 127.0.0.1:8080
+        rate_limit 200/s
+        tls auto
+    }",
+    )
+    .expect("parse");
+    assert_eq!(config.sites[0].directives.len(), 3);
+    assert!(matches!(
+        &config.sites[0].directives[1],
+        Directive::RateLimit(rl) if rl.requests_per_second == 200
+    ));
+}
+
+#[test]
+fn format_roundtrip_rate_limit() {
+    let input = "a.com {\n    rate_limit 100/s\n}\n";
+    let config = parse(input).expect("parse");
+    let formatted = crate::format::format_config(&config);
+    assert_eq!(formatted, input);
+}
+
+// ── Real-world Caddyfile samples ──────────────────────
+
+#[test]
+fn parse_typical_caddyfile() {
+    let config = parse(
+        r#"
+        api.example.com {
+            reverse_proxy localhost:3000
+            tls auto
+            encode gzip
+            header -Server
+        }
+
+        web.example.com {
+            reverse_proxy localhost:8080
+            header X-Frame-Options "SAMEORIGIN"
+        }
+
+        *.staging.example.com {
+            reverse_proxy localhost:9000
+            tls internal
+        }
+        "#,
+    )
+    .expect("typical caddyfile should parse");
+
+    assert_eq!(config.sites.len(), 3);
+    assert_eq!(config.sites[0].address, "api.example.com");
+    assert_eq!(config.sites[0].directives.len(), 4);
+    assert_eq!(config.sites[1].address, "web.example.com");
+    assert_eq!(config.sites[2].address, "*.staging.example.com");
+}
+
+// ── respond directive (ISSUE-051) ─────────────────────
+
+#[test]
+fn respond_with_body_and_status() {
+    let config = parse(
+        r#"
+        example.com {
+            respond "Not Found" 404
+        }
+        "#,
+    )
+    .expect("should parse");
+    let d = &config.sites[0].directives[0];
+    let Directive::Respond(r) = d else {
+        panic!("expected Respond directive");
+    };
+    assert_eq!(r.status, 404);
+    assert_eq!(r.body, "Not Found");
+}
+
+#[test]
+fn respond_status_only() {
+    let config = parse("health.example.com {\n    respond 204\n}\n").expect("should parse");
+    let Directive::Respond(r) = &config.sites[0].directives[0] else {
+        panic!("expected Respond");
+    };
+    assert_eq!(r.status, 204);
+    assert!(r.body.is_empty());
+}
+
+#[test]
+fn respond_body_only() {
+    let config = parse(
+        r#"
+        example.com {
+            respond "ok"
+        }
+        "#,
+    )
+    .expect("should parse");
+    let Directive::Respond(r) = &config.sites[0].directives[0] else {
+        panic!("expected Respond");
+    };
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body, "ok");
+}
+
+#[test]
+fn respond_no_args_is_200_empty() {
+    let config = parse("a.com {\n    respond\n}\n").expect("should parse");
+    let Directive::Respond(r) = &config.sites[0].directives[0] else {
+        panic!("expected Respond");
+    };
+    assert_eq!(r.status, 200);
+    assert!(r.body.is_empty());
+}
+
+#[test]
+fn respond_followed_by_other_directive() {
+    let config =
+        parse("a.com {\n    respond 204\n    header X-Custom \"val\"\n}\n").expect("should parse");
+    assert_eq!(config.sites[0].directives.len(), 2);
+    assert!(matches!(
+        config.sites[0].directives[0],
+        Directive::Respond(_)
+    ));
+    assert!(matches!(
+        config.sites[0].directives[1],
+        Directive::Header(_)
+    ));
+}
+
+#[test]
+fn respond_invalid_status_code_rejected() {
+    let result = parse(
+        r#"
+        example.com {
+            respond "err" 999
+        }
+        "#,
+    );
+    assert!(result.is_err());
+}
+
+// ── rewrite and uri directives (ISSUE-049) ───────────
+
+#[test]
+fn rewrite_replaces_path() {
+    let config =
+        parse("a.com {\n    reverse_proxy :8080\n    rewrite /new\n}\n").expect("should parse");
+    let Directive::Rewrite(r) = &config.sites[0].directives[1] else {
+        panic!("expected Rewrite");
+    };
+    assert_eq!(r.to, "/new");
+}
+
+#[test]
+fn uri_strip_prefix() {
+    let config = parse("a.com {\n    reverse_proxy :8080\n    uri strip_prefix /api\n}\n")
+        .expect("should parse");
+    let Directive::Uri(u) = &config.sites[0].directives[1] else {
+        panic!("expected Uri");
+    };
+    assert!(matches!(&u.operation, UriOperation::StripPrefix(p) if p == "/api"));
+}
+
+#[test]
+fn uri_strip_suffix() {
+    let config = parse("a.com {\n    reverse_proxy :8080\n    uri strip_suffix .html\n}\n")
+        .expect("should parse");
+    let Directive::Uri(u) = &config.sites[0].directives[1] else {
+        panic!("expected Uri");
+    };
+    assert!(matches!(&u.operation, UriOperation::StripSuffix(s) if s == ".html"));
+}
+
+#[test]
+fn uri_replace() {
+    let config = parse("a.com {\n    reverse_proxy :8080\n    uri replace /old /new\n}\n")
+        .expect("should parse");
+    let Directive::Uri(u) = &config.sites[0].directives[1] else {
+        panic!("expected Uri");
+    };
+    assert!(matches!(
+        &u.operation,
+        UriOperation::Replace { find, replace } if find == "/old" && replace == "/new"
+    ));
+}
+
+#[test]
+fn uri_unknown_operation_rejected() {
+    let result = parse("a.com {\n    reverse_proxy :8080\n    uri explode /foo\n}\n");
+    assert!(result.is_err());
+}
+
+#[test]
+fn rewrite_missing_path_rejected() {
+    let result = parse("a.com {\n    reverse_proxy :8080\n    rewrite\n}\n");
+    assert!(result.is_err());
+}
+
+// ── basicauth directive (ISSUE-046) ──────────────────
+
+#[test]
+fn basicauth_parses_credentials() {
+    let config = parse(
+        r"
+        a.com {
+            reverse_proxy :8080
+            basicauth {
+                admin $2a$14$somehash
+                user $2a$14$otherhash
+            }
+        }
+        ",
+    )
+    .expect("should parse");
+    let Directive::BasicAuth(ba) = &config.sites[0].directives[1] else {
+        panic!("expected BasicAuth");
+    };
+    assert_eq!(ba.credentials.len(), 2);
+    assert_eq!(ba.credentials[0].username, "admin");
+    assert_eq!(ba.credentials[1].username, "user");
+    assert!(ba.realm.is_none());
+}
+
+#[test]
+fn basic_auth_underscore_form_accepted() {
+    let config =
+        parse("a.com {\n    reverse_proxy :8080\n    basic_auth {\n        admin hash\n    }\n}\n")
+            .expect("should parse");
+    assert!(matches!(
+        config.sites[0].directives[1],
+        Directive::BasicAuth(_)
+    ));
+}
+
+#[test]
+fn basicauth_empty_block_rejected() {
+    let result = parse("a.com {\n    reverse_proxy :8080\n    basicauth {\n    }\n}\n");
+    assert!(result.is_err());
+}
+
+#[test]
+fn basicauth_missing_brace_rejected() {
+    let result = parse("a.com {\n    reverse_proxy :8080\n    basicauth admin hash\n}\n");
+    assert!(result.is_err());
+}
+
+// ── forward_auth directive (ISSUE-047) ───────────────
+
+#[test]
+fn forward_auth_parses_full_block() {
+    let config = parse(
+        "a.com {\n    reverse_proxy :8080\n    forward_auth 127.0.0.1:9091 {\n        uri /api/verify\n        copy_headers Remote-User Remote-Groups\n    }\n}\n",
+    )
+    .expect("should parse");
+    let Directive::ForwardAuth(fa) = &config.sites[0].directives[1] else {
+        panic!("expected ForwardAuth");
+    };
+    assert_eq!(fa.uri.as_deref(), Some("/api/verify"));
+    assert_eq!(fa.copy_headers, vec!["Remote-User", "Remote-Groups"]);
+}
+
+#[test]
+fn forward_auth_minimal_block() {
+    let config =
+        parse("a.com {\n    reverse_proxy :8080\n    forward_auth 127.0.0.1:9091 {\n    }\n}\n")
+            .expect("should parse");
+    let Directive::ForwardAuth(fa) = &config.sites[0].directives[1] else {
+        panic!("expected ForwardAuth");
+    };
+    assert!(fa.uri.is_none());
+    assert!(fa.copy_headers.is_empty());
+}
+
+#[test]
+fn forward_auth_missing_upstream_rejected() {
+    let result = parse("a.com {\n    reverse_proxy :8080\n    forward_auth {\n    }\n}\n");
+    assert!(result.is_err());
+}
+
+#[test]
+fn forward_auth_unknown_subdirective_rejected() {
+    let result = parse(
+        "a.com {\n    reverse_proxy :8080\n    forward_auth 127.0.0.1:9091 {\n        method POST\n    }\n}\n",
+    );
+    assert!(result.is_err());
+}
+
+// ── file_server and root directives (ISSUE-048) ──────
+
+#[test]
+fn file_server_parses() {
+    let config = parse("a.com {\n    root * /var/www\n    file_server\n}\n").expect("should parse");
+    assert!(matches!(config.sites[0].directives[0], Directive::Root(_)));
+    assert!(matches!(
+        config.sites[0].directives[1],
+        Directive::FileServer(FileServerDirective { browse: false })
+    ));
+}
+
+#[test]
+fn file_server_browse() {
+    let config =
+        parse("a.com {\n    root * /var/www\n    file_server browse\n}\n").expect("should parse");
+    assert!(matches!(
+        config.sites[0].directives[1],
+        Directive::FileServer(FileServerDirective { browse: true })
+    ));
+}
+
+#[test]
+fn root_without_matcher() {
+    let config = parse("a.com {\n    root /var/www\n    file_server\n}\n").expect("should parse");
+    let Directive::Root(r) = &config.sites[0].directives[0] else {
+        panic!("expected Root");
+    };
+    assert_eq!(r.path, "/var/www");
+}
+
+#[test]
+fn root_with_star_matcher() {
+    let config =
+        parse("a.com {\n    root * /srv/static\n    file_server\n}\n").expect("should parse");
+    let Directive::Root(r) = &config.sites[0].directives[0] else {
+        panic!("expected Root");
+    };
+    assert_eq!(r.path, "/srv/static");
+}
+
+// ── handle/handle_path/route directives (ISSUE-050) ──
+
+#[test]
+fn handle_with_pattern() {
+    let config = parse("a.com {\n    handle /api/* {\n        reverse_proxy :3000\n    }\n}\n")
+        .expect("should parse");
+    let Directive::Handle(h) = &config.sites[0].directives[0] else {
+        panic!("expected Handle");
+    };
+    assert_eq!(h.matcher.as_deref(), Some("/api/*"));
+    assert_eq!(h.directives.len(), 1);
+}
+
+#[test]
+fn handle_catch_all() {
+    let config =
+        parse("a.com {\n    handle {\n        respond 404\n    }\n}\n").expect("should parse");
+    let Directive::Handle(h) = &config.sites[0].directives[0] else {
+        panic!("expected Handle");
+    };
+    assert!(h.matcher.is_none());
+}
+
+#[test]
+fn handle_path_strips_prefix() {
+    let config =
+        parse("a.com {\n    handle_path /api/* {\n        reverse_proxy :3000\n    }\n}\n")
+            .expect("should parse");
+    let Directive::HandlePath(hp) = &config.sites[0].directives[0] else {
+        panic!("expected HandlePath");
+    };
+    assert_eq!(hp.path_prefix, "/api/*");
+}
+
+#[test]
+fn route_block() {
+    let config = parse("a.com {\n    route {\n        reverse_proxy :3000\n    }\n}\n")
+        .expect("should parse");
+    assert!(matches!(config.sites[0].directives[0], Directive::Route(_)));
+}
+
+#[test]
+fn multiple_handle_blocks() {
+    let config = parse(
+        "a.com {\n    handle /api/* {\n        reverse_proxy :3000\n    }\n    handle /static/* {\n        root * /var/www\n        file_server\n    }\n    handle {\n        respond 404\n    }\n}\n",
+    )
+    .expect("should parse");
+    assert_eq!(config.sites[0].directives.len(), 3);
+    assert!(matches!(
+        config.sites[0].directives[0],
+        Directive::Handle(_)
+    ));
+    assert!(matches!(
+        config.sites[0].directives[1],
+        Directive::Handle(_)
+    ));
+    assert!(matches!(
+        config.sites[0].directives[2],
+        Directive::Handle(_)
+    ));
+}
+
+#[test]
+fn handle_nested_with_middleware() {
+    let config = parse(
+        "a.com {\n    handle /admin/* {\n        basicauth {\n            admin hash\n        }\n        reverse_proxy :3000\n    }\n}\n",
+    )
+    .expect("should parse");
+    let Directive::Handle(h) = &config.sites[0].directives[0] else {
+        panic!("expected Handle");
+    };
+    assert_eq!(h.directives.len(), 2);
+    assert!(matches!(h.directives[0], Directive::BasicAuth(_)));
+    assert!(matches!(h.directives[1], Directive::ReverseProxy(_)));
+}
+
+// ── Global options block (Phase 1) ─────────────────────
+
+#[test]
+fn global_options_parses() {
+    let config = parse(
+        "{\n    http_port 8080\n    https_port 8443\n    email admin@example.com\n    debug\n}\n\na.com {\n    reverse_proxy :3000\n}\n",
+    )
+    .expect("should parse");
+    let opts = config.global_options.as_ref().expect("has global options");
+    assert_eq!(opts.http_port, Some(8080));
+    assert_eq!(opts.https_port, Some(8443));
+    assert_eq!(opts.email.as_deref(), Some("admin@example.com"));
+    assert!(opts.debug);
+    assert_eq!(config.sites.len(), 1);
+}
+
+#[test]
+fn global_options_empty_block() {
+    let config = parse("{\n}\na.com {\n    reverse_proxy :3000\n}\n").expect("should parse");
+    let opts = config.global_options.as_ref().expect("has global options");
+    assert_eq!(opts.http_port, None);
+    assert!(!opts.debug);
+}
+
+#[test]
+fn global_options_with_auto_https() {
+    let config = parse("{\n    auto_https off\n}\na.com {\n    reverse_proxy :3000\n}\n")
+        .expect("should parse");
+    let opts = config.global_options.as_ref().expect("has global options");
+    assert_eq!(opts.auto_https.as_deref(), Some("off"));
+}
+
+#[test]
+fn global_options_unknown_stored_as_passthrough() {
+    let config = parse(
+        "{\n    storage file_system\n    admin off\n}\na.com {\n    reverse_proxy :3000\n}\n",
+    )
+    .expect("should parse");
+    let opts = config.global_options.as_ref().expect("has global options");
+    assert!(!opts.passthrough.is_empty());
+}
+
+#[test]
+fn global_options_with_sub_block() {
+    let config = parse(
+        "{\n    log {\n        output file /var/log/caddy.log\n        level INFO\n    }\n}\na.com {\n    reverse_proxy :3000\n}\n",
+    )
+    .expect("sub-block in global options should parse");
+    assert!(config.global_options.is_some());
+}
+
+#[test]
+fn no_global_options_returns_none() {
+    let config = parse("a.com {\n    reverse_proxy :3000\n}\n").expect("should parse");
+    assert!(config.global_options.is_none());
+}
+
+#[test]
+fn global_options_only_no_sites() {
+    let config = parse("{\n    debug\n}\n").expect("global options without sites");
+    assert!(config.global_options.is_some());
+    assert!(config.sites.is_empty());
+}
