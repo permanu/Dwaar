@@ -11,12 +11,14 @@
 //! blank line between site blocks.
 
 use crate::model::{
-    BasicAuthDirective, BindDirective, Directive, DwaarConfig, EncodeDirective, ErrorDirective,
-    FileServerDirective, ForwardAuthDirective, HandleErrorsDirective, HeaderDirective,
-    LogDirective, LogFormat, LogOutput, MatcherCondition, MatcherDef, MethodDirective,
-    RateLimitDirective, RedirDirective, RequestBodyDirective, RequestHeaderDirective,
-    RespondDirective, ReverseProxyDirective, RewriteDirective, RootDirective, TlsDirective,
-    TryFilesDirective, UpstreamAddr, UriDirective, UriOperation, VarsDirective,
+    BasicAuthDirective, BindDirective, CopyResponseHeadersDirective, Directive, DwaarConfig,
+    EncodeDirective, ErrorDirective, FileServerDirective, ForwardAuthDirective, FsDirective,
+    HandleErrorsDirective, HeaderDirective, InterceptDirective, LogAppendDirective, LogDirective,
+    LogFormat, LogOutput, MapDirective, MapPattern, MatcherCondition, MatcherDef, MethodDirective,
+    RateLimitDirective, RecognizedDirective, RedirDirective, RequestBodyDirective,
+    RequestHeaderDirective, RespondDirective, ReverseProxyDirective, RewriteDirective,
+    RootDirective, TlsDirective, TryFilesDirective, UpstreamAddr, UriDirective, UriOperation,
+    VarsDirective,
 };
 
 /// Format a parsed config into canonical Dwaarfile text.
@@ -96,14 +98,44 @@ fn format_directive_at_depth(out: &mut String, directive: &Directive, depth: usi
         Directive::Bind(b) => format_bind(out, b),
         Directive::SkipLog => out.push_str("skip_log"),
         Directive::Vars(v) => format_vars(out, v),
-        // Passthrough directives were consumed by the parser but have no
-        // structured representation — we can't round-trip them faithfully.
-        // Emit the directive name as a comment so the user knows it was here.
-        Directive::Passthrough { name, .. } => {
-            out.push_str("# ");
-            out.push_str(name);
-            out.push_str(" (not yet implemented)");
+        // ── ISSUE-056: Typed passthrough replacements ───────────────────
+        Directive::Map(m) => format_map(out, m, depth),
+        Directive::LogAppend(la) => format_log_append(out, la, depth),
+        Directive::LogName(ln) => {
+            out.push_str("log_name ");
+            out.push_str(&ln.name);
         }
+        Directive::Invoke(i) => {
+            out.push_str("invoke ");
+            out.push_str(&i.name);
+        }
+        Directive::Fs(f) => format_fs(out, f, depth),
+        Directive::Intercept(ic) => format_intercept(out, ic, depth),
+        Directive::Metrics(m) => {
+            out.push_str("metrics");
+            if let Some(path) = &m.path {
+                out.push(' ');
+                out.push_str(path);
+            }
+        }
+        Directive::Tracing(t) => {
+            out.push_str("tracing");
+            if let Some(ep) = &t.endpoint {
+                out.push(' ');
+                out.push_str(ep);
+            }
+        }
+        Directive::CopyResponse(cr) => {
+            out.push_str("copy_response");
+            for s in &cr.statuses {
+                out.push(' ');
+                out.push_str(&s.to_string());
+            }
+        }
+        Directive::CopyResponseHeaders(ch) => format_copy_response_headers(out, ch, depth),
+        Directive::Templates(r) => format_recognized(out, "templates", r),
+        Directive::Push(r) => format_recognized(out, "push", r),
+        Directive::AcmeServer(r) => format_recognized(out, "acme_server", r),
     }
 }
 
@@ -578,6 +610,103 @@ fn format_size(bytes: u64) -> String {
     } else {
         bytes.to_string()
     }
+}
+
+// ── ISSUE-056 formatters ─────────────────────────────────────────────────────
+
+fn format_map(out: &mut String, m: &MapDirective, depth: usize) {
+    out.push_str("map ");
+    out.push_str(&m.source);
+    out.push(' ');
+    out.push_str(&m.dest_var);
+    out.push_str(" {\n");
+    let inner = "    ".repeat(depth + 1);
+    for entry in &m.entries {
+        out.push_str(&inner);
+        match &entry.pattern {
+            MapPattern::Exact(e) => {
+                out.push_str(e);
+            }
+            MapPattern::Regex(r) => {
+                out.push('~');
+                out.push_str(r);
+            }
+            MapPattern::Default => {
+                out.push_str("default");
+            }
+        }
+        out.push(' ');
+        out.push_str(&entry.value);
+        out.push('\n');
+    }
+    let outer = "    ".repeat(depth);
+    out.push_str(&outer);
+    out.push('}');
+}
+
+fn format_log_append(out: &mut String, la: &LogAppendDirective, depth: usize) {
+    out.push_str("log_append {\n");
+    let inner = "    ".repeat(depth + 1);
+    for (name, value) in &la.fields {
+        out.push_str(&inner);
+        out.push_str(name);
+        out.push(' ');
+        out.push_str(value);
+        out.push('\n');
+    }
+    let outer = "    ".repeat(depth);
+    out.push_str(&outer);
+    out.push('}');
+}
+
+fn format_fs(out: &mut String, f: &FsDirective, _depth: usize) {
+    out.push_str("fs");
+    for arg in &f.args {
+        out.push(' ');
+        out.push_str(arg);
+    }
+    // NOTE: FsDirective currently stores only args (no block). If a block
+    // field is added to the model later, block formatting should go here.
+}
+
+fn format_intercept(out: &mut String, ic: &InterceptDirective, depth: usize) {
+    out.push_str("intercept");
+    for s in &ic.statuses {
+        out.push(' ');
+        out.push_str(&s.to_string());
+    }
+    out.push_str(" {\n");
+    for d in &ic.directives {
+        format_directive_at_depth(out, d, depth + 1);
+        out.push('\n');
+    }
+    let outer = "    ".repeat(depth);
+    out.push_str(&outer);
+    out.push('}');
+}
+
+fn format_copy_response_headers(out: &mut String, ch: &CopyResponseHeadersDirective, depth: usize) {
+    out.push_str("copy_response_headers {\n");
+    let inner = "    ".repeat(depth + 1);
+    for h in &ch.headers {
+        out.push_str(&inner);
+        out.push_str(h);
+        out.push('\n');
+    }
+    let outer = "    ".repeat(depth);
+    out.push_str(&outer);
+    out.push('}');
+}
+
+fn format_recognized(out: &mut String, name: &str, r: &RecognizedDirective) {
+    out.push_str(name);
+    for arg in &r.args {
+        out.push(' ');
+        out.push_str(arg);
+    }
+    // Recognized directives don't have a block field — they just store args.
+    // If they had a block, it would need to be formatted, but RecognizedDirective
+    // only captures args for forward-compat round-tripping.
 }
 
 #[cfg(test)]

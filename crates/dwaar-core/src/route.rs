@@ -56,6 +56,7 @@ use ahash::RandomState;
 use compact_str::CompactString;
 
 use crate::template::{CompiledTemplate, TemplateContext, VarSlots};
+use regex::Regex;
 
 /// Validate that a string is a legal hostname or wildcard pattern.
 /// Rejects path traversal, null bytes, and non-hostname characters.
@@ -244,7 +245,77 @@ pub struct HandlerBlock {
     pub basic_auth: Option<std::sync::Arc<dwaar_plugins::basic_auth::BasicAuthConfig>>,
     /// Forward auth config — subrequest to external auth service.
     pub forward_auth: Option<std::sync::Arc<dwaar_plugins::forward_auth::ForwardAuthConfig>>,
+    /// Compiled `map` directives — evaluated per-request to populate `VarSlots`.
+    pub maps: Vec<CompiledMap>,
+    /// Compiled `log_append` fields — evaluated per-request for dynamic log entries.
+    pub log_append_fields: Vec<(String, CompiledTemplate)>,
+    /// Named logger from `log_name` directive.
+    pub log_name: Option<String>,
     pub handler: Handler,
+}
+
+// ── Compiled Map (ISSUE-056) ──────────────────────────────────────
+
+/// A compiled `map {source} {dest_var} { ... }` directive.
+///
+/// At request time, evaluates the source template, matches against entries
+/// (first match wins), and writes the result to the destination `VarSlot`.
+#[derive(Debug, Clone)]
+pub struct CompiledMap {
+    /// Template that produces the value to match against.
+    pub source: CompiledTemplate,
+    /// Slot index in `VarSlots` to write the matched value.
+    pub dest_slot: u16,
+    /// Ordered entries — first match wins. The last entry is often `default`.
+    pub entries: Vec<CompiledMapEntry>,
+}
+
+impl CompiledMap {
+    /// Evaluate this map against the request context.
+    ///
+    /// Returns the matched value (or the default), or `None` if nothing matches
+    /// and there's no default.
+    pub fn evaluate(&self, ctx: &TemplateContext<'_>) -> Option<String> {
+        let source_val = self.source.evaluate(ctx);
+        for entry in &self.entries {
+            if entry.matches(&source_val) {
+                return Some(entry.value.evaluate(ctx));
+            }
+        }
+        None
+    }
+}
+
+/// One pattern → value entry inside a [`CompiledMap`].
+#[derive(Debug, Clone)]
+pub struct CompiledMapEntry {
+    /// How to match the evaluated source value.
+    pub pattern: CompiledMapPattern,
+    /// Template to produce the output value when matched.
+    pub value: CompiledTemplate,
+    /// Whether this is the `default` fallback entry.
+    pub is_default: bool,
+}
+
+impl CompiledMapEntry {
+    fn matches(&self, input: &str) -> bool {
+        match &self.pattern {
+            CompiledMapPattern::Exact(e) => e.eq_ignore_ascii_case(input),
+            CompiledMapPattern::Regex(re) => re.is_match(input),
+            CompiledMapPattern::Default => true,
+        }
+    }
+}
+
+/// How a map entry matches the evaluated source value.
+#[derive(Debug, Clone)]
+pub enum CompiledMapPattern {
+    /// Case-insensitive exact string match.
+    Exact(String),
+    /// Pre-compiled regular expression.
+    Regex(Regex),
+    /// Always matches — the `default` fallback.
+    Default,
 }
 
 // ── Route ────────────────────────────────────────────────────
@@ -313,6 +384,9 @@ impl Route {
                 rewrites: vec![],
                 basic_auth: None,
                 forward_auth: None,
+                maps: vec![],
+                log_append_fields: vec![],
+                log_name: None,
                 handler: Handler::ReverseProxy { upstream },
             }],
             var_defaults: VarSlots::default(),

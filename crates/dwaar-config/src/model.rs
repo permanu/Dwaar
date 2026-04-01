@@ -259,15 +259,45 @@ pub enum Directive {
     /// `vars key value`
     Vars(VarsDirective),
 
-    /// A directive recognized as valid Caddyfile syntax but not yet implemented
-    /// by Dwaar. Parsed successfully to satisfy Guardrail #14 (every valid
-    /// Caddyfile is a valid Dwaarfile), emits a warning at compile time.
-    Passthrough {
-        /// The directive name (e.g., "templates").
-        name: String,
-        /// Whether the directive had a `{ ... }` block.
-        has_block: bool,
-    },
+    // ── ISSUE-056: Typed passthrough replacements ──────────────────────────────
+    /// `map {source} {dest_var} { pattern value ... }` — request-time variable mapping.
+    Map(MapDirective),
+
+    /// `log_append { field value; ... }` — append dynamic fields to log entries.
+    LogAppend(LogAppendDirective),
+
+    /// `log_name <name>` — name the logger for this site.
+    LogName(LogNameDirective),
+
+    /// `invoke <name>` — invoke a named route/snippet.
+    Invoke(InvokeDirective),
+
+    /// `fs [args] { ... }` — filesystem operations.
+    Fs(FsDirective),
+
+    /// `intercept [statuses...] { directives }` — response-phase interception.
+    Intercept(InterceptDirective),
+
+    /// `metrics [path]` — expose Prometheus/OpenTelemetry metrics.
+    Metrics(MetricsDirective),
+
+    /// `tracing [endpoint]` — distributed tracing configuration.
+    Tracing(TracingDirective),
+
+    /// `copy_response [statuses...]` — copy upstream response body.
+    CopyResponse(CopyResponseDirective),
+
+    /// `copy_response_headers { include/exclude ... }` — copy selected headers.
+    CopyResponseHeaders(CopyResponseHeadersDirective),
+
+    /// `templates` — Caddy server-side template rendering (not yet implemented).
+    Templates(RecognizedDirective),
+
+    /// `push` — HTTP/2 server push (not yet implemented).
+    Push(RecognizedDirective),
+
+    /// `acme_server` — internal ACME CA server (not yet implemented).
+    AcmeServer(RecognizedDirective),
 }
 
 /// `handle` — path-scoped directive block. First match wins.
@@ -589,6 +619,124 @@ pub enum UriOperation {
     StripSuffix(String),
     /// `uri replace /old /new` — substring replacement
     Replace { find: String, replace: String },
+}
+
+// ── ISSUE-056: Typed passthrough replacement structs ────────────────────────────
+
+/// `map {source} {dest_var} { pattern value; ... }` — request-time variable mapping.
+///
+/// Evaluates a source expression per-request, matches against pattern entries,
+/// and sets the destination variable. This is how Caddy implements conditional
+/// variable assignment without scripting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapDirective {
+    /// Source expression — a template like `{query.mode}` or `{host}`.
+    pub source: String,
+    /// Destination variable name (used by other directives via `{dest_var}`).
+    pub dest_var: String,
+    /// Ordered pattern-value entries. First match wins.
+    pub entries: Vec<MapEntry>,
+}
+
+/// A single entry inside a `map { ... }` block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapEntry {
+    /// How to match the evaluated source value.
+    pub pattern: MapPattern,
+    /// Value to assign when this pattern matches (may contain placeholders).
+    pub value: String,
+}
+
+/// Matching strategy for a `MapEntry`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MapPattern {
+    /// Case-insensitive exact string match.
+    Exact(String),
+    /// Regular expression match (from `~pattern` syntax).
+    Regex(String),
+    /// Fallback when no other entry matches.
+    Default,
+}
+
+/// `log_append { field value; ... }` — append dynamic fields to log entries.
+///
+/// Each field's value is a template evaluated per-request, so you can inject
+/// request-scoped data into structured log output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogAppendDirective {
+    /// Ordered list of (`field_name`, `template_value`) pairs.
+    pub fields: Vec<(String, String)>,
+}
+
+/// `log_name <name>` — give the site's logger a name for per-site routing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogNameDirective {
+    pub name: String,
+}
+
+/// `invoke <name>` — invoke a named route or snippet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvokeDirective {
+    pub name: String,
+}
+
+/// `fs [args]` — filesystem operations directive.
+///
+/// Currently stores raw args for forward compat; runtime not yet implemented.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsDirective {
+    pub args: Vec<String>,
+}
+
+/// `intercept [status...] { directives }` — response-phase interception.
+///
+/// Matches specific upstream response status codes and applies directives
+/// (rewrite, respond, etc.) before the response reaches the client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterceptDirective {
+    /// HTTP status codes to intercept. Empty = intercept all.
+    pub statuses: Vec<u16>,
+    /// Directives to apply when matched.
+    pub directives: Vec<Directive>,
+}
+
+/// `metrics [path]` — expose a metrics endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricsDirective {
+    /// Optional URL path for the metrics endpoint (defaults to `/metrics`).
+    pub path: Option<String>,
+}
+
+/// `tracing [endpoint]` — distributed tracing configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TracingDirective {
+    /// Optional collector endpoint (e.g., `http://jaeger:4318/v1/traces`).
+    pub endpoint: Option<String>,
+}
+
+/// `copy_response [status...]` — copy the upstream response body verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyResponseDirective {
+    /// Status codes to match. Empty = match all.
+    pub statuses: Vec<u16>,
+}
+
+/// `copy_response_headers { include Header1; exclude Header2 }` — selective
+/// header copying from upstream response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyResponseHeadersDirective {
+    /// Header names to include or exclude.
+    pub headers: Vec<String>,
+}
+
+/// Recognized Caddyfile directive without runtime support.
+///
+/// Stores raw arguments so the formatter can round-trip the config. Emits
+/// a warning at compile time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecognizedDirective {
+    /// Positional arguments after the directive name.
+    pub args: Vec<String>,
 }
 
 impl DwaarConfig {

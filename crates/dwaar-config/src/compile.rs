@@ -17,14 +17,16 @@ use std::path::PathBuf;
 use bytes::Bytes;
 use compact_str::CompactString;
 use dwaar_core::route::{
-    BlockKind, Handler, HandlerBlock, PathMatcher, RewriteRule, Route, RouteTable, is_valid_domain,
+    BlockKind, CompiledMap, CompiledMapEntry, CompiledMapPattern, Handler, HandlerBlock,
+    PathMatcher, RewriteRule, Route, RouteTable, is_valid_domain,
 };
 use dwaar_core::template::{CompiledTemplate, VarRegistry, VarSlots};
 use tracing::warn;
 
 use crate::model::{
-    Directive, DwaarConfig, FileServerDirective, PhpFastcgiDirective, RespondDirective,
-    ReverseProxyDirective, RootDirective, TlsDirective, UpstreamAddr, UriOperation,
+    Directive, DwaarConfig, FileServerDirective, MapDirective, MapPattern, PhpFastcgiDirective,
+    RespondDirective, ReverseProxyDirective, RootDirective, TlsDirective, UpstreamAddr,
+    UriOperation,
 };
 use dwaar_plugins::basic_auth::BasicAuthConfig;
 use dwaar_plugins::forward_auth::ForwardAuthConfig;
@@ -47,14 +49,11 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
             continue;
         }
 
-        // Warn about passthrough directives so users know what's being ignored
+        // Warn about directives that parse but don't have runtime support yet
+        warn_pending_runtime(&site.address, &site.directives);
         for d in &site.directives {
-            if let Directive::Passthrough { name, .. } = d {
-                warn!(
-                    address = %site.address,
-                    directive = %name,
-                    "directive parsed but not yet implemented by Dwaar, ignoring"
-                );
+            if let Directive::Handle(h) = d {
+                warn_pending_runtime(&site.address, &h.directives);
             }
         }
 
@@ -98,6 +97,9 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
                 rewrites,
                 basic_auth,
                 forward_auth,
+                maps: compile_maps(&site.directives, &var_registry),
+                log_append_fields: compile_log_append(&site.directives, &var_registry),
+                log_name: find_log_name(&site.directives),
                 handler: Handler::ReverseProxy { upstream: addr },
             };
             routes.push(Route::with_handlers(
@@ -119,6 +121,9 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
                 rewrites,
                 basic_auth,
                 forward_auth,
+                maps: compile_maps(&site.directives, &var_registry),
+                log_append_fields: compile_log_append(&site.directives, &var_registry),
+                log_name: find_log_name(&site.directives),
                 handler: Handler::StaticResponse {
                     status: resp.status,
                     body: Bytes::from(resp.body.clone()),
@@ -150,6 +155,9 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
                 rewrites,
                 basic_auth,
                 forward_auth,
+                maps: compile_maps(&site.directives, &var_registry),
+                log_append_fields: compile_log_append(&site.directives, &var_registry),
+                log_name: find_log_name(&site.directives),
                 handler: Handler::FileServer {
                     root: root_path,
                     browse: fs_directive.browse,
@@ -180,6 +188,9 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
                 rewrites,
                 basic_auth,
                 forward_auth,
+                maps: compile_maps(&site.directives, &var_registry),
+                log_append_fields: compile_log_append(&site.directives, &var_registry),
+                log_name: find_log_name(&site.directives),
                 handler: Handler::FastCgi {
                     upstream: addr,
                     root: root_path,
@@ -379,6 +390,9 @@ fn compile_single_block(
         rewrites,
         basic_auth,
         forward_auth,
+        maps: compile_maps(inner_directives, registry),
+        log_append_fields: compile_log_append(inner_directives, registry),
+        log_name: find_log_name(inner_directives),
         handler,
     })
 }
@@ -536,44 +550,69 @@ fn resolve_upstream(upstreams: &[UpstreamAddr]) -> Option<SocketAddr> {
 
 // ── Variable compilation (ISSUE-055) ─────────────────────────
 
-/// Collect `vars` directives from a site and build a `VarRegistry` + default `VarSlots`.
+/// Collect `vars` and `map` directives from a site and build a `VarRegistry` + default `VarSlots`.
 ///
 /// Returns `(registry, slots)` where:
 /// - `registry` maps variable names → slot indices (used during template compilation)
 /// - `slots` holds the static default values (stored on the `Route` for per-request cloning)
 ///
-/// Variables from `map` output parameters are NOT registered here — that's ISSUE-056.
+/// `vars` directives register their key and populate a default value.
+/// `map` directives register their `dest_var` but leave the slot empty (filled per-request).
 fn compile_vars(directives: &[Directive]) -> (VarRegistry, VarSlots) {
     let mut registry = VarRegistry::new();
 
     // First pass: register all variable names to assign slots
     for d in directives {
-        if let Directive::Vars(v) = d {
-            registry.register(&v.key);
+        match d {
+            Directive::Vars(v) => {
+                registry.register(&v.key);
+            }
+            Directive::Map(m) => {
+                registry.register(&m.dest_var);
+            }
+            _ => {}
         }
     }
 
-    // Also check inside handle/handle_path/route blocks for nested vars
+    // Also check inside handle/handle_path/route blocks for nested vars/map
     for d in directives {
         match d {
             Directive::Handle(h) => {
                 for inner in &h.directives {
-                    if let Directive::Vars(v) = inner {
-                        registry.register(&v.key);
+                    match inner {
+                        Directive::Vars(v) => {
+                            registry.register(&v.key);
+                        }
+                        Directive::Map(m) => {
+                            registry.register(&m.dest_var);
+                        }
+                        _ => {}
                     }
                 }
             }
             Directive::HandlePath(hp) => {
                 for inner in &hp.directives {
-                    if let Directive::Vars(v) = inner {
-                        registry.register(&v.key);
+                    match inner {
+                        Directive::Vars(v) => {
+                            registry.register(&v.key);
+                        }
+                        Directive::Map(m) => {
+                            registry.register(&m.dest_var);
+                        }
+                        _ => {}
                     }
                 }
             }
             Directive::Route(r) => {
                 for inner in &r.directives {
-                    if let Directive::Vars(v) = inner {
-                        registry.register(&v.key);
+                    match inner {
+                        Directive::Vars(v) => {
+                            registry.register(&v.key);
+                        }
+                        Directive::Map(m) => {
+                            registry.register(&m.dest_var);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -603,6 +642,147 @@ fn compile_vars(directives: &[Directive]) -> (VarRegistry, VarSlots) {
     }
 
     (registry, slots)
+}
+
+/// Compile `map` directives into runtime `CompiledMap` structures.
+///
+/// Each map evaluates a source template per-request, matches against pattern
+/// entries (first match wins), and writes the result to a `VarSlot`.
+fn compile_maps(directives: &[Directive], registry: &VarRegistry) -> Vec<CompiledMap> {
+    let mut maps = Vec::new();
+    for d in directives {
+        if let Directive::Map(m) = d {
+            match compile_one_map(m, registry) {
+                Ok(compiled) => maps.push(compiled),
+                Err(e) => warn!("map compilation failed: {e}"),
+            }
+        }
+    }
+    maps
+}
+
+fn compile_one_map(m: &MapDirective, registry: &VarRegistry) -> Result<CompiledMap, String> {
+    let source = CompiledTemplate::compile_with_registry(&m.source, registry)
+        .map_err(|e| format!("map source template: {e}"))?;
+
+    let dest_slot = registry
+        .get(&m.dest_var)
+        .ok_or_else(|| format!("map dest_var '{}' not registered", m.dest_var))?;
+
+    let mut entries = Vec::with_capacity(m.entries.len());
+    for entry in &m.entries {
+        let pattern = match &entry.pattern {
+            MapPattern::Exact(e) => CompiledMapPattern::Exact(e.clone()),
+            MapPattern::Regex(re) => {
+                let compiled = regex::Regex::new(&format!("(?i)^{re}$"))
+                    .map_err(|e| format!("map regex '{re}': {e}"))?;
+                CompiledMapPattern::Regex(compiled)
+            }
+            MapPattern::Default => CompiledMapPattern::Default,
+        };
+        let value = CompiledTemplate::compile_with_registry(&entry.value, registry)
+            .map_err(|e| format!("map entry value template: {e}"))?;
+        let is_default = matches!(&entry.pattern, MapPattern::Default);
+        entries.push(CompiledMapEntry {
+            pattern,
+            value,
+            is_default,
+        });
+    }
+
+    Ok(CompiledMap {
+        source,
+        dest_slot,
+        entries,
+    })
+}
+
+/// Compile `log_append` directives into runtime `(field_name, CompiledTemplate)` pairs.
+fn compile_log_append(
+    directives: &[Directive],
+    registry: &VarRegistry,
+) -> Vec<(String, CompiledTemplate)> {
+    let mut fields = Vec::new();
+    for d in directives {
+        if let Directive::LogAppend(la) = d {
+            for (name, raw_value) in &la.fields {
+                match CompiledTemplate::compile_with_registry(raw_value, registry) {
+                    Ok(tmpl) => fields.push((name.clone(), tmpl)),
+                    Err(e) => warn!("log_append field '{}' template error: {e}", name),
+                }
+            }
+        }
+    }
+    fields
+}
+
+/// Extract the `log_name` from directives, if present.
+fn find_log_name(directives: &[Directive]) -> Option<String> {
+    for d in directives {
+        if let Directive::LogName(ln) = d {
+            return Some(ln.name.clone());
+        }
+    }
+    None
+}
+
+/// Emit warnings for directives that parse correctly but don't have runtime support yet.
+fn warn_pending_runtime(address: &str, directives: &[Directive]) {
+    for d in directives {
+        match d {
+            Directive::Templates(_) => warn!(
+                address = %address,
+                directive = "templates",
+                "directive parsed but not yet implemented by Dwaar, ignoring"
+            ),
+            Directive::Push(_) => warn!(
+                address = %address,
+                directive = "push",
+                "directive parsed but not yet implemented by Dwaar, ignoring"
+            ),
+            Directive::AcmeServer(_) => warn!(
+                address = %address,
+                directive = "acme_server",
+                "directive parsed but not yet implemented by Dwaar, ignoring"
+            ),
+            Directive::Intercept(_) => warn!(
+                address = %address,
+                directive = "intercept",
+                "directive parsed but not yet implemented by Dwaar, ignoring"
+            ),
+            Directive::Metrics(_) => warn!(
+                address = %address,
+                directive = "metrics",
+                "directive parsed but not yet implemented by Dwaar, ignoring"
+            ),
+            Directive::Tracing(_) => warn!(
+                address = %address,
+                directive = "tracing",
+                "directive parsed but not yet implemented by Dwaar, ignoring"
+            ),
+            Directive::CopyResponse(_) => warn!(
+                address = %address,
+                directive = "copy_response",
+                "directive parsed but not yet implemented by Dwaar, ignoring"
+            ),
+            Directive::CopyResponseHeaders(_) => warn!(
+                address = %address,
+                directive = "copy_response_headers",
+                "directive parsed but not yet implemented by Dwaar, ignoring"
+            ),
+            Directive::Fs(_) => warn!(
+                address = %address,
+                directive = "fs",
+                "directive parsed but not yet implemented by Dwaar, ignoring"
+            ),
+            Directive::Invoke(_) => warn!(
+                address = %address,
+                directive = "invoke",
+                "directive parsed but not yet implemented by Dwaar, ignoring"
+            ),
+            _ => {}
+        }
+    }
 }
 
 /// Compile a template with optional variable registry support.

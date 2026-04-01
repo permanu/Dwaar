@@ -41,6 +41,8 @@ use dwaar_analytics::injector::HtmlInjector;
 use dwaar_plugins::plugin::PluginCtx;
 use uuid::Uuid;
 
+use crate::template::VarSlots;
+
 /// Per-request state shared across all Pingora lifecycle hooks.
 ///
 /// Created once per request by [`DwaarProxy::new_ctx()`], dropped when the
@@ -109,6 +111,9 @@ pub struct RequestContext {
 
     /// Streaming decompressor for compressed HTML responses (core, not a plugin).
     pub decompressor: Option<Decompressor>,
+
+    /// Per-request variable slots (cloned from `route.var_defaults`, populated by map evaluation).
+    pub var_slots: Option<VarSlots>,
 }
 
 impl RequestContext {
@@ -135,6 +140,7 @@ impl RequestContext {
             fastcgi_root: None,
             injector: None,
             decompressor: None,
+            var_slots: None,
         }
     }
 
