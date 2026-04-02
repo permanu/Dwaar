@@ -549,6 +549,7 @@ impl ProxyHttp for DwaarProxy {
                         let path = ctx.effective_path.as_deref().unwrap_or(&request_path);
                         if cache_cfg.path_matches(path)
                             && !ctx.is_websocket
+                            && !ctx.is_grpc
                             && ctx.plugin_ctx.method == "GET"
                         {
                             ctx.cache_enabled = true;
@@ -1332,7 +1333,7 @@ impl ProxyHttp for DwaarProxy {
         // Skip for WebSocket upgrades — the 101 response body is a bidirectional
         // stream, not HTML (ISSUE-068).
         let status = upstream_response.status.as_u16();
-        if !ctx.is_websocket && (200..300).contains(&status) {
+        if !ctx.is_websocket && !ctx.is_grpc && (200..300).contains(&status) {
             let is_html = upstream_response
                 .headers
                 .get(http::header::CONTENT_TYPE)
