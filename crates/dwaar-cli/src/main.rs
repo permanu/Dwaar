@@ -352,12 +352,33 @@ fn run_server(
         None
     };
 
+    // Cache backend (ISSUE-073): find max cache size from all routes, init once.
+    let cache_backend = if cli.cache_enabled() {
+        let max_cache_size = route_table
+            .load()
+            .all_routes()
+            .iter()
+            .flat_map(|r| r.handlers.iter())
+            .filter_map(|h| h.cache.as_ref())
+            .map(|c| c.max_size)
+            .max();
+
+        max_cache_size.map(|size| {
+            tracing::info!(max_size_bytes = size, "HTTP cache enabled");
+            dwaar_core::cache::init_cache_backend(size)
+        })
+    } else {
+        info!("HTTP cache disabled via CLI flag");
+        None
+    };
+
     info!(
         logging = cli.logging_enabled(),
         plugins = cli.plugins_enabled(),
         analytics = cli.analytics_enabled(),
         geoip = cli.geoip_enabled(),
         metrics = cli.metrics_enabled(),
+        cache = cli.cache_enabled(),
         "feature flags resolved"
     );
 
@@ -370,7 +391,7 @@ fn run_server(
         geo_lookup,
         plugin_chain,
         prometheus.clone(),
-        None, // cache backend wired in ISSUE-073 Task 6
+        cache_backend,
     );
 
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, proxy);
