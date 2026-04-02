@@ -399,6 +399,9 @@ fn parse_directive(t: &mut Tokenizer<'_>) -> Result<Directive, ParseError> {
         "encode" => Ok(Directive::Encode(transforms::parse_encode(t)?)),
         "basicauth" | "basic_auth" => Ok(Directive::BasicAuth(transforms::parse_basicauth(t)?)),
         "rate_limit" => Ok(Directive::RateLimit(transforms::parse_rate_limit(t)?)),
+        "ip_filter" => Ok(Directive::IpFilter(transforms::parse_ip_filter(
+            t, &name_tok,
+        )?)),
         "method" => Ok(Directive::Method(transforms::parse_method(t, &name_tok)?)),
         "request_body" => Ok(Directive::RequestBody(transforms::parse_request_body(
             t, &name_tok,

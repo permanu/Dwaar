@@ -164,6 +164,7 @@ pub(super) fn is_directive_name(w: &str) -> bool {
             | "templates"
             | "request_body"
             | "response_body_limit"
+            | "ip_filter"
             | "request_header"
             | "method"
             | "try_files"

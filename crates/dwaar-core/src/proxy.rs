@@ -400,6 +400,11 @@ impl ProxyHttp for DwaarProxy {
                         ctx.copy_response_headers = Some(crh.clone());
                     }
 
+                    // IP filter config (ISSUE-071)
+                    if let Some(ref filter) = block.ip_filter {
+                        ctx.plugin_ctx.ip_filter = Some(filter.clone());
+                    }
+
                     // Body size limits (ISSUE-069, ISSUE-070)
                     if let Some(limit) = block.request_body_max_size {
                         ctx.request_body_max_size = limit;

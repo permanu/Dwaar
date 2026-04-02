@@ -79,6 +79,7 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
 
         // Flat site (no handle blocks) — extract single handler + site-level middleware
         let rate_limit_rps = find_rate_limit(&site.directives);
+        let ip_filter = compile_ip_filter(&site.directives);
         let request_body_max_size = find_request_body_max_size(&site.directives);
         let response_body_max_size = find_response_body_limit(&site.directives);
         let rewrites = collect_rewrites(&site.directives, &var_registry);
@@ -109,6 +110,7 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
                 handler: proxy_handler,
                 intercepts: intercepts.clone(),
                 copy_response_headers: copy_response_headers.clone(),
+                ip_filter: ip_filter.clone(),
                 request_body_max_size,
                 response_body_max_size,
             };
@@ -140,6 +142,7 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
                 },
                 intercepts: intercepts.clone(),
                 copy_response_headers: copy_response_headers.clone(),
+                ip_filter: ip_filter.clone(),
                 request_body_max_size,
                 response_body_max_size,
             };
@@ -178,6 +181,7 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
                 },
                 intercepts: intercepts.clone(),
                 copy_response_headers: copy_response_headers.clone(),
+                ip_filter: ip_filter.clone(),
                 request_body_max_size,
                 response_body_max_size,
             };
@@ -215,6 +219,7 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
                 },
                 intercepts,
                 copy_response_headers,
+                ip_filter,
                 request_body_max_size,
                 response_body_max_size,
             };
@@ -479,6 +484,7 @@ fn compile_single_block(
     registry: &VarRegistry,
 ) -> Option<HandlerBlock> {
     let rate_limit_rps = find_rate_limit(inner_directives);
+    let ip_filter = compile_ip_filter(inner_directives);
     let request_body_max_size = find_request_body_max_size(inner_directives);
     let response_body_max_size = find_response_body_limit(inner_directives);
     let rewrites = collect_rewrites(inner_directives, registry);
@@ -527,6 +533,7 @@ fn compile_single_block(
         handler,
         intercepts: compile_intercepts(inner_directives),
         copy_response_headers: compile_copy_response_headers(inner_directives),
+        ip_filter,
         request_body_max_size,
         response_body_max_size,
     })
@@ -662,6 +669,43 @@ fn find_rate_limit(directives: &[Directive]) -> Option<u32> {
         Directive::RateLimit(rl) => Some(rl.requests_per_second),
         _ => None,
     })
+}
+
+fn compile_ip_filter(
+    directives: &[Directive],
+) -> Option<std::sync::Arc<dwaar_plugins::ip_filter::IpFilterConfig>> {
+    use dwaar_plugins::ip_filter::{CidrTrie, DefaultPolicy, IpAction, IpFilterConfig, parse_cidr};
+    let ipf = directives.iter().find_map(|d| match d {
+        Directive::IpFilter(f) => Some(f),
+        _ => None,
+    })?;
+
+    let mut trie = CidrTrie::new();
+    for cidr_str in &ipf.allow {
+        if let Some((addr, prefix_len)) = parse_cidr(cidr_str) {
+            trie.insert(addr, prefix_len, IpAction::Allow);
+        } else {
+            warn!(cidr = %cidr_str, "invalid CIDR in ip_filter allow, skipping");
+        }
+    }
+    for cidr_str in &ipf.deny {
+        if let Some((addr, prefix_len)) = parse_cidr(cidr_str) {
+            trie.insert(addr, prefix_len, IpAction::Deny);
+        } else {
+            warn!(cidr = %cidr_str, "invalid CIDR in ip_filter deny, skipping");
+        }
+    }
+
+    let default_policy = if ipf.default_allow {
+        DefaultPolicy::Allow
+    } else {
+        DefaultPolicy::Deny
+    };
+
+    Some(std::sync::Arc::new(IpFilterConfig {
+        trie,
+        default_policy,
+    }))
 }
 
 fn find_request_body_max_size(directives: &[Directive]) -> Option<u64> {
