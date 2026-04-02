@@ -19,8 +19,9 @@
 #![allow(unsafe_code, clippy::cast_possible_wrap)]
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpListener;
+use std::fmt::Write as FmtWrite;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::thread;
@@ -197,6 +198,33 @@ fn serve_and_capture_headers(listener: &TcpListener) -> HashMap<String, String> 
     let _ = stream.flush();
 
     headers
+}
+
+/// Send a raw HTTP request through the proxy with custom headers.
+/// Returns nothing — caller consumes the upstream side.
+/// Used when reqwest's header normalization would interfere (e.g., Connection, Upgrade).
+fn send_raw_request(path: &str, extra_headers: &[(&str, &str)]) {
+    let mut stream =
+        TcpStream::connect("127.0.0.1:6188").expect("connect to proxy for raw request");
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+
+    let mut request = format!(
+        "GET {path} HTTP/1.1\r\n\
+         Host: 127.0.0.1\r\n"
+    );
+    for (name, value) in extra_headers {
+        let _ = write!(request, "{name}: {value}\r\n");
+    }
+    request.push_str("\r\n");
+
+    stream
+        .write_all(request.as_bytes())
+        .expect("write raw request");
+    stream.flush().expect("flush raw request");
+
+    // Read until we get at least the status line back (don't hang)
+    let mut buf = [0u8; 1024];
+    let _ = stream.read(&mut buf);
 }
 
 /// ISSUE-005: Verifies that Dwaar forwards HTTP requests to the upstream
@@ -490,6 +518,140 @@ fn proxy_adds_security_response_headers() {
         .get("x-request-id")
         .expect("response should still have X-Request-Id");
     assert_eq!(request_id.len(), 36);
+
+    stop_dwaar(child);
+}
+
+/// ISSUE-068: Verifies that WebSocket upgrade headers are preserved when both
+/// `Upgrade: websocket` and `Connection: Upgrade` are present. The upstream
+/// must receive both headers plus Sec-WebSocket-Key for the handshake to work.
+#[test]
+fn websocket_upgrade_headers_preserved() {
+    let _lock = PORT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let upstream =
+        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+
+    let child = start_dwaar_proxy();
+
+    let handle = thread::spawn({
+        let upstream_fd = upstream.try_clone().expect("clone listener");
+        move || serve_and_capture_headers(&upstream_fd)
+    });
+
+    send_raw_request(
+        "/ws",
+        &[
+            ("Upgrade", "websocket"),
+            ("Connection", "Upgrade"),
+            ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
+            ("Sec-WebSocket-Version", "13"),
+        ],
+    );
+
+    let upstream_headers = handle.join().expect("upstream thread");
+
+    // Upgrade header must reach the upstream — Dwaar detected WebSocket
+    // and skipped hop-by-hop stripping for this header.
+    let upgrade = upstream_headers
+        .get("upgrade")
+        .expect("upstream must receive Upgrade header for WebSocket");
+    assert_eq!(
+        upgrade, "websocket",
+        "Upgrade value must be preserved verbatim"
+    );
+
+    // Connection header must contain Upgrade for the handshake
+    let connection = upstream_headers
+        .get("connection")
+        .expect("upstream must receive Connection header");
+    assert!(
+        connection.to_lowercase().contains("upgrade"),
+        "Connection must contain 'upgrade', got: {connection}"
+    );
+
+    // Sec-WebSocket-Key must pass through (never in hop-by-hop list)
+    let ws_key = upstream_headers
+        .get("sec-websocket-key")
+        .expect("upstream must receive Sec-WebSocket-Key");
+    assert_eq!(ws_key, "dGhlIHNhbXBsZSBub25jZQ==");
+
+    // Sec-WebSocket-Version must pass through
+    let ws_ver = upstream_headers
+        .get("sec-websocket-version")
+        .expect("upstream must receive Sec-WebSocket-Version");
+    assert_eq!(ws_ver, "13");
+
+    stop_dwaar(child);
+}
+
+/// ISSUE-068: Non-WebSocket requests must still have Upgrade stripped.
+/// Sending `Upgrade: h2c` without `Connection: Upgrade` (or with a non-websocket
+/// upgrade) must not trigger WebSocket preservation.
+#[test]
+fn non_websocket_upgrade_still_stripped() {
+    let _lock = PORT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let upstream =
+        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+
+    let child = start_dwaar_proxy();
+
+    let handle = thread::spawn({
+        let upstream_fd = upstream.try_clone().expect("clone listener");
+        move || serve_and_capture_headers(&upstream_fd)
+    });
+
+    // h2c upgrade — not websocket, Upgrade should be stripped
+    send_raw_request("/api", &[("Upgrade", "h2c"), ("Connection", "Upgrade")]);
+
+    let upstream_headers = handle.join().expect("upstream thread");
+
+    assert!(
+        !upstream_headers.contains_key("upgrade"),
+        "Upgrade: h2c should be stripped (not a WebSocket upgrade)"
+    );
+
+    stop_dwaar(child);
+}
+
+/// ISSUE-068: Malformed WebSocket request (has Upgrade: websocket but missing
+/// Connection: Upgrade) should NOT trigger WebSocket preservation. The Upgrade
+/// header should be stripped as usual.
+#[test]
+fn malformed_websocket_missing_connection_upgrade() {
+    let _lock = PORT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let upstream =
+        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+
+    let child = start_dwaar_proxy();
+
+    let handle = thread::spawn({
+        let upstream_fd = upstream.try_clone().expect("clone listener");
+        move || serve_and_capture_headers(&upstream_fd)
+    });
+
+    // Has Upgrade: websocket but Connection is keep-alive (no "upgrade" token)
+    send_raw_request(
+        "/ws-broken",
+        &[
+            ("Upgrade", "websocket"),
+            ("Connection", "keep-alive"),
+            ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
+            ("Sec-WebSocket-Version", "13"),
+        ],
+    );
+
+    let upstream_headers = handle.join().expect("upstream thread");
+
+    assert!(
+        !upstream_headers.contains_key("upgrade"),
+        "Upgrade should be stripped when Connection doesn't contain 'upgrade'"
+    );
 
     stop_dwaar(child);
 }

@@ -296,12 +296,31 @@ impl ProxyHttp for DwaarProxy {
             .and_then(|v| v.to_str().ok())
             .map_or_else(CompactString::default, CompactString::from);
 
+        // --- WebSocket upgrade detection (ISSUE-068) ---
+        // RFC 6455 §4.1: valid handshake has `Upgrade: websocket` (case-insensitive)
+        // AND `Connection` header containing "upgrade". Dwaar doesn't validate the
+        // full handshake (Sec-WebSocket-Key, version) — upstream decides to accept or reject.
+        ctx.is_websocket = header
+            .headers
+            .get(http::header::UPGRADE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
+            && header
+                .headers
+                .get(http::header::CONNECTION)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| {
+                    v.split(',')
+                        .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+                });
+
         debug!(
             request_id = %ctx.request_id(),
             client_ip = ?ctx.plugin_ctx.client_ip,
             host = ?ctx.plugin_ctx.host,
             method = %ctx.plugin_ctx.method,
             path = %ctx.plugin_ctx.path,
+            is_websocket = ctx.is_websocket,
             "request metadata extracted"
         );
 
@@ -908,9 +927,14 @@ impl ProxyHttp for DwaarProxy {
             "Proxy-Authorization",
             "TE",
             "Trailer",
-            "Upgrade",
         ] {
             upstream_request.remove_header(*header_name);
+        }
+
+        // WebSocket upgrades need Upgrade + Connection preserved for the 101 handshake.
+        // Pingora handles the bidirectional tunnel after the upstream sends 101.
+        if !ctx.is_websocket {
+            upstream_request.remove_header("Upgrade");
         }
 
         // SECURITY: Strip Authorization header when Dwaar handled basic auth.
@@ -1051,8 +1075,10 @@ impl ProxyHttp for DwaarProxy {
         // --- Analytics injection setup (ISSUE-026a + 026c) ---
         // Must run BEFORE the plugin chain so that the compression plugin
         // sees Content-Encoding already stripped (for HTML injection path).
+        // Skip for WebSocket upgrades — the 101 response body is a bidirectional
+        // stream, not HTML (ISSUE-068).
         let status = upstream_response.status.as_u16();
-        if (200..300).contains(&status) {
+        if !ctx.is_websocket && (200..300).contains(&status) {
             let is_html = upstream_response
                 .headers
                 .get(http::header::CONTENT_TYPE)
