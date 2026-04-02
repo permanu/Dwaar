@@ -370,6 +370,8 @@ pub struct HandlerBlock {
     pub intercepts: Vec<CompiledIntercept>,
     /// Selective header copy config — controls which upstream headers reach the client.
     pub copy_response_headers: Option<CompiledCopyResponseHeaders>,
+    /// IP allowlist/blocklist config (ISSUE-071). Compiled CIDR trie + default policy.
+    pub ip_filter: Option<std::sync::Arc<dwaar_plugins::ip_filter::IpFilterConfig>>,
     /// Max request body size in bytes (ISSUE-069). `None` = use default (10 MB).
     pub request_body_max_size: Option<u64>,
     /// Max response body size in bytes (ISSUE-070). `None` = use default (100 MB).
@@ -512,6 +514,7 @@ impl Route {
                 handler: Handler::ReverseProxy { upstream },
                 intercepts: vec![],
                 copy_response_headers: None,
+                ip_filter: None,
                 request_body_max_size: None,
                 response_body_max_size: None,
             }],

@@ -59,6 +59,10 @@ pub struct PluginCtx {
     /// Whether Under Attack Mode is enabled for this route.
     pub under_attack: bool,
 
+    /// Per-route IP filter config. Populated from `HandlerBlock` during
+    /// route resolution. `None` means no IP filtering for this route.
+    pub ip_filter: Option<std::sync::Arc<crate::ip_filter::IpFilterConfig>>,
+
     // -- Fields written by plugins --
     pub is_bot: bool,
     pub bot_category: Option<BotCategory>,

@@ -12,7 +12,7 @@
 use crate::error::{ParseError, ParseErrorKind};
 use crate::model::{
     BasicAuthCredential, BasicAuthDirective, BindDirective, EncodeDirective, ErrorDirective,
-    HeaderDirective, MethodDirective, RateLimitDirective, RequestBodyDirective,
+    HeaderDirective, IpFilterDirective, MethodDirective, RateLimitDirective, RequestBodyDirective,
     RequestHeaderDirective, ResponseBodyLimitDirective, TlsDirective, VarsDirective,
 };
 use crate::token::{Token, TokenKind, Tokenizer};
@@ -358,6 +358,92 @@ pub(super) fn parse_rate_limit(t: &mut Tokenizer<'_>) -> Result<RateLimitDirecti
 
     Ok(RateLimitDirective {
         requests_per_second: rps,
+    })
+}
+
+/// `ip_filter { allow 10.0.0.0/8; deny 203.0.113.0/24; default allow }`
+pub(super) fn parse_ip_filter(
+    t: &mut Tokenizer<'_>,
+    dir_tok: &Token,
+) -> Result<IpFilterDirective, ParseError> {
+    if t.peek().kind != TokenKind::OpenBrace {
+        return Err(ParseError {
+            line: dir_tok.line,
+            col: dir_tok.col,
+            kind: ParseErrorKind::InvalidValue {
+                directive: "ip_filter".to_string(),
+                message: "expected '{' block".to_string(),
+            },
+        });
+    }
+    t.next_token(); // consume '{'
+
+    let mut allow = Vec::new();
+    let mut deny = Vec::new();
+    let mut default_allow = true; // blocklist mode by default
+
+    loop {
+        let tok = t.peek();
+        match &tok.kind {
+            TokenKind::CloseBrace => {
+                t.next_token();
+                break;
+            }
+            TokenKind::Eof => {
+                return Err(ParseError {
+                    line: tok.line,
+                    col: tok.col,
+                    kind: ParseErrorKind::UnexpectedEof {
+                        expected: "'}' to close ip_filter block".to_string(),
+                    },
+                });
+            }
+            TokenKind::Word(w) => {
+                let keyword = w.clone();
+                t.next_token();
+                match keyword.as_str() {
+                    "allow" => {
+                        while matches!(t.peek().kind, TokenKind::Word(_)) {
+                            if let TokenKind::Word(cidr) = t.next_token().kind {
+                                allow.push(cidr);
+                            }
+                        }
+                    }
+                    "deny" => {
+                        while matches!(t.peek().kind, TokenKind::Word(_)) {
+                            if let TokenKind::Word(cidr) = t.next_token().kind {
+                                deny.push(cidr);
+                            }
+                        }
+                    }
+                    "default" => {
+                        if let TokenKind::Word(policy) = &t.peek().kind {
+                            default_allow = policy.eq_ignore_ascii_case("allow");
+                            t.next_token();
+                        }
+                    }
+                    _ => {
+                        skip_to_next_line(t);
+                    }
+                }
+            }
+            _ => {
+                return Err(ParseError {
+                    line: tok.line,
+                    col: tok.col,
+                    kind: ParseErrorKind::Expected {
+                        expected: "ip_filter sub-directive (allow/deny/default) or '}'".to_string(),
+                        got: format!("{:?}", tok.kind),
+                    },
+                });
+            }
+        }
+    }
+
+    Ok(IpFilterDirective {
+        allow,
+        deny,
+        default_allow,
     })
 }
 
