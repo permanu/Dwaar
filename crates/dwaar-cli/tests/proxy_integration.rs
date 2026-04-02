@@ -872,3 +872,71 @@ fn response_body_over_limit_returns_error() {
     std::fs::remove_file(&config_file).ok();
     thread::sleep(Duration::from_secs(1));
 }
+
+/// ISSUE-071: IP filter denies requests from blocked IPs (returns 403).
+/// Uses a Dwaarfile that denies 127.0.0.1 (the test client's IP).
+#[test]
+fn ip_filter_denies_blocked_ip() {
+    let _lock = PORT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _upstream =
+        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+
+    let config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    std::fs::create_dir_all(&config_path).ok();
+    let config_file = config_path.join("ip_filter_deny_test.dwaarfile");
+    std::fs::write(
+        &config_file,
+        "127.0.0.1 {\n    reverse_proxy 127.0.0.1:8080\n    ip_filter {\n        deny 127.0.0.1\n        default allow\n    }\n}\n",
+    )
+    .expect("write test Dwaarfile");
+
+    let child = start_dwaar_with_config(Some(&config_file));
+
+    // Test client connects from 127.0.0.1 — should be denied
+    let resp = send_through_proxy("/blocked");
+    assert_eq!(resp.status, 403, "denied IP should get 403 Forbidden");
+
+    stop_dwaar(child);
+    std::fs::remove_file(&config_file).ok();
+    thread::sleep(Duration::from_secs(1));
+}
+
+/// ISSUE-071: IP filter allows requests from permitted IPs.
+/// Uses a Dwaarfile with `default deny` but allows 127.0.0.0/8.
+#[test]
+fn ip_filter_allows_permitted_ip() {
+    let _lock = PORT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let upstream =
+        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+
+    let config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    std::fs::create_dir_all(&config_path).ok();
+    let config_file = config_path.join("ip_filter_allow_test.dwaarfile");
+    std::fs::write(
+        &config_file,
+        "127.0.0.1 {\n    reverse_proxy 127.0.0.1:8080\n    ip_filter {\n        allow 127.0.0.0/8\n        default deny\n    }\n}\n",
+    )
+    .expect("write test Dwaarfile");
+
+    let child = start_dwaar_with_config(Some(&config_file));
+
+    let handle = thread::spawn({
+        let upstream_fd = upstream.try_clone().expect("clone listener");
+        move || serve_one_request(&upstream_fd, 200, "allowed")
+    });
+
+    let resp = send_through_proxy("/allowed");
+    handle.join().expect("upstream thread");
+    assert_eq!(
+        resp.status, 200,
+        "allowed IP should be forwarded to upstream"
+    );
+
+    stop_dwaar(child);
+    std::fs::remove_file(&config_file).ok();
+    thread::sleep(Duration::from_secs(1));
+}
