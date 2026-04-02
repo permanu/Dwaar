@@ -282,6 +282,7 @@ impl ProxyHttp for DwaarProxy {
             Some(backend.lock),
             None,  // no option overrides
         );
+        ctx.cache_status = Some("MISS"); // default; refined by cache_hit_filter
         Ok(())
     }
 
@@ -332,6 +333,24 @@ impl ProxyHttp for DwaarProxy {
         }
         // On upstream failure, any cache config implies willingness to serve stale
         ctx.cache_config.is_some()
+    }
+
+    /// Track cache hits: fresh responses are HIT, stale responses are STALE.
+    /// Called by Pingora after a successful cache lookup, before the cached
+    /// response is served.
+    async fn cache_hit_filter(
+        &self,
+        _session: &mut Session,
+        _meta: &pingora_cache::CacheMeta,
+        _hit_handler: &mut pingora_cache::storage::HitHandler,
+        is_fresh: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<Option<pingora_cache::ForcedFreshness>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        ctx.cache_status = if is_fresh { Some("HIT") } else { Some("STALE") };
+        Ok(None)
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool>
@@ -1175,6 +1194,13 @@ impl ProxyHttp for DwaarProxy {
             .insert_header("X-Request-Id", ctx.request_id())
             .expect("UUID is valid header value");
 
+        // --- Cache status header (ISSUE-073f) ---
+        if let Some(status) = ctx.cache_status {
+            upstream_response
+                .insert_header("X-Cache", status)
+                .expect("static str is valid header value");
+        }
+
         // --- Intercept check (ISSUE-067) ---
         // Run before analytics setup so we operate on the original upstream status.
         // First matching rule wins; empty statuses catches all non-2xx responses.
@@ -1491,7 +1517,7 @@ impl ProxyHttp for DwaarProxy {
                 s
             }),
             upstream_response_time_us: 0,
-            cache_status: None,
+            cache_status: ctx.cache_status.map(CompactString::from),
             compression: None,
         };
 

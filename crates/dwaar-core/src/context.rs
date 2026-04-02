@@ -165,6 +165,10 @@ pub struct RequestContext {
 
     /// Cache config for this request, cached from route lookup (Guardrail #27).
     pub cache_config: Option<std::sync::Arc<crate::cache::CacheConfig>>,
+
+    /// Cache outcome: "HIT", "MISS", "STALE", or None (cache disabled).
+    /// Injected as `X-Cache` response header and logged in `RequestLog`.
+    pub cache_status: Option<&'static str>,
 }
 
 impl RequestContext {
@@ -204,6 +208,7 @@ impl RequestContext {
             metrics_domain: None,
             cache_enabled: false,
             cache_config: None,
+            cache_status: None,
         }
     }
 
