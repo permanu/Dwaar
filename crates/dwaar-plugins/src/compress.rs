@@ -114,6 +114,8 @@ fn parse_encoding_with_quality(part: &str) -> (&str, f32) {
 
 /// Content types eligible for compression. Binary formats (images, video,
 /// fonts) are already compressed and re-compressing wastes CPU.
+/// `application/grpc` is intentionally absent — gRPC has its own compression
+/// protocol (`grpc-encoding` header). Double-compressing breaks gRPC framing.
 const COMPRESSIBLE_TYPES: &[&str] = &[
     "text/html",
     "text/css",
@@ -530,6 +532,13 @@ mod tests {
     #[test]
     fn octet_stream_is_not_compressible() {
         assert!(!is_compressible("application/octet-stream"));
+    }
+
+    #[test]
+    fn grpc_is_not_compressible() {
+        assert!(!is_compressible("application/grpc"));
+        assert!(!is_compressible("application/grpc+proto"));
+        assert!(!is_compressible("application/grpc-web"));
     }
 
     // ── Should-compress logic ──────────────────────────────────────

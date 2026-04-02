@@ -21,7 +21,7 @@ use pingora_cache::cache_control::CacheControl;
 use pingora_cache::filters::resp_cacheable;
 use pingora_cache::{CacheKey, NoCacheReason, RespCacheable};
 use pingora_core::Result;
-use pingora_core::upstreams::peer::HttpPeer;
+use pingora_core::upstreams::peer::{ALPN, HttpPeer};
 use pingora_error::{Error, ErrorType::HTTPStatus};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
@@ -428,6 +428,16 @@ impl ProxyHttp for DwaarProxy {
                         .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
                 });
 
+        // gRPC detection (ISSUE-074): Content-Type starting with "application/grpc"
+        // covers application/grpc, application/grpc+proto, application/grpc-web
+        if !ctx.is_websocket {
+            ctx.is_grpc = header
+                .headers
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|ct| ct.starts_with("application/grpc"));
+        }
+
         debug!(
             request_id = %ctx.request_id(),
             client_ip = ?ctx.plugin_ctx.client_ip,
@@ -435,6 +445,7 @@ impl ProxyHttp for DwaarProxy {
             method = %ctx.plugin_ctx.method,
             path = %ctx.plugin_ctx.path,
             is_websocket = ctx.is_websocket,
+            is_grpc = ctx.is_grpc,
             "request metadata extracted"
         );
 
@@ -527,11 +538,18 @@ impl ProxyHttp for DwaarProxy {
                         ctx.response_body_max_size = limit;
                     }
 
+                    // gRPC streaming RPCs have unbounded body — disable limits
+                    if ctx.is_grpc {
+                        ctx.request_body_max_size = u64::MAX;
+                        ctx.response_body_max_size = u64::MAX;
+                    }
+
                     // Cache config (ISSUE-073) — only for GET requests on matching paths
                     if let Some(ref cache_cfg) = block.cache {
                         let path = ctx.effective_path.as_deref().unwrap_or(&request_path);
                         if cache_cfg.path_matches(path)
                             && !ctx.is_websocket
+                            && !ctx.is_grpc
                             && ctx.plugin_ctx.method == "GET"
                         {
                             ctx.cache_enabled = true;
@@ -1045,6 +1063,11 @@ impl ProxyHttp for DwaarProxy {
         // to avoid sending requests on connections the upstream is about to close.
         peer.options.idle_timeout = Some(std::time::Duration::from_secs(60));
 
+        // gRPC requires HTTP/2 end-to-end — force h2 ALPN negotiation
+        if ctx.is_grpc {
+            peer.options.alpn = ALPN::H2;
+        }
+
         Ok(Box::new(peer))
     }
 
@@ -1310,7 +1333,7 @@ impl ProxyHttp for DwaarProxy {
         // Skip for WebSocket upgrades — the 101 response body is a bidirectional
         // stream, not HTML (ISSUE-068).
         let status = upstream_response.status.as_u16();
-        if !ctx.is_websocket && (200..300).contains(&status) {
+        if !ctx.is_websocket && !ctx.is_grpc && (200..300).contains(&status) {
             let is_html = upstream_response
                 .headers
                 .get(http::header::CONTENT_TYPE)
