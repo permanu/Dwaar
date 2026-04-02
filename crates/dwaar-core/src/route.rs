@@ -370,6 +370,10 @@ pub struct HandlerBlock {
     pub intercepts: Vec<CompiledIntercept>,
     /// Selective header copy config — controls which upstream headers reach the client.
     pub copy_response_headers: Option<CompiledCopyResponseHeaders>,
+    /// Max request body size in bytes (ISSUE-069). `None` = use default (10 MB).
+    pub request_body_max_size: Option<u64>,
+    /// Max response body size in bytes (ISSUE-070). `None` = use default (100 MB).
+    pub response_body_max_size: Option<u64>,
 }
 
 // ── Compiled Map (ISSUE-056) ──────────────────────────────────────
@@ -508,6 +512,8 @@ impl Route {
                 handler: Handler::ReverseProxy { upstream },
                 intercepts: vec![],
                 copy_response_headers: None,
+                request_body_max_size: None,
+                response_body_max_size: None,
             }],
             var_defaults: VarSlots::default(),
         }

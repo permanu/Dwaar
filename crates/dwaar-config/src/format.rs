@@ -16,9 +16,9 @@ use crate::model::{
     HandleErrorsDirective, HeaderDirective, InterceptDirective, LbPolicy, LogAppendDirective,
     LogDirective, LogFormat, LogOutput, MapDirective, MapPattern, MatcherCondition, MatcherDef,
     MethodDirective, RateLimitDirective, RecognizedDirective, RedirDirective, RequestBodyDirective,
-    RequestHeaderDirective, RespondDirective, ReverseProxyDirective, RewriteDirective,
-    RootDirective, TlsDirective, TryFilesDirective, UpstreamAddr, UriDirective, UriOperation,
-    VarsDirective,
+    RequestHeaderDirective, RespondDirective, ResponseBodyLimitDirective, ReverseProxyDirective,
+    RewriteDirective, RootDirective, TlsDirective, TryFilesDirective, UpstreamAddr, UriDirective,
+    UriOperation, VarsDirective,
 };
 
 /// Format a parsed config into canonical Dwaarfile text.
@@ -93,6 +93,7 @@ fn format_directive_at_depth(out: &mut String, directive: &Directive, depth: usi
         Directive::Abort => out.push_str("abort"),
         Directive::Method(m) => format_method(out, m),
         Directive::RequestBody(rb) => format_request_body(out, rb, depth),
+        Directive::ResponseBodyLimit(rbl) => format_response_body_limit(out, rbl),
         Directive::TryFiles(tf) => format_try_files(out, tf),
         Directive::HandleErrors(he) => format_handle_errors(out, he, depth),
         Directive::Bind(b) => format_bind(out, b),
@@ -625,6 +626,11 @@ fn format_request_body(out: &mut String, rb: &RequestBodyDirective, depth: usize
     }
     out.push_str(&outer);
     out.push('}');
+}
+
+fn format_response_body_limit(out: &mut String, rbl: &ResponseBodyLimitDirective) {
+    out.push_str("response_body_limit ");
+    out.push_str(&format_size(rbl.max_size));
 }
 
 fn format_try_files(out: &mut String, tf: &TryFilesDirective) {

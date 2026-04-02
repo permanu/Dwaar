@@ -244,6 +244,9 @@ pub enum Directive {
     /// `request_body { max_size 10MB }`
     RequestBody(RequestBodyDirective),
 
+    /// `response_body_limit 100MB` — max upstream response size before 502.
+    ResponseBodyLimit(ResponseBodyLimitDirective),
+
     /// `try_files {path}.html {path} /index.html`
     TryFiles(TryFilesDirective),
 
@@ -505,6 +508,13 @@ pub struct MethodDirective {
 pub struct RequestBodyDirective {
     /// Maximum allowed request body size in bytes. `None` means no limit.
     pub max_size: Option<u64>,
+}
+
+/// `response_body_limit` — max upstream response body size before Dwaar cuts the connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResponseBodyLimitDirective {
+    /// Maximum allowed response body size in bytes.
+    pub max_size: u64,
 }
 
 /// `try_files` — attempt to serve static files before falling through.

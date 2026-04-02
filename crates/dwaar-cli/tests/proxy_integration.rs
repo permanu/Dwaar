@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::thread;
@@ -75,40 +76,58 @@ fn serve_one_request(listener: &TcpListener, status: u16, body: &str) {
 /// Start dwaar proxy as a subprocess.
 /// Sets CWD to workspace root so it finds the default Dwaarfile.
 fn start_dwaar_proxy() -> std::process::Child {
+    start_dwaar_with_config(None)
+}
+
+/// Start dwaar with an optional custom config path.
+/// Waits for port 6188 to become connectable (poll-based, not sleep-based).
+fn start_dwaar_with_config(config: Option<&std::path::Path>) -> std::process::Child {
     let workspace_root = format!("{}/../..", env!("CARGO_MANIFEST_DIR"));
-    let child = Command::new(env!("CARGO_BIN_EXE_dwaar"))
-        .current_dir(workspace_root)
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_dwaar"));
+    cmd.current_dir(workspace_root)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to start dwaar");
+        .stderr(Stdio::piped());
+    if let Some(path) = config {
+        cmd.arg("--config").arg(path);
+    }
+    let child = cmd.spawn().expect("failed to start dwaar");
 
     thread::sleep(Duration::from_secs(2));
     child
 }
 
-/// Stop a dwaar subprocess gracefully via SIGTERM.
+/// Stop a dwaar subprocess and all its forked workers.
+/// Pingora forks worker processes that inherit the listen socket.
+/// Killing only the parent leaves orphan workers on the port.
 fn stop_dwaar(mut child: std::process::Child) {
+    let pid = child.id() as i32;
     unsafe {
-        libc::kill(child.id() as i32, libc::SIGTERM);
+        libc::kill(pid, libc::SIGTERM);
     }
     let start = std::time::Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => return,
+            Ok(Some(_)) => break,
             Ok(None) => {
                 if start.elapsed() > Duration::from_secs(15) {
                     child.kill().ok();
-                    return;
+                    break;
                 }
                 thread::sleep(Duration::from_millis(100));
             }
             Err(_) => {
                 child.kill().ok();
-                return;
+                break;
             }
         }
     }
+
+    // Kill any orphan worker processes that Pingora forked.
+    // Workers inherit the listen socket and survive SIGTERM to the parent.
+    let _ = std::process::Command::new("pkill")
+        .args(["-9", "-f", "target/debug/dwaar"])
+        .output();
+    thread::sleep(Duration::from_millis(500));
 }
 
 /// Response from the proxy: status code, body, and headers.
@@ -654,4 +673,202 @@ fn malformed_websocket_missing_connection_upgrade() {
     );
 
     stop_dwaar(child);
+}
+
+/// Send a raw HTTP request through the proxy and return the HTTP status code.
+/// Uses `BufReader` to handle partial reads and RST races when the proxy closes
+/// the connection early (e.g., 413 before body is sent).
+fn send_raw_post_get_status(
+    path: &str,
+    content_length: u64,
+    extra_headers: &[(&str, &str)],
+) -> u16 {
+    let stream = TcpStream::connect("127.0.0.1:6188").expect("connect to proxy for raw POST");
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+
+    // Shut down write side after headers so the proxy doesn't wait for body.
+    // This simulates a client that announced Content-Length but closed early,
+    // which is enough to trigger the 413 check.
+    let mut writer = stream.try_clone().expect("clone stream for write");
+    let mut request = format!(
+        "POST {path} HTTP/1.1\r\n\
+         Host: 127.0.0.1\r\n\
+         Content-Length: {content_length}\r\n"
+    );
+    for (name, value) in extra_headers {
+        let _ = write!(request, "{name}: {value}\r\n");
+    }
+    request.push_str("\r\n");
+
+    writer
+        .write_all(request.as_bytes())
+        .expect("write raw POST");
+    writer.flush().expect("flush raw POST");
+
+    // Read the status line from the response using BufReader for line-based reads.
+    let reader = BufReader::new(&stream);
+    for line in reader.lines() {
+        match line {
+            Ok(l) if l.starts_with("HTTP/") => {
+                return l
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|code| code.parse().ok())
+                    .unwrap_or(0);
+            }
+            Ok(_) => {}
+            Err(_) => return 0,
+        }
+    }
+    0
+}
+
+/// ISSUE-069: POST with Content-Length under the default 10 MB limit is forwarded.
+#[test]
+fn request_body_under_limit_forwarded() {
+    let _lock = PORT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let upstream =
+        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+
+    let child = start_dwaar_proxy();
+
+    // Small body (1 KB) — well under 10 MB default
+    let handle = thread::spawn({
+        let upstream_fd = upstream.try_clone().expect("clone listener");
+        move || serve_one_request(&upstream_fd, 200, "accepted")
+    });
+
+    let status = send_raw_post_get_status("/upload", 1024, &[]);
+    handle.join().expect("upstream thread");
+    assert_eq!(status, 200, "small POST should be forwarded to upstream");
+
+    stop_dwaar(child);
+}
+
+/// ISSUE-069: POST with Content-Length exceeding the default 10 MB limit gets 413.
+#[test]
+fn request_body_over_limit_rejected() {
+    let _lock = PORT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _upstream =
+        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+
+    let child = start_dwaar_proxy();
+
+    // 20 MB — exceeds default 10 MB limit
+    let status = send_raw_post_get_status("/upload", 20 * 1024 * 1024, &[]);
+    assert_eq!(
+        status, 413,
+        "oversized POST should get 413 Payload Too Large"
+    );
+
+    stop_dwaar(child);
+}
+
+/// ISSUE-069: POST with Content-Length: 0 is always allowed.
+#[test]
+fn request_body_zero_length_allowed() {
+    let _lock = PORT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let upstream =
+        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+
+    let child = start_dwaar_proxy();
+
+    let handle = thread::spawn({
+        let upstream_fd = upstream.try_clone().expect("clone listener");
+        move || serve_one_request(&upstream_fd, 204, "")
+    });
+
+    let status = send_raw_post_get_status("/empty", 0, &[]);
+    handle.join().expect("upstream thread");
+    assert_eq!(status, 204, "zero-length POST should be forwarded");
+
+    stop_dwaar(child);
+}
+
+/// ISSUE-069: Custom `request_body` `max_size` from Dwaarfile is respected.
+/// Uses a separate Dwaarfile with a 1 KB limit. Isolated test to avoid port
+/// contention with other tests that use the default Dwaarfile.
+#[test]
+fn request_body_custom_limit_from_config() {
+    let _lock = PORT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _upstream =
+        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+
+    // Write a Dwaarfile with a tiny 1 KB limit
+    let config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    std::fs::create_dir_all(&config_path).ok();
+    let config_file = config_path.join("body_limit_test.dwaarfile");
+    std::fs::write(
+        &config_file,
+        "127.0.0.1 {\n    reverse_proxy 127.0.0.1:8080\n    request_body {\n        max_size 1KB\n    }\n}\n",
+    )
+    .expect("write test Dwaarfile");
+
+    let child = start_dwaar_with_config(Some(&config_file));
+
+    // 2 KB — exceeds the 1 KB custom limit
+    let status = send_raw_post_get_status("/upload", 2048, &[]);
+    assert_eq!(
+        status, 413,
+        "POST exceeding custom 1KB limit should get 413"
+    );
+
+    stop_dwaar(child);
+    // Cleanup + wait for port to fully release before next test
+    std::fs::remove_file(&config_file).ok();
+    thread::sleep(Duration::from_secs(1));
+}
+
+/// ISSUE-070: Response body exceeding limit causes connection abort.
+/// Uses a separate Dwaarfile with a tiny `response_body_limit`.
+#[test]
+fn response_body_over_limit_returns_error() {
+    let _lock = PORT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let upstream =
+        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+
+    // response_body_limit 100 bytes — upstream will send more than that
+    let config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    std::fs::create_dir_all(&config_path).ok();
+    let config_file = config_path.join("resp_limit_test.dwaarfile");
+    std::fs::write(
+        &config_file,
+        "127.0.0.1 {\n    reverse_proxy 127.0.0.1:8080\n    response_body_limit 100\n}\n",
+    )
+    .expect("write test Dwaarfile");
+
+    let child = start_dwaar_with_config(Some(&config_file));
+
+    // Upstream sends a 500-byte response body — exceeds 100-byte limit
+    let big_body = "X".repeat(500);
+    let handle = thread::spawn({
+        let upstream_fd = upstream.try_clone().expect("clone listener");
+        move || serve_one_request(&upstream_fd, 200, &big_body)
+    });
+
+    let status = send_raw_post_get_status("/data", 0, &[]);
+    handle.join().expect("upstream thread");
+
+    // Dwaar detects Content-Length > limit in response_filter() and replaces
+    // the response with 502 before the body is sent to the client.
+    assert_eq!(
+        status, 502,
+        "response over limit should get 502 Bad Gateway"
+    );
+
+    stop_dwaar(child);
+    // Cleanup + wait for port release
+    std::fs::remove_file(&config_file).ok();
+    thread::sleep(Duration::from_secs(1));
 }
