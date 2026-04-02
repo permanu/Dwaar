@@ -159,6 +159,16 @@ pub struct RequestContext {
     /// Set in `request_filter()` after host resolution, used in `logging()` to
     /// decrement the gauge with the exact same key.
     pub metrics_domain: Option<CompactString>,
+
+    /// Whether caching is enabled for this request (ISSUE-073).
+    pub cache_enabled: bool,
+
+    /// Cache config for this request, cached from route lookup (Guardrail #27).
+    pub cache_config: Option<std::sync::Arc<crate::cache::CacheConfig>>,
+
+    /// Cache outcome: "HIT", "MISS", "STALE", or None (cache disabled).
+    /// Injected as `X-Cache` response header and logged in `RequestLog`.
+    pub cache_status: Option<&'static str>,
 }
 
 impl RequestContext {
@@ -196,6 +206,9 @@ impl RequestContext {
             response_body_max_size: 100 * 1024 * 1024, // 100 MB default
             response_body_sent: 0,
             metrics_domain: None,
+            cache_enabled: false,
+            cache_config: None,
+            cache_status: None,
         }
     }
 

@@ -15,6 +15,7 @@ pingora-core = { workspace = true }
 pingora-proxy = { workspace = true }
 pingora-http = { workspace = true }
 pingora-load-balancing = { workspace = true }
+pingora-cache = { workspace = true }
 pingora-error = { workspace = true }
 dwaar-analytics = { workspace = true }
 dwaar-plugins = { workspace = true }

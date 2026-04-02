@@ -104,6 +104,10 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub no_metrics: bool,
 
+    /// Disable HTTP response caching globally
+    #[arg(long)]
+    pub no_cache: bool,
+
     /// Number of worker processes to spawn. "auto" uses all available CPU cores.
     /// Each worker gets its own Pingora server and binds independently via `SO_REUSEPORT`.
     #[arg(long, default_value = "auto")]
@@ -193,6 +197,10 @@ impl Cli {
 
     pub(crate) fn metrics_enabled(&self) -> bool {
         !self.bare && !self.no_metrics
+    }
+
+    pub(crate) fn cache_enabled(&self) -> bool {
+        !self.bare && !self.no_cache
     }
 }
 

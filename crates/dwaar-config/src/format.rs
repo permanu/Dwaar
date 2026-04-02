@@ -11,10 +11,10 @@
 //! blank line between site blocks.
 
 use crate::model::{
-    BasicAuthDirective, BindDirective, CopyResponseHeadersDirective, Directive, DwaarConfig,
-    EncodeDirective, ErrorDirective, FileServerDirective, ForwardAuthDirective, FsDirective,
-    HandleErrorsDirective, HeaderDirective, InterceptDirective, IpFilterDirective, LbPolicy,
-    LogAppendDirective, LogDirective, LogFormat, LogOutput, MapDirective, MapPattern,
+    BasicAuthDirective, BindDirective, CacheDirective, CopyResponseHeadersDirective, Directive,
+    DwaarConfig, EncodeDirective, ErrorDirective, FileServerDirective, ForwardAuthDirective,
+    FsDirective, HandleErrorsDirective, HeaderDirective, InterceptDirective, IpFilterDirective,
+    LbPolicy, LogAppendDirective, LogDirective, LogFormat, LogOutput, MapDirective, MapPattern,
     MatcherCondition, MatcherDef, MethodDirective, RateLimitDirective, RecognizedDirective,
     RedirDirective, RequestBodyDirective, RequestHeaderDirective, RespondDirective,
     ResponseBodyLimitDirective, ReverseProxyDirective, RewriteDirective, RootDirective,
@@ -138,6 +138,7 @@ fn format_directive_at_depth(out: &mut String, directive: &Directive, depth: usi
         Directive::Templates(r) => format_recognized(out, "templates", r),
         Directive::Push(r) => format_recognized(out, "push", r),
         Directive::AcmeServer(r) => format_recognized(out, "acme_server", r),
+        Directive::Cache(c) => format_cache(out, c, depth),
     }
 }
 
@@ -651,6 +652,38 @@ fn format_ip_filter(out: &mut String, ipf: &IpFilterDirective, depth: usize) {
     } else {
         "default deny\n"
     });
+    out.push_str(&outer);
+    out.push('}');
+}
+
+fn format_cache(out: &mut String, c: &CacheDirective, depth: usize) {
+    let inner = "    ".repeat(depth + 1);
+    let outer = "    ".repeat(depth);
+    out.push_str("cache {\n");
+    if let Some(size) = c.max_size {
+        out.push_str(&inner);
+        out.push_str("max_size ");
+        out.push_str(&format_size(size));
+        out.push('\n');
+    }
+    if !c.match_paths.is_empty() {
+        out.push_str(&inner);
+        out.push_str("match_path ");
+        out.push_str(&c.match_paths.join(" "));
+        out.push('\n');
+    }
+    if let Some(ttl) = c.default_ttl {
+        out.push_str(&inner);
+        out.push_str("default_ttl ");
+        out.push_str(&ttl.to_string());
+        out.push('\n');
+    }
+    if let Some(swr) = c.stale_while_revalidate {
+        out.push_str(&inner);
+        out.push_str("stale_while_revalidate ");
+        out.push_str(&swr.to_string());
+        out.push('\n');
+    }
     out.push_str(&outer);
     out.push('}');
 }

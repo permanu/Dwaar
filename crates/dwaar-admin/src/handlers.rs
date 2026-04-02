@@ -102,6 +102,36 @@ pub fn delete_route(route_table: &ArcSwap<RouteTable>, domain: &str) -> Option<S
     Some(domain_lower)
 }
 
+/// Purge a single cache entry by host/path key.
+///
+/// The key format is `{host}/{path}` — extracted from the PURGE URL.
+/// We reconstruct a GET cache key (caching only applies to GET requests).
+pub async fn purge_cache_key(
+    storage: &'static (dyn pingora_cache::storage::Storage + Sync),
+    key_str: &str,
+) -> bool {
+    use pingora_cache::storage::PurgeType;
+    use pingora_cache::trace::Span;
+
+    let (host, path) = key_str.split_once('/').unwrap_or((key_str, "/"));
+    let path = if path.starts_with('/') {
+        path.to_owned()
+    } else {
+        format!("/{path}")
+    };
+    let cache_key = dwaar_core::cache::build_cache_key(host, &path, "GET");
+    let compact = cache_key.to_compact();
+
+    // Inactive span — admin API doesn't participate in distributed tracing.
+    let span = Span::inactive();
+    let handle = span.handle();
+
+    storage
+        .purge(&compact, PurgeType::Invalidation, &handle)
+        .await
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

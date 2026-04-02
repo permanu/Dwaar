@@ -17,6 +17,9 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use chrono::Utc;
+use pingora_cache::cache_control::CacheControl;
+use pingora_cache::filters::resp_cacheable;
+use pingora_cache::{CacheKey, NoCacheReason, RespCacheable};
 use pingora_core::Result;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_error::{Error, ErrorType::HTTPStatus};
@@ -80,6 +83,8 @@ pub struct DwaarProxy {
     plugin_chain: Arc<PluginChain>,
     /// Prometheus metrics registry (ISSUE-072). `None` when `--no-metrics`.
     prometheus: Option<Arc<dwaar_analytics::prometheus::PrometheusMetrics>>,
+    /// HTTP cache backend (ISSUE-073). `None` when no route has `cache {}` or `--no-cache`.
+    cache_backend: Option<crate::cache::CacheBackend>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -93,6 +98,7 @@ impl DwaarProxy {
         geo_lookup: Option<Arc<dwaar_geo::GeoLookup>>,
         plugin_chain: Arc<PluginChain>,
         prometheus: Option<Arc<dwaar_analytics::prometheus::PrometheusMetrics>>,
+        cache_backend: Option<crate::cache::CacheBackend>,
     ) -> Self {
         Self {
             route_table,
@@ -103,6 +109,7 @@ impl DwaarProxy {
             geo_lookup,
             plugin_chain,
             prometheus,
+            cache_backend,
         }
     }
 }
@@ -251,6 +258,109 @@ impl ProxyHttp for DwaarProxy {
 
     fn new_ctx(&self) -> Self::CTX {
         RequestContext::new()
+    }
+
+    // -- Cache lifecycle hooks (ISSUE-073) ------------------------------------
+
+    /// Enable Pingora's cache subsystem for requests that matched a `cache {}` block.
+    /// Called by Pingora after `request_filter()` returns, so `ctx.cache_enabled`
+    /// and `ctx.cache_config` are already populated.
+    fn request_cache_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        if !ctx.cache_enabled {
+            return Ok(());
+        }
+        let Some(ref backend) = self.cache_backend else {
+            return Ok(());
+        };
+        session.cache.enable(
+            backend.storage,
+            Some(backend.eviction),
+            None, // no predictor
+            Some(backend.lock),
+            None, // no option overrides
+        );
+        ctx.cache_status = Some("MISS"); // default; refined by cache_hit_filter
+        Ok(())
+    }
+
+    /// Build a cache key scoped to host + path + method so that different
+    /// virtual hosts never share cache entries.
+    fn cache_key_callback(&self, _session: &Session, ctx: &mut Self::CTX) -> Result<CacheKey> {
+        let host = ctx.plugin_ctx.host.as_deref().unwrap_or("_unknown_");
+        let path = ctx
+            .effective_path
+            .as_deref()
+            .unwrap_or(ctx.plugin_ctx.path.as_str());
+        let method = ctx.plugin_ctx.method.as_str();
+        Ok(crate::cache::build_cache_key(host, path, method))
+    }
+
+    /// Decide whether the upstream response is cacheable by consulting
+    /// Cache-Control headers and the per-route defaults.
+    fn response_cache_filter(
+        &self,
+        session: &Session,
+        resp: &ResponseHeader,
+        ctx: &mut Self::CTX,
+    ) -> Result<RespCacheable> {
+        let Some(ref cache_cfg) = ctx.cache_config else {
+            return Ok(RespCacheable::Uncacheable(NoCacheReason::NeverEnabled));
+        };
+
+        let defaults = crate::cache::make_cache_defaults(
+            cache_cfg.default_ttl,
+            cache_cfg.stale_while_revalidate,
+        );
+        // `from_resp_headers` expects `&http::response::Parts`; `ResponseHeader`
+        // derefs to `Parts` via `AsRef`.
+        let cc = CacheControl::from_resp_headers(resp.as_ref());
+        let has_auth = session.req_header().headers.contains_key("authorization");
+        Ok(resp_cacheable(
+            cc.as_ref(),
+            resp.clone(),
+            has_auth,
+            &defaults,
+        ))
+    }
+
+    /// Serve stale responses per RFC 5861:
+    /// - No error → stale-while-revalidate (background refresh in flight)
+    /// - Upstream error → stale-if-error (serve stale as fallback)
+    fn should_serve_stale(
+        &self,
+        _session: &mut Session,
+        ctx: &mut Self::CTX,
+        error: Option<&pingora_error::Error>,
+    ) -> bool {
+        if error.is_none() {
+            return ctx
+                .cache_config
+                .as_ref()
+                .is_some_and(|c| c.stale_while_revalidate > 0);
+        }
+        // On upstream failure, any cache config implies willingness to serve stale
+        ctx.cache_config.is_some()
+    }
+
+    /// Track cache hits: fresh responses are HIT, stale responses are STALE.
+    /// Called by Pingora after a successful cache lookup, before the cached
+    /// response is served.
+    async fn cache_hit_filter(
+        &self,
+        _session: &mut Session,
+        _meta: &pingora_cache::CacheMeta,
+        _hit_handler: &mut pingora_cache::storage::HitHandler,
+        is_fresh: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<Option<pingora_cache::ForcedFreshness>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        ctx.cache_status = if is_fresh { Some("HIT") } else { Some("STALE") };
+        Ok(None)
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool>
@@ -415,6 +525,18 @@ impl ProxyHttp for DwaarProxy {
                     }
                     if let Some(limit) = block.response_body_max_size {
                         ctx.response_body_max_size = limit;
+                    }
+
+                    // Cache config (ISSUE-073) — only for GET requests on matching paths
+                    if let Some(ref cache_cfg) = block.cache {
+                        let path = ctx.effective_path.as_deref().unwrap_or(&request_path);
+                        if cache_cfg.path_matches(path)
+                            && !ctx.is_websocket
+                            && ctx.plugin_ctx.method == "GET"
+                        {
+                            ctx.cache_enabled = true;
+                            ctx.cache_config = Some(cache_cfg.clone());
+                        }
                     }
 
                     // Evaluate map directives to populate VarSlots (ISSUE-056)
@@ -1081,6 +1203,13 @@ impl ProxyHttp for DwaarProxy {
             .insert_header("X-Request-Id", ctx.request_id())
             .expect("UUID is valid header value");
 
+        // --- Cache status header (ISSUE-073f) ---
+        if let Some(status) = ctx.cache_status {
+            upstream_response
+                .insert_header("X-Cache", status)
+                .expect("static str is valid header value");
+        }
+
         // --- Intercept check (ISSUE-067) ---
         // Run before analytics setup so we operate on the original upstream status.
         // First matching rule wins; empty statuses catches all non-2xx responses.
@@ -1397,7 +1526,7 @@ impl ProxyHttp for DwaarProxy {
                 s
             }),
             upstream_response_time_us: 0,
-            cache_status: None,
+            cache_status: ctx.cache_status.map(CompactString::from),
             compression: None,
         };
 
@@ -1423,6 +1552,7 @@ mod tests {
             None,
             None,
             chain,
+            None,
             None,
         )
     }
