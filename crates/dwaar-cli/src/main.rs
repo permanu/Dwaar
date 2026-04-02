@@ -343,11 +343,21 @@ fn run_server(
         Arc::new(dwaar_plugins::plugin::PluginChain::new(vec![]))
     };
 
+    // Prometheus metrics registry (ISSUE-072)
+    let prometheus = if cli.metrics_enabled() {
+        Some(std::sync::Arc::new(
+            dwaar_analytics::prometheus::PrometheusMetrics::new(),
+        ))
+    } else {
+        None
+    };
+
     info!(
         logging = cli.logging_enabled(),
         plugins = cli.plugins_enabled(),
         analytics = cli.analytics_enabled(),
         geoip = cli.geoip_enabled(),
+        metrics = cli.metrics_enabled(),
         "feature flags resolved"
     );
 
@@ -359,6 +369,7 @@ fn run_server(
         agg_sender,
         geo_lookup,
         plugin_chain,
+        prometheus.clone(),
     );
 
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, proxy);
@@ -414,6 +425,13 @@ fn run_server(
         admin_token,
     )
     .with_reload_notify(Arc::clone(&config_notify));
+
+    let admin_service = if let Some(ref prom) = prometheus {
+        admin_service.with_prometheus(Arc::clone(prom))
+    } else {
+        admin_service
+    };
+
     let mut admin_listening =
         pingora_core::services::listening::Service::new("admin API".to_string(), admin_service);
     admin_listening.add_tcp("127.0.0.1:6190");

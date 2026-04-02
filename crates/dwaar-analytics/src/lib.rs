@@ -20,6 +20,7 @@ pub mod aggregation;
 pub mod beacon;
 pub mod decompress;
 pub mod injector;
+pub mod prometheus;
 
 #[cfg(test)]
 mod tests {

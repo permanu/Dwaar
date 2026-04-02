@@ -78,6 +78,8 @@ pub struct DwaarProxy {
     geo_lookup: Option<Arc<dwaar_geo::GeoLookup>>,
     /// Plugin chain — holds all feature plugins sorted by priority.
     plugin_chain: Arc<PluginChain>,
+    /// Prometheus metrics registry (ISSUE-072). `None` when `--no-metrics`.
+    prometheus: Option<Arc<dwaar_analytics::prometheus::PrometheusMetrics>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -90,6 +92,7 @@ impl DwaarProxy {
         agg_sender: Option<AggSender>,
         geo_lookup: Option<Arc<dwaar_geo::GeoLookup>>,
         plugin_chain: Arc<PluginChain>,
+        prometheus: Option<Arc<dwaar_analytics::prometheus::PrometheusMetrics>>,
     ) -> Self {
         Self {
             route_table,
@@ -99,6 +102,7 @@ impl DwaarProxy {
             agg_sender,
             geo_lookup,
             plugin_chain,
+            prometheus,
         }
     }
 }
@@ -481,6 +485,15 @@ impl ProxyHttp for DwaarProxy {
                     }
                 }
             }
+        }
+
+        // --- Prometheus active connection tracking (ISSUE-072) ---
+        if let Some(ref prom) = self.prometheus
+            && let Some(ref host) = ctx.plugin_ctx.host
+        {
+            let domain = host.clone();
+            prom.connection_start(&domain);
+            ctx.metrics_domain = Some(domain);
         }
 
         // --- Request body size check (ISSUE-069) ---
@@ -1268,12 +1281,29 @@ impl ProxyHttp for DwaarProxy {
     ) where
         Self::CTX: Send + Sync,
     {
+        let response_time_us = ctx.start_time.elapsed().as_micros() as u64;
+        let status = session.response_written().map_or(0, |r| r.status.as_u16());
+        let bytes_sent = session.body_bytes_sent() as u64;
+        let bytes_received = session.body_bytes_read() as u64;
+
+        // Prometheus metrics (ISSUE-072) — recorded before host.take() moves it
+        if let Some(ref prom) = self.prometheus
+            && let Some(ref domain) = ctx.metrics_domain
+        {
+            prom.record_request(
+                domain,
+                ctx.plugin_ctx.method.as_str(),
+                status,
+                response_time_us,
+                bytes_sent,
+                bytes_received,
+            );
+            prom.connection_end(domain);
+        }
+
         let Some(ref sender) = self.log_sender else {
             return;
         };
-
-        let response_time_us = ctx.start_time.elapsed().as_micros() as u64;
-        let status = session.response_written().map_or(0, |r| r.status.as_u16());
 
         // Split path and query without allocating when there's no query string.
         // std::mem::take moves the CompactString out of ctx, avoiding clone.
@@ -1310,7 +1340,6 @@ impl ProxyHttp for DwaarProxy {
             .get("referer")
             .and_then(|v| v.to_str().ok())
             .map(CompactString::from);
-        let bytes_sent = session.body_bytes_sent() as u64;
 
         if let Some(ref agg) = self.agg_sender {
             let event = AggEvent {
@@ -1352,7 +1381,7 @@ impl ProxyHttp for DwaarProxy {
                 .map(CompactString::from),
             referer,
             bytes_sent,
-            bytes_received: session.body_bytes_read() as u64,
+            bytes_received,
             tls_version: session
                 .downstream_session
                 .digest()
@@ -1394,6 +1423,7 @@ mod tests {
             None,
             None,
             chain,
+            None,
         )
     }
 
