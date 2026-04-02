@@ -183,6 +183,18 @@ fn parse_global_option_line(
         "debug" => {
             opts.debug = true;
         }
+        "drain_timeout" => {
+            let val = peek_consume_word_or_quoted(t);
+            let secs = parse_duration_secs(&val).ok_or(ParseError {
+                line: key_tok.line,
+                col: key_tok.col,
+                kind: ParseErrorKind::InvalidValue {
+                    directive: "drain_timeout".to_string(),
+                    message: format!("'{val}' is not a valid duration (e.g. '30s', '1m', '60')"),
+                },
+            })?;
+            opts.drain_timeout_secs = Some(secs);
+        }
         // Unknown option — collect args, consume sub-blocks
         _ => {
             let args = collect_global_passthrough_args(t);
@@ -273,7 +285,20 @@ fn is_global_option_key(w: &str) -> bool {
             | "pki"
             | "events"
             | "filesystem"
+            | "drain_timeout"
     )
+}
+
+/// Parse a duration string like "30s", "1m", "60" into seconds.
+/// Supports bare numbers (seconds), `Ns` (seconds), and `Nm` (minutes).
+fn parse_duration_secs(s: &str) -> Option<u64> {
+    if let Some(rest) = s.strip_suffix('s') {
+        rest.parse().ok()
+    } else if let Some(rest) = s.strip_suffix('m') {
+        rest.parse::<u64>().ok().map(|m| m * 60)
+    } else {
+        s.parse().ok()
+    }
 }
 
 /// Parse one site block: `address { directive* }`
