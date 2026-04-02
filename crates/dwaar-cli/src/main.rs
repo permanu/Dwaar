@@ -187,6 +187,7 @@ fn main() -> anyhow::Result<()> {
 
     let config_path = &cli.config;
     let dwaar_config = load_config(config_path)?;
+    let drain_timeout = std::time::Duration::from_secs(extract_drain_timeout(&dwaar_config));
 
     if cli.test {
         info!("config valid");
@@ -204,12 +205,19 @@ fn main() -> anyhow::Result<()> {
 
     // Single-process mode skips forking — same behavior as before.
     if worker_count <= 1 {
-        return run_server(&cli, &dwaar_config, config_path, 0, 1);
+        return run_server(&cli, &dwaar_config, config_path, drain_timeout, 0, 1);
     }
 
     match fork_workers(worker_count)? {
         WorkerRole::Supervisor => Ok(()),
-        WorkerRole::Worker(id) => run_server(&cli, &dwaar_config, config_path, id, worker_count),
+        WorkerRole::Worker(id) => run_server(
+            &cli,
+            &dwaar_config,
+            config_path,
+            drain_timeout,
+            id,
+            worker_count,
+        ),
     }
 }
 
@@ -218,6 +226,7 @@ fn run_server(
     cli: &Cli,
     dwaar_config: &dwaar_config::model::DwaarConfig,
     config_path: &std::path::Path,
+    drain_timeout: std::time::Duration,
     worker_id: usize,
     worker_count: usize,
 ) -> anyhow::Result<()> {
@@ -500,6 +509,7 @@ fn run_server(
         &route_table_for_agg,
         &agg_metrics,
         health_pools,
+        drain_timeout,
     );
 
     info!("entering run loop, waiting for connections or signals");
@@ -524,6 +534,7 @@ fn register_background_services(
     route_table_for_agg: &Arc<ArcSwap<dwaar_core::route::RouteTable>>,
     agg_metrics: &Arc<DashMap<String, dwaar_analytics::aggregation::DomainMetrics>>,
     health_pools: Vec<Arc<dwaar_core::upstream::UpstreamPool>>,
+    drain_timeout: std::time::Duration,
 ) {
     // Upstream health checker — only registered when there are pools with health URIs.
     // Per Guardrail #20: all async background work must be a BackgroundService.
@@ -580,6 +591,7 @@ fn register_background_services(
         Arc::clone(route_table),
         initial_hash,
     )
+    .with_drain_timeout(drain_timeout)
     .with_reload_notify(Arc::clone(config_notify));
     let config_watcher = if cli.docker_socket.is_some() {
         config_watcher.with_docker_mode(Arc::clone(dwaarfile_snapshot), Arc::clone(config_notify))
@@ -649,6 +661,16 @@ fn load_config(path: &std::path::Path) -> anyhow::Result<dwaar_config::model::Dw
     );
 
     Ok(config)
+}
+
+/// Extract `drain_timeout` from the parsed config's global options.
+/// Defaults to 30 seconds when not specified.
+fn extract_drain_timeout(config: &dwaar_config::model::DwaarConfig) -> u64 {
+    config
+        .global_options
+        .as_ref()
+        .and_then(|g| g.drain_timeout_secs)
+        .unwrap_or(30)
 }
 
 fn setup_tls_listener(

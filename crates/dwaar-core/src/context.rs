@@ -34,6 +34,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use std::time::Instant;
 
 use compact_str::CompactString;
@@ -165,6 +166,11 @@ pub struct RequestContext {
     /// decrement the gauge with the exact same key.
     pub metrics_domain: Option<CompactString>,
 
+    /// Active connection counter for the matched route (ISSUE-075).
+    /// Decremented in `logging()` when the request completes, enabling
+    /// graceful drain when a route is removed during hot-reload.
+    pub drain_counter: Option<Arc<AtomicU32>>,
+
     /// Whether caching is enabled for this request (ISSUE-073).
     pub cache_enabled: bool,
 
@@ -212,6 +218,7 @@ impl RequestContext {
             response_body_max_size: 100 * 1024 * 1024, // 100 MB default
             response_body_sent: 0,
             metrics_domain: None,
+            drain_counter: None,
             cache_enabled: false,
             cache_config: None,
             cache_status: None,

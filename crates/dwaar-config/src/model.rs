@@ -30,6 +30,9 @@ pub struct GlobalOptions {
     pub debug: bool,
     /// Auto HTTPS behavior. `auto_https off` / `auto_https disable_redirects`
     pub auto_https: Option<String>,
+    /// How long to wait for in-flight requests before force-closing a
+    /// removed route (ISSUE-075). Default: 30 seconds.
+    pub drain_timeout_secs: Option<u64>,
     /// Options we recognized but don't act on — stored so we never error
     /// on valid Caddyfile syntax we haven't implemented yet.
     pub passthrough: Vec<(String, Vec<String>)>,
