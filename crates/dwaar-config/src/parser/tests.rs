@@ -244,6 +244,44 @@ fn passthrough_directive_with_args() {
     assert!(matches!(&config.sites[0].directives[0], Directive::Bind(_)));
 }
 
+// ── bind directive parser tests (ISSUE-066) ──────────────────────────────────
+
+#[test]
+fn bind_single_port_shorthand() {
+    let config = parse("a.com { bind :8443 }").expect("bind :port should parse");
+    let Directive::Bind(b) = &config.sites[0].directives[0] else {
+        panic!("expected Directive::Bind");
+    };
+    assert_eq!(b.addresses, vec![":8443"]);
+}
+
+#[test]
+fn bind_bare_ip() {
+    let config = parse("a.com { bind 127.0.0.1 }").expect("bind bare IP should parse");
+    let Directive::Bind(b) = &config.sites[0].directives[0] else {
+        panic!("expected Directive::Bind");
+    };
+    assert_eq!(b.addresses, vec!["127.0.0.1"]);
+}
+
+#[test]
+fn bind_multiple_addresses() {
+    let config = parse("a.com { bind 127.0.0.1 ::1 }").expect("bind multi-addr should parse");
+    let Directive::Bind(b) = &config.sites[0].directives[0] else {
+        panic!("expected Directive::Bind");
+    };
+    assert_eq!(b.addresses, vec!["127.0.0.1", "::1"]);
+}
+
+#[test]
+fn bind_missing_address_is_an_error() {
+    // `bind` with no arguments must be a parse error, not silently ignored.
+    assert!(
+        parse("a.com { bind }").is_err(),
+        "bind with no args should fail"
+    );
+}
+
 #[test]
 fn passthrough_directive_with_block() {
     // `log` with a block is now fully implemented — parses as Directive::Log
@@ -852,4 +890,306 @@ fn global_options_only_no_sites() {
     let config = parse("{\n    debug\n}\n").expect("global options without sites");
     assert!(config.global_options.is_some());
     assert!(config.sites.is_empty());
+}
+
+// ── reverse_proxy block form (ISSUE-065) ─────────────────────────────────────
+
+#[test]
+fn reverse_proxy_inline_backward_compat() {
+    // Inline form must still work after block-form support is added.
+    let config = parse("a.com {\n    reverse_proxy localhost:8080\n}\n").expect("should parse");
+    let Directive::ReverseProxy(rp) = &config.sites[0].directives[0] else {
+        panic!("expected ReverseProxy");
+    };
+    assert_eq!(rp.upstreams.len(), 1);
+    assert!(rp.lb_policy.is_none());
+    assert!(!rp.transport_tls);
+}
+
+#[test]
+fn reverse_proxy_inline_multi_upstream() {
+    let config = parse("a.com {\n    reverse_proxy 127.0.0.1:8080 127.0.0.1:8081\n}\n")
+        .expect("should parse");
+    let Directive::ReverseProxy(rp) = &config.sites[0].directives[0] else {
+        panic!("expected ReverseProxy");
+    };
+    assert_eq!(rp.upstreams.len(), 2);
+}
+
+#[test]
+fn reverse_proxy_block_basic() {
+    let config = parse(
+        "a.com {
+            reverse_proxy {
+                to 127.0.0.1:8080
+                lb_policy round_robin
+            }
+        }",
+    )
+    .expect("should parse");
+    let Directive::ReverseProxy(rp) = &config.sites[0].directives[0] else {
+        panic!("expected ReverseProxy");
+    };
+    assert_eq!(rp.upstreams.len(), 1);
+    assert_eq!(rp.lb_policy, Some(LbPolicy::RoundRobin));
+}
+
+#[test]
+fn reverse_proxy_block_all_lb_policies() {
+    for (name, expected) in [
+        ("round_robin", LbPolicy::RoundRobin),
+        ("least_conn", LbPolicy::LeastConn),
+        ("random", LbPolicy::Random),
+        ("ip_hash", LbPolicy::IpHash),
+    ] {
+        let src = format!(
+            "a.com {{\n    reverse_proxy {{\n        to 127.0.0.1:9000\n        lb_policy {name}\n    }}\n}}\n"
+        );
+        let config = parse(&src).unwrap_or_else(|_| panic!("should parse lb_policy {name}"));
+        let Directive::ReverseProxy(rp) = &config.sites[0].directives[0] else {
+            panic!("expected ReverseProxy");
+        };
+        assert_eq!(rp.lb_policy, Some(expected));
+    }
+}
+
+#[test]
+fn reverse_proxy_block_health_options() {
+    let config = parse(
+        "a.com {
+            reverse_proxy {
+                to 127.0.0.1:8080
+                health_uri /ping
+                health_interval 5
+                fail_duration 30
+            }
+        }",
+    )
+    .expect("should parse");
+    let Directive::ReverseProxy(rp) = &config.sites[0].directives[0] else {
+        panic!("expected ReverseProxy");
+    };
+    assert_eq!(rp.health_uri.as_deref(), Some("/ping"));
+    assert_eq!(rp.health_interval, Some(5));
+    assert_eq!(rp.fail_duration, Some(30));
+}
+
+#[test]
+fn reverse_proxy_block_max_conns() {
+    let config = parse(
+        "a.com {
+            reverse_proxy {
+                to 127.0.0.1:8080
+                max_conns 100
+            }
+        }",
+    )
+    .expect("should parse");
+    let Directive::ReverseProxy(rp) = &config.sites[0].directives[0] else {
+        panic!("expected ReverseProxy");
+    };
+    assert_eq!(rp.max_conns, Some(100));
+}
+
+#[test]
+fn reverse_proxy_block_transport_tls_server_name() {
+    let config = parse(
+        "a.com {
+            reverse_proxy {
+                to backend.internal:443
+                transport {
+                    tls_server_name backend.internal
+                }
+            }
+        }",
+    )
+    .expect("should parse");
+    let Directive::ReverseProxy(rp) = &config.sites[0].directives[0] else {
+        panic!("expected ReverseProxy");
+    };
+    assert!(rp.transport_tls);
+    assert_eq!(rp.tls_server_name.as_deref(), Some("backend.internal"));
+}
+
+#[test]
+fn reverse_proxy_block_transport_plain_tls() {
+    // `transport { tls }` with no server name
+    let config = parse(
+        "a.com {
+            reverse_proxy {
+                to 127.0.0.1:8443
+                transport {
+                    tls
+                }
+            }
+        }",
+    )
+    .expect("should parse");
+    let Directive::ReverseProxy(rp) = &config.sites[0].directives[0] else {
+        panic!("expected ReverseProxy");
+    };
+    assert!(rp.transport_tls);
+    assert!(rp.tls_server_name.is_none());
+}
+
+#[test]
+fn reverse_proxy_block_multi_upstream() {
+    let config = parse(
+        "a.com {
+            reverse_proxy {
+                to 127.0.0.1:8080 127.0.0.1:8081 127.0.0.1:8082
+                lb_policy least_conn
+            }
+        }",
+    )
+    .expect("should parse");
+    let Directive::ReverseProxy(rp) = &config.sites[0].directives[0] else {
+        panic!("expected ReverseProxy");
+    };
+    assert_eq!(rp.upstreams.len(), 3);
+    assert_eq!(rp.lb_policy, Some(LbPolicy::LeastConn));
+}
+
+#[test]
+fn reverse_proxy_block_empty_to_is_error() {
+    // Block form with no `to` subdirective must error.
+    let result = parse(
+        "a.com {
+            reverse_proxy {
+                lb_policy round_robin
+            }
+        }",
+    );
+    assert!(result.is_err(), "empty upstream list must be rejected");
+}
+
+#[test]
+fn reverse_proxy_block_unknown_lb_policy_is_error() {
+    let result = parse(
+        "a.com {
+            reverse_proxy {
+                to 127.0.0.1:8080
+                lb_policy magic
+            }
+        }",
+    );
+    assert!(result.is_err(), "unknown lb_policy must be rejected");
+}
+
+// ── Intercept / CopyResponseHeaders parser tests (ISSUE-067) ─────────────
+
+#[test]
+fn parse_intercept_with_status_and_respond() {
+    // Caddyfile respond syntax: respond "body" STATUS (body before status code)
+    let config = parse(
+        r#"example.com {
+            reverse_proxy 127.0.0.1:8080
+            intercept 404 {
+                respond "not found page" 200
+            }
+        }"#,
+    )
+    .expect("should parse");
+
+    assert_eq!(config.sites[0].directives.len(), 2);
+    let Directive::Intercept(i) = &config.sites[0].directives[1] else {
+        panic!("expected Intercept directive");
+    };
+    assert_eq!(i.statuses, vec![404]);
+    assert_eq!(i.directives.len(), 1);
+    let Directive::Respond(r) = &i.directives[0] else {
+        panic!("expected nested Respond directive");
+    };
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body, "not found page");
+}
+
+#[test]
+fn parse_intercept_multiple_statuses() {
+    let config = parse(
+        "example.com {
+            reverse_proxy 127.0.0.1:8080
+            intercept 404 503 502 {
+                respond 200
+            }
+        }",
+    )
+    .expect("should parse");
+
+    let Directive::Intercept(i) = &config.sites[0].directives[1] else {
+        panic!("expected Intercept directive");
+    };
+    assert_eq!(i.statuses, vec![404, 503, 502]);
+}
+
+#[test]
+fn parse_intercept_inside_handle_block() {
+    let config = parse(
+        r#"example.com {
+            handle /api/* {
+                reverse_proxy 127.0.0.1:8080
+                intercept 404 {
+                    respond "api not found" 200
+                }
+            }
+        }"#,
+    )
+    .expect("should parse");
+
+    let Directive::Handle(h) = &config.sites[0].directives[0] else {
+        panic!("expected Handle directive");
+    };
+    let intercept = h
+        .directives
+        .iter()
+        .find(|d| matches!(d, Directive::Intercept(_)));
+    assert!(
+        intercept.is_some(),
+        "intercept should parse inside handle block"
+    );
+}
+
+#[test]
+fn parse_copy_response_headers_include() {
+    let config = parse(
+        "example.com {
+            reverse_proxy 127.0.0.1:8080
+            copy_response_headers {
+                X-Custom
+                X-Other
+            }
+        }",
+    )
+    .expect("should parse");
+
+    let crh = config.sites[0].directives.iter().find_map(|d| match d {
+        Directive::CopyResponseHeaders(crh) => Some(crh),
+        _ => None,
+    });
+    let crh = crh.expect("should have copy_response_headers");
+    assert!(crh.headers.contains(&"X-Custom".to_string()));
+    assert!(crh.headers.contains(&"X-Other".to_string()));
+}
+
+#[test]
+fn parse_copy_response_headers_exclude_prefix() {
+    let config = parse(
+        "example.com {
+            reverse_proxy 127.0.0.1:8080
+            copy_response_headers {
+                -Set-Cookie
+                -Server
+            }
+        }",
+    )
+    .expect("should parse");
+
+    let crh = config.sites[0].directives.iter().find_map(|d| match d {
+        Directive::CopyResponseHeaders(crh) => Some(crh),
+        _ => None,
+    });
+    let crh = crh.expect("should have copy_response_headers");
+    // Parser stores the raw string including the '-' prefix; compiler strips it
+    assert!(crh.headers.contains(&"-Set-Cookie".to_string()));
+    assert!(crh.headers.contains(&"-Server".to_string()));
 }

@@ -13,9 +13,9 @@
 use crate::model::{
     BasicAuthDirective, BindDirective, CopyResponseHeadersDirective, Directive, DwaarConfig,
     EncodeDirective, ErrorDirective, FileServerDirective, ForwardAuthDirective, FsDirective,
-    HandleErrorsDirective, HeaderDirective, InterceptDirective, LogAppendDirective, LogDirective,
-    LogFormat, LogOutput, MapDirective, MapPattern, MatcherCondition, MatcherDef, MethodDirective,
-    RateLimitDirective, RecognizedDirective, RedirDirective, RequestBodyDirective,
+    HandleErrorsDirective, HeaderDirective, InterceptDirective, LbPolicy, LogAppendDirective,
+    LogDirective, LogFormat, LogOutput, MapDirective, MapPattern, MatcherCondition, MatcherDef,
+    MethodDirective, RateLimitDirective, RecognizedDirective, RedirDirective, RequestBodyDirective,
     RequestHeaderDirective, RespondDirective, ReverseProxyDirective, RewriteDirective,
     RootDirective, TlsDirective, TryFilesDirective, UpstreamAddr, UriDirective, UriOperation,
     VarsDirective,
@@ -140,12 +140,81 @@ fn format_directive_at_depth(out: &mut String, directive: &Directive, depth: usi
 }
 
 fn format_reverse_proxy(out: &mut String, rp: &ReverseProxyDirective) {
-    out.push_str("reverse_proxy");
-    for upstream in &rp.upstreams {
-        out.push(' ');
-        match upstream {
-            UpstreamAddr::SocketAddr(addr) => out.push_str(&addr.to_string()),
-            UpstreamAddr::HostPort(hp) => out.push_str(hp),
+    let has_block_options = rp.lb_policy.is_some()
+        || rp.health_uri.is_some()
+        || rp.health_interval.is_some()
+        || rp.fail_duration.is_some()
+        || rp.max_conns.is_some()
+        || rp.transport_tls
+        || rp.tls_server_name.is_some()
+        || rp.upstreams.len() > 1;
+
+    if has_block_options {
+        // Block form — one upstream per line under `to`, then options
+        out.push_str("reverse_proxy {\n");
+        out.push('\t');
+        out.push_str("\tto");
+        for upstream in &rp.upstreams {
+            out.push(' ');
+            match upstream {
+                UpstreamAddr::SocketAddr(addr) => out.push_str(&addr.to_string()),
+                UpstreamAddr::HostPort(hp) => out.push_str(hp),
+            }
+        }
+        out.push('\n');
+
+        if let Some(policy) = rp.lb_policy {
+            out.push_str("\t\tlb_policy ");
+            out.push_str(match policy {
+                LbPolicy::RoundRobin => "round_robin",
+                LbPolicy::LeastConn => "least_conn",
+                LbPolicy::Random => "random",
+                LbPolicy::IpHash => "ip_hash",
+            });
+            out.push('\n');
+        }
+        if let Some(ref uri) = rp.health_uri {
+            out.push_str("\t\thealth_uri ");
+            out.push_str(uri);
+            out.push('\n');
+        }
+        if let Some(interval) = rp.health_interval {
+            out.push_str("\t\thealth_interval ");
+            out.push_str(&interval.to_string());
+            out.push('\n');
+        }
+        if let Some(dur) = rp.fail_duration {
+            out.push_str("\t\tfail_duration ");
+            out.push_str(&dur.to_string());
+            out.push('\n');
+        }
+        if let Some(max) = rp.max_conns {
+            out.push_str("\t\tmax_conns ");
+            out.push_str(&max.to_string());
+            out.push('\n');
+        }
+        if rp.transport_tls || rp.tls_server_name.is_some() {
+            out.push_str("\t\ttransport {\n");
+            if let Some(ref sni) = rp.tls_server_name {
+                out.push_str("\t\t\ttls_server_name ");
+                out.push_str(sni);
+                out.push('\n');
+            } else {
+                out.push_str("\t\t\ttls\n");
+            }
+            out.push_str("\t\t}\n");
+        }
+        out.push('\t');
+        out.push('}');
+    } else {
+        // Inline form — space-separated upstreams on one line
+        out.push_str("reverse_proxy");
+        for upstream in &rp.upstreams {
+            out.push(' ');
+            match upstream {
+                UpstreamAddr::SocketAddr(addr) => out.push_str(&addr.to_string()),
+                UpstreamAddr::HostPort(hp) => out.push_str(hp),
+            }
         }
     }
 }
