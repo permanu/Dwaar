@@ -21,7 +21,7 @@ use pingora_cache::cache_control::CacheControl;
 use pingora_cache::filters::resp_cacheable;
 use pingora_cache::{CacheKey, NoCacheReason, RespCacheable};
 use pingora_core::Result;
-use pingora_core::upstreams::peer::{HttpPeer, ALPN};
+use pingora_core::upstreams::peer::{ALPN, HttpPeer};
 use pingora_error::{Error, ErrorType::HTTPStatus};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};

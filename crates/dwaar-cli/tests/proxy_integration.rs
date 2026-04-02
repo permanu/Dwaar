@@ -1149,3 +1149,141 @@ fn cache_respects_no_store() {
     std::fs::remove_file(&config_file).ok();
     thread::sleep(Duration::from_secs(1));
 }
+
+// ---------------------------------------------------------------------------
+// gRPC transparent proxying tests (ISSUE-074)
+// ---------------------------------------------------------------------------
+
+/// ISSUE-074: Upstream responses with `application/grpc` Content-Type are
+/// proxied without analytics script injection. The proxy detects gRPC
+/// content and skips HTML injection even though the upstream returned 200.
+/// Note: gRPC request-side detection forces H2 ALPN to the upstream, so
+/// this test verifies the response path with a plain HTTP request that
+/// gets a gRPC-typed response — proving the proxy never injects into
+/// non-HTML binary content types.
+#[test]
+fn grpc_response_proxied_without_injection() {
+    let _lock = PORT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let upstream = TcpListener::bind("127.0.0.1:8080").expect("bind upstream");
+
+    let proxy = start_dwaar_proxy();
+
+    // Upstream serves a gRPC-typed response with binary-framed body
+    let upstream_handle = thread::spawn(move || {
+        let (mut stream, _) = upstream.accept().expect("accept");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                break;
+            }
+        }
+        let body = b"\x00\x00\x00\x00\x05hello";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: application/grpc\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.write_all(body);
+        let _ = stream.flush();
+    });
+
+    // Plain GET — no gRPC Content-Type on the request side, so no H2
+    // forcing. The upstream responds with application/grpc anyway.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    let resp = rt.block_on(async {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build client");
+        client
+            .get("http://127.0.0.1:6188/grpc.Service/Method")
+            .send()
+            .await
+            .expect("request should succeed")
+    });
+
+    assert_eq!(resp.status().as_u16(), 200);
+
+    let body_bytes = rt.block_on(resp.bytes()).expect("read body");
+    let body_str = String::from_utf8_lossy(&body_bytes);
+    assert!(
+        !body_str.contains("<script"),
+        "gRPC response must not have analytics injection"
+    );
+
+    upstream_handle.join().expect("upstream thread");
+    stop_dwaar(proxy);
+}
+
+/// ISSUE-074: gRPC requests bypass request body size limits for streaming.
+#[test]
+fn grpc_request_bypasses_body_limit() {
+    let _lock = PORT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let upstream = TcpListener::bind("127.0.0.1:8080").expect("bind upstream");
+
+    // Dwaarfile with very small body limit (1KB) — gRPC should bypass
+    let config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    std::fs::create_dir_all(&config_path).ok();
+    let config_file = config_path.join("grpc_body_limit_test.dwaarfile");
+    std::fs::write(
+        &config_file,
+        "127.0.0.1 {\n    reverse_proxy 127.0.0.1:8080\n    request_body {\n        max_size 1KB\n    }\n}\n",
+    )
+    .expect("write test Dwaarfile");
+
+    let proxy = start_dwaar_with_config(Some(&config_file));
+
+    // Upstream just accepts and responds
+    let upstream_handle = thread::spawn(move || {
+        serve_one_request(&upstream, 200, "ok");
+    });
+
+    // Send gRPC POST with body larger than 1KB limit
+    let large_body = vec![0u8; 2048];
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime");
+
+    let resp = rt.block_on(async {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build client");
+        client
+            .post("http://127.0.0.1:6188/grpc.Service/Method")
+            .header("Content-Type", "application/grpc")
+            .body(large_body)
+            .send()
+            .await
+            .expect("request should succeed")
+    });
+
+    // Must NOT be 413 — gRPC bypasses body limits
+    assert_ne!(
+        resp.status().as_u16(),
+        413,
+        "gRPC should bypass body size limits"
+    );
+
+    upstream_handle.join().expect("upstream thread");
+    stop_dwaar(proxy);
+    std::fs::remove_file(&config_file).ok();
+    thread::sleep(Duration::from_secs(1));
+}
