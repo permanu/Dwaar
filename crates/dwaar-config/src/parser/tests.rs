@@ -1193,3 +1193,52 @@ fn parse_copy_response_headers_exclude_prefix() {
     assert!(crh.headers.contains(&"-Set-Cookie".to_string()));
     assert!(crh.headers.contains(&"-Server".to_string()));
 }
+
+#[test]
+fn parse_cache_directive_full() {
+    let config = parse(
+        "example.com {
+            cache {
+                max_size 1g
+                match_path /static/* /assets/*
+                default_ttl 3600
+                stale_while_revalidate 60
+            }
+            reverse_proxy localhost:8080
+        }",
+    )
+    .expect("should parse");
+
+    let cache = config.sites[0].directives.iter().find_map(|d| match d {
+        Directive::Cache(c) => Some(c),
+        _ => None,
+    });
+    let cache = cache.expect("should have cache directive");
+    assert_eq!(cache.max_size, Some(1024 * 1024 * 1024)); // 1 GiB
+    assert_eq!(cache.match_paths, vec!["/static/*", "/assets/*"]);
+    assert_eq!(cache.default_ttl, Some(3600));
+    assert_eq!(cache.stale_while_revalidate, Some(60));
+}
+
+#[test]
+fn parse_cache_directive_minimal() {
+    let config = parse(
+        "example.com {
+            cache {
+                match_path /api/*
+            }
+            reverse_proxy localhost:8080
+        }",
+    )
+    .expect("should parse");
+
+    let cache = config.sites[0].directives.iter().find_map(|d| match d {
+        Directive::Cache(c) => Some(c),
+        _ => None,
+    });
+    let cache = cache.expect("should have cache directive");
+    assert_eq!(cache.max_size, None);
+    assert_eq!(cache.match_paths, vec!["/api/*"]);
+    assert_eq!(cache.default_ttl, None);
+    assert_eq!(cache.stale_while_revalidate, None);
+}
