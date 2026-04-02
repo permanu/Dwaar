@@ -7,13 +7,13 @@
 //! Transformation directive parsers — what changes about the request or response.
 //!
 //! Covers: `tls`, `header`, `request_header`, `encode`, `basicauth`, `rate_limit`,
-//! `method`, `request_body`, `bind`, `vars`, `error`.
+//! `method`, `request_body`, `response_body_limit`, `bind`, `vars`, `error`.
 
 use crate::error::{ParseError, ParseErrorKind};
 use crate::model::{
     BasicAuthCredential, BasicAuthDirective, BindDirective, EncodeDirective, ErrorDirective,
     HeaderDirective, MethodDirective, RateLimitDirective, RequestBodyDirective,
-    RequestHeaderDirective, TlsDirective, VarsDirective,
+    RequestHeaderDirective, ResponseBodyLimitDirective, TlsDirective, VarsDirective,
 };
 use crate::token::{Token, TokenKind, Tokenizer};
 
@@ -465,6 +465,36 @@ pub(super) fn parse_request_body(
     }
 
     Ok(RequestBodyDirective { max_size })
+}
+
+/// `response_body_limit 100MB`
+pub(super) fn parse_response_body_limit(
+    t: &mut Tokenizer<'_>,
+    _dir_tok: &Token,
+) -> Result<ResponseBodyLimitDirective, ParseError> {
+    let size_tok = t.next_token();
+    let (line, col) = (size_tok.line, size_tok.col);
+    let TokenKind::Word(size_str) = size_tok.kind else {
+        return Err(ParseError {
+            line,
+            col,
+            kind: ParseErrorKind::InvalidValue {
+                directive: "response_body_limit".to_string(),
+                message: "expected size value (e.g. 100MB, 1GB)".to_string(),
+            },
+        });
+    };
+    let max_size = parse_size(&size_str).ok_or_else(|| ParseError {
+        line,
+        col,
+        kind: ParseErrorKind::InvalidValue {
+            directive: "response_body_limit".to_string(),
+            message: format!(
+                "invalid size '{size_str}' — expected a number with optional unit (KB, MB, GB)"
+            ),
+        },
+    })?;
+    Ok(ResponseBodyLimitDirective { max_size })
 }
 
 /// `bind 0.0.0.0` or `bind 127.0.0.1 ::1`
