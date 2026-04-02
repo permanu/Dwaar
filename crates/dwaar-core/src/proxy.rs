@@ -17,13 +17,13 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use chrono::Utc;
+use pingora_cache::cache_control::CacheControl;
+use pingora_cache::filters::resp_cacheable;
+use pingora_cache::{CacheKey, NoCacheReason, RespCacheable};
 use pingora_core::Result;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_error::{Error, ErrorType::HTTPStatus};
 use pingora_http::{RequestHeader, ResponseHeader};
-use pingora_cache::cache_control::CacheControl;
-use pingora_cache::filters::resp_cacheable;
-use pingora_cache::{CacheKey, NoCacheReason, RespCacheable};
 use pingora_proxy::{ProxyHttp, Session};
 use tracing::{debug, warn};
 
@@ -278,9 +278,9 @@ impl ProxyHttp for DwaarProxy {
         session.cache.enable(
             backend.storage,
             Some(backend.eviction),
-            None,  // no predictor
+            None, // no predictor
             Some(backend.lock),
-            None,  // no option overrides
+            None, // no option overrides
         );
         ctx.cache_status = Some("MISS"); // default; refined by cache_hit_filter
         Ok(())
@@ -290,7 +290,9 @@ impl ProxyHttp for DwaarProxy {
     /// virtual hosts never share cache entries.
     fn cache_key_callback(&self, _session: &Session, ctx: &mut Self::CTX) -> Result<CacheKey> {
         let host = ctx.plugin_ctx.host.as_deref().unwrap_or("_unknown_");
-        let path = ctx.effective_path.as_deref()
+        let path = ctx
+            .effective_path
+            .as_deref()
             .unwrap_or(ctx.plugin_ctx.path.as_str());
         let method = ctx.plugin_ctx.method.as_str();
         Ok(crate::cache::build_cache_key(host, path, method))
@@ -316,7 +318,12 @@ impl ProxyHttp for DwaarProxy {
         // derefs to `Parts` via `AsRef`.
         let cc = CacheControl::from_resp_headers(resp.as_ref());
         let has_auth = session.req_header().headers.contains_key("authorization");
-        Ok(resp_cacheable(cc.as_ref(), resp.clone(), has_auth, &defaults))
+        Ok(resp_cacheable(
+            cc.as_ref(),
+            resp.clone(),
+            has_auth,
+            &defaults,
+        ))
     }
 
     /// Serve stale responses per RFC 5861:
@@ -329,7 +336,10 @@ impl ProxyHttp for DwaarProxy {
         error: Option<&pingora_error::Error>,
     ) -> bool {
         if error.is_none() {
-            return ctx.cache_config.as_ref().is_some_and(|c| c.stale_while_revalidate > 0);
+            return ctx
+                .cache_config
+                .as_ref()
+                .is_some_and(|c| c.stale_while_revalidate > 0);
         }
         // On upstream failure, any cache config implies willingness to serve stale
         ctx.cache_config.is_some()
@@ -519,8 +529,7 @@ impl ProxyHttp for DwaarProxy {
 
                     // Cache config (ISSUE-073) — only for GET requests on matching paths
                     if let Some(ref cache_cfg) = block.cache {
-                        let path = ctx.effective_path.as_deref()
-                            .unwrap_or(&request_path);
+                        let path = ctx.effective_path.as_deref().unwrap_or(&request_path);
                         if cache_cfg.path_matches(path)
                             && !ctx.is_websocket
                             && ctx.plugin_ctx.method == "GET"

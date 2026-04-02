@@ -13,9 +13,8 @@
 use crate::model::{
     BasicAuthDirective, BindDirective, CacheDirective, CopyResponseHeadersDirective, Directive,
     DwaarConfig, EncodeDirective, ErrorDirective, FileServerDirective, ForwardAuthDirective,
-    FsDirective,
-    HandleErrorsDirective, HeaderDirective, InterceptDirective, IpFilterDirective, LbPolicy,
-    LogAppendDirective, LogDirective, LogFormat, LogOutput, MapDirective, MapPattern,
+    FsDirective, HandleErrorsDirective, HeaderDirective, InterceptDirective, IpFilterDirective,
+    LbPolicy, LogAppendDirective, LogDirective, LogFormat, LogOutput, MapDirective, MapPattern,
     MatcherCondition, MatcherDef, MethodDirective, RateLimitDirective, RecognizedDirective,
     RedirDirective, RequestBodyDirective, RequestHeaderDirective, RespondDirective,
     ResponseBodyLimitDirective, ReverseProxyDirective, RewriteDirective, RootDirective,

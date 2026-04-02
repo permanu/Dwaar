@@ -715,7 +715,9 @@ fn compile_ip_filter(
     }))
 }
 
-fn compile_cache(directives: &[Directive]) -> Option<std::sync::Arc<dwaar_core::cache::CacheConfig>> {
+fn compile_cache(
+    directives: &[Directive],
+) -> Option<std::sync::Arc<dwaar_core::cache::CacheConfig>> {
     let cache_dir = directives.iter().find_map(|d| match d {
         Directive::Cache(c) => Some(c),
         _ => None,

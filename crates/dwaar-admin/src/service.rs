@@ -218,7 +218,10 @@ impl AdminService {
                 ),
             },
             ("PURGE", _) if path.starts_with("/cache/") => {
-                let key_path = path.strip_prefix("/cache/").unwrap_or("").trim_end_matches('/');
+                let key_path = path
+                    .strip_prefix("/cache/")
+                    .unwrap_or("")
+                    .trim_end_matches('/');
                 if key_path.is_empty() {
                     return json_response(
                         400,

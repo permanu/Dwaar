@@ -249,7 +249,11 @@ mod tests {
         // 200 should be cacheable
         assert!(defaults.fresh_sec(StatusCode::OK).is_some());
         // 500 should not be cached by default
-        assert!(defaults.fresh_sec(StatusCode::INTERNAL_SERVER_ERROR).is_none());
+        assert!(
+            defaults
+                .fresh_sec(StatusCode::INTERNAL_SERVER_ERROR)
+                .is_none()
+        );
     }
 
     // -- init_cache_backend -------------------------------------------------
