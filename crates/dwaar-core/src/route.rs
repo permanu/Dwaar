@@ -376,6 +376,9 @@ pub struct HandlerBlock {
     pub request_body_max_size: Option<u64>,
     /// Max response body size in bytes (ISSUE-070). `None` = use default (100 MB).
     pub response_body_max_size: Option<u64>,
+    /// HTTP response cache config (ISSUE-073). Compiled from `cache {}` directive.
+    /// `None` = caching disabled for this handler block.
+    pub cache: Option<std::sync::Arc<crate::cache::CacheConfig>>,
 }
 
 // ── Compiled Map (ISSUE-056) ──────────────────────────────────────
@@ -517,6 +520,7 @@ impl Route {
                 ip_filter: None,
                 request_body_max_size: None,
                 response_body_max_size: None,
+                cache: None,
             }],
             var_defaults: VarSlots::default(),
         }
