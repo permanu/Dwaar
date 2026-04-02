@@ -1031,11 +1031,8 @@ fn warn_pending_runtime(address: &str, directives: &[Directive]) {
                 directive = "acme_server",
                 "directive parsed but not yet implemented by Dwaar, ignoring"
             ),
-            Directive::Metrics(_) => warn!(
-                address = %address,
-                directive = "metrics",
-                "directive parsed but not yet implemented by Dwaar, ignoring"
-            ),
+            // Metrics directive recognized — ISSUE-072 handles collection
+            // via PrometheusMetrics registry, not per-route config.
             Directive::Tracing(_) => warn!(
                 address = %address,
                 directive = "tracing",
