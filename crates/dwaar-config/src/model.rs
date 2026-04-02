@@ -336,11 +336,41 @@ pub struct PhpFastcgiDirective {
     pub upstream: UpstreamAddr,
 }
 
+/// Load balancing strategy for multi-upstream `reverse_proxy` blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LbPolicy {
+    /// Distribute requests evenly in turn across backends.
+    RoundRobin,
+    /// Send each request to the backend with the fewest active connections.
+    LeastConn,
+    /// Pick a backend at random.
+    Random,
+    /// Hash the client IP to pick a backend — same client always hits same backend.
+    IpHash,
+}
+
 /// `reverse_proxy` — route requests to one or more upstream backends.
+///
+/// Supports both inline form (`reverse_proxy host:port`) and block form with
+/// load balancing, health checks, and per-upstream TLS settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReverseProxyDirective {
     /// One or more upstream addresses. Multiple means load-balanced.
     pub upstreams: Vec<UpstreamAddr>,
+    /// Load balancing policy. `None` defaults to `RoundRobin`.
+    pub lb_policy: Option<LbPolicy>,
+    /// HTTP path to poll on each backend for health checks (e.g. `/health`).
+    pub health_uri: Option<String>,
+    /// Seconds between health check polls.
+    pub health_interval: Option<u64>,
+    /// How long (seconds) to keep a backend marked unhealthy after a failure.
+    pub fail_duration: Option<u64>,
+    /// Maximum concurrent connections per backend (None = unlimited).
+    pub max_conns: Option<u32>,
+    /// Connect to upstream over TLS (e.g. backend is HTTPS).
+    pub transport_tls: bool,
+    /// SNI hostname to use for upstream TLS connections.
+    pub tls_server_name: Option<String>,
 }
 
 /// An upstream address — either a socket address or a host:port string
@@ -775,6 +805,13 @@ mod tests {
                     upstreams: vec![UpstreamAddr::SocketAddr(
                         "127.0.0.1:3000".parse().expect("valid"),
                     )],
+                    lb_policy: None,
+                    health_uri: None,
+                    health_interval: None,
+                    fail_duration: None,
+                    max_conns: None,
+                    transport_tls: false,
+                    tls_server_name: None,
                 }),
                 Directive::Tls(TlsDirective::Auto),
             ],

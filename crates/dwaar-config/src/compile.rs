@@ -13,20 +13,23 @@
 use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use compact_str::CompactString;
 use dwaar_core::route::{
-    BlockKind, CompiledMap, CompiledMapEntry, CompiledMapPattern, Handler, HandlerBlock,
-    PathMatcher, RewriteRule, Route, RouteTable, is_valid_domain,
+    BlockKind, CompiledCopyResponseHeaders, CompiledIntercept, CompiledMap, CompiledMapEntry,
+    CompiledMapPattern, Handler, HandlerBlock, PathMatcher, RewriteRule, Route, RouteTable,
+    is_valid_domain,
 };
 use dwaar_core::template::{CompiledTemplate, VarRegistry, VarSlots};
+use dwaar_core::upstream::{BackendConfig, LbPolicy as CoreLbPolicy, UpstreamPool};
 use tracing::warn;
 
 use crate::model::{
-    Directive, DwaarConfig, FileServerDirective, MapDirective, MapPattern, PhpFastcgiDirective,
-    RespondDirective, ReverseProxyDirective, RootDirective, TlsDirective, UpstreamAddr,
-    UriOperation,
+    BindDirective, Directive, DwaarConfig, FileServerDirective, HeaderDirective, LbPolicy,
+    MapDirective, MapPattern, PhpFastcgiDirective, RespondDirective, ReverseProxyDirective,
+    RootDirective, TlsDirective, UpstreamAddr, UriOperation,
 };
 use dwaar_plugins::basic_auth::BasicAuthConfig;
 use dwaar_plugins::forward_auth::ForwardAuthConfig;
@@ -80,13 +83,14 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
         let basic_auth = compile_basic_auth(&site.directives);
         let forward_auth = compile_forward_auth(&site.directives);
 
+        // Compile response-phase directives shared across all flat-site handler types.
+        let intercepts = compile_intercepts(&site.directives);
+        let copy_response_headers = compile_copy_response_headers(&site.directives);
+
         // Try reverse_proxy first (most common)
         if let Some(rp) = find_reverse_proxy(&site.directives) {
-            let Some(addr) = resolve_upstream(&rp.upstreams) else {
-                warn!(
-                    address = %site.address,
-                    "could not resolve any upstream address, skipping"
-                );
+            let handler_result = compile_reverse_proxy_handler(rp, &site.address);
+            let Some(proxy_handler) = handler_result else {
                 continue;
             };
             let handler = HandlerBlock {
@@ -100,7 +104,9 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
                 maps: compile_maps(&site.directives, &var_registry),
                 log_append_fields: compile_log_append(&site.directives, &var_registry),
                 log_name: find_log_name(&site.directives),
-                handler: Handler::ReverseProxy { upstream: addr },
+                handler: proxy_handler,
+                intercepts: intercepts.clone(),
+                copy_response_headers: copy_response_headers.clone(),
             };
             routes.push(Route::with_handlers(
                 &site.address,
@@ -128,6 +134,8 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
                     status: resp.status,
                     body: Bytes::from(resp.body.clone()),
                 },
+                intercepts: intercepts.clone(),
+                copy_response_headers: copy_response_headers.clone(),
             };
             routes.push(Route::with_handlers(
                 &site.address,
@@ -162,6 +170,8 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
                     root: root_path,
                     browse: fs_directive.browse,
                 },
+                intercepts: intercepts.clone(),
+                copy_response_headers: copy_response_headers.clone(),
             };
             routes.push(Route::with_handlers(
                 &site.address,
@@ -195,6 +205,8 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
                     upstream: addr,
                     root: root_path,
                 },
+                intercepts,
+                copy_response_headers,
             };
             routes.push(Route::with_handlers(
                 &site.address,
@@ -272,6 +284,114 @@ pub fn compile_acme_domains(config: &DwaarConfig) -> Vec<String> {
         })
         .map(|site| site.address.to_lowercase())
         .collect()
+}
+
+/// The fallback HTTP listen address when no `bind` directive is present.
+const DEFAULT_HTTP_BIND: &str = "0.0.0.0:6188";
+
+/// The fallback port appended when a `bind` address has no port.
+const DEFAULT_BIND_PORT: u16 = 6188;
+
+/// A compiled listener address extracted from a `bind` directive.
+///
+/// Distinguishes between TCP sockets (most common) and Unix domain sockets
+/// (`unix//tmp/dwaar.sock`). UDS is useful for same-host reverse proxy
+/// chaining without the TCP stack overhead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindAddress {
+    /// A TCP `ip:port` address (e.g. `"0.0.0.0:8443"`, `"127.0.0.1:80"`).
+    Tcp(String),
+    /// A Unix domain socket path (e.g. `/tmp/dwaar.sock`).
+    Unix(std::path::PathBuf),
+}
+
+/// Extract listener addresses from a parsed config.
+///
+/// Gathers `bind` directives across all site blocks. Multiple sites with `bind`
+/// produce a union of all their addresses (deduplication preserves insertion
+/// order). The function always returns at least the default TCP address so the
+/// caller never has to special-case an empty result.
+///
+/// Parsing rules for address strings:
+/// - `unix/path` or `unix//path` → [`BindAddress::Unix`]
+/// - `:port`                     → `BindAddress::Tcp("0.0.0.0:port")`
+/// - `ip` (bare IP, no port)     → `BindAddress::Tcp("ip:6188")`
+/// - `ip:port`                   → `BindAddress::Tcp("ip:port")`
+pub fn extract_bind_addresses(config: &DwaarConfig) -> Vec<BindAddress> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut addrs: Vec<BindAddress> = Vec::new();
+
+    for site in &config.sites {
+        if let Some(bind) = find_bind(&site.directives) {
+            for raw in &bind.addresses {
+                let addr = parse_bind_address(raw);
+                // Deduplicate by canonical string key so that two sites with
+                // the same bind don't register the same port twice.
+                let key = match &addr {
+                    BindAddress::Tcp(s) => s.clone(),
+                    BindAddress::Unix(p) => p.to_string_lossy().into_owned(),
+                };
+                if seen.insert(key) {
+                    addrs.push(addr);
+                }
+            }
+        }
+    }
+
+    // Fall back to the built-in default when no site specifies bind.
+    if addrs.is_empty() {
+        addrs.push(BindAddress::Tcp(DEFAULT_HTTP_BIND.to_owned()));
+    }
+
+    addrs
+}
+
+/// Parse a single bind address token into a [`BindAddress`].
+fn parse_bind_address(raw: &str) -> BindAddress {
+    // Unix domain socket — Caddy supports both `unix/path` and `unix//abs/path`.
+    // Stripping `unix/` gives either `path` (relative) or `/abs/path` (absolute
+    // when the original had a double-slash like `unix//tmp/sock`).
+    if let Some(after_unix) = raw.strip_prefix("unix/") {
+        return BindAddress::Unix(std::path::PathBuf::from(after_unix));
+    }
+
+    // `:port` shorthand — listen on all interfaces on the given port.
+    if let Some(port_str) = raw.strip_prefix(':') {
+        return BindAddress::Tcp(format!("0.0.0.0:{port_str}"));
+    }
+
+    // Bracketed IPv6 (with or without port) passes through unchanged:
+    // `[::1]:8080` or `[::1]` (port-less bracketed form is unusual but valid).
+    if raw.starts_with('[') {
+        // If no port bracket present, append the default port.
+        if raw.ends_with(']') {
+            return BindAddress::Tcp(format!("{raw}:{DEFAULT_BIND_PORT}"));
+        }
+        return BindAddress::Tcp(raw.to_owned());
+    }
+
+    // If there is exactly one colon it is a plain `ip:port` — pass through.
+    // More than one colon without brackets is a bare IPv6 address; append port.
+    let colon_count = raw.chars().filter(|&c| c == ':').count();
+    match colon_count.cmp(&1) {
+        std::cmp::Ordering::Equal => BindAddress::Tcp(raw.to_owned()),
+        std::cmp::Ordering::Greater => {
+            // Bare IPv6 like `::1` or `fe80::1` — wrap and append default port.
+            BindAddress::Tcp(format!("[{raw}]:{DEFAULT_BIND_PORT}"))
+        }
+        std::cmp::Ordering::Less => {
+            // Bare IPv4 address or hostname — append default port.
+            BindAddress::Tcp(format!("{raw}:{DEFAULT_BIND_PORT}"))
+        }
+    }
+}
+
+/// Find the first `bind` directive in a site's directive list.
+fn find_bind(directives: &[Directive]) -> Option<&BindDirective> {
+    directives.iter().find_map(|d| match d {
+        Directive::Bind(b) => Some(b),
+        _ => None,
+    })
 }
 
 /// Returns true if a site's directives include a TLS config that
@@ -355,8 +475,7 @@ fn compile_single_block(
 
     // Find the handler directive inside the block
     let handler = if let Some(rp) = find_reverse_proxy(inner_directives) {
-        let addr = resolve_upstream(&rp.upstreams)?;
-        Handler::ReverseProxy { upstream: addr }
+        compile_reverse_proxy_handler(rp, "handle block")?
     } else if let Some(resp) = find_respond(inner_directives) {
         Handler::StaticResponse {
             status: resp.status,
@@ -394,6 +513,8 @@ fn compile_single_block(
         log_append_fields: compile_log_append(inner_directives, registry),
         log_name: find_log_name(inner_directives),
         handler,
+        intercepts: compile_intercepts(inner_directives),
+        copy_response_headers: compile_copy_response_headers(inner_directives),
     })
 }
 
@@ -546,6 +667,99 @@ fn resolve_upstream(upstreams: &[UpstreamAddr]) -> Option<SocketAddr> {
         }
     }
     None
+}
+
+/// Resolve all upstreams in the list, logging and skipping unresolvable entries.
+fn resolve_all_upstreams(upstreams: &[UpstreamAddr]) -> Vec<SocketAddr> {
+    upstreams
+        .iter()
+        .filter_map(|u| match u {
+            UpstreamAddr::SocketAddr(addr) => Some(*addr),
+            UpstreamAddr::HostPort(hp) => {
+                if let Some(addr) = hp.to_socket_addrs().ok().and_then(|mut i| i.next()) {
+                    Some(addr)
+                } else {
+                    warn!(upstream = %hp, "DNS resolution failed for upstream, skipping");
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+/// Map a config `LbPolicy` to the runtime `CoreLbPolicy`.
+fn map_lb_policy(policy: Option<LbPolicy>) -> CoreLbPolicy {
+    match policy {
+        None | Some(LbPolicy::RoundRobin) => CoreLbPolicy::RoundRobin,
+        Some(LbPolicy::LeastConn) => CoreLbPolicy::LeastConn,
+        Some(LbPolicy::Random) => CoreLbPolicy::Random,
+        Some(LbPolicy::IpHash) => CoreLbPolicy::IpHash,
+    }
+}
+
+/// Decide whether `rp` needs a pool (multi-upstream or has block-form options).
+///
+/// Single upstream + no block-form fields → `Handler::ReverseProxy` (zero overhead).
+/// Anything else → `Handler::ReverseProxyPool`.
+fn compile_reverse_proxy_handler(rp: &ReverseProxyDirective, location: &str) -> Option<Handler> {
+    let is_block_form = rp.lb_policy.is_some()
+        || rp.health_uri.is_some()
+        || rp.health_interval.is_some()
+        || rp.fail_duration.is_some()
+        || rp.max_conns.is_some()
+        || rp.transport_tls
+        || rp.tls_server_name.is_some();
+
+    if rp.upstreams.len() <= 1 && !is_block_form {
+        // Common single-upstream case — zero overhead path.
+        let addr = resolve_upstream(&rp.upstreams)?;
+        return Some(Handler::ReverseProxy { upstream: addr });
+    }
+
+    // Multi-upstream or block-form options — build a pool.
+    let addrs = resolve_all_upstreams(&rp.upstreams);
+    if addrs.is_empty() {
+        warn!(location, "reverse_proxy: no resolvable upstreams, skipping");
+        return None;
+    }
+
+    let policy = map_lb_policy(rp.lb_policy);
+    let tls = rp.transport_tls;
+    let sni = rp.tls_server_name.clone().unwrap_or_default();
+
+    let backends = addrs
+        .into_iter()
+        .map(|addr| BackendConfig {
+            addr,
+            max_conns: rp.max_conns,
+            tls,
+            tls_server_name: sni.clone(),
+        })
+        .collect();
+
+    let pool = UpstreamPool::new(backends, policy, rp.health_uri.clone(), rp.health_interval);
+
+    Some(Handler::ReverseProxyPool {
+        pool: Arc::new(pool),
+    })
+}
+
+/// Collect all `UpstreamPool`s from a compiled route table for health checking.
+///
+/// Called once at startup to gather pools that need background health probes.
+pub fn collect_pools(table: &dwaar_core::route::RouteTable) -> Vec<Arc<UpstreamPool>> {
+    let mut pools = Vec::new();
+    for route in table.all_routes() {
+        for block in &route.handlers {
+            if let Handler::ReverseProxyPool { pool } = &block.handler {
+                // Only pools with a health URI need the background checker.
+                if pool.has_health_check() {
+                    pools.push(pool.clone());
+                }
+            }
+        }
+    }
+    pools
 }
 
 // ── Variable compilation (ISSUE-055) ─────────────────────────
@@ -745,11 +959,6 @@ fn warn_pending_runtime(address: &str, directives: &[Directive]) {
                 directive = "acme_server",
                 "directive parsed but not yet implemented by Dwaar, ignoring"
             ),
-            Directive::Intercept(_) => warn!(
-                address = %address,
-                directive = "intercept",
-                "directive parsed but not yet implemented by Dwaar, ignoring"
-            ),
             Directive::Metrics(_) => warn!(
                 address = %address,
                 directive = "metrics",
@@ -758,16 +967,6 @@ fn warn_pending_runtime(address: &str, directives: &[Directive]) {
             Directive::Tracing(_) => warn!(
                 address = %address,
                 directive = "tracing",
-                "directive parsed but not yet implemented by Dwaar, ignoring"
-            ),
-            Directive::CopyResponse(_) => warn!(
-                address = %address,
-                directive = "copy_response",
-                "directive parsed but not yet implemented by Dwaar, ignoring"
-            ),
-            Directive::CopyResponseHeaders(_) => warn!(
-                address = %address,
-                directive = "copy_response_headers",
                 "directive parsed but not yet implemented by Dwaar, ignoring"
             ),
             Directive::Fs(_) => warn!(
@@ -810,6 +1009,83 @@ fn compile_template(input: &str, registry: &VarRegistry) -> CompiledTemplate {
     }
 }
 
+// ── Intercept / CopyResponseHeaders compilation (ISSUE-067) ─────────────────
+
+/// Compile `intercept` directives into `CompiledIntercept` rules.
+///
+/// Each `intercept` may carry a nested `respond` for status/body override and
+/// `header` directives for header injection. First-match-wins semantics are
+/// enforced at runtime in `response_filter()`.
+fn compile_intercepts(directives: &[Directive]) -> Vec<CompiledIntercept> {
+    directives
+        .iter()
+        .filter_map(|d| {
+            let Directive::Intercept(i) = d else {
+                return None;
+            };
+
+            // Extract the first nested `respond` for status + body override.
+            let (replace_status, replace_body) = i
+                .directives
+                .iter()
+                .find_map(|inner| match inner {
+                    Directive::Respond(r) => {
+                        Some((Some(r.status), Some(Bytes::from(r.body.clone()))))
+                    }
+                    _ => None,
+                })
+                .unwrap_or((None, None));
+
+            // Extract nested `header Name Value` directives for response header injection.
+            let set_headers = i
+                .directives
+                .iter()
+                .filter_map(|inner| match inner {
+                    Directive::Header(HeaderDirective::Set { name, value }) => Some((
+                        CompactString::from(name.as_str()),
+                        CompactString::from(value.as_str()),
+                    )),
+                    _ => None,
+                })
+                .collect();
+
+            Some(CompiledIntercept {
+                statuses: i.statuses.clone(),
+                replace_status,
+                replace_body,
+                set_headers,
+            })
+        })
+        .collect()
+}
+
+/// Compile a `copy_response_headers` directive into a `CompiledCopyResponseHeaders`.
+///
+/// Headers prefixed with `-` are excludes; the rest are includes.
+/// Returns `None` when the directive is absent.
+fn compile_copy_response_headers(directives: &[Directive]) -> Option<CompiledCopyResponseHeaders> {
+    let crh = directives.iter().find_map(|d| match d {
+        Directive::CopyResponseHeaders(crh) => Some(crh),
+        _ => None,
+    })?;
+
+    let mut include = Vec::new();
+    let mut exclude = Vec::new();
+    for header in &crh.headers {
+        if let Some(name) = header.strip_prefix('-') {
+            exclude.push(CompactString::from(name));
+        } else {
+            include.push(CompactString::from(header.as_str()));
+        }
+    }
+
+    Some(CompiledCopyResponseHeaders {
+        statuses: vec![],
+        include,
+        exclude,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -818,6 +1094,42 @@ mod tests {
     fn rp(addr: &str) -> Directive {
         Directive::ReverseProxy(ReverseProxyDirective {
             upstreams: vec![UpstreamAddr::SocketAddr(addr.parse().expect("valid addr"))],
+            lb_policy: None,
+            health_uri: None,
+            health_interval: None,
+            fail_duration: None,
+            max_conns: None,
+            transport_tls: false,
+            tls_server_name: None,
+        })
+    }
+
+    fn rp_multi(addrs: &[&str]) -> Directive {
+        Directive::ReverseProxy(ReverseProxyDirective {
+            upstreams: addrs
+                .iter()
+                .map(|a| UpstreamAddr::SocketAddr(a.parse().expect("valid addr")))
+                .collect(),
+            lb_policy: Some(LbPolicy::RoundRobin),
+            health_uri: None,
+            health_interval: None,
+            fail_duration: None,
+            max_conns: None,
+            transport_tls: false,
+            tls_server_name: None,
+        })
+    }
+
+    fn rp_with_health(addr: &str, health_uri: &str) -> Directive {
+        Directive::ReverseProxy(ReverseProxyDirective {
+            upstreams: vec![UpstreamAddr::SocketAddr(addr.parse().expect("valid addr"))],
+            lb_policy: None,
+            health_uri: Some(health_uri.to_string()),
+            health_interval: Some(5),
+            fail_duration: None,
+            max_conns: None,
+            transport_tls: false,
+            tls_server_name: None,
         })
     }
 
@@ -895,6 +1207,13 @@ mod tests {
                 matchers: vec![],
                 directives: vec![Directive::ReverseProxy(ReverseProxyDirective {
                     upstreams: vec![UpstreamAddr::HostPort("localhost:8080".to_string())],
+                    lb_policy: None,
+                    health_uri: None,
+                    health_interval: None,
+                    fail_duration: None,
+                    max_conns: None,
+                    transport_tls: false,
+                    tls_server_name: None,
                 })],
             }],
         };
@@ -1418,5 +1737,340 @@ mod tests {
         // Should compile without panic — the unknown var produces a warning
         let table = compile_routes(&config);
         assert_eq!(table.len(), 1);
+    }
+
+    // ── bind directive extraction (ISSUE-066) ────────────────────────────────
+
+    fn bind(addrs: &[&str]) -> Directive {
+        Directive::Bind(BindDirective {
+            addresses: addrs.iter().map(std::string::ToString::to_string).collect(),
+        })
+    }
+
+    fn site_with_bind(host: &str, addrs: &[&str]) -> SiteBlock {
+        SiteBlock {
+            address: host.to_string(),
+            matchers: vec![],
+            directives: vec![bind(addrs)],
+        }
+    }
+
+    #[test]
+    fn bind_port_shorthand_expands_to_all_interfaces() {
+        let config = DwaarConfig {
+            global_options: None,
+            sites: vec![site_with_bind("example.com", &[":8443"])],
+        };
+        let addrs = extract_bind_addresses(&config);
+        assert_eq!(addrs, vec![BindAddress::Tcp("0.0.0.0:8443".to_string())]);
+    }
+
+    #[test]
+    fn bind_bare_ip_appends_default_port() {
+        let config = DwaarConfig {
+            global_options: None,
+            sites: vec![site_with_bind("example.com", &["127.0.0.1"])],
+        };
+        let addrs = extract_bind_addresses(&config);
+        assert_eq!(addrs, vec![BindAddress::Tcp("127.0.0.1:6188".to_string())]);
+    }
+
+    #[test]
+    fn bind_ip_port_passes_through() {
+        let config = DwaarConfig {
+            global_options: None,
+            sites: vec![site_with_bind("example.com", &["10.0.0.1:9090"])],
+        };
+        let addrs = extract_bind_addresses(&config);
+        assert_eq!(addrs, vec![BindAddress::Tcp("10.0.0.1:9090".to_string())]);
+    }
+
+    #[test]
+    fn bind_unix_socket_absolute_path() {
+        let config = DwaarConfig {
+            global_options: None,
+            // `unix//tmp/dwaar.sock` → strip `unix/` → `/tmp/dwaar.sock`
+            sites: vec![site_with_bind("example.com", &["unix//tmp/dwaar.sock"])],
+        };
+        let addrs = extract_bind_addresses(&config);
+        assert_eq!(
+            addrs,
+            vec![BindAddress::Unix(std::path::PathBuf::from(
+                "/tmp/dwaar.sock"
+            ))]
+        );
+    }
+
+    #[test]
+    fn bind_unix_socket_relative_path() {
+        let config = DwaarConfig {
+            global_options: None,
+            sites: vec![site_with_bind("example.com", &["unix/run/dwaar.sock"])],
+        };
+        let addrs = extract_bind_addresses(&config);
+        assert_eq!(
+            addrs,
+            vec![BindAddress::Unix(std::path::PathBuf::from(
+                "run/dwaar.sock"
+            ))]
+        );
+    }
+
+    #[test]
+    fn bind_no_directive_returns_default() {
+        let config = DwaarConfig {
+            global_options: None,
+            sites: vec![SiteBlock {
+                address: "example.com".to_string(),
+                matchers: vec![],
+                directives: vec![rp("127.0.0.1:8080")],
+            }],
+        };
+        let addrs = extract_bind_addresses(&config);
+        assert_eq!(addrs, vec![BindAddress::Tcp("0.0.0.0:6188".to_string())]);
+    }
+
+    #[test]
+    fn bind_multiple_addresses_on_one_site() {
+        let config = DwaarConfig {
+            global_options: None,
+            sites: vec![site_with_bind(
+                "example.com",
+                &["0.0.0.0:80", "0.0.0.0:8080"],
+            )],
+        };
+        let addrs = extract_bind_addresses(&config);
+        assert_eq!(addrs.len(), 2);
+        assert!(addrs.contains(&BindAddress::Tcp("0.0.0.0:80".to_string())));
+        assert!(addrs.contains(&BindAddress::Tcp("0.0.0.0:8080".to_string())));
+    }
+
+    #[test]
+    fn bind_deduplicates_across_sites() {
+        // Two different sites with the same bind address should register only once.
+        let config = DwaarConfig {
+            global_options: None,
+            sites: vec![
+                site_with_bind("a.example.com", &["0.0.0.0:80"]),
+                site_with_bind("b.example.com", &["0.0.0.0:80"]),
+            ],
+        };
+        let addrs = extract_bind_addresses(&config);
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(addrs[0], BindAddress::Tcp("0.0.0.0:80".to_string()));
+    }
+
+    // ── reverse_proxy compilation (ISSUE-065) ────────────────────────────────
+
+    fn make_site(address: &str, directive: Directive) -> SiteBlock {
+        SiteBlock {
+            address: address.to_string(),
+            matchers: vec![],
+            directives: vec![directive],
+        }
+    }
+
+    #[test]
+    fn single_upstream_no_block_options_compiles_to_reverse_proxy() {
+        let config = DwaarConfig {
+            global_options: None,
+            sites: vec![make_site("example.com", rp("127.0.0.1:8080"))],
+        };
+        let table = compile_routes(&config);
+        let route = table.resolve("example.com").expect("should resolve");
+        let block = route.handlers.first().expect("has handler block");
+        assert!(
+            matches!(&block.handler, Handler::ReverseProxy { upstream }
+                    if *upstream == "127.0.0.1:8080".parse::<SocketAddr>().expect("valid test addr")),
+            "single upstream without block options must compile to ReverseProxy"
+        );
+    }
+
+    #[test]
+    fn multi_upstream_compiles_to_reverse_proxy_pool() {
+        let config = DwaarConfig {
+            global_options: None,
+            sites: vec![make_site(
+                "example.com",
+                rp_multi(&["127.0.0.1:8080", "127.0.0.1:8081"]),
+            )],
+        };
+        let table = compile_routes(&config);
+        let route = table.resolve("example.com").expect("should resolve");
+        let block = route.handlers.first().expect("has handler block");
+        assert!(
+            matches!(&block.handler, Handler::ReverseProxyPool { pool } if pool.len() == 2),
+            "multi-upstream must compile to ReverseProxyPool"
+        );
+    }
+
+    #[test]
+    fn health_uri_triggers_pool_creation() {
+        let config = DwaarConfig {
+            global_options: None,
+            sites: vec![make_site(
+                "example.com",
+                rp_with_health("127.0.0.1:8080", "/health"),
+            )],
+        };
+        let table = compile_routes(&config);
+        let route = table.resolve("example.com").expect("should resolve");
+        let block = route.handlers.first().expect("has handler block");
+        assert!(
+            matches!(&block.handler, Handler::ReverseProxyPool { .. }),
+            "health_uri must trigger pool creation even for single upstream"
+        );
+    }
+
+    #[test]
+    fn collect_pools_finds_health_pools() {
+        let config = DwaarConfig {
+            global_options: None,
+            sites: vec![
+                make_site("a.com", rp_with_health("127.0.0.1:8080", "/health")),
+                make_site("b.com", rp("127.0.0.1:9090")),
+            ],
+        };
+        let table = compile_routes(&config);
+        let pools = collect_pools(&table);
+        assert_eq!(
+            pools.len(),
+            1,
+            "only the pool with health_uri should be collected"
+        );
+    }
+
+    // ── Intercept compilation (ISSUE-067) ────────────────────────
+
+    #[test]
+    fn compile_intercept_with_respond_override() {
+        let config = DwaarConfig {
+            global_options: None,
+            sites: vec![SiteBlock {
+                address: "example.com".to_string(),
+                matchers: vec![],
+                directives: vec![
+                    rp("127.0.0.1:8080"),
+                    Directive::Intercept(InterceptDirective {
+                        statuses: vec![404],
+                        directives: vec![Directive::Respond(RespondDirective {
+                            status: 200,
+                            body: "not found page".to_string(),
+                        })],
+                    }),
+                ],
+            }],
+        };
+        let table = compile_routes(&config);
+        let route = table.resolve("example.com").expect("should resolve");
+        let block = route.handlers.first().expect("has handler block");
+        assert_eq!(block.intercepts.len(), 1);
+        let rule = &block.intercepts[0];
+        assert_eq!(rule.statuses, vec![404]);
+        assert_eq!(rule.replace_status, Some(200));
+        assert_eq!(
+            rule.replace_body.as_deref(),
+            Some(b"not found page".as_ref())
+        );
+    }
+
+    #[test]
+    fn compile_intercept_empty_statuses_is_catch_all() {
+        let config = DwaarConfig {
+            global_options: None,
+            sites: vec![SiteBlock {
+                address: "example.com".to_string(),
+                matchers: vec![],
+                directives: vec![
+                    rp("127.0.0.1:8080"),
+                    Directive::Intercept(InterceptDirective {
+                        statuses: vec![],
+                        directives: vec![Directive::Respond(RespondDirective {
+                            status: 503,
+                            body: String::new(),
+                        })],
+                    }),
+                ],
+            }],
+        };
+        let table = compile_routes(&config);
+        let route = table.resolve("example.com").expect("should resolve");
+        let block = route.handlers.first().expect("has handler block");
+        assert_eq!(block.intercepts.len(), 1);
+        // Empty statuses = catch all non-2xx at runtime
+        assert!(block.intercepts[0].statuses.is_empty());
+    }
+
+    #[test]
+    fn compile_copy_response_headers_include() {
+        let config = DwaarConfig {
+            global_options: None,
+            sites: vec![SiteBlock {
+                address: "example.com".to_string(),
+                matchers: vec![],
+                directives: vec![
+                    rp("127.0.0.1:8080"),
+                    Directive::CopyResponseHeaders(CopyResponseHeadersDirective {
+                        headers: vec!["X-Custom".to_string(), "X-Other".to_string()],
+                    }),
+                ],
+            }],
+        };
+        let table = compile_routes(&config);
+        let route = table.resolve("example.com").expect("should resolve");
+        let block = route.handlers.first().expect("has handler block");
+        let crh = block
+            .copy_response_headers
+            .as_ref()
+            .expect("has copy_response_headers");
+        assert_eq!(crh.include.len(), 2);
+        assert!(crh.exclude.is_empty());
+        assert!(crh.include.iter().any(|h| h.as_str() == "X-Custom"));
+    }
+
+    #[test]
+    fn compile_copy_response_headers_exclude() {
+        let config = DwaarConfig {
+            global_options: None,
+            sites: vec![SiteBlock {
+                address: "example.com".to_string(),
+                matchers: vec![],
+                directives: vec![
+                    rp("127.0.0.1:8080"),
+                    Directive::CopyResponseHeaders(CopyResponseHeadersDirective {
+                        headers: vec!["-Set-Cookie".to_string(), "-Server".to_string()],
+                    }),
+                ],
+            }],
+        };
+        let table = compile_routes(&config);
+        let route = table.resolve("example.com").expect("should resolve");
+        let block = route.handlers.first().expect("has handler block");
+        let crh = block
+            .copy_response_headers
+            .as_ref()
+            .expect("has copy_response_headers");
+        assert!(crh.include.is_empty());
+        assert_eq!(crh.exclude.len(), 2);
+        // Strip prefix is applied during compile — stored without the '-'
+        assert!(crh.exclude.iter().any(|h| h.as_str() == "Set-Cookie"));
+        assert!(crh.exclude.iter().any(|h| h.as_str() == "Server"));
+    }
+
+    #[test]
+    fn compile_no_copy_response_headers_gives_none() {
+        let config = DwaarConfig {
+            global_options: None,
+            sites: vec![SiteBlock {
+                address: "example.com".to_string(),
+                matchers: vec![],
+                directives: vec![rp("127.0.0.1:8080")],
+            }],
+        };
+        let table = compile_routes(&config);
+        let route = table.resolve("example.com").expect("should resolve");
+        let block = route.handlers.first().expect("has handler block");
+        assert!(block.copy_response_headers.is_none());
+        assert!(block.intercepts.is_empty());
     }
 }
