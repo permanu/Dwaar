@@ -21,7 +21,7 @@ use pingora_cache::cache_control::CacheControl;
 use pingora_cache::filters::resp_cacheable;
 use pingora_cache::{CacheKey, NoCacheReason, RespCacheable};
 use pingora_core::Result;
-use pingora_core::upstreams::peer::HttpPeer;
+use pingora_core::upstreams::peer::{HttpPeer, ALPN};
 use pingora_error::{Error, ErrorType::HTTPStatus};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
@@ -428,6 +428,16 @@ impl ProxyHttp for DwaarProxy {
                         .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
                 });
 
+        // gRPC detection (ISSUE-074): Content-Type starting with "application/grpc"
+        // covers application/grpc, application/grpc+proto, application/grpc-web
+        if !ctx.is_websocket {
+            ctx.is_grpc = header
+                .headers
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|ct| ct.starts_with("application/grpc"));
+        }
+
         debug!(
             request_id = %ctx.request_id(),
             client_ip = ?ctx.plugin_ctx.client_ip,
@@ -435,6 +445,7 @@ impl ProxyHttp for DwaarProxy {
             method = %ctx.plugin_ctx.method,
             path = %ctx.plugin_ctx.path,
             is_websocket = ctx.is_websocket,
+            is_grpc = ctx.is_grpc,
             "request metadata extracted"
         );
 
@@ -525,6 +536,12 @@ impl ProxyHttp for DwaarProxy {
                     }
                     if let Some(limit) = block.response_body_max_size {
                         ctx.response_body_max_size = limit;
+                    }
+
+                    // gRPC streaming RPCs have unbounded body — disable limits
+                    if ctx.is_grpc {
+                        ctx.request_body_max_size = u64::MAX;
+                        ctx.response_body_max_size = u64::MAX;
                     }
 
                     // Cache config (ISSUE-073) — only for GET requests on matching paths
@@ -1044,6 +1061,11 @@ impl ProxyHttp for DwaarProxy {
         // Set slightly below common upstream keepalive_timeout (nginx default: 75s)
         // to avoid sending requests on connections the upstream is about to close.
         peer.options.idle_timeout = Some(std::time::Duration::from_secs(60));
+
+        // gRPC requires HTTP/2 end-to-end — force h2 ALPN negotiation
+        if ctx.is_grpc {
+            peer.options.alpn = ALPN::H2;
+        }
 
         Ok(Box::new(peer))
     }
