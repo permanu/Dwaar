@@ -51,11 +51,13 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use ahash::RandomState;
 use compact_str::CompactString;
 
 use crate::template::{CompiledTemplate, TemplateContext, VarSlots};
+use crate::upstream::UpstreamPool;
 use regex::Regex;
 
 /// Validate that a string is a legal hostname or wildcard pattern.
@@ -81,13 +83,20 @@ pub fn is_valid_domain(s: &str) -> bool {
 /// What produces the response — the terminal action for a matched request.
 ///
 /// Each handler block resolves to exactly one `Handler`. The proxy dispatches
-/// based on this: `ReverseProxy` continues to `upstream_peer()`, while future
-/// variants like `StaticResponse` and `FileServer` short-circuit in
-/// `request_filter()`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// based on this: `ReverseProxy`/`ReverseProxyPool` continue to `upstream_peer()`,
+/// while `StaticResponse` and `FileServer` short-circuit in `request_filter()`.
+#[derive(Debug, Clone)]
 pub enum Handler {
-    /// Forward the request to an upstream backend.
+    /// Forward the request to a single upstream backend (zero-overhead common case).
+    ///
+    /// Used when the config has exactly one upstream and no block-form options.
+    /// Keeps `upstream_peer()` allocation-free: no `Arc` load, no pool scan.
     ReverseProxy { upstream: SocketAddr },
+    /// Forward the request through a load-balancing pool of backends.
+    ///
+    /// Created when the config has multiple upstreams or block-form options
+    /// (`lb_policy`, `health_uri`, `max_conns`, transport tls).
+    ReverseProxyPool { pool: Arc<UpstreamPool> },
     /// Return a fixed response — no upstream contacted. Used by `respond` directive.
     StaticResponse { status: u16, body: bytes::Bytes },
     /// Serve static files from disk. Used by `file_server` directive.
@@ -101,6 +110,55 @@ pub enum Handler {
         root: std::path::PathBuf,
     },
 }
+
+impl PartialEq for Handler {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Handler::ReverseProxy { upstream: a }, Handler::ReverseProxy { upstream: b }) => {
+                a == b
+            }
+            // Pool equality is by pointer identity — two pools are equal only if
+            // they point to the same allocation. This is intentional: pool contents
+            // are mutable (health state), so value equality would be misleading.
+            (Handler::ReverseProxyPool { pool: a }, Handler::ReverseProxyPool { pool: b }) => {
+                Arc::ptr_eq(a, b)
+            }
+            (
+                Handler::StaticResponse {
+                    status: s1,
+                    body: b1,
+                },
+                Handler::StaticResponse {
+                    status: s2,
+                    body: b2,
+                },
+            ) => s1 == s2 && b1 == b2,
+            (
+                Handler::FileServer {
+                    root: r1,
+                    browse: b1,
+                },
+                Handler::FileServer {
+                    root: r2,
+                    browse: b2,
+                },
+            ) => r1 == r2 && b1 == b2,
+            (
+                Handler::FastCgi {
+                    upstream: u1,
+                    root: r1,
+                },
+                Handler::FastCgi {
+                    upstream: u2,
+                    root: r2,
+                },
+            ) => u1 == u2 && r1 == r2,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Handler {}
 
 /// How a handler block was declared, controlling execution semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,6 +220,61 @@ impl PathMatcher {
                 }
             }
         }
+    }
+}
+
+// ── Intercept / CopyResponseHeaders (ISSUE-067) ─────────────────────────────
+
+/// Compiled `intercept` rule — matches upstream status codes and overrides the response.
+///
+/// Applied in `response_filter()` before the response reaches the client.
+/// First matching rule wins; remaining rules are skipped.
+#[derive(Debug, Clone)]
+pub struct CompiledIntercept {
+    /// Status codes to match. Empty = match all non-2xx responses.
+    pub statuses: Vec<u16>,
+    /// Replacement status code (from nested `respond` directive).
+    pub replace_status: Option<u16>,
+    /// Replacement body bytes (from nested `respond` directive).
+    pub replace_body: Option<bytes::Bytes>,
+    /// Response headers to set when this intercept fires.
+    pub set_headers: Vec<(CompactString, CompactString)>,
+}
+
+impl CompiledIntercept {
+    /// Whether this rule matches the given upstream status code.
+    ///
+    /// Empty `statuses` acts as a catch-all for non-2xx responses — matching
+    /// Caddy's semantics where a bare `intercept` block targets error responses.
+    #[inline]
+    pub fn matches_status(&self, status: u16) -> bool {
+        if self.statuses.is_empty() {
+            !(200..300).contains(&status)
+        } else {
+            self.statuses.contains(&status)
+        }
+    }
+}
+
+/// Compiled `copy_response_headers` rule — controls which upstream headers reach the client.
+///
+/// Applied in `response_filter()`. `include` and `exclude` are mutually exclusive in
+/// practice — the Caddyfile style uses one or the other per block.
+#[derive(Debug, Clone)]
+pub struct CompiledCopyResponseHeaders {
+    /// Status codes to apply this rule to. Empty = apply to all responses.
+    pub statuses: Vec<u16>,
+    /// Header names to keep (strip everything else). Empty = keep all headers.
+    pub include: Vec<CompactString>,
+    /// Header names to strip from the upstream response.
+    pub exclude: Vec<CompactString>,
+}
+
+impl CompiledCopyResponseHeaders {
+    /// Whether this rule applies to the given status code.
+    #[inline]
+    pub fn matches_status(&self, status: u16) -> bool {
+        self.statuses.is_empty() || self.statuses.contains(&status)
     }
 }
 
@@ -252,6 +365,11 @@ pub struct HandlerBlock {
     /// Named logger from `log_name` directive.
     pub log_name: Option<String>,
     pub handler: Handler,
+    /// Intercept rules — match upstream status codes and replace the response.
+    /// Applied in `response_filter()` before the response reaches the client.
+    pub intercepts: Vec<CompiledIntercept>,
+    /// Selective header copy config — controls which upstream headers reach the client.
+    pub copy_response_headers: Option<CompiledCopyResponseHeaders>,
 }
 
 // ── Compiled Map (ISSUE-056) ──────────────────────────────────────
@@ -388,6 +506,8 @@ impl Route {
                 log_append_fields: vec![],
                 log_name: None,
                 handler: Handler::ReverseProxy { upstream },
+                intercepts: vec![],
+                copy_response_headers: None,
             }],
             var_defaults: VarSlots::default(),
         }
@@ -407,6 +527,9 @@ impl Route {
             Handler::ReverseProxy { upstream } | Handler::FastCgi { upstream, .. } => {
                 Some(*upstream)
             }
+            // For pool handlers, cache the first backend address so the common
+            // path (no pool selection needed) stays zero-cost.
+            Handler::ReverseProxyPool { pool } => pool.first_addr(),
             Handler::StaticResponse { .. } | Handler::FileServer { .. } => None,
         });
         let first = handlers.first();
@@ -896,5 +1019,111 @@ mod tests {
             replace: CompactString::from("/v2"),
         };
         assert!(r.apply("/api/v3/users", None).is_none());
+    }
+
+    // ── CompiledIntercept (ISSUE-067) ────────────────────────
+
+    #[test]
+    fn intercept_matches_explicit_status() {
+        let rule = CompiledIntercept {
+            statuses: vec![404, 503],
+            replace_status: None,
+            replace_body: None,
+            set_headers: vec![],
+        };
+        assert!(rule.matches_status(404));
+        assert!(rule.matches_status(503));
+        assert!(!rule.matches_status(200));
+        assert!(!rule.matches_status(500));
+    }
+
+    #[test]
+    fn intercept_empty_statuses_catches_non_2xx() {
+        let rule = CompiledIntercept {
+            statuses: vec![],
+            replace_status: None,
+            replace_body: None,
+            set_headers: vec![],
+        };
+        // Non-2xx: should match
+        assert!(rule.matches_status(404));
+        assert!(rule.matches_status(500));
+        assert!(rule.matches_status(301));
+        // 2xx: should NOT match (empty statuses means "catch errors, not success")
+        assert!(!rule.matches_status(200));
+        assert!(!rule.matches_status(201));
+        assert!(!rule.matches_status(299));
+    }
+
+    #[test]
+    fn intercept_carries_replace_status_and_body() {
+        let rule = CompiledIntercept {
+            statuses: vec![404],
+            replace_status: Some(200),
+            replace_body: Some(bytes::Bytes::from("custom body")),
+            set_headers: vec![],
+        };
+        assert_eq!(rule.replace_status, Some(200));
+        assert_eq!(rule.replace_body.as_deref(), Some(b"custom body".as_ref()));
+    }
+
+    #[test]
+    fn intercept_set_headers_are_collected() {
+        let rule = CompiledIntercept {
+            statuses: vec![404],
+            replace_status: None,
+            replace_body: None,
+            set_headers: vec![
+                (
+                    CompactString::from("X-Custom"),
+                    CompactString::from("value"),
+                ),
+                (
+                    CompactString::from("Cache-Control"),
+                    CompactString::from("no-store"),
+                ),
+            ],
+        };
+        assert_eq!(rule.set_headers.len(), 2);
+        assert_eq!(rule.set_headers[0].0.as_str(), "X-Custom");
+    }
+
+    // ── CompiledCopyResponseHeaders (ISSUE-067) ──────────────
+
+    #[test]
+    fn copy_response_headers_empty_statuses_matches_all() {
+        let crh = CompiledCopyResponseHeaders {
+            statuses: vec![],
+            include: vec![],
+            exclude: vec![],
+        };
+        assert!(crh.matches_status(200));
+        assert!(crh.matches_status(404));
+        assert!(crh.matches_status(500));
+    }
+
+    #[test]
+    fn copy_response_headers_explicit_statuses() {
+        let crh = CompiledCopyResponseHeaders {
+            statuses: vec![200, 201],
+            include: vec![],
+            exclude: vec![],
+        };
+        assert!(crh.matches_status(200));
+        assert!(crh.matches_status(201));
+        assert!(!crh.matches_status(404));
+    }
+
+    #[test]
+    fn copy_response_headers_include_and_exclude_populated() {
+        let crh = CompiledCopyResponseHeaders {
+            statuses: vec![],
+            include: vec![CompactString::from("X-Custom")],
+            exclude: vec![CompactString::from("Set-Cookie")],
+        };
+        assert_eq!(crh.include.len(), 1);
+        assert_eq!(crh.exclude.len(), 1);
+        assert_eq!(crh.include[0].as_str(), "X-Custom");
+        assert_eq!(crh.exclude[0].as_str(), "Set-Cookie");
     }
 }

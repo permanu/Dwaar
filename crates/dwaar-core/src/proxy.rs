@@ -39,6 +39,18 @@ use crate::context::RequestContext;
 use crate::route::RouteTable;
 use crate::template::TemplateContext;
 
+/// Headers that `copy_response_headers include` must never strip.
+///
+/// HTTP's hop-by-hop headers and framing headers (Content-Length,
+/// Transfer-Encoding, etc.) are required for correct message framing.
+/// Stripping them based on user config would break the HTTP layer.
+fn is_essential_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "content-type" | "content-length" | "transfer-encoding" | "connection" | "date" | "server"
+    )
+}
+
 /// Sanitize a request path for use in a redirect Location header.
 /// Prevents CRLF injection and protocol-relative open redirects.
 fn sanitize_redirect_path(path: &str) -> String {
@@ -334,6 +346,17 @@ impl ProxyHttp for DwaarProxy {
                         crate::route::Handler::ReverseProxy { upstream } => {
                             ctx.route_upstream = Some(*upstream);
                         }
+                        crate::route::Handler::ReverseProxyPool { pool } => {
+                            // Resolve the upstream now using the LB policy.
+                            // Cache the selected address in `route_upstream` so
+                            // `upstream_peer()` doesn't need to call `select()` again
+                            // for single-backend pools.
+                            let selected = pool.select(ctx.plugin_ctx.client_ip);
+                            ctx.route_upstream = selected.as_ref().map(|s| s.addr);
+                            // Always cache the pool so `upstream_peer()` can use the
+                            // correct TLS settings even in the single-backend case.
+                            ctx.upstream_pool = Some(pool.clone());
+                        }
                         crate::route::Handler::FastCgi { upstream, root } => {
                             ctx.route_upstream = Some(*upstream);
                             ctx.fastcgi_root = Some(root.clone());
@@ -346,6 +369,16 @@ impl ProxyHttp for DwaarProxy {
                     }
                     if let Some(ref fwd) = block.forward_auth {
                         ctx.forward_auth = Some(fwd.clone());
+                    }
+
+                    // Cache response-phase intercept rules (ISSUE-067).
+                    // Cloning a small Vec of compiled structs here is cheaper than
+                    // re-loading the ArcSwap in response_filter().
+                    if !block.intercepts.is_empty() {
+                        ctx.intercepts.clone_from(&block.intercepts);
+                    }
+                    if let Some(ref crh) = block.copy_response_headers {
+                        ctx.copy_response_headers = Some(crh.clone());
                     }
 
                     // Evaluate map directives to populate VarSlots (ISSUE-056)
@@ -768,13 +801,37 @@ impl ProxyHttp for DwaarProxy {
             upstream
         };
 
+        // Determine TLS settings from the pool (if this is a pool-backed route).
+        // Single-backend routes that were compiled as plain `ReverseProxy` use
+        // no TLS by default — transport TLS must be configured explicitly.
+        let (use_tls, sni) = if let Some(ref pool) = ctx.upstream_pool {
+            // Re-select from the pool to get TLS metadata for the chosen backend.
+            // The address was already selected in request_filter(), so this scan
+            // is a O(n) match on the small backends Vec — not on the hot path.
+            let tls = pool
+                .backends
+                .iter()
+                .find(|b| b.addr == upstream)
+                .is_some_and(|b| b.tls);
+            let sni = pool
+                .backends
+                .iter()
+                .find(|b| b.addr == upstream)
+                .map(|b| b.tls_server_name.clone())
+                .unwrap_or_default();
+            (tls, sni)
+        } else {
+            (false, String::new())
+        };
+
         debug!(
             upstream = %upstream,
+            tls = use_tls,
             request_id = %ctx.request_id(),
             "route resolved"
         );
 
-        let mut peer = HttpPeer::new(upstream, false, String::new());
+        let mut peer = HttpPeer::new(upstream, use_tls, sni);
         peer.options.connection_timeout = Some(std::time::Duration::from_secs(10));
         peer.options.read_timeout = Some(std::time::Duration::from_secs(30));
         peer.options.write_timeout = Some(std::time::Duration::from_secs(30));
@@ -920,6 +977,77 @@ impl ProxyHttp for DwaarProxy {
             .insert_header("X-Request-Id", ctx.request_id())
             .expect("UUID is valid header value");
 
+        // --- Intercept check (ISSUE-067) ---
+        // Run before analytics setup so we operate on the original upstream status.
+        // First matching rule wins; empty statuses catches all non-2xx responses.
+        let response_status = upstream_response.status.as_u16();
+        if !ctx.intercepts.is_empty() {
+            // Extract the matching action before touching ctx again — the borrow
+            // on ctx.intercepts must end before we can assign ctx.intercept_body.
+            let matched = ctx.intercepts.iter().find_map(|intercept| {
+                if intercept.matches_status(response_status) {
+                    Some((
+                        intercept.replace_status,
+                        intercept
+                            .set_headers
+                            .iter()
+                            .map(|(n, v)| (n.as_str().to_owned(), v.as_str().to_owned()))
+                            .collect::<Vec<_>>(),
+                        intercept.replace_body.clone(),
+                    ))
+                } else {
+                    None
+                }
+            });
+            if let Some((new_status, set_headers, replace_body)) = matched {
+                if let Some(code) = new_status {
+                    upstream_response
+                        .set_status(
+                            pingora_http::StatusCode::from_u16(code)
+                                .expect("intercept status must be a valid HTTP code"),
+                        )
+                        .expect("failed to set intercept status");
+                }
+                for (name, value) in set_headers {
+                    upstream_response
+                        .insert_header(name, value)
+                        .expect("intercept header name/value must be valid");
+                }
+                if let Some(body) = replace_body {
+                    // Signal body replacement to response_body_filter().
+                    // Remove Content-Length so the new body length is not validated.
+                    ctx.intercept_body = Some(body);
+                    upstream_response.remove_header("Content-Length");
+                }
+            }
+        }
+
+        // --- Copy response headers filter (ISSUE-067) ---
+        // Strip excluded headers and optionally keep only an allowed subset.
+        if let Some(ref crh) = ctx.copy_response_headers
+            && crh.matches_status(response_status)
+        {
+            for name in &crh.exclude {
+                upstream_response.remove_header(name.as_str());
+            }
+            if !crh.include.is_empty() {
+                // Collect names to strip; cannot mutate while iterating the map.
+                let to_remove: Vec<String> = upstream_response
+                    .headers
+                    .keys()
+                    .filter(|k| {
+                        let name = k.as_str();
+                        !crh.include.iter().any(|i| i.eq_ignore_ascii_case(name))
+                            && !is_essential_header(name)
+                    })
+                    .map(|k| k.as_str().to_owned())
+                    .collect();
+                for name in &to_remove {
+                    upstream_response.remove_header(name.as_str());
+                }
+            }
+        }
+
         // --- Analytics injection setup (ISSUE-026a + 026c) ---
         // Must run BEFORE the plugin chain so that the compression plugin
         // sees Content-Encoding already stripped (for HTML injection path).
@@ -972,6 +1100,14 @@ impl ProxyHttp for DwaarProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // --- Intercept body override (ISSUE-067) ---
+        // When an intercept rule has a replacement body, substitute it here
+        // and skip all other body processing (analytics injection, compression).
+        if let Some(replacement) = ctx.intercept_body.take() {
+            *body = Some(replacement);
+            return Ok(None);
+        }
+
         // Decompress first (if compressed response) — core analytics
         if let Some(ref mut decompressor) = ctx.decompressor {
             decompressor.decompress(body, end_of_stream);

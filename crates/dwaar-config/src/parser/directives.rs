@@ -12,7 +12,7 @@
 use crate::error::{ParseError, ParseErrorKind};
 use crate::model::{
     Directive, FileServerDirective, ForwardAuthDirective, HandleDirective, HandleErrorsDirective,
-    HandlePathDirective, PhpFastcgiDirective, RedirDirective, RespondDirective,
+    HandlePathDirective, LbPolicy, PhpFastcgiDirective, RedirDirective, RespondDirective,
     ReverseProxyDirective, RewriteDirective, RootDirective, RouteDirective, TryFilesDirective,
     UriDirective, UriOperation,
 };
@@ -22,25 +22,48 @@ use super::helpers::{
     expect_word_or_quoted, is_directive_name, parse_optional_pattern, parse_upstream_addr,
 };
 
-/// `reverse_proxy localhost:8080` or `reverse_proxy 10.0.0.1:3000 10.0.0.2:3000`
+/// `reverse_proxy localhost:8080` or block form:
+/// ```text
+/// reverse_proxy {
+///     to backend1:8080 backend2:8080
+///     lb_policy round_robin
+///     health_uri /health
+///     health_interval 10
+///     fail_duration 30
+///     max_conns 100
+///     transport {
+///         tls_server_name backend.internal
+///     }
+/// }
+/// ```
 pub(super) fn parse_reverse_proxy(
     t: &mut Tokenizer<'_>,
 ) -> Result<ReverseProxyDirective, ParseError> {
+    // Check whether this is inline form or block form.
+    // Inline: address words follow immediately.
+    // Block: a `{` follows immediately (possibly after whitespace).
+    if let TokenKind::OpenBrace = t.peek().kind {
+        parse_reverse_proxy_block(t)
+    } else {
+        parse_reverse_proxy_inline(t)
+    }
+}
+
+/// Parse inline form: `reverse_proxy host1:port [host2:port ...]`
+fn parse_reverse_proxy_inline(t: &mut Tokenizer<'_>) -> Result<ReverseProxyDirective, ParseError> {
     let mut upstreams = Vec::new();
 
-    // Consume upstream addresses until we hit a brace, another directive, or EOF
     loop {
         let tok = t.peek();
         match &tok.kind {
             TokenKind::Word(w) => {
-                // If this word is a known directive name, stop — it's the next directive
+                // Stop at the next directive name — it belongs to the enclosing block
                 if is_directive_name(w) {
                     break;
                 }
                 t.next_token();
                 upstreams.push(parse_upstream_addr(w));
             }
-            // Stop at braces, EOF, or quoted strings (not valid upstream addrs)
             _ => break,
         }
     }
@@ -57,7 +80,222 @@ pub(super) fn parse_reverse_proxy(
         });
     }
 
-    Ok(ReverseProxyDirective { upstreams })
+    Ok(ReverseProxyDirective {
+        upstreams,
+        lb_policy: None,
+        health_uri: None,
+        health_interval: None,
+        fail_duration: None,
+        max_conns: None,
+        transport_tls: false,
+        tls_server_name: None,
+    })
+}
+
+/// Returns true if `w` is a known subdirective keyword inside a `reverse_proxy { }` block.
+///
+/// Needed so the `to` argument parser stops at the next subdirective instead of
+/// treating keywords like `lb_policy` as upstream addresses.
+fn is_reverse_proxy_subdirective(w: &str) -> bool {
+    matches!(
+        w,
+        "to" | "lb_policy"
+            | "health_uri"
+            | "health_interval"
+            | "fail_duration"
+            | "max_conns"
+            | "transport"
+    )
+}
+
+/// Parse block form: `reverse_proxy { to ...; lb_policy ...; ... }`
+#[allow(clippy::too_many_lines)]
+fn parse_reverse_proxy_block(t: &mut Tokenizer<'_>) -> Result<ReverseProxyDirective, ParseError> {
+    // Consume the opening `{`
+    t.next_token();
+
+    let mut upstreams = Vec::new();
+    let mut lb_policy: Option<LbPolicy> = None;
+    let mut health_uri: Option<String> = None;
+    let mut health_interval: Option<u64> = None;
+    let mut fail_duration: Option<u64> = None;
+    let mut max_conns: Option<u32> = None;
+    let mut transport_tls = false;
+    let mut tls_server_name: Option<String> = None;
+
+    loop {
+        let tok = t.next_token();
+        match tok.kind {
+            TokenKind::CloseBrace | TokenKind::Eof => break,
+            TokenKind::Word(ref sub) => match sub.as_str() {
+                "to" => {
+                    // Consume upstream addresses until the next subdirective keyword or brace.
+                    // We can't use is_directive_name() here because block subdirectives like
+                    // `lb_policy` are not top-level directive names.
+                    loop {
+                        match t.peek().kind {
+                            TokenKind::Word(ref w) if !is_reverse_proxy_subdirective(w) => {
+                                let addr_tok = t.next_token();
+                                if let TokenKind::Word(w) = addr_tok.kind {
+                                    upstreams.push(parse_upstream_addr(&w));
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+                "lb_policy" => {
+                    let policy_tok = t.next_token();
+                    let (line, col) = (policy_tok.line, policy_tok.col);
+                    if let TokenKind::Word(p) = policy_tok.kind {
+                        lb_policy = Some(match p.as_str() {
+                            "round_robin" => LbPolicy::RoundRobin,
+                            "least_conn" => LbPolicy::LeastConn,
+                            "random" => LbPolicy::Random,
+                            "ip_hash" => LbPolicy::IpHash,
+                            other => {
+                                return Err(ParseError {
+                                    line,
+                                    col,
+                                    kind: ParseErrorKind::InvalidValue {
+                                        directive: "reverse_proxy".to_string(),
+                                        message: format!(
+                                            "unknown lb_policy '{other}'; \
+                                             expected round_robin, least_conn, random, ip_hash"
+                                        ),
+                                    },
+                                });
+                            }
+                        });
+                    }
+                }
+                "health_uri" => {
+                    let uri_tok = t.next_token();
+                    if let TokenKind::Word(u) | TokenKind::QuotedString(u) = uri_tok.kind {
+                        health_uri = Some(u);
+                    }
+                }
+                "health_interval" => {
+                    let val_tok = t.next_token();
+                    let (line, col) = (val_tok.line, val_tok.col);
+                    if let TokenKind::Word(v) = val_tok.kind {
+                        health_interval = Some(v.parse().map_err(|_| ParseError {
+                            line,
+                            col,
+                            kind: ParseErrorKind::InvalidValue {
+                                directive: "reverse_proxy".to_string(),
+                                message: format!(
+                                    "health_interval must be a positive integer, got '{v}'"
+                                ),
+                            },
+                        })?);
+                    }
+                }
+                "fail_duration" => {
+                    let val_tok = t.next_token();
+                    let (line, col) = (val_tok.line, val_tok.col);
+                    if let TokenKind::Word(v) = val_tok.kind {
+                        fail_duration = Some(v.parse().map_err(|_| ParseError {
+                            line,
+                            col,
+                            kind: ParseErrorKind::InvalidValue {
+                                directive: "reverse_proxy".to_string(),
+                                message: format!(
+                                    "fail_duration must be a positive integer, got '{v}'"
+                                ),
+                            },
+                        })?);
+                    }
+                }
+                "max_conns" => {
+                    let val_tok = t.next_token();
+                    let (line, col) = (val_tok.line, val_tok.col);
+                    if let TokenKind::Word(v) = val_tok.kind {
+                        max_conns = Some(v.parse().map_err(|_| ParseError {
+                            line,
+                            col,
+                            kind: ParseErrorKind::InvalidValue {
+                                directive: "reverse_proxy".to_string(),
+                                message: format!("max_conns must be a positive integer, got '{v}'"),
+                            },
+                        })?);
+                    }
+                }
+                "transport" => {
+                    // Expect an optional block `{ tls_server_name ... }`
+                    if let TokenKind::OpenBrace = t.peek().kind {
+                        t.next_token(); // consume `{`
+                        loop {
+                            let inner = t.next_token();
+                            match inner.kind {
+                                TokenKind::CloseBrace | TokenKind::Eof => break,
+                                TokenKind::Word(ref kw) if kw == "tls" => {
+                                    // `transport { tls }` — plain TLS flag
+                                    transport_tls = true;
+                                }
+                                TokenKind::Word(ref kw) if kw == "tls_server_name" => {
+                                    transport_tls = true;
+                                    let sni_tok = t.next_token();
+                                    if let TokenKind::Word(sni) | TokenKind::QuotedString(sni) =
+                                        sni_tok.kind
+                                    {
+                                        tls_server_name = Some(sni);
+                                    }
+                                }
+                                // Skip unknown transport sub-directives gracefully
+                                _ => {}
+                            }
+                        }
+                    } else {
+                        // `transport tls` on a single line — no block
+                        if let TokenKind::Word(ref kw) = t.peek().kind
+                            && kw == "tls"
+                        {
+                            t.next_token();
+                            transport_tls = true;
+                        }
+                    }
+                }
+                // Unknown sub-directive — skip tokens until the next known
+                // subdirective keyword or the closing brace. This keeps the parser
+                // forward-compatible with future `reverse_proxy` block options.
+                _ => loop {
+                    match t.peek().kind {
+                        TokenKind::CloseBrace | TokenKind::Eof => break,
+                        TokenKind::Word(ref w) if is_reverse_proxy_subdirective(w) => break,
+                        _ => {
+                            t.next_token();
+                        }
+                    }
+                },
+            },
+            _ => {}
+        }
+    }
+
+    if upstreams.is_empty() {
+        let (line, col) = t.position();
+        return Err(ParseError {
+            line,
+            col,
+            kind: ParseErrorKind::InvalidValue {
+                directive: "reverse_proxy".to_string(),
+                message: "block form requires at least one upstream via 'to' subdirective"
+                    .to_string(),
+            },
+        });
+    }
+
+    Ok(ReverseProxyDirective {
+        upstreams,
+        lb_policy,
+        health_uri,
+        health_interval,
+        fail_duration,
+        max_conns,
+        transport_tls,
+        tls_server_name,
+    })
 }
 
 /// `redir /old /new [code]`
@@ -248,15 +486,24 @@ pub(super) fn parse_respond(t: &mut Tokenizer<'_>) -> Result<RespondDirective, P
                 body: first,
             })
         }
-        // Single argument — is it a status code or body?
+        // Single argument, or `respond <status> "body"` form.
         _ => {
             if let Ok(code) = first.parse::<u16>()
                 && (100..=599).contains(&code)
             {
-                return Ok(RespondDirective {
-                    status: code,
-                    body: String::new(),
-                });
+                // Check if the next token is a quoted body string.
+                // Caddyfile allows: `respond 200 "custom body"`
+                let body = if let TokenKind::QuotedString(_) = &t.peek().kind {
+                    let body_tok = t.next_token();
+                    if let TokenKind::QuotedString(s) = body_tok.kind {
+                        s
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
+                return Ok(RespondDirective { status: code, body });
             }
             // Not a valid status — treat as body
             Ok(RespondDirective {

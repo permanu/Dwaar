@@ -20,3 +20,4 @@ pub mod file_server;
 pub mod proxy;
 pub mod route;
 pub mod template;
+pub mod upstream;
