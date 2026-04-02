@@ -134,6 +134,10 @@ pub struct RequestContext {
     /// `None` for single-upstream routes — they use `route_upstream` directly,
     /// avoiding all pool overhead on the common case.
     pub upstream_pool: Option<Arc<UpstreamPool>>,
+
+    /// WebSocket upgrade detected — preserves hop-by-hop headers and skips
+    /// analytics injection so Pingora can establish the bidirectional tunnel.
+    pub is_websocket: bool,
 }
 
 impl RequestContext {
@@ -165,6 +169,7 @@ impl RequestContext {
             intercept_body: None,
             copy_response_headers: None,
             upstream_pool: None,
+            is_websocket: false,
         }
     }
 
@@ -242,5 +247,6 @@ mod tests {
         assert!(ctx.plugin_ctx.bot_category.is_none());
         assert!(ctx.plugin_ctx.country.is_none());
         assert!(ctx.plugin_ctx.compressor.is_none());
+        assert!(!ctx.is_websocket);
     }
 }
