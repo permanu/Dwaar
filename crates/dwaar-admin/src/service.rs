@@ -13,6 +13,7 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use dwaar_analytics::aggregation::DomainMetrics;
+use dwaar_analytics::prometheus::PrometheusMetrics;
 use dwaar_core::route::RouteTable;
 use http::Response;
 use pingora_core::apps::http_app::ServeHttp;
@@ -36,6 +37,9 @@ pub struct AdminService {
     /// Notifier to trigger config reload. When signaled, the `ConfigWatcher`
     /// re-reads the Dwaarfile and updates the route table.
     reload_notify: Option<Arc<Notify>>,
+    /// Prometheus metrics registry. When set, `GET /metrics` serves the
+    /// Prometheus text exposition format.
+    prometheus: Option<Arc<PrometheusMetrics>>,
 }
 
 impl AdminService {
@@ -54,6 +58,7 @@ impl AdminService {
             start_time,
             auth: Auth::new(admin_token),
             reload_notify: None,
+            prometheus: None,
         }
     }
 
@@ -61,6 +66,13 @@ impl AdminService {
     #[must_use]
     pub fn with_reload_notify(mut self, notify: Arc<Notify>) -> Self {
         self.reload_notify = Some(notify);
+        self
+    }
+
+    /// Enable the Prometheus `/metrics` endpoint.
+    #[must_use]
+    pub fn with_prometheus(mut self, prom: Arc<PrometheusMetrics>) -> Self {
+        self.prometheus = Some(prom);
         self
     }
 }
@@ -164,6 +176,13 @@ impl ServeHttp for AdminService {
                     None => json_response(404, r#"{"error":"no analytics for domain"}"#),
                 }
             }
+            ("GET", "/metrics") => match &self.prometheus {
+                Some(prom) => prometheus_response(&prom.render()),
+                None => json_response(
+                    404,
+                    r#"{"error":"metrics not enabled — start with --no-metrics=false"}"#,
+                ),
+            },
             ("POST", "/reload") => match &self.reload_notify {
                 Some(notify) => {
                     notify.notify_one();
@@ -178,6 +197,15 @@ impl ServeHttp for AdminService {
             _ => json_response(405, r#"{"error":"method not allowed"}"#),
         }
     }
+}
+
+/// Build a Prometheus text exposition response.
+fn prometheus_response(body: &str) -> Response<Vec<u8>> {
+    Response::builder()
+        .status(200)
+        .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+        .body(body.as_bytes().to_vec())
+        .expect("valid response")
 }
 
 /// Build a JSON HTTP response.
