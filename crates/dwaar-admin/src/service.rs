@@ -40,6 +40,8 @@ pub struct AdminService {
     /// Prometheus metrics registry. When set, `GET /metrics` serves the
     /// Prometheus text exposition format.
     prometheus: Option<Arc<PrometheusMetrics>>,
+    /// Cache storage for PURGE endpoint (ISSUE-073). `None` = cache disabled.
+    cache_storage: Option<&'static pingora_cache::MemCache>,
 }
 
 impl AdminService {
@@ -59,6 +61,7 @@ impl AdminService {
             auth: Auth::new(admin_token),
             reload_notify: None,
             prometheus: None,
+            cache_storage: None,
         }
     }
 
@@ -73,6 +76,13 @@ impl AdminService {
     #[must_use]
     pub fn with_prometheus(mut self, prom: Arc<PrometheusMetrics>) -> Self {
         self.prometheus = Some(prom);
+        self
+    }
+
+    /// Attach cache storage for the `PURGE /cache/{host}/{path}` endpoint.
+    #[must_use]
+    pub fn with_cache_storage(mut self, storage: &'static pingora_cache::MemCache) -> Self {
+        self.cache_storage = Some(storage);
         self
     }
 }
@@ -124,7 +134,20 @@ impl ServeHttp for AdminService {
             return json_response(401, r#"{"error":"unauthorized"}"#);
         }
 
-        match (method.as_str(), path.as_str()) {
+        self.dispatch(session, &method, &path, source).await
+    }
+}
+
+impl AdminService {
+    /// Route the authenticated request to the appropriate handler.
+    async fn dispatch(
+        &self,
+        session: &mut ServerSession,
+        method: &str,
+        path: &str,
+        source: &str,
+    ) -> Response<Vec<u8>> {
+        match (method, path) {
             ("GET", "/routes") => match handlers::list_routes(&self.route_table) {
                 Ok(json) => json_response(200, &json),
                 Err(e) => json_response(500, &format!(r#"{{"error":"{e}"}}"#)),
@@ -194,6 +217,26 @@ impl ServeHttp for AdminService {
                     r#"{"error":"reload not supported — config watcher not active"}"#,
                 ),
             },
+            ("PURGE", _) if path.starts_with("/cache/") => {
+                let key_path = path.strip_prefix("/cache/").unwrap_or("").trim_end_matches('/');
+                if key_path.is_empty() {
+                    return json_response(
+                        400,
+                        r#"{"error":"missing cache key — use PURGE /cache/{host}/{path}"}"#,
+                    );
+                }
+                match &self.cache_storage {
+                    Some(storage) => {
+                        if handlers::purge_cache_key(*storage, key_path).await {
+                            info!(source, key = key_path, "cache entry purged");
+                            json_response(200, r#"{"purged":true}"#)
+                        } else {
+                            json_response(404, r#"{"purged":false,"reason":"not found"}"#)
+                        }
+                    }
+                    None => json_response(501, r#"{"error":"cache not enabled"}"#),
+                }
+            }
             _ => json_response(405, r#"{"error":"method not allowed"}"#),
         }
     }
