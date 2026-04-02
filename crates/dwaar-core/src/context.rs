@@ -154,6 +154,11 @@ pub struct RequestContext {
 
     /// Accumulated response body bytes received so far (ISSUE-070).
     pub response_body_sent: u64,
+
+    /// Domain key for Prometheus active connection tracking (ISSUE-072).
+    /// Set in `request_filter()` after host resolution, used in `logging()` to
+    /// decrement the gauge with the exact same key.
+    pub metrics_domain: Option<CompactString>,
 }
 
 impl RequestContext {
@@ -190,6 +195,7 @@ impl RequestContext {
             request_body_received: 0,
             response_body_max_size: 100 * 1024 * 1024, // 100 MB default
             response_body_sent: 0,
+            metrics_domain: None,
         }
     }
 
