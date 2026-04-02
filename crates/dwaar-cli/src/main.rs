@@ -370,6 +370,7 @@ fn run_server(
         geo_lookup,
         plugin_chain,
         prometheus.clone(),
+        None, // cache backend wired in ISSUE-073 Task 6
     );
 
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, proxy);
