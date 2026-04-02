@@ -419,6 +419,7 @@ fn parse_directive(t: &mut Tokenizer<'_>) -> Result<Directive, ParseError> {
         )?)),
         "log_name" => Ok(Directive::LogName(observe::parse_log_name(t)?)),
         "metrics" => Ok(Directive::Metrics(observe::parse_metrics(t))),
+        "cache" => Ok(Directive::Cache(transforms::parse_cache(t, &name_tok)?)),
         "tracing" => Ok(Directive::Tracing(observe::parse_tracing(t))),
         "map" => Ok(Directive::Map(observe::parse_map(t, &name_tok)?)),
         "invoke" => Ok(Directive::Invoke(observe::parse_invoke(t)?)),
