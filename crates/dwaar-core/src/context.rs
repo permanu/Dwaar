@@ -63,6 +63,7 @@ use crate::upstream::UpstreamPool;
 /// - `request_id`: inline `[u8; 36]` instead of `String` (avoids 1 heap alloc)
 /// - `plugin_ctx` fields are populated from request headers (unavoidable allocs)
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)] // Protocol flags (tls, websocket, grpc, cache) are independent booleans, not a state machine
 pub struct RequestContext {
     /// When this request started processing. Uses `Instant` (monotonic clock)
     /// because we need elapsed time, not wall-clock time.
@@ -139,6 +140,10 @@ pub struct RequestContext {
     /// analytics injection so Pingora can establish the bidirectional tunnel.
     pub is_websocket: bool,
 
+    /// gRPC request detected — forces HTTP/2 upstream, disables body limits,
+    /// skips analytics injection. gRPC has its own compression and framing.
+    pub is_grpc: bool,
+
     /// Max request body size in bytes (ISSUE-069). Enforced in `request_filter()`
     /// (Content-Length) and `request_body_filter()` (chunked streaming).
     /// Default: 10 MB. Set to `u64::MAX` for unlimited.
@@ -201,6 +206,7 @@ impl RequestContext {
             copy_response_headers: None,
             upstream_pool: None,
             is_websocket: false,
+            is_grpc: false,
             request_body_max_size: 10 * 1024 * 1024, // 10 MB default
             request_body_received: 0,
             response_body_max_size: 100 * 1024 * 1024, // 100 MB default
@@ -287,5 +293,6 @@ mod tests {
         assert!(ctx.plugin_ctx.country.is_none());
         assert!(ctx.plugin_ctx.compressor.is_none());
         assert!(!ctx.is_websocket);
+        assert!(!ctx.is_grpc);
     }
 }
