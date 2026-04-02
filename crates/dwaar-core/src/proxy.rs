@@ -296,12 +296,31 @@ impl ProxyHttp for DwaarProxy {
             .and_then(|v| v.to_str().ok())
             .map_or_else(CompactString::default, CompactString::from);
 
+        // --- WebSocket upgrade detection (ISSUE-068) ---
+        // RFC 6455 §4.1: valid handshake has `Upgrade: websocket` (case-insensitive)
+        // AND `Connection` header containing "upgrade". Dwaar doesn't validate the
+        // full handshake (Sec-WebSocket-Key, version) — upstream decides to accept or reject.
+        ctx.is_websocket = header
+            .headers
+            .get(http::header::UPGRADE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
+            && header
+                .headers
+                .get(http::header::CONNECTION)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| {
+                    v.split(',')
+                        .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+                });
+
         debug!(
             request_id = %ctx.request_id(),
             client_ip = ?ctx.plugin_ctx.client_ip,
             host = ?ctx.plugin_ctx.host,
             method = %ctx.plugin_ctx.method,
             path = %ctx.plugin_ctx.path,
+            is_websocket = ctx.is_websocket,
             "request metadata extracted"
         );
 
@@ -381,6 +400,14 @@ impl ProxyHttp for DwaarProxy {
                         ctx.copy_response_headers = Some(crh.clone());
                     }
 
+                    // Body size limits (ISSUE-069, ISSUE-070)
+                    if let Some(limit) = block.request_body_max_size {
+                        ctx.request_body_max_size = limit;
+                    }
+                    if let Some(limit) = block.response_body_max_size {
+                        ctx.response_body_max_size = limit;
+                    }
+
                     // Evaluate map directives to populate VarSlots (ISSUE-056)
                     if !block.maps.is_empty() || !route.var_defaults.is_empty() {
                         let mut slots = route.var_defaults.clone();
@@ -449,6 +476,32 @@ impl ProxyHttp for DwaarProxy {
                     }
                 }
             }
+        }
+
+        // --- Request body size check (ISSUE-069) ---
+        // Content-Length known: reject immediately without reading body.
+        // Chunked requests without Content-Length are tracked in request_body_filter().
+        if let Some(cl) = session
+            .req_header()
+            .headers
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            && cl > ctx.request_body_max_size
+        {
+            warn!(
+                request_id = %ctx.request_id(),
+                content_length = cl,
+                limit = ctx.request_body_max_size,
+                "request body exceeds limit — returning 413"
+            );
+            let mut resp = ResponseHeader::build(413, Some(2))?;
+            resp.insert_header("Content-Length", "0")
+                .map_err(|e| Error::explain(HTTPStatus(413), format!("bad header: {e}")))?;
+            resp.insert_header("Connection", "close")
+                .map_err(|e| Error::explain(HTTPStatus(413), format!("bad header: {e}")))?;
+            session.write_response_header(Box::new(resp), true).await?;
+            return Ok(true);
         }
 
         // --- Run plugin chain (bot detect, rate limit, under attack) ---
@@ -855,6 +908,34 @@ impl ProxyHttp for DwaarProxy {
         Ok(Box::new(peer))
     }
 
+    async fn request_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<Bytes>,
+        _end_of_stream: bool,
+        ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        // Track accumulated request body bytes for chunked requests (ISSUE-069).
+        // Content-Length requests are already rejected in request_filter(); this
+        // catches chunked transfer encoding where the total size isn't known upfront.
+        if let Some(chunk) = body.as_ref() {
+            ctx.request_body_received += chunk.len() as u64;
+            if ctx.request_body_received > ctx.request_body_max_size {
+                warn!(
+                    request_id = %ctx.request_id(),
+                    received = ctx.request_body_received,
+                    limit = ctx.request_body_max_size,
+                    "chunked request body exceeds limit — aborting"
+                );
+                return Err(Error::explain(HTTPStatus(413), "request body too large"));
+            }
+        }
+        Ok(())
+    }
+
     async fn upstream_request_filter(
         &self,
         session: &mut Session,
@@ -908,9 +989,14 @@ impl ProxyHttp for DwaarProxy {
             "Proxy-Authorization",
             "TE",
             "Trailer",
-            "Upgrade",
         ] {
             upstream_request.remove_header(*header_name);
+        }
+
+        // WebSocket upgrades need Upgrade + Connection preserved for the 101 handshake.
+        // Pingora handles the bidirectional tunnel after the upstream sends 101.
+        if !ctx.is_websocket {
+            upstream_request.remove_header("Upgrade");
         }
 
         // SECURITY: Strip Authorization header when Dwaar handled basic auth.
@@ -1048,11 +1134,36 @@ impl ProxyHttp for DwaarProxy {
             }
         }
 
+        // --- Response body size pre-check (ISSUE-070) ---
+        // If the upstream declares Content-Length, we can reject immediately
+        // instead of waiting for the body to stream through response_body_filter.
+        if let Some(cl) = upstream_response
+            .headers
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            && cl > ctx.response_body_max_size
+        {
+            warn!(
+                request_id = %ctx.request_id(),
+                content_length = cl,
+                limit = ctx.response_body_max_size,
+                "upstream response body exceeds limit — replacing with 502"
+            );
+            upstream_response
+                .set_status(pingora_http::StatusCode::from_u16(502).expect("502 is valid"))
+                .expect("failed to set 502 status");
+            upstream_response.remove_header("Content-Length");
+            ctx.intercept_body = Some(bytes::Bytes::from_static(b"upstream response too large"));
+        }
+
         // --- Analytics injection setup (ISSUE-026a + 026c) ---
         // Must run BEFORE the plugin chain so that the compression plugin
         // sees Content-Encoding already stripped (for HTML injection path).
+        // Skip for WebSocket upgrades — the 101 response body is a bidirectional
+        // stream, not HTML (ISSUE-068).
         let status = upstream_response.status.as_u16();
-        if (200..300).contains(&status) {
+        if !ctx.is_websocket && (200..300).contains(&status) {
             let is_html = upstream_response
                 .headers
                 .get(http::header::CONTENT_TYPE)
@@ -1100,6 +1211,25 @@ impl ProxyHttp for DwaarProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // --- Response body size check (ISSUE-070) ---
+        // Track accumulated response bytes. If the upstream sends more than the
+        // configured limit, abort the connection and return 502 to the client.
+        if let Some(chunk) = body.as_ref() {
+            ctx.response_body_sent += chunk.len() as u64;
+            if ctx.response_body_sent > ctx.response_body_max_size {
+                warn!(
+                    request_id = %ctx.request_id(),
+                    received = ctx.response_body_sent,
+                    limit = ctx.response_body_max_size,
+                    "response body exceeds limit — aborting upstream"
+                );
+                return Err(Error::explain(
+                    HTTPStatus(502),
+                    "upstream response body too large",
+                ));
+            }
+        }
+
         // --- Intercept body override (ISSUE-067) ---
         // When an intercept rule has a replacement body, substitute it here
         // and skip all other body processing (analytics injection, compression).

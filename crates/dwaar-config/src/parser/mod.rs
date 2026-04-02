@@ -403,6 +403,9 @@ fn parse_directive(t: &mut Tokenizer<'_>) -> Result<Directive, ParseError> {
         "request_body" => Ok(Directive::RequestBody(transforms::parse_request_body(
             t, &name_tok,
         )?)),
+        "response_body_limit" => Ok(Directive::ResponseBodyLimit(
+            transforms::parse_response_body_limit(t, &name_tok)?,
+        )),
         "bind" => Ok(Directive::Bind(transforms::parse_bind(t, &name_tok)?)),
         "vars" => Ok(Directive::Vars(transforms::parse_vars(t, &name_tok)?)),
 
