@@ -127,6 +127,7 @@ pub fn suggest_directive(input: &str) -> Option<&'static str> {
         "templates",
         "request_body",
         "response_body_limit",
+        "ip_filter",
         "request_header",
         "method",
         "try_files",

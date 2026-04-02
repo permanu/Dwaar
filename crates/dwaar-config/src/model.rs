@@ -193,6 +193,9 @@ pub enum Directive {
     /// `rate_limit 100/s`
     RateLimit(RateLimitDirective),
 
+    /// `ip_filter { allow 10.0.0.0/8; deny 203.0.113.0/24; default allow }`
+    IpFilter(IpFilterDirective),
+
     /// `respond "body" 404` / `respond 204` / `respond "ok"`
     Respond(RespondDirective),
 
@@ -432,6 +435,17 @@ pub struct EncodeDirective {
 pub struct RateLimitDirective {
     /// Maximum requests per second per IP for this route.
     pub requests_per_second: u32,
+}
+
+/// `ip_filter` — IP allowlist/blocklist per route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpFilterDirective {
+    /// CIDR ranges to allow (e.g., `["10.0.0.0/8", "192.168.1.0/24"]`).
+    pub allow: Vec<String>,
+    /// CIDR ranges to deny (e.g., `["203.0.113.0/24"]`).
+    pub deny: Vec<String>,
+    /// Default policy when no rule matches. `true` = allow, `false` = deny.
+    pub default_allow: bool,
 }
 
 // ── New directive types (Phase 3 + 4) ─────────────────────────────────────────

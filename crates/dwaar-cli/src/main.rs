@@ -333,6 +333,7 @@ fn run_server(
             Box::new(dwaar_plugins::under_attack::UnderAttackPlugin::new(
                 under_attack_secret,
             )),
+            Box::new(dwaar_plugins::ip_filter::IpFilterPlugin::new()),
             Box::new(dwaar_plugins::rate_limit::RateLimitPlugin::new()),
             Box::new(dwaar_plugins::compress::CompressionPlugin::new()),
             Box::new(dwaar_plugins::security_headers::SecurityHeadersPlugin::new()),

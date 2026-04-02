@@ -13,12 +13,12 @@
 use crate::model::{
     BasicAuthDirective, BindDirective, CopyResponseHeadersDirective, Directive, DwaarConfig,
     EncodeDirective, ErrorDirective, FileServerDirective, ForwardAuthDirective, FsDirective,
-    HandleErrorsDirective, HeaderDirective, InterceptDirective, LbPolicy, LogAppendDirective,
-    LogDirective, LogFormat, LogOutput, MapDirective, MapPattern, MatcherCondition, MatcherDef,
-    MethodDirective, RateLimitDirective, RecognizedDirective, RedirDirective, RequestBodyDirective,
-    RequestHeaderDirective, RespondDirective, ResponseBodyLimitDirective, ReverseProxyDirective,
-    RewriteDirective, RootDirective, TlsDirective, TryFilesDirective, UpstreamAddr, UriDirective,
-    UriOperation, VarsDirective,
+    HandleErrorsDirective, HeaderDirective, InterceptDirective, IpFilterDirective, LbPolicy,
+    LogAppendDirective, LogDirective, LogFormat, LogOutput, MapDirective, MapPattern,
+    MatcherCondition, MatcherDef, MethodDirective, RateLimitDirective, RecognizedDirective,
+    RedirDirective, RequestBodyDirective, RequestHeaderDirective, RespondDirective,
+    ResponseBodyLimitDirective, ReverseProxyDirective, RewriteDirective, RootDirective,
+    TlsDirective, TryFilesDirective, UpstreamAddr, UriDirective, UriOperation, VarsDirective,
 };
 
 /// Format a parsed config into canonical Dwaarfile text.
@@ -93,6 +93,7 @@ fn format_directive_at_depth(out: &mut String, directive: &Directive, depth: usi
         Directive::Abort => out.push_str("abort"),
         Directive::Method(m) => format_method(out, m),
         Directive::RequestBody(rb) => format_request_body(out, rb, depth),
+        Directive::IpFilter(ipf) => format_ip_filter(out, ipf, depth),
         Directive::ResponseBodyLimit(rbl) => format_response_body_limit(out, rbl),
         Directive::TryFiles(tf) => format_try_files(out, tf),
         Directive::HandleErrors(he) => format_handle_errors(out, he, depth),
@@ -624,6 +625,32 @@ fn format_request_body(out: &mut String, rb: &RequestBodyDirective, depth: usize
         out.push_str(&format_size(max_size));
         out.push('\n');
     }
+    out.push_str(&outer);
+    out.push('}');
+}
+
+fn format_ip_filter(out: &mut String, ipf: &IpFilterDirective, depth: usize) {
+    let inner = "    ".repeat(depth + 1);
+    let outer = "    ".repeat(depth);
+    out.push_str("ip_filter {\n");
+    if !ipf.allow.is_empty() {
+        out.push_str(&inner);
+        out.push_str("allow ");
+        out.push_str(&ipf.allow.join(" "));
+        out.push('\n');
+    }
+    if !ipf.deny.is_empty() {
+        out.push_str(&inner);
+        out.push_str("deny ");
+        out.push_str(&ipf.deny.join(" "));
+        out.push('\n');
+    }
+    out.push_str(&inner);
+    out.push_str(if ipf.default_allow {
+        "default allow\n"
+    } else {
+        "default deny\n"
+    });
     out.push_str(&outer);
     out.push('}');
 }
