@@ -138,6 +138,22 @@ pub struct RequestContext {
     /// WebSocket upgrade detected — preserves hop-by-hop headers and skips
     /// analytics injection so Pingora can establish the bidirectional tunnel.
     pub is_websocket: bool,
+
+    /// Max request body size in bytes (ISSUE-069). Enforced in `request_filter()`
+    /// (Content-Length) and `request_body_filter()` (chunked streaming).
+    /// Default: 10 MB. Set to `u64::MAX` for unlimited.
+    pub request_body_max_size: u64,
+
+    /// Accumulated request body bytes received so far (ISSUE-069).
+    /// Tracked in `request_body_filter()` for chunked requests.
+    pub request_body_received: u64,
+
+    /// Max response body size in bytes (ISSUE-070). Enforced in
+    /// `response_body_filter()`. Default: 100 MB. Set to `u64::MAX` for unlimited.
+    pub response_body_max_size: u64,
+
+    /// Accumulated response body bytes received so far (ISSUE-070).
+    pub response_body_sent: u64,
 }
 
 impl RequestContext {
@@ -170,6 +186,10 @@ impl RequestContext {
             copy_response_headers: None,
             upstream_pool: None,
             is_websocket: false,
+            request_body_max_size: 10 * 1024 * 1024, // 10 MB default
+            request_body_received: 0,
+            response_body_max_size: 100 * 1024 * 1024, // 100 MB default
+            response_body_sent: 0,
         }
     }
 

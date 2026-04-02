@@ -163,6 +163,7 @@ pub(super) fn is_directive_name(w: &str) -> bool {
             | "metrics"
             | "templates"
             | "request_body"
+            | "response_body_limit"
             | "request_header"
             | "method"
             | "try_files"

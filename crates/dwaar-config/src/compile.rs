@@ -79,6 +79,8 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
 
         // Flat site (no handle blocks) — extract single handler + site-level middleware
         let rate_limit_rps = find_rate_limit(&site.directives);
+        let request_body_max_size = find_request_body_max_size(&site.directives);
+        let response_body_max_size = find_response_body_limit(&site.directives);
         let rewrites = collect_rewrites(&site.directives, &var_registry);
         let basic_auth = compile_basic_auth(&site.directives);
         let forward_auth = compile_forward_auth(&site.directives);
@@ -107,6 +109,8 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
                 handler: proxy_handler,
                 intercepts: intercepts.clone(),
                 copy_response_headers: copy_response_headers.clone(),
+                request_body_max_size,
+                response_body_max_size,
             };
             routes.push(Route::with_handlers(
                 &site.address,
@@ -136,6 +140,8 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
                 },
                 intercepts: intercepts.clone(),
                 copy_response_headers: copy_response_headers.clone(),
+                request_body_max_size,
+                response_body_max_size,
             };
             routes.push(Route::with_handlers(
                 &site.address,
@@ -172,6 +178,8 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
                 },
                 intercepts: intercepts.clone(),
                 copy_response_headers: copy_response_headers.clone(),
+                request_body_max_size,
+                response_body_max_size,
             };
             routes.push(Route::with_handlers(
                 &site.address,
@@ -207,6 +215,8 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
                 },
                 intercepts,
                 copy_response_headers,
+                request_body_max_size,
+                response_body_max_size,
             };
             routes.push(Route::with_handlers(
                 &site.address,
@@ -469,6 +479,8 @@ fn compile_single_block(
     registry: &VarRegistry,
 ) -> Option<HandlerBlock> {
     let rate_limit_rps = find_rate_limit(inner_directives);
+    let request_body_max_size = find_request_body_max_size(inner_directives);
+    let response_body_max_size = find_response_body_limit(inner_directives);
     let rewrites = collect_rewrites(inner_directives, registry);
     let basic_auth = compile_basic_auth(inner_directives);
     let forward_auth = compile_forward_auth(inner_directives);
@@ -515,6 +527,8 @@ fn compile_single_block(
         handler,
         intercepts: compile_intercepts(inner_directives),
         copy_response_headers: compile_copy_response_headers(inner_directives),
+        request_body_max_size,
+        response_body_max_size,
     })
 }
 
@@ -646,6 +660,20 @@ fn find_respond(directives: &[Directive]) -> Option<&RespondDirective> {
 fn find_rate_limit(directives: &[Directive]) -> Option<u32> {
     directives.iter().find_map(|d| match d {
         Directive::RateLimit(rl) => Some(rl.requests_per_second),
+        _ => None,
+    })
+}
+
+fn find_request_body_max_size(directives: &[Directive]) -> Option<u64> {
+    directives.iter().find_map(|d| match d {
+        Directive::RequestBody(rb) => rb.max_size,
+        _ => None,
+    })
+}
+
+fn find_response_body_limit(directives: &[Directive]) -> Option<u64> {
+    directives.iter().find_map(|d| match d {
+        Directive::ResponseBodyLimit(rbl) => Some(rbl.max_size),
         _ => None,
     })
 }
