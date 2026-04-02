@@ -454,6 +454,12 @@ fn run_server(
         admin_service
     };
 
+    let admin_service = if let Some(ref cb) = cache_backend {
+        admin_service.with_cache_storage(cb.storage)
+    } else {
+        admin_service
+    };
+
     let mut admin_listening =
         pingora_core::services::listening::Service::new("admin API".to_string(), admin_service);
     admin_listening.add_tcp("127.0.0.1:6190");
