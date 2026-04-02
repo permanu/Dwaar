@@ -52,6 +52,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use ahash::RandomState;
 use compact_str::CompactString;
@@ -489,6 +490,15 @@ pub struct Route {
     /// At request time, clone this and populate dynamic vars (from `map`).
     /// Empty when no `vars` or `map` directives are present.
     pub var_defaults: VarSlots,
+
+    /// Number of in-flight requests using this route. Incremented in
+    /// `request_filter()`, decremented in `logging()`. Used during
+    /// connection draining to know when it's safe to drop the route.
+    pub active_connections: Arc<AtomicU32>,
+
+    /// When true, this route is being drained — new requests get 502,
+    /// but in-flight requests continue until complete or drain timeout.
+    pub draining: Arc<AtomicBool>,
 }
 
 impl Route {
@@ -523,6 +533,8 @@ impl Route {
                 cache: None,
             }],
             var_defaults: VarSlots::default(),
+            active_connections: Arc::new(AtomicU32::new(0)),
+            draining: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -557,6 +569,8 @@ impl Route {
             default_under_attack,
             handlers,
             var_defaults,
+            active_connections: Arc::new(AtomicU32::new(0)),
+            draining: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -578,6 +592,23 @@ impl Route {
     #[inline]
     pub fn under_attack(&self) -> bool {
         self.default_under_attack
+    }
+
+    /// Check if this route is draining (rejecting new connections).
+    #[inline]
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::Relaxed)
+    }
+
+    /// Mark this route as draining — new requests will be rejected with 502.
+    pub fn mark_draining(&self) {
+        self.draining.store(true, Ordering::Relaxed);
+    }
+
+    /// Current number of in-flight requests on this route.
+    #[inline]
+    pub fn active_connection_count(&self) -> u32 {
+        self.active_connections.load(Ordering::Relaxed)
     }
 }
 
@@ -709,6 +740,17 @@ impl RouteTable {
     /// Returns all routes as a Vec, for serialization and admin API mutations.
     pub fn all_routes(&self) -> Vec<Route> {
         self.routes.values().cloned().collect()
+    }
+
+    /// Returns the set of domain keys, for comparing old vs new tables during drain.
+    pub fn domain_keys(&self) -> impl Iterator<Item = &str> {
+        self.routes.keys().map(String::as_str)
+    }
+
+    /// Look up a route by exact domain key (no wildcard fallback).
+    /// Used during drain to grab the old route's atomic counters.
+    pub fn get_exact(&self, domain: &str) -> Option<&Route> {
+        self.routes.get(domain)
     }
 }
 
@@ -1138,5 +1180,68 @@ mod tests {
         assert_eq!(crh.exclude.len(), 1);
         assert_eq!(crh.include[0].as_str(), "X-Custom");
         assert_eq!(crh.exclude[0].as_str(), "Set-Cookie");
+    }
+
+    // ── Connection draining (ISSUE-075) ─────────────────────
+
+    #[test]
+    fn route_starts_not_draining() {
+        let route = Route::new("api.example.com", addr(3000), false, None);
+        assert!(!route.is_draining());
+        assert_eq!(route.active_connection_count(), 0);
+    }
+
+    #[test]
+    fn mark_draining_sets_flag() {
+        let route = Route::new("api.example.com", addr(3000), false, None);
+        route.mark_draining();
+        assert!(route.is_draining());
+    }
+
+    #[test]
+    fn active_connections_increment_decrement() {
+        let route = Route::new("api.example.com", addr(3000), false, None);
+        route.active_connections.fetch_add(1, Ordering::Relaxed);
+        route.active_connections.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(route.active_connection_count(), 2);
+
+        route.active_connections.fetch_sub(1, Ordering::Relaxed);
+        assert_eq!(route.active_connection_count(), 1);
+
+        route.active_connections.fetch_sub(1, Ordering::Relaxed);
+        assert_eq!(route.active_connection_count(), 0);
+    }
+
+    #[test]
+    fn cloned_route_shares_drain_state() {
+        let route = Route::new("api.example.com", addr(3000), false, None);
+        let cloned = route.clone();
+
+        // Marking the original draining should be visible through the clone
+        // because both share the same Arc<AtomicBool>.
+        route.mark_draining();
+        assert!(cloned.is_draining());
+
+        // Same for active connections
+        route.active_connections.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(cloned.active_connection_count(), 1);
+    }
+
+    #[test]
+    fn domain_keys_returns_all_domains() {
+        let table = RouteTable::new(vec![
+            Route::new("a.example.com", addr(3000), false, None),
+            Route::new("b.example.com", addr(4000), false, None),
+        ]);
+        let mut keys: Vec<&str> = table.domain_keys().collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["a.example.com", "b.example.com"]);
+    }
+
+    #[test]
+    fn get_exact_finds_route() {
+        let table = RouteTable::new(vec![Route::new("api.example.com", addr(3000), false, None)]);
+        assert!(table.get_exact("api.example.com").is_some());
+        assert!(table.get_exact("other.com").is_none());
     }
 }

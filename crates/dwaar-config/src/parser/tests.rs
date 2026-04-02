@@ -1242,3 +1242,37 @@ fn parse_cache_directive_minimal() {
     assert_eq!(cache.default_ttl, None);
     assert_eq!(cache.stale_while_revalidate, None);
 }
+
+// ── drain_timeout (ISSUE-075) ───────────────────────────────────────────────
+
+#[test]
+fn drain_timeout_seconds() {
+    let config = parse("{\n    drain_timeout 30s\n}\na.com {\n    reverse_proxy :3000\n}\n")
+        .expect("should parse");
+    let opts = config.global_options.as_ref().expect("has global options");
+    assert_eq!(opts.drain_timeout_secs, Some(30));
+}
+
+#[test]
+fn drain_timeout_minutes() {
+    let config = parse("{\n    drain_timeout 2m\n}\na.com {\n    reverse_proxy :3000\n}\n")
+        .expect("should parse");
+    let opts = config.global_options.as_ref().expect("has global options");
+    assert_eq!(opts.drain_timeout_secs, Some(120));
+}
+
+#[test]
+fn drain_timeout_bare_number() {
+    let config = parse("{\n    drain_timeout 60\n}\na.com {\n    reverse_proxy :3000\n}\n")
+        .expect("should parse");
+    let opts = config.global_options.as_ref().expect("has global options");
+    assert_eq!(opts.drain_timeout_secs, Some(60));
+}
+
+#[test]
+fn drain_timeout_default_when_absent() {
+    let config =
+        parse("{\n    debug\n}\na.com {\n    reverse_proxy :3000\n}\n").expect("should parse");
+    let opts = config.global_options.as_ref().expect("has global options");
+    assert_eq!(opts.drain_timeout_secs, None);
+}

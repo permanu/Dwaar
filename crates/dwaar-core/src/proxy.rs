@@ -456,6 +456,30 @@ impl ProxyHttp for DwaarProxy {
             let host_stripped = host.split(':').next().unwrap_or(host);
             let table = self.route_table.load();
             if let Some(route) = table.resolve(host_stripped) {
+                // Route is being drained (removed in a config reload but still
+                // has in-flight requests) — reject new connections immediately.
+                if route.is_draining() {
+                    warn!(
+                        request_id = %ctx.request_id(),
+                        domain = %route.domain,
+                        "route is draining — rejecting new request with 502"
+                    );
+                    let mut resp = ResponseHeader::build(502, Some(2))?;
+                    resp.insert_header("Content-Length", "0")
+                        .map_err(|e| Error::explain(HTTPStatus(502), format!("bad header: {e}")))?;
+                    resp.insert_header("Connection", "close")
+                        .map_err(|e| Error::explain(HTTPStatus(502), format!("bad header: {e}")))?;
+                    session.write_response_header(Box::new(resp), true).await?;
+                    return Ok(true);
+                }
+
+                // Track this request for connection draining (ISSUE-075).
+                // Incremented here, decremented in logging() when the request completes.
+                route
+                    .active_connections
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                ctx.drain_counter = Some(route.active_connections.clone());
+
                 ctx.plugin_ctx.rate_limit_rps = route.rate_limit_rps();
                 ctx.plugin_ctx.route_domain = Some(CompactString::from(route.domain.as_str()));
                 ctx.plugin_ctx.under_attack = route.under_attack();
@@ -1433,6 +1457,13 @@ impl ProxyHttp for DwaarProxy {
     ) where
         Self::CTX: Send + Sync,
     {
+        // Decrement the route's active connection counter (ISSUE-075).
+        // This runs for every request, even failed ones, so the counter
+        // stays accurate for drain timeout decisions.
+        if let Some(ref counter) = ctx.drain_counter {
+            counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
         let response_time_us = ctx.start_time.elapsed().as_micros() as u64;
         let status = session.response_written().map_or(0, |r| r.status.as_u16());
         let bytes_sent = session.body_bytes_sent() as u64;

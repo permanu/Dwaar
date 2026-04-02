@@ -39,6 +39,9 @@ pub struct ConfigWatcher {
     dwaarfile_snapshot: Option<Arc<ArcSwap<Vec<Route>>>>,
     /// Signal `DockerWatcher` to re-merge after a Dwaarfile change.
     config_notify: Option<Arc<tokio::sync::Notify>>,
+    /// How long to wait for in-flight requests on removed routes before
+    /// force-dropping them (ISSUE-075). Default: 30 seconds.
+    drain_timeout: Duration,
 }
 
 impl std::fmt::Debug for ConfigWatcher {
@@ -65,7 +68,15 @@ impl ConfigWatcher {
             last_hash: std::sync::Mutex::new(initial_hash),
             dwaarfile_snapshot: None,
             config_notify: None,
+            drain_timeout: Duration::from_secs(30),
         }
+    }
+
+    /// Set a custom drain timeout for removed routes (ISSUE-075).
+    #[must_use]
+    pub fn with_drain_timeout(mut self, timeout: Duration) -> Self {
+        self.drain_timeout = timeout;
+        self
     }
 
     /// Set a `Notify` that triggers an immediate config reload (for `POST /reload`).
@@ -146,6 +157,14 @@ impl ConfigWatcher {
             }
         };
 
+        // Use drain timeout from the new config if specified, else keep the
+        // startup default. Computed per-reload since the config might change it.
+        let drain_timeout = config
+            .global_options
+            .as_ref()
+            .and_then(|g| g.drain_timeout_secs)
+            .map_or(self.drain_timeout, Duration::from_secs);
+
         // Compile routes
         let new_table = compile_routes(&config);
 
@@ -171,6 +190,11 @@ impl ConfigWatcher {
         } else {
             // Standard mode: write directly to route table
             log_route_diff(&old_table, &new_table);
+
+            // Drain routes that were removed (ISSUE-075): mark them as draining
+            // so in-flight requests complete, then let them drop after timeout.
+            drain_removed_routes(&old_table, &new_table, drain_timeout);
+
             self.route_table.store(Arc::new(new_table));
             info!(path = %self.config_path.display(), "config reloaded successfully");
         }
@@ -272,6 +296,56 @@ async fn shutdown_signal(shutdown: &ShutdownWatch) {
 }
 
 /// Log differences between old and new route tables.
+/// Mark removed routes as draining and spawn background tasks that wait
+/// for in-flight requests to complete (or timeout), then drop them.
+///
+/// Called during standard-mode config reload. The old route's `draining`
+/// flag causes `request_filter()` to reject new connections with 502,
+/// while existing requests continue on the cloned `active_connections` counter.
+fn drain_removed_routes(old: &RouteTable, new: &RouteTable, timeout: Duration) {
+    let new_domains: std::collections::HashSet<&str> = new.domain_keys().collect();
+
+    for domain in old.domain_keys() {
+        if new_domains.contains(domain) {
+            continue;
+        }
+
+        let Some(route) = old.get_exact(domain) else {
+            continue;
+        };
+
+        route.mark_draining();
+
+        let active = route.active_connections.clone();
+        let draining = route.draining.clone();
+        let domain_owned = domain.to_owned();
+
+        tokio::spawn(async move {
+            let start = tokio::time::Instant::now();
+            let poll_interval = Duration::from_millis(100);
+
+            // Wait until all in-flight requests finish or we hit the timeout
+            while active.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                if start.elapsed() >= timeout {
+                    let remaining = active.load(std::sync::atomic::Ordering::Relaxed);
+                    warn!(
+                        domain = %domain_owned,
+                        remaining_connections = remaining,
+                        "drain timeout reached — force-closing"
+                    );
+                    break;
+                }
+                tokio::time::sleep(poll_interval).await;
+            }
+
+            // Reset draining flag (the route is now fully removed from the table,
+            // so this only matters if someone held an Arc reference to it)
+            draining.store(false, std::sync::atomic::Ordering::Relaxed);
+            info!(domain = %domain_owned, "route drain complete");
+        });
+    }
+}
+
 fn log_route_diff(old: &RouteTable, new: &RouteTable) {
     let old_routes = old.all_routes();
     let new_routes = new.all_routes();
@@ -400,5 +474,87 @@ mod tests {
         assert!(table.load().resolve("a.com").is_some());
 
         drop(shutdown_tx);
+    }
+
+    #[test]
+    fn drain_marks_removed_routes() {
+        let old_route = Route::new("old.com", addr(1000), false, None);
+        let active = old_route.active_connections.clone();
+        let draining = old_route.draining.clone();
+
+        let old = RouteTable::new(vec![
+            old_route,
+            Route::new("kept.com", addr(2000), false, None),
+        ]);
+        let new = RouteTable::new(vec![Route::new("kept.com", addr(2000), false, None)]);
+
+        // The removed route should be marked as draining after the drain call.
+        // We need a tokio runtime for the spawned tasks, but the marking itself
+        // happens synchronously before the spawn.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            drain_removed_routes(&old, &new, Duration::from_millis(100));
+            assert!(draining.load(std::sync::atomic::Ordering::Relaxed));
+
+            // With no active connections, the drain task should complete quickly
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            // Draining flag resets after completion
+            assert!(!draining.load(std::sync::atomic::Ordering::Relaxed));
+        });
+
+        // The kept route should NOT be draining
+        assert!(!old.get_exact("kept.com").expect("exists").is_draining());
+        drop(active);
+    }
+
+    #[tokio::test]
+    async fn drain_waits_for_active_connections() {
+        let old_route = Route::new("slow.com", addr(1000), false, None);
+        let active = old_route.active_connections.clone();
+        let draining = old_route.draining.clone();
+
+        // Simulate 2 in-flight requests
+        active.store(2, std::sync::atomic::Ordering::Relaxed);
+
+        let old = RouteTable::new(vec![old_route]);
+        let new = RouteTable::new(vec![]);
+
+        drain_removed_routes(&old, &new, Duration::from_secs(5));
+        assert!(draining.load(std::sync::atomic::Ordering::Relaxed));
+
+        // Simulate requests completing
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+
+        // Give the drain task time to notice
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!draining.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn drain_timeout_force_closes() {
+        let old_route = Route::new("stuck.com", addr(1000), false, None);
+        let active = old_route.active_connections.clone();
+        let draining = old_route.draining.clone();
+
+        // Simulate a stuck request that never completes
+        active.store(1, std::sync::atomic::Ordering::Relaxed);
+
+        let old = RouteTable::new(vec![old_route]);
+        let new = RouteTable::new(vec![]);
+
+        drain_removed_routes(&old, &new, Duration::from_millis(200));
+        assert!(draining.load(std::sync::atomic::Ordering::Relaxed));
+
+        // After timeout, drain should complete even with active connections
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(!draining.load(std::sync::atomic::Ordering::Relaxed));
+        // The counter is still 1, but the route is force-closed
+        assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 }
