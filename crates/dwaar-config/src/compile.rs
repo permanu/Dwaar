@@ -82,6 +82,7 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
         let ip_filter = compile_ip_filter(&site.directives);
         let request_body_max_size = find_request_body_max_size(&site.directives);
         let response_body_max_size = find_response_body_limit(&site.directives);
+        let cache = compile_cache(&site.directives);
         let rewrites = collect_rewrites(&site.directives, &var_registry);
         let basic_auth = compile_basic_auth(&site.directives);
         let forward_auth = compile_forward_auth(&site.directives);
@@ -113,6 +114,7 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
                 ip_filter: ip_filter.clone(),
                 request_body_max_size,
                 response_body_max_size,
+                cache: cache.clone(),
             };
             routes.push(Route::with_handlers(
                 &site.address,
@@ -145,6 +147,7 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
                 ip_filter: ip_filter.clone(),
                 request_body_max_size,
                 response_body_max_size,
+                cache: cache.clone(),
             };
             routes.push(Route::with_handlers(
                 &site.address,
@@ -184,6 +187,7 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
                 ip_filter: ip_filter.clone(),
                 request_body_max_size,
                 response_body_max_size,
+                cache: cache.clone(),
             };
             routes.push(Route::with_handlers(
                 &site.address,
@@ -222,6 +226,7 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
                 ip_filter,
                 request_body_max_size,
                 response_body_max_size,
+                cache,
             };
             routes.push(Route::with_handlers(
                 &site.address,
@@ -485,6 +490,7 @@ fn compile_single_block(
 ) -> Option<HandlerBlock> {
     let rate_limit_rps = find_rate_limit(inner_directives);
     let ip_filter = compile_ip_filter(inner_directives);
+    let cache = compile_cache(inner_directives);
     let request_body_max_size = find_request_body_max_size(inner_directives);
     let response_body_max_size = find_response_body_limit(inner_directives);
     let rewrites = collect_rewrites(inner_directives, registry);
@@ -536,6 +542,7 @@ fn compile_single_block(
         ip_filter,
         request_body_max_size,
         response_body_max_size,
+        cache,
     })
 }
 
@@ -705,6 +712,22 @@ fn compile_ip_filter(
     Some(std::sync::Arc::new(IpFilterConfig {
         trie,
         default_policy,
+    }))
+}
+
+fn compile_cache(
+    directives: &[Directive],
+) -> Option<std::sync::Arc<dwaar_core::cache::CacheConfig>> {
+    let cache_dir = directives.iter().find_map(|d| match d {
+        Directive::Cache(c) => Some(c),
+        _ => None,
+    })?;
+
+    Some(std::sync::Arc::new(dwaar_core::cache::CacheConfig {
+        max_size: cache_dir.max_size.unwrap_or(1_073_741_824) as usize,
+        match_paths: cache_dir.match_paths.clone(),
+        default_ttl: cache_dir.default_ttl.unwrap_or(3600),
+        stale_while_revalidate: cache_dir.stale_while_revalidate.unwrap_or(60),
     }))
 }
 

@@ -287,6 +287,9 @@ pub enum Directive {
     /// `metrics [path]` — expose Prometheus/OpenTelemetry metrics.
     Metrics(MetricsDirective),
 
+    /// `cache { max_size 1g; match_path /static/*; default_ttl 3600 }`
+    Cache(CacheDirective),
+
     /// `tracing [endpoint]` — distributed tracing configuration.
     Tracing(TracingDirective),
 
@@ -304,6 +307,19 @@ pub enum Directive {
 
     /// `acme_server` — internal ACME CA server (not yet implemented).
     AcmeServer(RecognizedDirective),
+}
+
+/// `cache { max_size 1g; match_path /static/* /assets/*; default_ttl 3600; stale_while_revalidate 60 }`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheDirective {
+    /// Max cache size in bytes. `None` = use default (1 GiB).
+    pub max_size: Option<u64>,
+    /// Path prefixes eligible for caching. Empty = cache everything.
+    pub match_paths: Vec<String>,
+    /// Default TTL in seconds when upstream has no Cache-Control. `None` = use default (3600).
+    pub default_ttl: Option<u32>,
+    /// Seconds to serve stale while revalidating. `None` = use default (60).
+    pub stale_while_revalidate: Option<u32>,
 }
 
 /// `handle` — path-scoped directive block. First match wins.

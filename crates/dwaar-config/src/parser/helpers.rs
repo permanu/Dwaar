@@ -13,11 +13,26 @@ use crate::token::{Token, TokenKind, Tokenizer};
 /// Parse a human-readable size string like `10MB`, `512KB`, `1GB`, or a bare byte count.
 pub(super) fn parse_size(s: &str) -> Option<u64> {
     let s = s.trim();
-    if let Some(n) = s.strip_suffix("GB").or_else(|| s.strip_suffix("gb")) {
+    if let Some(n) = s
+        .strip_suffix("GB")
+        .or_else(|| s.strip_suffix("gb"))
+        .or_else(|| s.strip_suffix("G"))
+        .or_else(|| s.strip_suffix("g"))
+    {
         n.trim().parse::<u64>().ok().map(|n| n * 1024 * 1024 * 1024)
-    } else if let Some(n) = s.strip_suffix("MB").or_else(|| s.strip_suffix("mb")) {
+    } else if let Some(n) = s
+        .strip_suffix("MB")
+        .or_else(|| s.strip_suffix("mb"))
+        .or_else(|| s.strip_suffix("M"))
+        .or_else(|| s.strip_suffix("m"))
+    {
         n.trim().parse::<u64>().ok().map(|n| n * 1024 * 1024)
-    } else if let Some(n) = s.strip_suffix("KB").or_else(|| s.strip_suffix("kb")) {
+    } else if let Some(n) = s
+        .strip_suffix("KB")
+        .or_else(|| s.strip_suffix("kb"))
+        .or_else(|| s.strip_suffix("K"))
+        .or_else(|| s.strip_suffix("k"))
+    {
         n.trim().parse::<u64>().ok().map(|n| n * 1024)
     } else {
         s.parse().ok()
@@ -183,6 +198,7 @@ pub(super) fn is_directive_name(w: &str) -> bool {
             | "fs"
             | "copy_response"
             | "copy_response_headers"
+            | "cache"
     )
 }
 

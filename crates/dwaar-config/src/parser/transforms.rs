@@ -11,9 +11,10 @@
 
 use crate::error::{ParseError, ParseErrorKind};
 use crate::model::{
-    BasicAuthCredential, BasicAuthDirective, BindDirective, EncodeDirective, ErrorDirective,
-    HeaderDirective, IpFilterDirective, MethodDirective, RateLimitDirective, RequestBodyDirective,
-    RequestHeaderDirective, ResponseBodyLimitDirective, TlsDirective, VarsDirective,
+    BasicAuthCredential, BasicAuthDirective, BindDirective, CacheDirective, EncodeDirective,
+    ErrorDirective, HeaderDirective, IpFilterDirective, MethodDirective, RateLimitDirective,
+    RequestBodyDirective, RequestHeaderDirective, ResponseBodyLimitDirective, TlsDirective,
+    VarsDirective,
 };
 use crate::token::{Token, TokenKind, Tokenizer};
 
@@ -658,6 +659,167 @@ pub(super) fn parse_vars(
     };
 
     Ok(VarsDirective { key, value })
+}
+
+/// Returns true if `w` is a known `cache` sub-directive keyword.
+fn is_cache_sub_directive(w: &str) -> bool {
+    matches!(
+        w,
+        "max_size" | "match_path" | "default_ttl" | "stale_while_revalidate"
+    )
+}
+
+/// Parse a `max_size` value inside a `cache` block (e.g. `1g`, `500MB`).
+fn parse_cache_max_size(t: &mut Tokenizer<'_>) -> Result<u64, ParseError> {
+    let size_tok = t.next_token();
+    let (line, col) = (size_tok.line, size_tok.col);
+    let TokenKind::Word(size_str) = size_tok.kind else {
+        return Err(ParseError {
+            line,
+            col,
+            kind: ParseErrorKind::InvalidValue {
+                directive: "cache".to_string(),
+                message: "expected size value (e.g. 1g, 500MB)".to_string(),
+            },
+        });
+    };
+    parse_size(&size_str).ok_or_else(|| ParseError {
+        line,
+        col,
+        kind: ParseErrorKind::InvalidValue {
+            directive: "cache".to_string(),
+            message: format!(
+                "invalid size '{size_str}' — expected a number with optional unit (K, M, G, KB, MB, GB)"
+            ),
+        },
+    })
+}
+
+/// Parse a u32 seconds value for a named `cache` sub-directive (e.g. `default_ttl 3600`).
+fn parse_cache_seconds(t: &mut Tokenizer<'_>, field: &str) -> Result<u32, ParseError> {
+    let val_tok = t.next_token();
+    let (line, col) = (val_tok.line, val_tok.col);
+    let TokenKind::Word(val_str) = val_tok.kind else {
+        return Err(ParseError {
+            line,
+            col,
+            kind: ParseErrorKind::InvalidValue {
+                directive: "cache".to_string(),
+                message: format!("expected integer seconds for {field}"),
+            },
+        });
+    };
+    val_str.parse().map_err(|_| ParseError {
+        line,
+        col,
+        kind: ParseErrorKind::InvalidValue {
+            directive: "cache".to_string(),
+            message: format!("'{val_str}' is not a valid u32 for {field}"),
+        },
+    })
+}
+
+/// Collect path patterns for `match_path`, stopping at known sub-directives or block end.
+fn collect_cache_match_paths(t: &mut Tokenizer<'_>, paths: &mut Vec<String>) {
+    loop {
+        match &t.peek().kind {
+            TokenKind::Word(w) if is_cache_sub_directive(w) => break,
+            TokenKind::Word(_) | TokenKind::QuotedString(_) => {
+                let tok = t.next_token();
+                match tok.kind {
+                    TokenKind::Word(p) | TokenKind::QuotedString(p) => paths.push(p),
+                    _ => {}
+                }
+            }
+            _ => break,
+        }
+    }
+}
+
+/// `cache { max_size 1g; match_path /static/* /assets/*; default_ttl 3600; stale_while_revalidate 60 }`
+///
+/// All sub-directives are optional. An empty block enables caching with defaults.
+pub(super) fn parse_cache(
+    t: &mut Tokenizer<'_>,
+    dir_tok: &Token,
+) -> Result<CacheDirective, ParseError> {
+    if t.peek().kind != TokenKind::OpenBrace {
+        return Err(ParseError {
+            line: dir_tok.line,
+            col: dir_tok.col,
+            kind: ParseErrorKind::InvalidValue {
+                directive: "cache".to_string(),
+                message: "expected '{' block".to_string(),
+            },
+        });
+    }
+    t.next_token(); // consume '{'
+
+    let mut max_size: Option<u64> = None;
+    let mut match_paths: Vec<String> = Vec::new();
+    let mut default_ttl: Option<u32> = None;
+    let mut stale_while_revalidate: Option<u32> = None;
+
+    loop {
+        let tok = t.peek();
+        match &tok.kind {
+            TokenKind::CloseBrace => {
+                t.next_token();
+                break;
+            }
+            TokenKind::Eof => {
+                return Err(ParseError {
+                    line: tok.line,
+                    col: tok.col,
+                    kind: ParseErrorKind::UnexpectedEof {
+                        expected: "'}' to close cache block".to_string(),
+                    },
+                });
+            }
+            TokenKind::Word(w) => {
+                let keyword = w.clone();
+                let kw_tok = t.next_token();
+                match keyword.as_str() {
+                    "max_size" => max_size = Some(parse_cache_max_size(t)?),
+                    "match_path" => collect_cache_match_paths(t, &mut match_paths),
+                    "default_ttl" => default_ttl = Some(parse_cache_seconds(t, "default_ttl")?),
+                    "stale_while_revalidate" => {
+                        stale_while_revalidate =
+                            Some(parse_cache_seconds(t, "stale_while_revalidate")?);
+                    }
+                    other => {
+                        return Err(ParseError {
+                            line: kw_tok.line,
+                            col: kw_tok.col,
+                            kind: ParseErrorKind::InvalidValue {
+                                directive: "cache".to_string(),
+                                message: format!(
+                                    "unknown sub-directive '{other}' — expected max_size, match_path, default_ttl, or stale_while_revalidate"
+                                ),
+                            },
+                        });
+                    }
+                }
+            }
+            _ => {
+                return Err(ParseError {
+                    line: tok.line,
+                    col: tok.col,
+                    kind: ParseErrorKind::Expected {
+                        expected: "cache sub-directive or '}'".to_string(),
+                        got: format!("{:?}", tok.kind),
+                    },
+                });
+            }
+        }
+    }
+
+    Ok(CacheDirective {
+        max_size,
+        match_paths,
+        default_ttl,
+        stale_while_revalidate,
+    })
 }
 
 /// `error "message" 500` or `error 404`

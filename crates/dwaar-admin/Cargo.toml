@@ -13,6 +13,7 @@ authors.workspace = true
 dwaar-core = { workspace = true }
 dwaar-analytics = { workspace = true }
 pingora-core = { workspace = true }
+pingora-cache = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 arc-swap = { workspace = true }

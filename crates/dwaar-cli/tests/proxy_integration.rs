@@ -24,7 +24,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -934,6 +935,214 @@ fn ip_filter_allows_permitted_ip() {
     assert_eq!(
         resp.status, 200,
         "allowed IP should be forwarded to upstream"
+    );
+
+    stop_dwaar(child);
+    std::fs::remove_file(&config_file).ok();
+    thread::sleep(Duration::from_secs(1));
+}
+
+// ---------------------------------------------------------------------------
+// Cache integration tests (ISSUE-073)
+// ---------------------------------------------------------------------------
+
+/// Accept up to `max_requests` connections on `listener`, responding with
+/// the given Cache-Control header and body. Tracks how many requests actually
+/// arrived via `hit_count`. Uses a 3-second accept timeout so the caller
+/// isn't stuck when the proxy serves a cache HIT (no upstream contact).
+fn serve_cacheable_upstream(
+    listener: &TcpListener,
+    cache_control: &str,
+    body: &str,
+    max_requests: usize,
+    hit_count: &AtomicUsize,
+) {
+    for _ in 0..max_requests {
+        // Poll with non-blocking accept + short sleeps to create a
+        // timeout. This avoids blocking forever when the proxy serves
+        // from cache and never contacts the upstream.
+        listener
+            .set_nonblocking(true)
+            .expect("set non-blocking mode");
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        let stream = loop {
+            match listener.accept() {
+                Ok((s, _)) => break s,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        // Restore blocking before returning
+                        listener.set_nonblocking(false).ok();
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(_) => return,
+            }
+        };
+        listener.set_nonblocking(false).ok();
+        let mut stream = stream;
+        hit_count.fetch_add(1, Ordering::SeqCst);
+
+        let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+        let mut line = String::new();
+        // Drain the request
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                break;
+            }
+        }
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Length: {}\r\n\
+             Content-Type: text/plain\r\n\
+             Cache-Control: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {}",
+            body.len(),
+            cache_control,
+            body
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    }
+}
+
+/// ISSUE-073: First request is a cache MISS (upstream hit), second identical
+/// request is a cache HIT (served from memory, upstream not contacted).
+#[test]
+fn cache_miss_then_hit() {
+    let _lock = PORT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let upstream =
+        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+
+    let config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    std::fs::create_dir_all(&config_path).ok();
+    let config_file = config_path.join("cache_hit_miss_test.dwaarfile");
+    std::fs::write(
+        &config_file,
+        "127.0.0.1 {\n    reverse_proxy 127.0.0.1:8080\n    cache {\n        default_ttl 3600\n    }\n}\n",
+    )
+    .expect("write cache test Dwaarfile");
+
+    let child = start_dwaar_with_config(Some(&config_file));
+
+    let hit_count = Arc::new(AtomicUsize::new(0));
+    let upstream_handle = {
+        let hit_count = Arc::clone(&hit_count);
+        thread::spawn(move || {
+            serve_cacheable_upstream(
+                &upstream,
+                "public, max-age=3600",
+                "cached-body",
+                2,
+                &hit_count,
+            );
+        })
+    };
+
+    // First request — should be MISS (upstream hit)
+    let resp1 = send_through_proxy("/cached-page");
+    assert_eq!(resp1.status, 200, "first request should return 200");
+    assert_eq!(
+        resp1.headers.get("x-cache").map(String::as_str),
+        Some("MISS"),
+        "first request should be a cache MISS"
+    );
+    assert_eq!(resp1.body, "cached-body");
+
+    // Brief pause so the cache entry is fully committed
+    thread::sleep(Duration::from_millis(200));
+
+    // Second request — should be HIT (served from cache, no upstream contact)
+    let resp2 = send_through_proxy("/cached-page");
+    assert_eq!(resp2.status, 200, "cached response should return 200");
+    assert_eq!(
+        resp2.headers.get("x-cache").map(String::as_str),
+        Some("HIT"),
+        "second identical request should be a cache HIT"
+    );
+    assert_eq!(resp2.body, "cached-body");
+
+    // Wait for the upstream thread to finish (it will timeout after 3s on
+    // the second accept since the proxy never contacted it)
+    upstream_handle.join().expect("upstream thread");
+
+    // Upstream should have been hit exactly once — the second request was
+    // served from cache without contacting the upstream.
+    assert_eq!(
+        hit_count.load(Ordering::SeqCst),
+        1,
+        "cache HIT should not contact upstream — expected 1 hit, got {}",
+        hit_count.load(Ordering::SeqCst)
+    );
+
+    stop_dwaar(child);
+    std::fs::remove_file(&config_file).ok();
+    thread::sleep(Duration::from_secs(1));
+}
+
+/// ISSUE-073: When the upstream responds with Cache-Control: no-store,
+/// the proxy must NOT cache the response. Both requests should be MISS.
+#[test]
+fn cache_respects_no_store() {
+    let _lock = PORT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let upstream =
+        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+
+    let config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    std::fs::create_dir_all(&config_path).ok();
+    let config_file = config_path.join("cache_no_store_test.dwaarfile");
+    std::fs::write(
+        &config_file,
+        "127.0.0.1 {\n    reverse_proxy 127.0.0.1:8080\n    cache {\n        default_ttl 3600\n    }\n}\n",
+    )
+    .expect("write cache test Dwaarfile");
+
+    let child = start_dwaar_with_config(Some(&config_file));
+
+    let hit_count = Arc::new(AtomicUsize::new(0));
+    let upstream_handle = {
+        let hit_count = Arc::clone(&hit_count);
+        thread::spawn(move || {
+            serve_cacheable_upstream(&upstream, "no-store", "uncacheable-body", 2, &hit_count);
+        })
+    };
+
+    // First request — MISS (upstream hit, response not cached)
+    let resp1 = send_through_proxy("/no-store-page");
+    assert_eq!(resp1.status, 200);
+    assert_eq!(
+        resp1.headers.get("x-cache").map(String::as_str),
+        Some("MISS"),
+        "no-store response should be MISS"
+    );
+
+    thread::sleep(Duration::from_millis(200));
+
+    // Second request — still MISS because the first was not cached
+    let resp2 = send_through_proxy("/no-store-page");
+    assert_eq!(resp2.status, 200);
+    assert_eq!(
+        resp2.headers.get("x-cache").map(String::as_str),
+        Some("MISS"),
+        "no-store response should never become HIT"
+    );
+
+    upstream_handle.join().expect("upstream thread");
+
+    // Both requests should have hit the upstream
+    assert_eq!(
+        hit_count.load(Ordering::SeqCst),
+        2,
+        "no-store responses should always hit upstream — expected 2, got {}",
+        hit_count.load(Ordering::SeqCst)
     );
 
     stop_dwaar(child);
