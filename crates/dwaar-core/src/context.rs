@@ -33,6 +33,7 @@
 //! ```
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Instant;
 
 use compact_str::CompactString;
@@ -41,7 +42,9 @@ use dwaar_analytics::injector::HtmlInjector;
 use dwaar_plugins::plugin::PluginCtx;
 use uuid::Uuid;
 
+use crate::route::{CompiledCopyResponseHeaders, CompiledIntercept};
 use crate::template::VarSlots;
+use crate::upstream::UpstreamPool;
 
 /// Per-request state shared across all Pingora lifecycle hooks.
 ///
@@ -114,6 +117,23 @@ pub struct RequestContext {
 
     /// Per-request variable slots (cloned from `route.var_defaults`, populated by map evaluation).
     pub var_slots: Option<VarSlots>,
+
+    /// Intercept rules cached from route lookup (ISSUE-067).
+    /// Applied in `response_filter()` to match upstream status and override the response.
+    pub intercepts: Vec<CompiledIntercept>,
+
+    /// Body bytes to substitute for the upstream body (set when an intercept fires).
+    /// Consumed in the first `response_body_filter()` call, then cleared.
+    pub intercept_body: Option<bytes::Bytes>,
+
+    /// Copy response headers config cached from route lookup (ISSUE-067).
+    pub copy_response_headers: Option<CompiledCopyResponseHeaders>,
+
+    /// Load-balancing pool for multi-upstream routes (Guardrail #27 — no second `ArcSwap` load).
+    ///
+    /// `None` for single-upstream routes — they use `route_upstream` directly,
+    /// avoiding all pool overhead on the common case.
+    pub upstream_pool: Option<Arc<UpstreamPool>>,
 }
 
 impl RequestContext {
@@ -141,6 +161,10 @@ impl RequestContext {
             injector: None,
             decompressor: None,
             var_slots: None,
+            intercepts: Vec::new(),
+            intercept_body: None,
+            copy_response_headers: None,
+            upstream_pool: None,
         }
     }
 

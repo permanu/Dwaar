@@ -1037,6 +1037,7 @@ dependencies = [
  "dwaar-log",
  "dwaar-plugins",
  "dwaar-tls",
+ "fastrand",
  "http",
  "pingora",
  "pingora-core",

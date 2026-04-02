@@ -38,7 +38,8 @@ use dwaar_analytics::aggregation::service::{AggregationService, RouteValidator};
 use dwaar_analytics::beacon;
 use dwaar_config::MAX_CONFIG_SIZE;
 use dwaar_config::compile::{
-    compile_acme_domains, compile_routes, compile_tls_configs, has_tls_sites,
+    BindAddress, collect_pools, compile_acme_domains, compile_routes, compile_tls_configs,
+    extract_bind_addresses, has_tls_sites,
 };
 use dwaar_config::watcher::{ConfigWatcher, hash_content};
 use dwaar_core::proxy::DwaarProxy;
@@ -263,6 +264,10 @@ fn run_server(
     }
     info!(routes = route_table.len(), "route table compiled");
 
+    // Collect upstream pools that have health URIs before wrapping the table.
+    // This must happen before ArcSwap wrapping because collect_pools borrows the table.
+    let health_pools = collect_pools(&route_table);
+
     // Capture initial routes before wrapping — DockerWatcher needs a
     // separate snapshot of Dwaarfile routes for merge operations.
     let initial_routes = route_table.all_routes();
@@ -357,21 +362,29 @@ fn run_server(
 
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, proxy);
 
-    // Multiple workers each bind the same port independently via SO_REUSEPORT.
-    // The kernel distributes incoming connections across workers, providing
-    // CPU-affinity benefits and eliminating the accept() bottleneck.
-    if worker_count > 1 {
-        let mut sock_opt = TcpSocketOptions::default();
-        sock_opt.so_reuseport = Some(true);
-        proxy_service.add_tcp_with_settings("0.0.0.0:6188", sock_opt);
-    } else {
-        proxy_service.add_tcp("0.0.0.0:6188");
+    // Bind listeners from the `bind` directive, falling back to 0.0.0.0:6188
+    // when no site specifies one. Multiple workers each bind the same TCP
+    // address independently via SO_REUSEPORT — the kernel load-balances across
+    // workers without a single accept() bottleneck.
+    let bind_addrs = extract_bind_addresses(dwaar_config);
+    for addr in &bind_addrs {
+        match addr {
+            BindAddress::Tcp(a) => {
+                if worker_count > 1 {
+                    let mut sock_opt = TcpSocketOptions::default();
+                    sock_opt.so_reuseport = Some(true);
+                    proxy_service.add_tcp_with_settings(a, sock_opt);
+                } else {
+                    proxy_service.add_tcp(a);
+                }
+                info!(listen = %a, protocol = "http", "listener registered");
+            }
+            BindAddress::Unix(path) => {
+                proxy_service.add_uds(path.to_str().expect("bind path must be valid UTF-8"), None);
+                info!(listen = ?path, protocol = "http/uds", "listener registered");
+            }
+        }
     }
-    info!(
-        listen = "0.0.0.0:6188",
-        protocol = "http",
-        "listener registered"
-    );
 
     let cert_store = Arc::new(CertStore::new("/etc/dwaar/certs", 1000));
 
@@ -439,6 +452,7 @@ fn run_server(
         agg_receiver,
         &route_table_for_agg,
         &agg_metrics,
+        health_pools,
     );
 
     info!("entering run loop, waiting for connections or signals");
@@ -462,7 +476,18 @@ fn register_background_services(
     agg_receiver: Option<aggregation::AggReceiver>,
     route_table_for_agg: &Arc<ArcSwap<dwaar_core::route::RouteTable>>,
     agg_metrics: &Arc<DashMap<String, dwaar_analytics::aggregation::DomainMetrics>>,
+    health_pools: Vec<Arc<dwaar_core::upstream::UpstreamPool>>,
 ) {
+    // Upstream health checker — only registered when there are pools with health URIs.
+    // Per Guardrail #20: all async background work must be a BackgroundService.
+    if !health_pools.is_empty() {
+        let checker = dwaar_core::upstream::HealthChecker::new(health_pools);
+        let health_bg =
+            pingora_core::services::background::background_service("health checker", checker);
+        server.add_service(health_bg);
+        info!("upstream health checker registered");
+    }
+
     // ACME + OCSP background service
     if let Some(solver) = challenge_solver {
         let issuer = Arc::new(CertIssuer::new(
