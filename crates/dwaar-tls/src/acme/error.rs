@@ -41,4 +41,7 @@ pub enum AcmeError {
         le_error: String,
         gts_error: String,
     },
+
+    #[error("DNS-01 challenge failed for {domain}: {reason}")]
+    Dns01Failed { domain: String, reason: String },
 }

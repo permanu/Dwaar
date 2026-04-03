@@ -12,6 +12,8 @@
 
 pub mod acme;
 pub mod cert_store;
+pub mod dns;
+pub mod dns_cloudflare;
 pub mod mtls;
 pub mod ocsp;
 pub mod sni;
