@@ -1649,3 +1649,49 @@ fn timeouts_unknown_key_errors() {
         "error should mention unknown key"
     );
 }
+
+// ── HTTP/3 global option (ISSUE-079) ────────────────────────────────
+
+#[test]
+fn h3_on_in_servers_block() {
+    let config =
+        parse("{\n    servers {\n        h3 on\n    }\n}\na.com {\n    reverse_proxy :3000\n}\n")
+            .expect("should parse");
+    let opts = config.global_options.as_ref().expect("has global options");
+    assert!(opts.h3_enabled);
+}
+
+#[test]
+fn h3_off_in_servers_block() {
+    let config =
+        parse("{\n    servers {\n        h3 off\n    }\n}\na.com {\n    reverse_proxy :3000\n}\n")
+            .expect("should parse");
+    let opts = config.global_options.as_ref().expect("has global options");
+    assert!(!opts.h3_enabled);
+}
+
+#[test]
+fn h3_default_is_disabled() {
+    let config =
+        parse("{\n    debug\n}\na.com {\n    reverse_proxy :3000\n}\n").expect("should parse");
+    let opts = config.global_options.as_ref().expect("has global options");
+    assert!(!opts.h3_enabled);
+}
+
+#[test]
+fn servers_block_empty() {
+    let config = parse("{\n    servers {\n    }\n}\na.com {\n    reverse_proxy :3000\n}\n")
+        .expect("should parse");
+    let opts = config.global_options.as_ref().expect("has global options");
+    assert!(!opts.h3_enabled);
+}
+
+#[test]
+fn servers_block_unknown_keys_skipped() {
+    let config = parse(
+        "{\n    servers {\n        h3 on\n        strict_sni_host on\n    }\n}\na.com {\n    reverse_proxy :3000\n}\n",
+    )
+    .expect("should parse");
+    let opts = config.global_options.as_ref().expect("has global options");
+    assert!(opts.h3_enabled);
+}
