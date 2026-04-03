@@ -6,9 +6,10 @@
 
 //! WASM plugin runtime.
 //!
-//! Enabled via the `wasm` feature flag. Provides the engine and (in later
-//! issues) the module loader and host function bindings.
+//! Enabled via the `wasm` feature flag. Provides the engine, WIT-generated
+//! bindings, and (in later issues) the module loader and host functions.
 
+pub mod bindings;
 pub mod engine;
 
 pub use engine::{EngineError, WasmEngine};
