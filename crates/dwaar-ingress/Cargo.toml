@@ -45,9 +45,17 @@ clap = { workspace = true }
 # Time (for Lease renewTime handling)
 chrono = { workspace = true }
 
+[features]
+# Enable the K8s integration test suite. Requires a reachable cluster (e.g. kind).
+# Run with: cargo test -p dwaar-ingress --features k8s-integration -- --test-threads=1
+k8s-integration = []
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "signal", "sync"] }
 tempfile = "3"
+# Used by the k8s-integration tests to construct expired Lease timestamps.
+chrono = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true
