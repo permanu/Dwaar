@@ -135,6 +135,8 @@ wasmtime = { version = "30", default-features = false, features = [
     "pooling-allocator", "addr2line", "wat",
 ] }
 wat = "1"
+futures-util = "0.3"
+rcgen = "0.14"
 
 # K8s ingress controller (ISSUE-084)
 kube = { version = "0.98", default-features = false, features = ["runtime", "derive", "client", "rustls-tls"] }
