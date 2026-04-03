@@ -56,6 +56,8 @@ tempfile = "3"
 # Used by the k8s-integration tests to construct expired Lease timestamps.
 chrono = { workspace = true }
 serde_json = { workspace = true }
+# Required to install the CryptoProvider for kube-rs in integration tests.
+rustls = { workspace = true }
 
 [lints]
 workspace = true

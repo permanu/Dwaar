@@ -61,6 +61,11 @@ const TEST_NS: &str = "dwaar-integration-test";
 /// Returns `None` if no cluster is reachable — callers should skip the test
 /// in that case rather than failing. Returns `Some(client)` otherwise.
 async fn try_connect() -> Option<kube::Client> {
+    // kube-rs uses rustls under the hood. When workspace deps pull in both
+    // ring and aws-lc-rs, rustls can't auto-detect the provider. Installing
+    // ring explicitly avoids the "no CryptoProvider" panic.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     match kube::Client::try_default().await {
         Ok(client) => Some(client),
         Err(e) => {
