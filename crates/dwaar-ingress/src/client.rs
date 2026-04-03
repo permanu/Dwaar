@@ -6,33 +6,39 @@
 
 //! HTTP client for the Dwaar admin API.
 //!
-//! Wraps the three operations the ingress controller needs:
-//! upsert a route, delete a route, and list existing routes.
-//! `reqwest::Client` handles connection pooling and TLS.
+//! Provides `upsert_route`, `delete_route`, and `list_routes` — the three
+//! operations the ingress controller needs to keep Dwaar's route table in sync
+//! with the state of Kubernetes Ingress resources.
+//!
+//! Uses `reqwest` because we're outside Pingora's process boundary here: the
+//! controller is a separate binary that communicates over HTTP, not in-process.
 
 use serde::{Deserialize, Serialize};
+use tracing::{debug, instrument};
 
 use crate::error::AdminApiError;
 
-/// A route entry as returned by the admin API list endpoint.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RouteEntry {
-    pub domain: String,
-    pub upstream: String,
-    pub tls: bool,
-}
-
-/// Payload sent to `POST /routes` (upsert).
+/// Payload sent to `POST /routes` (upsert semantics — create or overwrite).
 #[derive(Debug, Serialize)]
-struct UpsertPayload<'a> {
+struct UpsertRouteRequest<'a> {
     domain: &'a str,
     upstream: &'a str,
     tls: bool,
 }
 
-/// Thin async wrapper around the Dwaar admin REST API.
+/// Minimal route descriptor returned by `GET /routes`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RouteEntry {
+    pub domain: String,
+    pub upstream: Option<String>,
+    pub tls: bool,
+}
+
+/// REST client for the Dwaar admin API.
 ///
-/// Uses `reqwest::Client` for connection pooling across calls.
+/// The client is intentionally stateless — it holds only the base URL and an
+/// `reqwest::Client` (which itself is a connection-pool handle and is cheaply
+/// cloneable). Callers share one instance across reconciliation loops.
 #[derive(Debug, Clone)]
 pub struct AdminApiClient {
     base_url: String,
@@ -40,15 +46,19 @@ pub struct AdminApiClient {
 }
 
 impl AdminApiClient {
-    /// Create a new client pointed at `base_url` (e.g. `http://127.0.0.1:9091`).
-    pub fn new(base_url: String) -> Self {
+    /// Create a new client pointing at `base_url` (e.g. `http://dwaar-admin:9000`).
+    pub fn new(base_url: impl Into<String>) -> Self {
         Self {
-            base_url,
+            base_url: base_url.into(),
             client: reqwest::Client::new(),
         }
     }
 
-    /// Upsert a route. Creates or overwrites the entry for `domain`.
+    /// Create or update the route for `domain`, forwarding to `upstream` (host:port).
+    ///
+    /// Idempotent — safe to call on every reconciliation pass. The admin API
+    /// uses the domain as the primary key and overwrites any existing entry.
+    #[instrument(skip(self), fields(domain, upstream, tls))]
     pub async fn upsert_route(
         &self,
         domain: &str,
@@ -56,80 +66,70 @@ impl AdminApiClient {
         tls: bool,
     ) -> Result<(), AdminApiError> {
         let url = format!("{}/routes", self.base_url);
-        let payload = UpsertPayload {
+        let body = UpsertRouteRequest {
             domain,
             upstream,
             tls,
         };
 
-        let resp = self
-            .client
-            .post(&url)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(AdminApiError::Transport)?;
+        debug!(%domain, %upstream, tls, "upserting route");
 
-        let status = resp.status().as_u16();
+        let resp = self.client.post(&url).json(&body).send().await?;
 
-        if status == 200 || status == 201 {
-            return Ok(());
+        if !resp.status().is_success() {
+            return Err(AdminApiError::Status {
+                status: resp.status().as_u16(),
+                method: "POST",
+                path: format!("/routes (domain={domain})"),
+            });
         }
 
-        let body = resp
-            .text()
-            .await
-            .unwrap_or_else(|_| String::from("<unreadable body>"));
-        Err(AdminApiError::Status { status, body })
+        Ok(())
     }
 
-    /// Remove the route for `domain`. Returns `Ok(())` even if the domain
-    /// was not found (idempotent delete).
+    /// Remove the route for `domain`.
+    ///
+    /// Returns `Ok(())` whether or not the route existed — a 404 from the
+    /// admin API is treated as success because the desired state (no route)
+    /// already matches reality.
+    #[instrument(skip(self), fields(domain))]
     pub async fn delete_route(&self, domain: &str) -> Result<(), AdminApiError> {
         let url = format!("{}/routes/{}", self.base_url, domain);
-        let resp = self
-            .client
-            .delete(&url)
-            .send()
-            .await
-            .map_err(AdminApiError::Transport)?;
 
-        let status = resp.status().as_u16();
+        debug!(%domain, "deleting route");
 
-        // 200 = deleted, 404 = wasn't there — both are success from our perspective
-        if status == 200 || status == 404 {
-            return Ok(());
+        let resp = self.client.delete(&url).send().await?;
+
+        // 404 is fine — it means the route is already gone.
+        if !resp.status().is_success() && resp.status().as_u16() != 404 {
+            return Err(AdminApiError::Status {
+                status: resp.status().as_u16(),
+                method: "DELETE",
+                path: format!("/routes/{domain}"),
+            });
         }
 
-        let body = resp
-            .text()
-            .await
-            .unwrap_or_else(|_| String::from("<unreadable body>"));
-        Err(AdminApiError::Status { status, body })
+        Ok(())
     }
 
-    /// Retrieve all routes currently known to the admin API.
+    /// List all routes currently registered in the Dwaar admin API.
+    ///
+    /// Used on startup to reconcile state rather than blindly re-upserting
+    /// every Ingress — reduces unnecessary admin API churn.
+    #[instrument(skip(self))]
     pub async fn list_routes(&self) -> Result<Vec<RouteEntry>, AdminApiError> {
         let url = format!("{}/routes", self.base_url);
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(AdminApiError::Transport)?;
 
-        let status = resp.status().as_u16();
+        let resp = self.client.get(&url).send().await?;
 
-        if status != 200 {
-            let body = resp
-                .text()
-                .await
-                .unwrap_or_else(|_| String::from("<unreadable body>"));
-            return Err(AdminApiError::Status { status, body });
+        if !resp.status().is_success() {
+            return Err(AdminApiError::ListStatus {
+                status: resp.status().as_u16(),
+            });
         }
 
-        let routes: Vec<RouteEntry> = resp.json().await.map_err(AdminApiError::Transport)?;
-        Ok(routes)
+        let entries: Vec<RouteEntry> = resp.json().await?;
+        Ok(entries)
     }
 }
 
@@ -138,8 +138,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn client_base_url_stored() {
-        let c = AdminApiClient::new("http://127.0.0.1:9091".to_string());
-        assert_eq!(c.base_url, "http://127.0.0.1:9091");
+    fn upsert_request_serializes_correctly() {
+        let req = UpsertRouteRequest {
+            domain: "app.example.com",
+            upstream: "10.0.0.5:8080",
+            tls: true,
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(json.contains("\"domain\":\"app.example.com\""));
+        assert!(json.contains("\"upstream\":\"10.0.0.5:8080\""));
+        assert!(json.contains("\"tls\":true"));
+    }
+
+    #[test]
+    fn client_constructs_correct_urls() {
+        let client = AdminApiClient::new("http://dwaar-admin:9000");
+        assert_eq!(client.base_url, "http://dwaar-admin:9000");
+    }
+
+    #[test]
+    fn route_entry_deserializes() {
+        let json = r#"{"domain":"app.example.com","upstream":"10.0.0.5:8080","tls":false}"#;
+        let entry: RouteEntry = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(entry.domain, "app.example.com");
+        assert_eq!(entry.upstream.as_deref(), Some("10.0.0.5:8080"));
+        assert!(!entry.tls);
+    }
+
+    #[test]
+    fn route_entry_deserializes_null_upstream() {
+        let json = r#"{"domain":"app.example.com","upstream":null,"tls":false}"#;
+        let entry: RouteEntry = serde_json::from_str(json).expect("deserialize");
+        assert!(entry.upstream.is_none());
     }
 }

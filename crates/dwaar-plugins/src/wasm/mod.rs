@@ -23,6 +23,7 @@ pub mod bindings;
 pub mod cache;
 pub mod engine;
 pub mod error;
+pub mod host;
 pub mod limits;
 
 pub use adapter::WasmPlugin;

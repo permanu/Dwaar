@@ -6,11 +6,14 @@
 
 //! dwaar-ingress — Kubernetes ingress controller for Dwaar.
 //!
-//! Watches Ingress, Service, Secret, and `IngressClass` resources and syncs
-//! routes to the Dwaar admin API.
+//! Watches Ingress/Service/Secret resources and reconciles them into the Dwaar
+//! route table via the admin API. Supports leader election so multiple replicas
+//! can run for high availability without routing conflicts.
 
 pub mod client;
 pub mod error;
 pub mod health;
+pub mod leader;
 pub mod metrics;
+pub mod translator;
 pub mod watcher;
