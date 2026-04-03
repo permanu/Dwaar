@@ -85,6 +85,12 @@ pub struct DwaarProxy {
     prometheus: Option<Arc<dwaar_analytics::prometheus::PrometheusMetrics>>,
     /// HTTP cache backend (ISSUE-073). `None` when no route has `cache {}` or `--no-cache`.
     cache_backend: Option<crate::cache::CacheBackend>,
+    /// Downstream keepalive timeout in seconds (ISSUE-076). Overrides
+    /// Pingora's hardcoded 60s default per keep-alive connection.
+    keepalive_secs: u64,
+    /// Downstream body read timeout (ISSUE-076). Applied after headers
+    /// arrive so slow body senders get disconnected.
+    body_timeout: std::time::Duration,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -99,6 +105,8 @@ impl DwaarProxy {
         plugin_chain: Arc<PluginChain>,
         prometheus: Option<Arc<dwaar_analytics::prometheus::PrometheusMetrics>>,
         cache_backend: Option<crate::cache::CacheBackend>,
+        keepalive_secs: u64,
+        body_timeout_secs: u64,
     ) -> Self {
         Self {
             route_table,
@@ -110,6 +118,8 @@ impl DwaarProxy {
             plugin_chain,
             prometheus,
             cache_backend,
+            keepalive_secs,
+            body_timeout: std::time::Duration::from_secs(body_timeout_secs),
         }
     }
 }
@@ -367,6 +377,16 @@ impl ProxyHttp for DwaarProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // Slow loris protection (ISSUE-076): override Pingora defaults with
+        // user-configured keepalive and body read timeouts. Headers are already
+        // read by the time request_filter() runs, so `header` timeout is handled
+        // by Pingora's built-in read_timeout during read_request(). The body
+        // timeout applies to subsequent reads; keepalive applies between requests.
+        session.set_keepalive(Some(self.keepalive_secs));
+        session
+            .downstream_session
+            .set_read_timeout(Some(self.body_timeout));
+
         // --- Populate core identity fields ---
         ctx.plugin_ctx.client_ip = session
             .client_addr()
@@ -1608,6 +1628,8 @@ mod tests {
             chain,
             None,
             None,
+            60, // keepalive_secs
+            30, // body_timeout_secs
         )
     }
 

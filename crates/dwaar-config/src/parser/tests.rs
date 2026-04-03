@@ -1276,3 +1276,106 @@ fn drain_timeout_default_when_absent() {
     let opts = config.global_options.as_ref().expect("has global options");
     assert_eq!(opts.drain_timeout_secs, None);
 }
+
+// ── timeouts (ISSUE-076) ────────────────────────────────────────────────────
+
+#[test]
+fn timeouts_all_fields() {
+    let input = r"
+{
+    timeouts {
+        header 10s
+        body 30s
+        keepalive 60s
+        max_requests 1000
+    }
+}
+a.com {
+    reverse_proxy :3000
+}
+";
+    let config = parse(input).expect("should parse");
+    let opts = config.global_options.as_ref().expect("has global options");
+    let t = opts.timeouts.as_ref().expect("has timeouts");
+    assert_eq!(t.header_secs, 10);
+    assert_eq!(t.body_secs, 30);
+    assert_eq!(t.keepalive_secs, 60);
+    assert_eq!(t.max_requests, 1000);
+}
+
+#[test]
+fn timeouts_partial_override() {
+    let input = "{\n    timeouts {\n        header 5s\n        max_requests 500\n    }\n}\na.com {\n    reverse_proxy :3000\n}\n";
+    let config = parse(input).expect("should parse");
+    let t = config
+        .global_options
+        .as_ref()
+        .expect("global")
+        .timeouts
+        .as_ref()
+        .expect("timeouts");
+    assert_eq!(t.header_secs, 5);
+    assert_eq!(t.body_secs, 30); // default
+    assert_eq!(t.keepalive_secs, 60); // default
+    assert_eq!(t.max_requests, 500);
+}
+
+#[test]
+fn timeouts_duration_minutes() {
+    let input = "{\n    timeouts {\n        keepalive 2m\n        body 1m\n    }\n}\na.com {\n    reverse_proxy :3000\n}\n";
+    let config = parse(input).expect("should parse");
+    let t = config
+        .global_options
+        .as_ref()
+        .expect("global")
+        .timeouts
+        .as_ref()
+        .expect("timeouts");
+    assert_eq!(t.keepalive_secs, 120);
+    assert_eq!(t.body_secs, 60);
+}
+
+#[test]
+fn timeouts_bare_number() {
+    let input =
+        "{\n    timeouts {\n        header 15\n    }\n}\na.com {\n    reverse_proxy :3000\n}\n";
+    let config = parse(input).expect("should parse");
+    let t = config
+        .global_options
+        .as_ref()
+        .expect("global")
+        .timeouts
+        .as_ref()
+        .expect("timeouts");
+    assert_eq!(t.header_secs, 15);
+}
+
+#[test]
+fn timeouts_absent_means_none() {
+    let input = "{\n    debug\n}\na.com {\n    reverse_proxy :3000\n}\n";
+    let config = parse(input).expect("should parse");
+    let opts = config.global_options.as_ref().expect("global");
+    assert!(opts.timeouts.is_none());
+}
+
+#[test]
+fn timeouts_invalid_duration_errors() {
+    let input =
+        "{\n    timeouts {\n        header abc\n    }\n}\na.com {\n    reverse_proxy :3000\n}\n";
+    let err = parse(input).expect_err("should fail");
+    assert!(
+        format!("{err:?}").contains("timeouts.header"),
+        "error should mention timeouts.header"
+    );
+}
+
+#[test]
+fn timeouts_unknown_key_errors() {
+    let input =
+        "{\n    timeouts {\n        unknown 10s\n    }\n}\na.com {\n    reverse_proxy :3000\n}\n";
+    let err = parse(input).expect_err("should fail");
+    assert!(
+        format!("{err:?}").contains("unknown timeout key"),
+        "error should mention unknown key"
+    );
+}

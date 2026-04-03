@@ -41,8 +41,8 @@ mod transforms;
 mod tests;
 
 use crate::error::{ParseError, ParseErrorKind, suggest_directive};
-use crate::model::{Directive, DwaarConfig, GlobalOptions, SiteBlock};
-use crate::token::{TokenKind, Tokenizer};
+use crate::model::{Directive, DwaarConfig, GlobalOptions, SiteBlock, TimeoutsConfig};
+use crate::token::{Token, TokenKind, Tokenizer};
 
 use helpers::skip_brace_block;
 
@@ -195,6 +195,9 @@ fn parse_global_option_line(
             })?;
             opts.drain_timeout_secs = Some(secs);
         }
+        "timeouts" => {
+            opts.timeouts = Some(parse_timeouts_block(t, &key_tok)?);
+        }
         // Unknown option — collect args, consume sub-blocks
         _ => {
             let args = collect_global_passthrough_args(t);
@@ -286,6 +289,7 @@ fn is_global_option_key(w: &str) -> bool {
             | "events"
             | "filesystem"
             | "drain_timeout"
+            | "timeouts"
     )
 }
 
@@ -299,6 +303,108 @@ fn parse_duration_secs(s: &str) -> Option<u64> {
     } else {
         s.parse().ok()
     }
+}
+
+/// Parse a duration value for a `timeouts` sub-key like `header 10s`.
+fn parse_timeout_duration(val: &str, directive: &str, tok: &Token) -> Result<u32, ParseError> {
+    let secs = parse_duration_secs(val).ok_or(ParseError {
+        line: tok.line,
+        col: tok.col,
+        kind: ParseErrorKind::InvalidValue {
+            directive: directive.to_string(),
+            message: format!("'{val}' is not a valid duration (e.g. '10s', '1m')"),
+        },
+    })?;
+    Ok(u32::try_from(secs).unwrap_or(u32::MAX))
+}
+
+/// Parse the `timeouts { header 10s; body 30s; keepalive 60s; max_requests 1000 }` block.
+/// Starts with defaults matching nginx, then overrides with whatever the user specifies.
+fn parse_timeouts_block(
+    t: &mut Tokenizer<'_>,
+    _key_tok: &Token,
+) -> Result<TimeoutsConfig, ParseError> {
+    let brace = t.peek();
+    if brace.kind != TokenKind::OpenBrace {
+        return Err(ParseError {
+            line: brace.line,
+            col: brace.col,
+            kind: ParseErrorKind::InvalidValue {
+                directive: "timeouts".to_string(),
+                message: "expected '{' after 'timeouts'".to_string(),
+            },
+        });
+    }
+    t.next_token();
+
+    let mut cfg = TimeoutsConfig::default();
+
+    loop {
+        let tok = t.peek();
+        match &tok.kind {
+            TokenKind::CloseBrace => {
+                t.next_token();
+                break;
+            }
+            TokenKind::Eof => {
+                return Err(ParseError {
+                    line: tok.line,
+                    col: tok.col,
+                    kind: ParseErrorKind::UnexpectedEof {
+                        expected: "'}' to close timeouts block".to_string(),
+                    },
+                });
+            }
+            TokenKind::Word(_) => {
+                let sub_tok = t.next_token();
+                let sub_key = match &sub_tok.kind {
+                    TokenKind::Word(w) => w.clone(),
+                    _ => unreachable!(),
+                };
+                let val = peek_consume_word_or_quoted(t);
+                match sub_key.as_str() {
+                    "header" => {
+                        cfg.header_secs =
+                            parse_timeout_duration(&val, "timeouts.header", &sub_tok)?;
+                    }
+                    "body" => {
+                        cfg.body_secs = parse_timeout_duration(&val, "timeouts.body", &sub_tok)?;
+                    }
+                    "keepalive" => {
+                        cfg.keepalive_secs =
+                            parse_timeout_duration(&val, "timeouts.keepalive", &sub_tok)?;
+                    }
+                    "max_requests" => {
+                        cfg.max_requests = val.parse::<u32>().map_err(|_| ParseError {
+                            line: sub_tok.line,
+                            col: sub_tok.col,
+                            kind: ParseErrorKind::InvalidValue {
+                                directive: "timeouts.max_requests".to_string(),
+                                message: format!("'{val}' is not a valid integer"),
+                            },
+                        })?;
+                    }
+                    other => {
+                        return Err(ParseError {
+                            line: sub_tok.line,
+                            col: sub_tok.col,
+                            kind: ParseErrorKind::InvalidValue {
+                                directive: "timeouts".to_string(),
+                                message: format!(
+                                    "unknown timeout key '{other}' — expected header, body, keepalive, or max_requests"
+                                ),
+                            },
+                        });
+                    }
+                }
+            }
+            _ => {
+                t.next_token();
+            }
+        }
+    }
+
+    Ok(cfg)
 }
 
 /// Parse one site block: `address { directive* }`
