@@ -198,6 +198,9 @@ fn parse_global_option_line(
         "timeouts" => {
             opts.timeouts = Some(parse_timeouts_block(t, &key_tok)?);
         }
+        "servers" => {
+            parse_servers_block(t, opts, &key_tok)?;
+        }
         // Unknown option — collect args, consume sub-blocks
         _ => {
             let args = collect_global_passthrough_args(t);
@@ -405,6 +408,66 @@ fn parse_timeouts_block(
     }
 
     Ok(cfg)
+}
+
+/// Parse the `servers { h3 on }` block inside the global options.
+/// Caddy's `servers` block configures listener-level options.
+/// Currently we only extract `h3 on` to enable QUIC (ISSUE-079).
+fn parse_servers_block(
+    t: &mut Tokenizer<'_>,
+    opts: &mut GlobalOptions,
+    _key_tok: &Token,
+) -> Result<(), ParseError> {
+    let brace = t.peek();
+    if brace.kind != TokenKind::OpenBrace {
+        // `servers` without a sub-block — store as passthrough
+        let args = collect_global_passthrough_args(t);
+        opts.passthrough.push(("servers".to_string(), args));
+        return Ok(());
+    }
+    t.next_token(); // consume `{`
+
+    loop {
+        let tok = t.peek();
+        match &tok.kind {
+            TokenKind::CloseBrace => {
+                t.next_token();
+                break;
+            }
+            TokenKind::Eof => {
+                return Err(ParseError {
+                    line: tok.line,
+                    col: tok.col,
+                    kind: ParseErrorKind::UnexpectedEof {
+                        expected: "'}' to close servers block".to_string(),
+                    },
+                });
+            }
+            TokenKind::Word(_) => {
+                let sub_tok = t.next_token();
+                let sub_key = match &sub_tok.kind {
+                    TokenKind::Word(w) => w.clone(),
+                    _ => unreachable!(),
+                };
+                match sub_key.as_str() {
+                    "h3" => {
+                        let val = peek_consume_word_or_quoted(t);
+                        opts.h3_enabled = val.eq_ignore_ascii_case("on");
+                    }
+                    // Future server-level options go here.
+                    _ => {
+                        // Skip unknown keys inside servers block
+                        let _ = collect_global_passthrough_args(t);
+                    }
+                }
+            }
+            _ => {
+                t.next_token();
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Parse one site block: `address { directive* }`
