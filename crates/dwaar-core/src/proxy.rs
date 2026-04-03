@@ -1059,29 +1059,27 @@ impl ProxyHttp for DwaarProxy {
         // Determine TLS settings from the pool (if this is a pool-backed route).
         // Single-backend routes that were compiled as plain `ReverseProxy` use
         // no TLS by default — transport TLS must be configured explicitly.
-        let (use_tls, sni) = if let Some(ref pool) = ctx.upstream_pool {
-            // Re-select from the pool to get TLS metadata for the chosen backend.
+        let (use_tls, sni, client_cert_key, trusted_ca) = if let Some(ref pool) = ctx.upstream_pool
+        {
+            // Find the backend matching the selected address to get its TLS metadata.
             // The address was already selected in request_filter(), so this scan
-            // is a O(n) match on the small backends Vec — not on the hot path.
-            let tls = pool
-                .backends
-                .iter()
-                .find(|b| b.addr == upstream)
-                .is_some_and(|b| b.tls);
-            let sni = pool
-                .backends
-                .iter()
-                .find(|b| b.addr == upstream)
+            // is O(n) on the small backends Vec — not on the hot path.
+            let backend = pool.backends.iter().find(|b| b.addr == upstream);
+            let tls = backend.is_some_and(|b| b.tls);
+            let sni = backend
                 .map(|b| b.tls_server_name.clone())
                 .unwrap_or_default();
-            (tls, sni)
+            let ck = backend.and_then(|b| b.client_cert_key.clone());
+            let ca = backend.and_then(|b| b.trusted_ca.clone());
+            (tls, sni, ck, ca)
         } else {
-            (false, String::new())
+            (false, String::new(), None, None)
         };
 
         debug!(
             upstream = %upstream,
             tls = use_tls,
+            mtls = client_cert_key.is_some(),
             request_id = %ctx.request_id(),
             "route resolved"
         );
@@ -1090,6 +1088,15 @@ impl ProxyHttp for DwaarProxy {
         peer.options.connection_timeout = Some(std::time::Duration::from_secs(10));
         peer.options.read_timeout = Some(std::time::Duration::from_secs(30));
         peer.options.write_timeout = Some(std::time::Duration::from_secs(30));
+
+        // Wire mTLS client cert into the peer (ISSUE-077)
+        if let Some(ck) = client_cert_key {
+            peer.client_cert_key = Some(ck);
+        }
+        // Custom CA bundle for upstream server cert verification (ISSUE-077)
+        if let Some(ca) = trusted_ca {
+            peer.options.ca = Some(ca);
+        }
 
         // Detect dead upstream connections via TCP keepalive probes instead of
         // waiting for read_timeout (30s) on a silently broken connection.

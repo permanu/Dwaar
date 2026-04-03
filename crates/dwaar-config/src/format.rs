@@ -150,6 +150,8 @@ fn format_reverse_proxy(out: &mut String, rp: &ReverseProxyDirective) {
         || rp.max_conns.is_some()
         || rp.transport_tls
         || rp.tls_server_name.is_some()
+        || rp.tls_client_auth.is_some()
+        || rp.tls_trusted_ca_certs.is_some()
         || rp.upstreams.len() > 1;
 
     if has_block_options {
@@ -196,14 +198,29 @@ fn format_reverse_proxy(out: &mut String, rp: &ReverseProxyDirective) {
             out.push_str(&max.to_string());
             out.push('\n');
         }
-        if rp.transport_tls || rp.tls_server_name.is_some() {
+        let has_transport = rp.transport_tls
+            || rp.tls_server_name.is_some()
+            || rp.tls_client_auth.is_some()
+            || rp.tls_trusted_ca_certs.is_some();
+        if has_transport {
             out.push_str("\t\ttransport {\n");
+            out.push_str("\t\t\ttls\n");
             if let Some(ref sni) = rp.tls_server_name {
                 out.push_str("\t\t\ttls_server_name ");
                 out.push_str(sni);
                 out.push('\n');
-            } else {
-                out.push_str("\t\t\ttls\n");
+            }
+            if let Some((ref cert, ref key)) = rp.tls_client_auth {
+                out.push_str("\t\t\ttls_client_auth ");
+                out.push_str(cert);
+                out.push(' ');
+                out.push_str(key);
+                out.push('\n');
+            }
+            if let Some(ref ca) = rp.tls_trusted_ca_certs {
+                out.push_str("\t\t\ttls_trusted_ca_certs ");
+                out.push_str(ca);
+                out.push('\n');
             }
             out.push_str("\t\t}\n");
         }

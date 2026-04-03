@@ -803,7 +803,9 @@ fn compile_reverse_proxy_handler(rp: &ReverseProxyDirective, location: &str) -> 
         || rp.fail_duration.is_some()
         || rp.max_conns.is_some()
         || rp.transport_tls
-        || rp.tls_server_name.is_some();
+        || rp.tls_server_name.is_some()
+        || rp.tls_client_auth.is_some()
+        || rp.tls_trusted_ca_certs.is_some();
 
     if rp.upstreams.len() <= 1 && !is_block_form {
         // Common single-upstream case — zero overhead path.
@@ -822,6 +824,42 @@ fn compile_reverse_proxy_handler(rp: &ReverseProxyDirective, location: &str) -> 
     let tls = rp.transport_tls;
     let sni = rp.tls_server_name.clone().unwrap_or_default();
 
+    // Load and validate mTLS client cert+key at config time (Guardrail #18).
+    let client_cert_key = if let Some((ref cert_path, ref key_path)) = rp.tls_client_auth {
+        match dwaar_tls::mtls::load_client_cert_key(cert_path.as_ref(), key_path.as_ref()) {
+            Ok(ck) => Some(Arc::new(ck)),
+            Err(e) => {
+                warn!(
+                    location,
+                    cert = %cert_path,
+                    error = %e,
+                    "failed to load mTLS client cert, skipping site"
+                );
+                return None;
+            }
+        }
+    } else {
+        None
+    };
+
+    // Load custom CA bundle for upstream cert verification.
+    let trusted_ca = if let Some(ref ca_path) = rp.tls_trusted_ca_certs {
+        match dwaar_tls::mtls::load_ca_certs(ca_path.as_ref()) {
+            Ok(cas) => Some(cas),
+            Err(e) => {
+                warn!(
+                    location,
+                    ca_path = %ca_path,
+                    error = %e,
+                    "failed to load trusted CA certs, skipping site"
+                );
+                return None;
+            }
+        }
+    } else {
+        None
+    };
+
     let backends = addrs
         .into_iter()
         .map(|addr| BackendConfig {
@@ -829,6 +867,8 @@ fn compile_reverse_proxy_handler(rp: &ReverseProxyDirective, location: &str) -> 
             max_conns: rp.max_conns,
             tls,
             tls_server_name: sni.clone(),
+            client_cert_key: client_cert_key.clone(),
+            trusted_ca: trusted_ca.clone(),
         })
         .collect();
 
@@ -1193,6 +1233,8 @@ mod tests {
             max_conns: None,
             transport_tls: false,
             tls_server_name: None,
+            tls_client_auth: None,
+            tls_trusted_ca_certs: None,
         })
     }
 
@@ -1209,6 +1251,8 @@ mod tests {
             max_conns: None,
             transport_tls: false,
             tls_server_name: None,
+            tls_client_auth: None,
+            tls_trusted_ca_certs: None,
         })
     }
 
@@ -1222,6 +1266,8 @@ mod tests {
             max_conns: None,
             transport_tls: false,
             tls_server_name: None,
+            tls_client_auth: None,
+            tls_trusted_ca_certs: None,
         })
     }
 
@@ -1306,6 +1352,8 @@ mod tests {
                     max_conns: None,
                     transport_tls: false,
                     tls_server_name: None,
+                    tls_client_auth: None,
+                    tls_trusted_ca_certs: None,
                 })],
             }],
         };
