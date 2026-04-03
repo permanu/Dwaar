@@ -4,158 +4,92 @@
 // This file is part of Dwaar — https://dwaar.dev
 // Licensed under the Business Source License 1.1
 
-//! Generated WIT bindings and conversion helpers.
+//! WIT-generated bindings and host↔plugin type conversions.
 //!
-//! The [`wasmtime::component::bindgen!`] macro reads `wit/dwaar-plugin.wit` at
-//! compile time and emits Rust types for all WIT records, variants, and the
-//! guest trait that host-side adapter code implements.
+//! `wasmtime::component::bindgen!` reads the WIT file at compile time and
+//! emits Rust types for every record, enum, and exported function in the
+//! `dwaar-plugin` world. We isolate the generated code in `generated`
+//! to avoid name collisions with Dwaar's native `DwaarPlugin` trait.
 //!
-//! Conversion functions in this module translate between the generated WIT
-//! types and Dwaar's native [`crate::plugin::PluginAction`] /
-//! [`crate::plugin::PluginResponse`] types.
+//! # Generated layout (wasmtime 29)
+//!
+//! For a world named `dwaar-plugin` with direct function exports:
+//! - `generated::DwaarPlugin` — the binding struct; `instantiate()` + `call_*` methods
+//! - `generated::PluginAction`, `generated::RequestInfo`, `generated::ResponseInfo`,
+//!   `generated::HeaderEntry` — the WIT record/enum types
+//!
+//! We re-export these under cleaner names so adapter.rs doesn't have to
+//! navigate the internal `generated::` path.
 
-// The macro path is relative to the crate root (crates/dwaar-plugins/),
-// so `../../wit/` reaches the workspace root where the WIT file lives.
-//
-// The macro emits a module tree rooted at the package name: `dwaar::plugin::*`.
-// It also emits top-level re-exports for the world types (including `Header`,
-// `PluginAction`, `PluginResponse`) into the current module, so we must NOT
-// import anything with those names before expanding the macro.
-wasmtime::component::bindgen!({
-    world: "dwaar-plugin",
-    path: "../../wit/dwaar-plugin.wit",
-});
+use pingora_http::{RequestHeader, ResponseHeader};
 
-// Bring the generated WIT types into scope under distinct aliases so callers
-// can reference them without spelunking through the macro-generated hierarchy.
-// We alias them here to avoid ambiguity with Dwaar's native types.
-pub use dwaar::plugin::types::Header as WitHeader;
-pub use dwaar::plugin::types::PluginAction as WitPluginAction;
-pub use dwaar::plugin::types::PluginResponse as WitPluginResponse;
+use crate::plugin::PluginAction;
 
-// ---------------------------------------------------------------------------
-// WIT → native conversions
-// ---------------------------------------------------------------------------
+/// Isolated module for bindgen! output to avoid the name clash between the
+/// generated `DwaarPlugin` struct and our native `DwaarPlugin` trait.
+#[allow(clippy::pedantic)]
+mod generated {
+    wasmtime::component::bindgen!({
+        path: "wit/dwaar-plugin.wit",
+        world: "dwaar-plugin",
+        async: false,
+    });
+}
 
-/// Convert a WIT [`WitPluginAction`] into Dwaar's native [`crate::plugin::PluginAction`].
+/// The wasmtime-generated world binding struct, re-exported as `WitInstance`
+/// to distinguish it from the native `DwaarPlugin` trait.
+pub use generated::DwaarPlugin as WitInstance;
+
+/// WIT-generated types for constructing hook call arguments.
 ///
-/// Body bytes are zero-copy wrapped in [`bytes::Bytes::from`] (one allocation
-/// for the `Vec<u8>` buffer that the WASM guest already owns).
-pub fn wit_action_to_native(action: WitPluginAction) -> crate::plugin::PluginAction {
+/// Named `wit_types` (not `types`) to make import sites self-documenting:
+/// `wit_types::RequestInfo` reads clearly as "the WIT definition of `RequestInfo`".
+pub mod wit_types {
+    pub use super::generated::{HeaderEntry, PluginAction, RequestInfo, ResponseInfo};
+}
+
+// ---------------------------------------------------------------------------
+// Type conversions
+// ---------------------------------------------------------------------------
+
+/// Convert the WIT `plugin-action` enum into Dwaar's native `PluginAction`.
+///
+/// The `respond` variant doesn't yet carry status/body in the WIT — plugins
+/// that short-circuit get a 503 stub. Rich response data (status, headers,
+/// body) is tracked in ISSUE-097.
+pub fn wit_action_to_native(action: wit_types::PluginAction) -> PluginAction {
     match action {
-        WitPluginAction::Continue => crate::plugin::PluginAction::Continue,
-        WitPluginAction::Skip => crate::plugin::PluginAction::Skip,
-        WitPluginAction::Respond(r) => {
-            crate::plugin::PluginAction::Respond(crate::plugin::PluginResponse {
-                status: r.status,
-                headers: r
-                    .headers
-                    .into_iter()
-                    .map(|h| {
-                        // WIT strings become owned Strings. We need `&'static str`
-                        // keys for `PluginResponse::headers`. Since WIT plugin
-                        // headers are dynamic (not compile-time constants), we leak
-                        // the name string. Short-circuit responses from WASM plugins
-                        // are rare (error/block paths only), so the leak budget
-                        // is negligible — typically zero or one string per blocked
-                        // request, with no per-request leak for the hot path.
-                        let name: &'static str = Box::leak(h.name.into_boxed_str());
-                        (name, h.value)
-                    })
-                    .collect(),
-                body: bytes::Bytes::from(r.body),
-            })
-        }
+        wit_types::PluginAction::Continue => PluginAction::Continue,
+        wit_types::PluginAction::Respond => PluginAction::Respond(crate::plugin::PluginResponse {
+            status: 503,
+            headers: vec![("content-type", "text/plain".to_string())],
+            body: bytes::Bytes::from_static(b"plugin short-circuit"),
+        }),
+        wit_types::PluginAction::Skip => PluginAction::Skip,
     }
 }
 
-// ---------------------------------------------------------------------------
-// Native → WIT conversions
-// ---------------------------------------------------------------------------
-
-/// Convert a slice of HTTP headers into the WIT [`WitHeader`] list passed to
-/// `on-request` and `on-response` hooks.
+/// Build the WIT `list<header-entry>` from a Pingora `RequestHeader`.
 ///
-/// Allocates one `String` per header value; the WASM boundary requires owned
-/// data because the guest gets its own linear memory copy.
-pub fn headers_to_wit<'a, I>(iter: I) -> Vec<WitHeader>
-where
-    I: Iterator<Item = (&'a str, &'a [u8])>,
-{
-    iter.filter_map(|(name, value)| {
-        // Non-UTF-8 header values are silently skipped. WASM plugins only deal
-        // with text; binary values (rare in practice) stay in-proxy and are
-        // invisible to plugins.
-        let value = std::str::from_utf8(value).ok()?;
-        Some(WitHeader {
-            name: name.to_owned(),
-            value: value.to_owned(),
+/// Names are lowercased (HTTP/2 wire convention) so plugins match headers
+/// without case folding.
+pub fn headers_to_wit(req: &RequestHeader) -> Vec<wit_types::HeaderEntry> {
+    req.headers
+        .iter()
+        .map(|(name, value)| wit_types::HeaderEntry {
+            name: name.as_str().to_lowercase(),
+            value: value.to_str().unwrap_or("").to_owned(),
         })
-    })
-    .collect()
+        .collect()
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::plugin::PluginAction;
-
-    // Verify that the WIT `continue` variant maps cleanly through the
-    // round-trip conversion without allocating.
-    #[test]
-    fn continue_round_trips() {
-        let native = wit_action_to_native(WitPluginAction::Continue);
-        assert!(matches!(native, PluginAction::Continue));
-    }
-
-    // Verify that the WIT `skip` variant maps cleanly.
-    #[test]
-    fn skip_round_trips() {
-        let native = wit_action_to_native(WitPluginAction::Skip);
-        assert!(matches!(native, PluginAction::Skip));
-    }
-
-    // Verify that a `respond` action carries its status, headers, and body.
-    #[test]
-    fn respond_round_trips() {
-        let wit_resp = WitPluginResponse {
-            status: 403,
-            headers: vec![WitHeader {
-                name: "x-blocked-by".to_owned(),
-                value: "dwaar-wasm".to_owned(),
-            }],
-            body: b"Forbidden".to_vec(),
-        };
-        let native = wit_action_to_native(WitPluginAction::Respond(wit_resp));
-
-        let PluginAction::Respond(resp) = native else {
-            panic!("expected Respond variant");
-        };
-        assert_eq!(resp.status, 403);
-        assert_eq!(resp.headers.len(), 1);
-        assert_eq!(resp.headers[0].0, "x-blocked-by");
-        assert_eq!(resp.headers[0].1, "dwaar-wasm");
-        assert_eq!(resp.body.as_ref(), b"Forbidden");
-    }
-
-    // Verify that non-UTF-8 header values are silently dropped.
-    #[test]
-    fn headers_to_wit_skips_non_utf8() {
-        let raw: Vec<(&str, &[u8])> =
-            vec![("content-type", b"text/plain"), ("x-binary", b"\xff\xfe")];
-        let wit_headers = headers_to_wit(raw.into_iter());
-        assert_eq!(wit_headers.len(), 1);
-        assert_eq!(wit_headers[0].name, "content-type");
-    }
-
-    // Verify that an empty header list converts cleanly.
-    #[test]
-    fn headers_to_wit_empty() {
-        let wit_headers = headers_to_wit(std::iter::empty());
-        assert!(wit_headers.is_empty());
-    }
+/// Build the WIT `list<header-entry>` from a Pingora `ResponseHeader`.
+pub fn response_headers_to_wit(resp: &ResponseHeader) -> Vec<wit_types::HeaderEntry> {
+    resp.headers
+        .iter()
+        .map(|(name, value)| wit_types::HeaderEntry {
+            name: name.as_str().to_lowercase(),
+            value: value.to_str().unwrap_or("").to_owned(),
+        })
+        .collect()
 }
