@@ -35,6 +35,41 @@ pub enum AdminApiError {
     Parse(#[from] serde_json::Error),
 }
 
+/// Errors from annotation parsing.
+#[derive(Debug, thiserror::Error)]
+pub enum AnnotationError {
+    /// An annotation value could not be parsed into the expected type.
+    #[error("annotation '{annotation}' has invalid value '{value}': {reason}")]
+    InvalidValue {
+        annotation: String,
+        value: String,
+        reason: String,
+    },
+}
+
+/// Errors from TLS Secret materialisation.
+#[derive(Debug, thiserror::Error)]
+pub enum TlsError {
+    /// The referenced Secret was not yet in the reflector store.
+    #[error("Secret {namespace}/{name} not found in local store — cache may be warming")]
+    SecretNotFound { name: String, namespace: String },
+
+    /// The Secret exists but is missing a required field (`tls.crt` or `tls.key`).
+    #[error("Secret {secret} is missing required field '{field}'")]
+    MissingField { secret: String, field: String },
+
+    /// A path segment (namespace or secret name) contained unsafe characters.
+    #[error("unsafe path segment '{segment}': {reason}")]
+    InvalidSegment { segment: String, reason: String },
+
+    /// Writing a PEM file to disk failed.
+    #[error("failed to write PEM file {path}: {source}")]
+    Io {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+}
+
 /// Errors from the Kubernetes informer / watcher subsystem.
 #[derive(Debug, thiserror::Error)]
 pub enum WatcherError {

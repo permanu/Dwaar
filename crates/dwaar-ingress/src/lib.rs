@@ -10,10 +10,13 @@
 //! route table via the admin API. Supports leader election so multiple replicas
 //! can run for high availability without routing conflicts.
 
+pub mod annotations;
 pub mod client;
 pub mod error;
 pub mod health;
 pub mod leader;
 pub mod metrics;
+pub mod reconciler;
+pub mod tls;
 pub mod translator;
 pub mod watcher;
