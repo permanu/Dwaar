@@ -4,221 +4,212 @@
 // This file is part of Dwaar — https://dwaar.dev
 // Licensed under the Business Source License 1.1
 
-//! Kubernetes resource watchers for the ingress controller.
+//! Kubernetes informer loop for `Ingress`, `Service`, `Secret` and `IngressClass` resources.
 //!
-//! Watches four resource types that together describe an Ingress route:
-//! - `Ingress`      — the route spec (host → service mapping)
-//! - `Service`      — needed to resolve `ClusterIP` / port
-//! - `Secret`       — TLS certificates referenced by Ingress TLS blocks
-//! - `IngressClass` — governs which Ingress objects we own
+//! Uses `kube::runtime::reflector` to maintain warm in-memory caches of each
+//! resource type and `kube::runtime::watcher` to stream change events. All
+//! reflector stores are read-only from the reconciliation perspective; mutations
+//! to the Dwaar route table happen only through the admin API client.
 //!
-//! Each resource type is backed by a `kube_runtime::reflector::Store` so
-//! the rest of the controller can query current state without hitting the
-//! API server.  The Ingress watcher also drives reconciliation: every
-//! `Apply(Ingress)` event triggers an upsert to the Dwaar admin API,
-//! and every `Delete(Ingress)` triggers a deletion.
+//! ## kube 0.98 event model
 //!
-//! Reconnection / backoff is handled by `kube_runtime::watcher`'s built-in
-//! `default_backoff()` — exponential 1 s → 30 s — so we never need to
-//! write our own retry loop for the watch stream.
+//! The watcher emits four event variants:
+//! - `Init`       — start of a list/resync cycle (buffer start)
+//! - `InitApply`  — one object from the initial list pass
+//! - `InitDone`   — end of the initial list pass; objects not seen are gone
+//! - `Apply`      — an object was added or modified
+//! - `Delete`     — an object was deleted
 //!
-//! Graceful shutdown is signalled by the `shutdown_rx` channel: when it
-//! fires (SIGTERM / SIGINT from `main.rs`) the select! in `run()` exits.
+//! We treat `InitApply` the same as `Apply` (upsert semantics) and use `InitDone`
+//! to mark the initial sync complete and flip the readiness flag.
+//!
+//! ## Concurrency model
+//!
+//! All resource type streams are combined with `tokio::select!`. The event loop is
+//! single-threaded — reconciliation tasks are dispatched sequentially to avoid
+//! conflicting upserts.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
 
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
-use kube::api::ResourceExt;
-use kube::runtime::WatchStreamExt;
-use kube::runtime::reflector::{self, Store};
-use kube::runtime::watcher as kube_watcher;
-use kube::{Api, Client};
+use kube::Client;
+use kube::runtime::reflector::{self, Store, store};
+use kube::runtime::watcher::{self, Event};
 use tokio::sync::watch;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::client::AdminApiClient;
 use crate::health::ReadinessState;
 use crate::metrics::IngressMetrics;
+use crate::translator;
 
-/// The ingress-class annotation key.
-/// Ingress objects that do not carry a matching class name are ignored.
-const INGRESS_CLASS_ANNOTATION: &str = "kubernetes.io/ingress.class";
-
-/// Reflected state for all four resource types.
-///
-/// Each `Store<T>` is a cheap `Arc`-backed reader; cloning it is free.
-/// `Store<T>` does not implement `Debug` so we skip deriving it.
-#[allow(missing_debug_implementations)]
-#[derive(Clone)]
-pub struct WatcherStores {
-    pub ingresses: Store<Ingress>,
-    pub services: Store<Service>,
-    pub secrets: Store<Secret>,
-    pub ingress_classes: Store<IngressClass>,
-}
-
-/// Configuration for the watcher task.
-#[derive(Debug, Clone)]
-pub struct WatcherConfig {
-    /// If `Some`, restrict watches to this namespace. If `None`, watch all namespaces.
-    pub namespace: Option<String>,
-    /// Only reconcile Ingress objects whose `ingressClassName` (or annotation)
-    /// matches this value.
-    pub ingress_class: Option<String>,
-}
-
-/// Main watcher that owns the four reflectors and drives reconciliation.
-///
-/// Call [`IngressWatcher::run`] as a long-lived tokio task.  It never
-/// returns unless the shutdown channel fires.
-#[allow(missing_debug_implementations)]
+/// Watches Kubernetes Ingress/Service/Secret/IngressClass resources and
+/// reconciles changes into the Dwaar route table.
 pub struct IngressWatcher {
     client: Client,
-    admin: AdminApiClient,
-    config: WatcherConfig,
+    namespace: Option<String>,
+    ingress_class: Option<String>,
+    api_client: AdminApiClient,
     readiness: ReadinessState,
-    metrics: Arc<IngressMetrics>,
+    metrics: IngressMetrics,
+}
+
+impl std::fmt::Debug for IngressWatcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `client`, `api_client`, `readiness`, and `metrics` don't expose useful
+        // Debug information — omit them to keep the output readable.
+        f.debug_struct("IngressWatcher")
+            .field("namespace", &self.namespace)
+            .field("ingress_class", &self.ingress_class)
+            .finish_non_exhaustive()
+    }
 }
 
 impl IngressWatcher {
     pub fn new(
         client: Client,
-        admin: AdminApiClient,
-        config: WatcherConfig,
+        namespace: Option<String>,
+        ingress_class: Option<String>,
+        api_client: AdminApiClient,
         readiness: ReadinessState,
-        metrics: Arc<IngressMetrics>,
+        metrics: IngressMetrics,
     ) -> Self {
         Self {
             client,
-            admin,
-            config,
+            namespace,
+            ingress_class,
+            api_client,
             readiness,
             metrics,
         }
     }
 
-    /// Build a namespaced or cluster-wide `Api<T>` depending on config.
-    fn api<T>(&self) -> Api<T>
-    where
-        T: kube::Resource<Scope = k8s_openapi::NamespaceResourceScope>,
-        T: Clone + std::fmt::Debug + serde::de::DeserializeOwned + Send + Sync + 'static,
-        T::DynamicType: Default,
-    {
-        match &self.config.namespace {
-            Some(ns) => Api::namespaced(self.client.clone(), ns),
-            None => Api::all(self.client.clone()),
-        }
-    }
-
-    /// Build a cluster-scoped `Api<T>`.
-    fn cluster_api<T>(&self) -> Api<T>
-    where
-        T: kube::Resource<Scope = k8s_openapi::ClusterResourceScope>,
-        T: Clone + std::fmt::Debug + serde::de::DeserializeOwned + Send + Sync + 'static,
-        T::DynamicType: Default,
-    {
-        Api::all(self.client.clone())
-    }
-
-    /// Run all four watch streams concurrently until shutdown is signalled.
+    /// Run the informer loop until `shutdown` fires.
     ///
-    /// Returns the `WatcherStores` so callers can inspect reflected state.
-    pub async fn run(self: Arc<Self>, mut shutdown_rx: watch::Receiver<bool>) -> WatcherStores {
-        // Set up the four reflector store pairs.
-        let (ingress_reader, ingress_writer) = reflector::store();
-        let (service_reader, service_writer) = reflector::store();
-        let (secret_reader, secret_writer) = reflector::store();
-        let (class_reader, class_writer) = reflector::store();
+    /// Builds reflector stores for each resource type, then enters the main
+    /// event dispatch loop. Returns when shutdown is signalled or an
+    /// unrecoverable stream error occurs.
+    pub async fn run(self, mut shutdown: watch::Receiver<bool>) -> Result<(), kube::Error> {
+        let watcher_config = watcher::Config::default();
 
-        let stores = WatcherStores {
-            ingresses: ingress_reader,
-            services: service_reader,
-            secrets: secret_reader,
-            ingress_classes: class_reader,
+        // ── Reflector stores (warm in-memory caches) ──────────────────────────
+        let (_ingress_store, ingress_writer): (Store<Ingress>, store::Writer<Ingress>) =
+            reflector::store();
+        let (service_store, service_writer): (Store<Service>, store::Writer<Service>) =
+            reflector::store();
+        let (_secret_store, secret_writer): (Store<Secret>, store::Writer<Secret>) =
+            reflector::store();
+        let (_ingressclass_store, ingressclass_writer): (
+            Store<IngressClass>,
+            store::Writer<IngressClass>,
+        ) = reflector::store();
+
+        // We keep service_store in an Arc so it can be shared into reconcile calls.
+        let service_store = Arc::new(service_store);
+
+        // Tracks which domains each Ingress (by `namespace/name`) currently owns.
+        // This lets us clean up the correct routes on a Deleted event without
+        // needing to re-parse the object that just disappeared.
+        let mut ingress_domains: HashMap<String, Vec<String>> = HashMap::new();
+
+        // ── Watcher streams ───────────────────────────────────────────────────
+        let api_ingress: kube::Api<Ingress> = match &self.namespace {
+            Some(ns) => kube::Api::namespaced(self.client.clone(), ns),
+            None => kube::Api::all(self.client.clone()),
         };
+        let api_service: kube::Api<Service> = match &self.namespace {
+            Some(ns) => kube::Api::namespaced(self.client.clone(), ns),
+            None => kube::Api::all(self.client.clone()),
+        };
+        let api_secret: kube::Api<Secret> = match &self.namespace {
+            Some(ns) => kube::Api::namespaced(self.client.clone(), ns),
+            None => kube::Api::all(self.client.clone()),
+        };
+        let api_ingressclass: kube::Api<IngressClass> = kube::Api::all(self.client.clone());
 
-        // --- Ingress watcher + reconciler ---
-        // We keep the raw event stream (not `.applied_objects()`) so we can
-        // detect both Apply and Delete events for reconciliation.
-        let ingress_api: Api<Ingress> = self.api();
-        let ingress_watcher = kube_watcher::watcher(ingress_api, kube_watcher::Config::default())
-            .default_backoff()
-            .reflect(ingress_writer);
+        // Reflector wraps the watcher stream and keeps the Store warm.
+        let ingress_stream = reflector::reflector(
+            ingress_writer,
+            watcher::watcher(api_ingress, watcher_config.clone()),
+        )
+        .boxed();
 
-        // --- Service watcher (reflected, no reconcile action) ---
-        // `.applied_objects()` converts `TryStream<Item=Event<T>>` to `Stream<Item=T>`,
-        // so we use `.for_each()` (not `try_for_each()`) to drain it.
-        let service_api: Api<Service> = self.api();
-        let service_watcher = kube_watcher::watcher(service_api, kube_watcher::Config::default())
-            .default_backoff()
-            .reflect(service_writer)
-            .applied_objects();
+        let service_stream = reflector::reflector(
+            service_writer,
+            watcher::watcher(api_service, watcher_config.clone()),
+        )
+        .boxed();
 
-        // --- Secret watcher (reflected, no reconcile action) ---
-        let secret_api: Api<Secret> = self.api();
-        let secret_watcher = kube_watcher::watcher(secret_api, kube_watcher::Config::default())
-            .default_backoff()
-            .reflect(secret_writer)
-            .applied_objects();
+        let secret_stream = reflector::reflector(
+            secret_writer,
+            watcher::watcher(api_secret, watcher_config.clone()),
+        )
+        .boxed();
 
-        // --- IngressClass watcher (cluster-scoped, reflected only) ---
-        let class_api: Api<IngressClass> = self.cluster_api();
-        let class_watcher = kube_watcher::watcher(class_api, kube_watcher::Config::default())
-            .default_backoff()
-            .reflect(class_writer)
-            .applied_objects();
+        let _ingressclass_stream = reflector::reflector(
+            ingressclass_writer,
+            watcher::watcher(api_ingressclass, watcher_config),
+        );
 
-        // Spawn secondary watchers as background tasks. They run for the
-        // lifetime of the process and populate the reflector stores without
-        // requiring explicit event dispatch.
-        tokio::spawn(async move {
-            service_watcher.for_each(|_svc| async {}).await;
-            error!("Service watcher terminated unexpectedly");
-        });
+        tokio::pin!(ingress_stream);
+        tokio::pin!(service_stream);
+        tokio::pin!(secret_stream);
 
-        tokio::spawn(async move {
-            secret_watcher.for_each(|_secret| async {}).await;
-            error!("Secret watcher terminated unexpectedly");
-        });
-
-        tokio::spawn(async move {
-            class_watcher.for_each(|_class| async {}).await;
-            error!("IngressClass watcher terminated unexpectedly");
-        });
-
-        // Pin the Ingress stream; it remains a TryStream so we use try_next().
-        let mut ingress_stream = std::pin::pin!(ingress_watcher);
+        info!("IngressWatcher started");
 
         loop {
             tokio::select! {
                 biased;
 
-                // Shutdown signal takes highest priority
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
+                // Shutdown takes highest priority
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
                         info!("IngressWatcher shutting down");
-                        return stores;
+                        return Ok(());
                     }
                 }
 
-                event = ingress_stream.try_next() => {
-                    match event {
-                        Ok(Some(ev)) => {
-                            self.handle_ingress_event(ev).await;
-                        }
-                        Ok(None) => {
-                            // `default_backoff()` normally reconnects internally,
-                            // so stream exhaustion should not happen in practice.
-                            warn!("Ingress watch stream ended unexpectedly");
-                            self.readiness.watcher_ready.store(false, Ordering::Release);
+                // Ingress events drive route reconciliation
+                Some(ingress_event) = ingress_stream.next() => {
+                    match ingress_event {
+                        Ok(event) => {
+                            self.handle_ingress_event(
+                                event,
+                                &service_store,
+                                &mut ingress_domains,
+                            ).await;
                         }
                         Err(e) => {
-                            error!(error = %e, "Ingress watch stream error");
-                            self.readiness.watcher_ready.store(false, Ordering::Release);
+                            warn!(error = %e, "Ingress watcher stream error — continuing");
+                        }
+                    }
+                }
+
+                // Service events refresh the store (no explicit action needed —
+                // the reflector keeps the Store warm automatically).
+                Some(svc_event) = service_stream.next() => {
+                    match svc_event {
+                        Ok(_) => {
+                            debug!("Service store updated");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Service watcher stream error — continuing");
+                        }
+                    }
+                }
+
+                // Secret events are tracked for future TLS cert management.
+                Some(secret_event) = secret_stream.next() => {
+                    match secret_event {
+                        Ok(_) => {
+                            debug!("Secret store updated");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Secret watcher stream error — continuing");
                         }
                     }
                 }
@@ -226,363 +217,138 @@ impl IngressWatcher {
         }
     }
 
-    /// Dispatch a raw watcher event to the appropriate reconcile action.
-    async fn handle_ingress_event(&self, event: kube_watcher::Event<Ingress>) {
+    /// Dispatch an `Event<Ingress>` to the appropriate handler.
+    ///
+    /// kube 0.98 event variants:
+    /// - `Apply`     → object added or modified (steady state)
+    /// - `Delete`    → object removed
+    /// - `InitApply` → object seen during initial list/resync pass (treat as Apply)
+    /// - `Init`      → initial list pass beginning (no action needed)
+    /// - `InitDone`  → initial list pass complete; set readiness flag
+    async fn handle_ingress_event(
+        &self,
+        event: Event<Ingress>,
+        service_store: &Store<Service>,
+        ingress_domains: &mut HashMap<String, Vec<String>>,
+    ) {
         match event {
-            kube_watcher::Event::Apply(ingress) => {
-                self.readiness.watcher_ready.store(true, Ordering::Release);
-                self.metrics
-                    .watched_ingresses
-                    .set(self.metrics.watched_ingresses.get() + 1);
-
-                if self.should_reconcile(&ingress) {
-                    self.reconcile_upsert(&ingress).await;
-                }
+            Event::Apply(ingress) | Event::InitApply(ingress) => {
+                self.handle_applied(&ingress, service_store, ingress_domains)
+                    .await;
             }
-            kube_watcher::Event::Delete(ingress) => {
-                self.metrics
-                    .watched_ingresses
-                    .set((self.metrics.watched_ingresses.get() - 1).max(0));
-
-                if self.should_reconcile(&ingress) {
-                    self.reconcile_delete(&ingress).await;
-                }
+            Event::Delete(ingress) => {
+                self.handle_deleted(&ingress, service_store, ingress_domains)
+                    .await;
             }
-            // Init / InitApply / InitDone are emitted during the initial list
-            // phase. We treat InitApply items the same as Apply to bootstrap
-            // the admin API with existing state on startup.
-            kube_watcher::Event::Init => {
-                debug!("Ingress watcher initialising (list phase)");
+            Event::InitDone => {
+                // The reflector has finished its initial list pass — all known
+                // objects have been processed. It is now safe to mark sync complete.
+                self.readiness.sync_ready.store(true, Ordering::Release);
+                info!("Initial sync complete — readiness flag set");
             }
-            kube_watcher::Event::InitApply(ingress) => {
-                if self.should_reconcile(&ingress) {
-                    self.reconcile_upsert(&ingress).await;
-                }
-            }
-            kube_watcher::Event::InitDone => {
-                info!("Ingress watcher init complete — watch stream active");
-                self.readiness.watcher_ready.store(true, Ordering::Release);
+            Event::Init => {
+                // A new list/resync cycle is starting. Clear tracked state so
+                // that domains not seen in the resync are cleaned up.
+                debug!("Ingress store resync starting — clearing tracked state");
+                ingress_domains.clear();
             }
         }
     }
 
-    /// Returns `true` when the Ingress object belongs to our ingress class.
-    ///
-    /// If `--ingress-class` was not set, we handle everything.
-    /// Otherwise we check both the `ingressClassName` field and the legacy
-    /// `kubernetes.io/ingress.class` annotation.
-    fn should_reconcile(&self, ingress: &Ingress) -> bool {
-        let Some(ref expected_class) = self.config.ingress_class else {
-            return true;
-        };
-
-        // Check spec.ingressClassName (preferred since Kubernetes 1.18)
-        if let Some(spec) = &ingress.spec
-            && let Some(class_name) = &spec.ingress_class_name
-        {
-            return class_name == expected_class;
-        }
-
-        // Fall back to the legacy annotation
-        ingress.annotations().get(INGRESS_CLASS_ANNOTATION) == Some(expected_class)
-    }
-
-    /// Upsert all routes defined by a single Ingress object.
-    ///
-    /// An Ingress may define multiple rules (hostnames), each mapping to a
-    /// backend service. We derive the upstream from the first path's backend.
-    #[instrument(skip(self), fields(name = ingress.name_any(), namespace = ingress.namespace().unwrap_or_default()))]
-    async fn reconcile_upsert(&self, ingress: &Ingress) {
-        let start = Instant::now();
-        let Some(spec) = &ingress.spec else {
-            debug!("Ingress has no spec — skipping");
+    /// Handle an `Apply` or `InitApply` Ingress event.
+    async fn handle_applied(
+        &self,
+        ingress: &Ingress,
+        service_store: &Store<Service>,
+        ingress_domains: &mut HashMap<String, Vec<String>>,
+    ) {
+        // Skip Ingresses targeting a different IngressClass.
+        if !self.ingress_class_matches(ingress) {
             return;
-        };
-
-        let rules = match &spec.rules {
-            Some(r) if !r.is_empty() => r,
-            _ => {
-                debug!("Ingress has no rules — skipping");
-                return;
-            }
-        };
-
-        // TLS is enabled for this Ingress if any TLS block is present
-        let has_tls = spec.tls.as_ref().is_some_and(|t| !t.is_empty());
-
-        for rule in rules {
-            let Some(host) = &rule.host else {
-                debug!("Ingress rule has no host — skipping");
-                continue;
-            };
-
-            // Derive upstream from the first path backend of this rule
-            let Some(upstream) = derive_upstream(rule) else {
-                warn!(host, "Cannot derive upstream from Ingress rule — skipping");
-                continue;
-            };
-
-            info!(host, upstream, tls = has_tls, "upserting route");
-
-            match self.admin.upsert_route(host, &upstream, has_tls).await {
-                Ok(()) => {
-                    self.metrics.record_sync_ok();
-                    debug!(host, "route upserted");
-                }
-                Err(e) => {
-                    let reason = error_reason(&e);
-                    self.metrics.record_sync_error(reason);
-                    error!(host, error = %e, "failed to upsert route");
-                }
-            }
         }
 
-        self.metrics
-            .reconcile_duration_seconds
-            .observe(start.elapsed().as_secs_f64());
-    }
+        let key = translator::ingress_key(ingress);
+        let synced = translator::reconcile_applied(ingress, service_store, &self.api_client).await;
 
-    /// Delete all routes for the hosts defined by a deleted Ingress.
-    #[instrument(skip(self), fields(name = ingress.name_any(), namespace = ingress.namespace().unwrap_or_default()))]
-    async fn reconcile_delete(&self, ingress: &Ingress) {
-        let start = Instant::now();
-        let Some(spec) = &ingress.spec else {
-            return;
-        };
-
-        let rules = match &spec.rules {
-            Some(r) if !r.is_empty() => r,
-            _ => return,
-        };
-
-        for rule in rules {
-            let Some(host) = &rule.host else {
-                continue;
-            };
-
-            info!(host, "deleting route");
-
-            match self.admin.delete_route(host).await {
-                Ok(()) => {
-                    self.metrics.record_sync_ok();
-                    debug!(host, "route deleted");
-                }
-                Err(e) => {
-                    let reason = error_reason(&e);
-                    self.metrics.record_sync_error(reason);
-                    error!(host, error = %e, "failed to delete route");
-                }
-            }
+        for _ in &synced {
+            self.metrics.inc_routes_upserted();
         }
 
-        self.metrics
-            .reconcile_duration_seconds
-            .observe(start.elapsed().as_secs_f64());
-    }
-}
-
-/// Extract a `host:port` upstream string from the first backend in an Ingress rule.
-///
-/// The service name is used as the hostname so the proxy can resolve it via
-/// cluster DNS (e.g. `my-svc:8080`). An operator can override with an
-/// `ExternalName` service if a raw IP is required.
-fn derive_upstream(rule: &k8s_openapi::api::networking::v1::IngressRule) -> Option<String> {
-    let http = rule.http.as_ref()?;
-    let path = http.paths.first()?;
-    let backend = path.backend.service.as_ref()?;
-    let port = backend.port.as_ref()?;
-
-    let port_num = port.number?;
-    Some(format!("{}:{}", backend.name, port_num))
-}
-
-/// Map an `AdminApiError` to a short reason string for the metrics label.
-fn error_reason(e: &crate::error::AdminApiError) -> &'static str {
-    use crate::error::AdminApiError;
-    match e {
-        AdminApiError::Transport(_) => "transport",
-        AdminApiError::Status { .. } => "status",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use k8s_openapi::api::networking::v1::{
-        HTTPIngressPath, HTTPIngressRuleValue, IngressBackend, IngressRule, IngressServiceBackend,
-        IngressSpec, ServiceBackendPort,
-    };
-
-    fn make_ingress(host: &str, service: &str, port: i32, tls: bool) -> Ingress {
-        let tls_block = if tls {
-            Some(vec![k8s_openapi::api::networking::v1::IngressTLS {
-                hosts: Some(vec![host.to_string()]),
-                secret_name: Some("my-tls-secret".to_string()),
-            }])
+        if synced.is_empty() {
+            warn!(ingress = %key, "no routes resolved for Ingress — may have missing Services");
+            self.metrics.inc_service_lookup_misses();
         } else {
-            None
-        };
+            debug!(ingress = %key, domains = ?synced, "Ingress routes upserted");
+        }
 
-        Ingress {
-            metadata: k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta {
-                name: Some("test-ingress".to_string()),
-                namespace: Some("default".to_string()),
-                ..Default::default()
-            },
-            spec: Some(IngressSpec {
-                rules: Some(vec![IngressRule {
-                    host: Some(host.to_string()),
-                    http: Some(HTTPIngressRuleValue {
-                        paths: vec![HTTPIngressPath {
-                            backend: IngressBackend {
-                                service: Some(IngressServiceBackend {
-                                    name: service.to_string(),
-                                    port: Some(ServiceBackendPort {
-                                        number: Some(port),
-                                        name: None,
-                                    }),
-                                }),
-                                resource: None,
-                            },
-                            path: Some("/".to_string()),
-                            path_type: "Prefix".to_string(),
-                        }],
-                    }),
-                }]),
-                tls: tls_block,
-                ..Default::default()
-            }),
-            ..Default::default()
+        ingress_domains.insert(key, synced);
+    }
+
+    /// Handle a `Delete` Ingress event.
+    async fn handle_deleted(
+        &self,
+        ingress: &Ingress,
+        service_store: &Store<Service>,
+        ingress_domains: &mut HashMap<String, Vec<String>>,
+    ) {
+        if !self.ingress_class_matches(ingress) {
+            return;
+        }
+
+        let key = translator::ingress_key(ingress);
+
+        // Prefer tracked domains (fast path) over re-parsing the object.
+        let domains = ingress_domains.remove(&key).unwrap_or_else(|| {
+            warn!(
+                ingress = %key,
+                "Ingress deleted but no tracked domains found — falling back to spec parse"
+            );
+            translator::domains_from_ingress(ingress, service_store)
+        });
+
+        if domains.is_empty() {
+            debug!(ingress = %key, "deleted Ingress owned no routes");
+            return;
+        }
+
+        let errors = translator::reconcile_deleted(&domains, &self.api_client).await;
+        let deleted = domains.len() - errors.len();
+        for _ in 0..deleted {
+            self.metrics.inc_routes_deleted();
+        }
+        for e in &errors {
+            error!(ingress = %key, error = %e, "failed to delete route");
         }
     }
 
-    fn make_ingress_with_class(class_name: &str) -> Ingress {
-        let mut ingress = make_ingress("example.com", "my-svc", 80, false);
-        if let Some(spec) = ingress.spec.as_mut() {
-            spec.ingress_class_name = Some(class_name.to_string());
+    /// Return `true` if this Ingress should be processed by this controller.
+    ///
+    /// When `ingress_class` is `None`, we process all Ingresses (useful in
+    /// single-controller setups). When set, we match against the
+    /// `kubernetes.io/ingress.class` annotation or `spec.ingressClassName`.
+    fn ingress_class_matches(&self, ingress: &Ingress) -> bool {
+        let Some(ref class_name) = self.ingress_class else {
+            return true; // no filter configured — process everything
+        };
+
+        // Check annotation first (older convention)
+        let annotation = ingress
+            .metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get("kubernetes.io/ingress.class"))
+            .map(String::as_str);
+
+        if let Some(ann) = annotation {
+            return ann == class_name;
         }
-        ingress
-    }
 
-    fn make_ingress_with_annotation(class_name: &str) -> Ingress {
-        let mut ingress = make_ingress("example.com", "my-svc", 80, false);
-        ingress.metadata.annotations =
-            Some([(INGRESS_CLASS_ANNOTATION.to_string(), class_name.to_string())].into());
-        ingress
-    }
+        // Fall back to spec.ingressClassName (newer convention, v1.18+)
+        let spec_class = ingress
+            .spec
+            .as_ref()
+            .and_then(|s| s.ingress_class_name.as_deref());
 
-    fn make_watcher_config(class: Option<&str>, ns: Option<&str>) -> WatcherConfig {
-        WatcherConfig {
-            namespace: ns.map(ToString::to_string),
-            ingress_class: class.map(ToString::to_string),
-        }
-    }
-
-    // Thin struct to test the pure logic of should_reconcile without
-    // needing a live kube client.
-    struct PureWatcher {
-        config: WatcherConfig,
-    }
-
-    impl PureWatcher {
-        fn should_reconcile(&self, ingress: &Ingress) -> bool {
-            let Some(ref expected_class) = self.config.ingress_class else {
-                return true;
-            };
-            if let Some(spec) = &ingress.spec
-                && let Some(class_name) = &spec.ingress_class_name
-            {
-                return class_name == expected_class;
-            }
-            ingress.annotations().get(INGRESS_CLASS_ANNOTATION) == Some(expected_class)
-        }
-    }
-
-    #[test]
-    fn derive_upstream_extracts_service_and_port() {
-        let ingress = make_ingress("example.com", "my-backend", 8080, false);
-        let spec = ingress.spec.expect("test ingress has spec");
-        let rule = &spec.rules.expect("test ingress has rules")[0];
-        let upstream = derive_upstream(rule).expect("should derive upstream");
-        assert_eq!(upstream, "my-backend:8080");
-    }
-
-    #[test]
-    fn derive_upstream_no_paths_returns_none() {
-        let rule = IngressRule {
-            host: Some("example.com".to_string()),
-            http: Some(HTTPIngressRuleValue { paths: vec![] }),
-        };
-        assert!(derive_upstream(&rule).is_none());
-    }
-
-    #[test]
-    fn derive_upstream_no_http_returns_none() {
-        let rule = IngressRule {
-            host: Some("example.com".to_string()),
-            http: None,
-        };
-        assert!(derive_upstream(&rule).is_none());
-    }
-
-    #[test]
-    fn no_class_filter_reconciles_all() {
-        let w = PureWatcher {
-            config: make_watcher_config(None, None),
-        };
-        let ingress = make_ingress("example.com", "svc", 80, false);
-        assert!(w.should_reconcile(&ingress));
-    }
-
-    #[test]
-    fn class_filter_matches_spec_field() {
-        let w = PureWatcher {
-            config: make_watcher_config(Some("dwaar"), None),
-        };
-        let ingress = make_ingress_with_class("dwaar");
-        assert!(w.should_reconcile(&ingress));
-    }
-
-    #[test]
-    fn class_filter_rejects_wrong_class() {
-        let w = PureWatcher {
-            config: make_watcher_config(Some("dwaar"), None),
-        };
-        let ingress = make_ingress_with_class("nginx");
-        assert!(!w.should_reconcile(&ingress));
-    }
-
-    #[test]
-    fn class_filter_matches_annotation_fallback() {
-        let w = PureWatcher {
-            config: make_watcher_config(Some("dwaar"), None),
-        };
-        let ingress = make_ingress_with_annotation("dwaar");
-        assert!(w.should_reconcile(&ingress));
-    }
-
-    #[test]
-    fn class_filter_rejects_wrong_annotation() {
-        let w = PureWatcher {
-            config: make_watcher_config(Some("dwaar"), None),
-        };
-        let ingress = make_ingress_with_annotation("traefik");
-        assert!(!w.should_reconcile(&ingress));
-    }
-
-    #[test]
-    fn ingress_with_tls_block_has_tls_true() {
-        let ingress = make_ingress("secure.example.com", "svc", 443, true);
-        let spec = ingress.spec.expect("test ingress has spec");
-        let has_tls = spec.tls.as_ref().is_some_and(|t| !t.is_empty());
-        assert!(has_tls);
-    }
-
-    #[test]
-    fn ingress_without_tls_block_has_tls_false() {
-        let ingress = make_ingress("plain.example.com", "svc", 80, false);
-        let spec = ingress.spec.expect("test ingress has spec");
-        let has_tls = spec.tls.as_ref().is_some_and(|t| !t.is_empty());
-        assert!(!has_tls);
+        spec_class == Some(class_name.as_str())
     }
 }

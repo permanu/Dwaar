@@ -71,30 +71,45 @@ const MAX_CONSECUTIVE_TRAPS: u32 = 10;
 /// (e.g., letting plugins call back into Dwaar for rate-limit state) is
 /// tracked in ISSUE-097.
 pub(crate) struct PluginState {
-    // Fields are written at store creation and available to future host
-    // functions. They are not read in the current call-based invocation
-    // model (ISSUE-097 will add host function bindings that read them).
-    /// Client IP as a string (empty string when unavailable).
-    #[expect(dead_code, reason = "read by host functions added in ISSUE-097")]
-    pub(crate) client_ip: String,
+    /// Human-readable plugin name (used in log fields by host functions).
+    pub(crate) plugin_name: String,
+    /// Client IP address, if available.
+    pub(crate) client_ip: Option<std::net::IpAddr>,
     /// HTTP method of the inbound request (e.g., "GET").
-    #[expect(dead_code, reason = "read by host functions added in ISSUE-097")]
     pub(crate) method: String,
     /// Request path (e.g., "/api/v1/users").
-    #[expect(dead_code, reason = "read by host functions added in ISSUE-097")]
     pub(crate) path: String,
     /// True when the downstream connection used TLS.
-    #[expect(dead_code, reason = "read by host functions added in ISSUE-097")]
     pub(crate) is_tls: bool,
+    /// Snapshot of request headers for the current hook call.
+    pub(crate) request_headers: Vec<(String, String)>,
+    /// Snapshot of response headers for the current hook call.
+    pub(crate) response_headers: Vec<(String, String)>,
 }
 
 impl PluginState {
-    fn from_ctx(ctx: &PluginCtx) -> Self {
+    /// Create a new state with just the plugin name (for tests).
+    pub(crate) fn new(plugin_name: String) -> Self {
         Self {
-            client_ip: ctx.client_ip.map(|ip| ip.to_string()).unwrap_or_default(),
+            plugin_name,
+            client_ip: None,
+            method: String::new(),
+            path: String::new(),
+            is_tls: false,
+            request_headers: Vec::new(),
+            response_headers: Vec::new(),
+        }
+    }
+
+    fn from_ctx(ctx: &PluginCtx, plugin_name: &str) -> Self {
+        Self {
+            plugin_name: plugin_name.to_owned(),
+            client_ip: ctx.client_ip,
             method: ctx.method.to_string(),
             path: ctx.path.to_string(),
             is_tls: ctx.is_tls,
+            request_headers: Vec::new(),
+            response_headers: Vec::new(),
         }
     }
 }
@@ -229,7 +244,7 @@ impl WasmPlugin {
             return PluginAction::Continue;
         }
 
-        let state = PluginState::from_ctx(ctx);
+        let state = PluginState::from_ctx(ctx, self.name);
         let mut store = Store::new(&self.engine, state);
         let linker: Linker<PluginState> = Linker::new(&self.engine);
 

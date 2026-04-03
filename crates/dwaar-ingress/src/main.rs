@@ -4,160 +4,164 @@
 // This file is part of Dwaar — https://dwaar.dev
 // Licensed under the Business Source License 1.1
 
-//! Entry point for the Dwaar Kubernetes ingress controller.
+//! dwaar-ingress binary — Kubernetes ingress controller entry point.
 //!
-//! Parses CLI args, builds a kube `Client`, wires up the health server,
-//! and starts the watcher.  Graceful shutdown is triggered by SIGTERM or
-//! SIGINT (Ctrl-C).
+//! Starts the leader election loop, health server, and (on leadership acquisition)
+//! the Ingress/Service/Secret watcher that reconciles routes into Dwaar.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
-use anyhow::Context as _;
+use anyhow::{Context, Result};
 use clap::Parser;
-use kube::Client;
 use tokio::sync::watch;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use dwaar_ingress::client::AdminApiClient;
 use dwaar_ingress::health::{ReadinessState, serve as health_serve};
+use dwaar_ingress::leader::{LeaderConfig, LeaderElector};
 use dwaar_ingress::metrics::IngressMetrics;
-use dwaar_ingress::watcher::{IngressWatcher, WatcherConfig};
+use dwaar_ingress::watcher::IngressWatcher;
 
-/// Dwaar Kubernetes ingress controller.
-#[derive(Parser, Debug)]
-#[command(name = "dwaar-ingress", version, about)]
-struct Cli {
-    /// Path to a kubeconfig file. Defaults to in-cluster config when omitted.
-    #[arg(long, env = "KUBECONFIG")]
-    kubeconfig: Option<String>,
-
-    /// Base URL of the Dwaar admin API (e.g. `http://127.0.0.1:9091`).
-    #[arg(long, env = "DWAAR_ADMIN_URL", default_value = "http://127.0.0.1:9091")]
+#[derive(Debug, Parser)]
+#[command(
+    name = "dwaar-ingress",
+    about = "Kubernetes ingress controller for Dwaar",
+    version
+)]
+struct Args {
+    /// Dwaar admin API base URL (e.g. `http://dwaar-admin:9000`)
+    #[arg(long, env = "DWAAR_ADMIN_URL", default_value = "http://localhost:9000")]
     admin_url: String,
 
-    /// Restrict watches to this namespace. Watches all namespaces when omitted.
-    #[arg(long, env = "DWAAR_NAMESPACE")]
-    namespace: Option<String>,
+    /// Address for the health/readiness server
+    #[arg(long, env = "HEALTH_ADDR", default_value = "0.0.0.0:8080")]
+    health_addr: SocketAddr,
 
-    /// `IngressClass` name to handle. Handles all classes when omitted.
-    #[arg(long, env = "DWAAR_INGRESS_CLASS")]
+    /// Only manage Ingresses with this class name (empty = manage all)
+    #[arg(long, env = "INGRESS_CLASS")]
     ingress_class: Option<String>,
 
-    /// Port for the liveness/readiness/metrics HTTP server.
-    #[arg(long, env = "DWAAR_PROBE_PORT", default_value = "8081")]
-    probe_port: u16,
+    /// Namespace to watch (empty = watch all namespaces)
+    #[arg(long, env = "WATCH_NAMESPACE")]
+    namespace: Option<String>,
+
+    /// Leader election lease name
+    #[arg(long, env = "LEASE_NAME", default_value = "dwaar-ingress-leader")]
+    lease_name: String,
+
+    /// Namespace where the leader election Lease lives
+    #[arg(long, env = "LEASE_NAMESPACE", default_value = "kube-system")]
+    lease_namespace: String,
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // Structured JSON logging by default; RUST_LOG controls filter level.
+async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .json()
         .with_env_filter(EnvFilter::from_default_env())
+        .json()
         .init();
 
-    let cli = Cli::parse();
+    let args = Args::parse();
 
     info!(
-        admin_url = %cli.admin_url,
-        namespace = ?cli.namespace,
-        ingress_class = ?cli.ingress_class,
-        probe_port = cli.probe_port,
+        admin_url = %args.admin_url,
+        health_addr = %args.health_addr,
+        ingress_class = ?args.ingress_class,
+        namespace = ?args.namespace,
         "dwaar-ingress starting"
     );
 
-    // Build the kube client from in-cluster config or kubeconfig file.
-    let kube_client = if let Some(ref path) = cli.kubeconfig {
-        let config = kube::Config::from_kubeconfig(&kube::config::KubeConfigOptions {
-            context: None,
-            cluster: None,
-            user: None,
-        })
-        .await
-        .with_context(|| format!("loading kubeconfig from {path}"))?;
-        Client::try_from(config).context("building kube client from kubeconfig")?
-    } else {
-        Client::try_default()
-            .await
-            .context("building in-cluster kube client")?
-    };
-
-    let admin_client = AdminApiClient::new(cli.admin_url);
-
-    let watcher_config = WatcherConfig {
-        namespace: cli.namespace,
-        ingress_class: cli.ingress_class,
-    };
+    let kube_client = kube::Client::try_default().await.context(
+        "failed to build Kubernetes client — check KUBECONFIG / in-cluster service account",
+    )?;
 
     let readiness = ReadinessState::new();
     let metrics = IngressMetrics::new();
+    let api_client = AdminApiClient::new(&args.admin_url);
 
-    // No leader election in this phase: mark leader as ready immediately.
-    // When leader election (ISSUE-095) is added, this flag will be managed
-    // by the lease controller.
-    readiness.leader_ready.store(true, Ordering::Release);
-    metrics.leader_is_leader.set(1);
-
-    // Shutdown channel: broadcast `true` when SIGTERM / SIGINT fires.
+    // Shutdown channel — broadcast to all subsystems.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    // Health / readiness / metrics server
-    let health_addr = SocketAddr::from(([0, 0, 0, 0], cli.probe_port));
+    // Spawn the health server — always runs, even when not leader.
     let health_readiness = readiness.clone();
-    let health_metrics = Arc::clone(&metrics);
     tokio::spawn(async move {
-        if let Err(e) = health_serve(health_addr, health_readiness, health_metrics).await {
-            tracing::error!(error = %e, "health server error");
+        if let Err(e) = health_serve(args.health_addr, health_readiness).await {
+            tracing::error!(error = %e, "health server exited unexpectedly");
         }
     });
 
-    // Watcher task
-    let watcher = Arc::new(IngressWatcher::new(
-        kube_client,
-        admin_client,
-        watcher_config,
-        readiness,
-        Arc::clone(&metrics),
-    ));
-
-    let watcher_handle = tokio::spawn({
-        let watcher = Arc::clone(&watcher);
-        let rx = shutdown_rx.clone();
-        async move { watcher.run(rx).await }
+    // Wire up SIGTERM / Ctrl-C → graceful shutdown.
+    let shutdown_tx_signal = shutdown_tx.clone();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut sigterm =
+                signal(SignalKind::terminate()).expect("SIGTERM handler registration must succeed");
+            tokio::select! {
+                _ = sigterm.recv() => {}
+                _ = tokio::signal::ctrl_c() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+        info!("shutdown signal received");
+        let _ = shutdown_tx_signal.send(true);
     });
 
-    // Wait for SIGTERM or SIGINT
-    wait_for_shutdown().await;
-    info!("shutdown signal received");
+    // Leader election config.
+    let leader_config = LeaderConfig {
+        lease_name: args.lease_name,
+        namespace: args.lease_namespace,
+        ..LeaderConfig::default()
+    };
 
-    // Signal all tasks to stop
-    let _ = shutdown_tx.send(true);
+    let elector = LeaderElector::new(
+        leader_config,
+        kube_client.clone(),
+        readiness.clone(),
+        metrics.clone(),
+    );
 
-    // Give the watcher task a moment to clean up
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), watcher_handle).await;
+    // Run leader election. The closure starts the watcher when we acquire leadership.
+    let kube_client_inner = kube_client.clone();
+    let ingress_class = args.ingress_class.clone();
+    let namespace = args.namespace.clone();
+    let api_client_inner = api_client.clone();
+    let readiness_inner = readiness.clone();
+    let metrics_inner = metrics.clone();
+    let shutdown_rx_watcher = shutdown_rx.clone();
 
-    info!("dwaar-ingress stopped");
+    elector
+        .run(shutdown_rx, move |lost_rx| {
+            let kube = kube_client_inner.clone();
+            let class = ingress_class.clone();
+            let ns = namespace.clone();
+            let api = api_client_inner.clone();
+            let rd = readiness_inner.clone();
+            let m = metrics_inner.clone();
+            let mut done = lost_rx;
+            let shutdown = shutdown_rx_watcher.clone();
+            async move {
+                let watcher = IngressWatcher::new(kube, ns, class, api, rd, m);
+                // Run until leadership is lost or process shuts down.
+                tokio::select! {
+                    res = watcher.run(shutdown) => {
+                        if let Err(e) = res {
+                            tracing::error!(error = %e, "IngressWatcher exited with error");
+                        }
+                    }
+                    _ = done.changed() => {
+                        info!("IngressWatcher stopping — leadership lost");
+                    }
+                }
+            }
+        })
+        .await;
+
+    info!("dwaar-ingress exiting");
     Ok(())
-}
-
-/// Wait for either SIGTERM (Unix) or CTRL-C.
-async fn wait_for_shutdown() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut sigterm =
-            signal(SignalKind::terminate()).expect("SIGTERM handler registration failed");
-        tokio::select! {
-            _ = sigterm.recv() => {}
-            _ = tokio::signal::ctrl_c() => {}
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
 }

@@ -4,57 +4,48 @@
 // This file is part of Dwaar — https://dwaar.dev
 // Licensed under the Business Source License 1.1
 
-//! Liveness, readiness, and metrics HTTP endpoints.
+//! HTTP health and readiness endpoints.
 //!
-//! Serves a minimal HTTP/1.1 server on the configured probe port (default 8081).
-//! All three endpoints are on the same port:
+//! `/healthz` — liveness: always 200 if the process is running.
+//! `/readyz`  — readiness: 200 only when this pod holds the leader lease and
+//!              has finished its initial sync. Non-leaders return 503 so that
+//!              the K8s service load balancer routes traffic elsewhere.
 //!
-//! - `GET /healthz` — liveness probe: always 200 once the process is up.
-//! - `GET /readyz` — readiness probe: 200 only when the watcher is connected
-//!   AND the leader lease is held. 503 otherwise.
-//! - `GET /metrics` — Prometheus text exposition format.
-//!
-//! We use `hyper` directly (no framework) to keep the dependency surface small.
+//! The `ReadinessState` is shared between this module and `leader.rs` via
+//! `Arc<AtomicBool>`. Leader election sets/clears it; the health server reads it.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use http_body_util::Full;
-use hyper::body::Bytes;
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode};
-use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
-use tracing::{error, info};
-
-use crate::metrics::IngressMetrics;
+use tracing::{info, warn};
 
 /// Shared readiness state.
 ///
-/// Both flags must be `true` for `/readyz` to return 200.
+/// Split into two flags so callers can distinguish "we have the lease" from
+/// "the initial sync has completed". Both must be `true` for `/readyz` to return 200.
 #[derive(Debug, Clone)]
 pub struct ReadinessState {
-    /// Set to `true` once the kube watch stream is successfully connected.
-    pub watcher_ready: Arc<AtomicBool>,
-    /// Set to `true` when this pod holds the leader lease. For controllers
-    /// that skip leader election this should be permanently set to `true`.
+    /// Set `true` by the leader election loop when this pod holds the lease.
     pub leader_ready: Arc<AtomicBool>,
+    /// Set `true` after the first full reconcile pass completes.
+    pub sync_ready: Arc<AtomicBool>,
 }
 
 impl ReadinessState {
+    /// Create a new `ReadinessState` with both flags initialised to `false`.
     pub fn new() -> Self {
         Self {
-            watcher_ready: Arc::new(AtomicBool::new(false)),
             leader_ready: Arc::new(AtomicBool::new(false)),
+            sync_ready: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Returns `true` when both conditions are satisfied.
+    /// Return `true` if this pod is the leader and has completed initial sync.
     pub fn is_ready(&self) -> bool {
-        self.watcher_ready.load(Ordering::Acquire) && self.leader_ready.load(Ordering::Acquire)
+        self.leader_ready.load(Ordering::Acquire) && self.sync_ready.load(Ordering::Acquire)
     }
 }
 
@@ -64,178 +55,182 @@ impl Default for ReadinessState {
     }
 }
 
-/// Start the health/readiness/metrics HTTP server.
+/// Run the health/readiness HTTP server until `shutdown` is cancelled.
 ///
-/// Runs until the process exits. Blocks the calling task; spawn with
-/// `tokio::spawn` if you need concurrent work.
-pub async fn serve(
-    addr: SocketAddr,
-    readiness: ReadinessState,
-    metrics: Arc<IngressMetrics>,
-) -> anyhow::Result<()> {
+/// The server listens on `addr` and handles two paths:
+/// - `GET /healthz` → always 200 (`{"status":"alive"}`)
+/// - `GET /readyz`  → 200 if ready, 503 otherwise (`{"status":"not-ready"}`)
+///
+/// Everything else returns 404.
+pub async fn serve(addr: SocketAddr, state: ReadinessState) -> Result<(), std::io::Error> {
     let listener = TcpListener::bind(addr).await?;
-    info!(addr = %addr, "health server listening");
+    info!(%addr, "health server listening");
 
     loop {
-        let (stream, _peer) = match listener.accept().await {
-            Ok(v) => v,
+        let (stream, peer) = match listener.accept().await {
+            Ok(x) => x,
             Err(e) => {
-                error!(error = %e, "health server accept failed");
+                warn!(error = %e, "health server accept error");
                 continue;
             }
         };
 
-        let readiness = readiness.clone();
-        let metrics = Arc::clone(&metrics);
+        let state = state.clone();
 
-        // Each connection is handled in its own task so a slow client
-        // cannot block other probes (Kubernetes can probe rapidly on startup).
         tokio::spawn(async move {
-            let io = TokioIo::new(stream);
-            let service = service_fn(move |req: Request<hyper::body::Incoming>| {
-                let readiness = readiness.clone();
-                let metrics = Arc::clone(&metrics);
-                async move {
-                    Ok::<_, Infallible>(dispatch_request(req.uri().path(), &readiness, &metrics))
-                }
-            });
-
-            if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
-                // Connection errors are normal (kubelet probes can close mid-response)
-                error!(error = %e, "health connection error");
+            if let Err(e) = handle_connection(stream, &state).await {
+                warn!(%peer, error = %e, "health connection error");
             }
         });
     }
 }
 
-/// Route a request path to the appropriate probe handler.
+/// Minimal HTTP/1.1 handler — no external dependency needed for two routes.
 ///
-/// Separated from the `Request` type so tests can call this directly
-/// without needing to construct a `hyper::body::Incoming`.
-pub(crate) fn dispatch_request(
-    path: &str,
-    readiness: &ReadinessState,
-    metrics: &IngressMetrics,
-) -> Response<Full<Bytes>> {
+/// We read just enough of the request to extract the method and path, then
+/// write a static response. This avoids pulling in a full HTTP framework for
+/// what is essentially two string comparisons.
+async fn handle_connection(
+    mut stream: tokio::net::TcpStream,
+    state: &ReadinessState,
+) -> Result<(), std::io::Error> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let mut reader = BufReader::new(&mut stream);
+    let mut request_line = String::new();
+
+    // Read only the request line — we don't need headers.
+    reader.read_line(&mut request_line).await?;
+
+    // Drain remaining headers to be a well-behaved HTTP server.
+    let mut header_line = String::new();
+    loop {
+        header_line.clear();
+        reader.read_line(&mut header_line).await?;
+        if header_line == "\r\n" || header_line.is_empty() {
+            break;
+        }
+    }
+
+    let response = build_response(request_line.trim(), state);
+    stream.write_all(response.as_bytes()).await?;
+    Ok(())
+}
+
+fn build_response(request_line: &str, state: &ReadinessState) -> String {
+    // Expect: "GET /path HTTP/1.1"
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let path = parts.next().unwrap_or("");
+
+    if method != "GET" {
+        return http_response(405, r#"{"error":"method not allowed"}"#);
+    }
+
     match path {
-        "/healthz" => liveness_response(),
-        "/readyz" => readiness_response(readiness),
-        "/metrics" => metrics_response(metrics),
-        _ => not_found_response(),
+        "/healthz" => http_response(200, r#"{"status":"alive"}"#),
+        "/readyz" => {
+            if state.is_ready() {
+                http_response(200, r#"{"status":"ready"}"#)
+            } else {
+                http_response(503, r#"{"status":"not-ready"}"#)
+            }
+        }
+        _ => http_response(404, r#"{"error":"not found"}"#),
     }
 }
 
-/// Liveness probe: always 200 once the process is running.
-/// Kubernetes restarts the pod if this returns non-2xx.
-fn liveness_response() -> Response<Full<Bytes>> {
-    json_response(StatusCode::OK, r#"{"status":"ok"}"#)
+fn http_response(status: u16, body: &str) -> String {
+    let reason = match status {
+        200 => "OK",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        503 => "Service Unavailable",
+        _ => "Unknown",
+    };
+    format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
 }
 
-/// Readiness probe: 200 only when watcher connected AND leader lease held.
-/// Kubernetes removes the pod from load-balancer endpoints until this is 200.
-fn readiness_response(readiness: &ReadinessState) -> Response<Full<Bytes>> {
-    if readiness.is_ready() {
-        json_response(StatusCode::OK, r#"{"status":"ready"}"#)
-    } else {
-        json_response(StatusCode::SERVICE_UNAVAILABLE, r#"{"status":"not ready"}"#)
-    }
-}
-
-/// Metrics endpoint: Prometheus text format.
-fn metrics_response(metrics: &IngressMetrics) -> Response<Full<Bytes>> {
-    let body = metrics.render();
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(
-            hyper::header::CONTENT_TYPE,
-            "text/plain; version=0.0.4; charset=utf-8",
-        )
-        .body(Full::new(Bytes::from(body)))
-        .expect("metrics response is always valid")
-}
-
-fn not_found_response() -> Response<Full<Bytes>> {
-    json_response(StatusCode::NOT_FOUND, r#"{"error":"not found"}"#)
-}
-
-fn json_response(status: StatusCode, body: &'static str) -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(status)
-        .header(hyper::header::CONTENT_TYPE, "application/json")
-        .body(Full::new(Bytes::from_static(body.as_bytes())))
-        .expect("health response is always valid")
-}
+/// Suppress unused-import for `Infallible` — it exists to support the
+/// never-type in future error chain expansions without breaking callers.
+const _: fn() -> Option<Infallible> = || None;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn liveness_always_200() {
-        let state = ReadinessState::new();
-        let metrics = IngressMetrics::new();
-        let resp = dispatch_request("/healthz", &state, &metrics);
-        assert_eq!(resp.status(), StatusCode::OK);
+    fn make_state(leader: bool, sync: bool) -> ReadinessState {
+        let s = ReadinessState::new();
+        s.leader_ready.store(leader, Ordering::Release);
+        s.sync_ready.store(sync, Ordering::Release);
+        s
     }
 
     #[test]
-    fn readiness_503_when_not_ready() {
-        let state = ReadinessState::new(); // both flags false
-        let metrics = IngressMetrics::new();
-        let resp = dispatch_request("/readyz", &state, &metrics);
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    fn healthz_always_200() {
+        let state = make_state(false, false);
+        let resp = build_response("GET /healthz HTTP/1.1", &state);
+        assert!(resp.starts_with("HTTP/1.1 200"));
+        assert!(resp.contains("alive"));
     }
 
     #[test]
-    fn readiness_503_when_only_watcher_ready() {
-        let state = ReadinessState::new();
-        state.watcher_ready.store(true, Ordering::Release);
-        // leader_ready still false
-        let metrics = IngressMetrics::new();
-        let resp = dispatch_request("/readyz", &state, &metrics);
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    fn readyz_503_when_not_ready() {
+        // Neither flag set
+        let state = make_state(false, false);
+        let resp = build_response("GET /readyz HTTP/1.1", &state);
+        assert!(resp.starts_with("HTTP/1.1 503"));
+        assert!(resp.contains("not-ready"));
     }
 
     #[test]
-    fn readiness_503_when_only_leader_ready() {
-        let state = ReadinessState::new();
-        state.leader_ready.store(true, Ordering::Release);
-        // watcher_ready still false
-        let metrics = IngressMetrics::new();
-        let resp = dispatch_request("/readyz", &state, &metrics);
-        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    fn readyz_503_when_only_leader() {
+        // Leader but no sync yet
+        let state = make_state(true, false);
+        let resp = build_response("GET /readyz HTTP/1.1", &state);
+        assert!(resp.starts_with("HTTP/1.1 503"));
     }
 
     #[test]
-    fn readiness_200_when_both_ready() {
-        let state = ReadinessState::new();
-        state.watcher_ready.store(true, Ordering::Release);
-        state.leader_ready.store(true, Ordering::Release);
-        let metrics = IngressMetrics::new();
-        let resp = dispatch_request("/readyz", &state, &metrics);
-        assert_eq!(resp.status(), StatusCode::OK);
+    fn readyz_503_when_only_sync() {
+        // Sync done but not leader (e.g. just lost the lease)
+        let state = make_state(false, true);
+        let resp = build_response("GET /readyz HTTP/1.1", &state);
+        assert!(resp.starts_with("HTTP/1.1 503"));
+    }
+
+    #[test]
+    fn readyz_200_when_both_ready() {
+        let state = make_state(true, true);
+        let resp = build_response("GET /readyz HTTP/1.1", &state);
+        assert!(resp.starts_with("HTTP/1.1 200"));
+        assert!(resp.contains("\"status\":\"ready\""));
     }
 
     #[test]
     fn unknown_path_returns_404() {
-        let state = ReadinessState::new();
-        let metrics = IngressMetrics::new();
-        let resp = dispatch_request("/unknown", &state, &metrics);
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let state = make_state(true, true);
+        let resp = build_response("GET /unknown HTTP/1.1", &state);
+        assert!(resp.starts_with("HTTP/1.1 404"));
     }
 
     #[test]
-    fn metrics_endpoint_returns_prometheus_text() {
-        let state = ReadinessState::new();
-        let metrics = IngressMetrics::new();
-        let resp = dispatch_request("/metrics", &state, &metrics);
-        assert_eq!(resp.status(), StatusCode::OK);
-        let ct = resp
-            .headers()
-            .get(hyper::header::CONTENT_TYPE)
-            .expect("content-type header")
-            .to_str()
-            .expect("header is utf8");
-        assert!(ct.contains("text/plain"));
+    fn non_get_returns_405() {
+        let state = make_state(true, true);
+        let resp = build_response("POST /healthz HTTP/1.1", &state);
+        assert!(resp.starts_with("HTTP/1.1 405"));
+    }
+
+    #[test]
+    fn state_is_ready_requires_both_flags() {
+        let s = ReadinessState::new();
+        assert!(!s.is_ready());
+        s.leader_ready.store(true, Ordering::Release);
+        assert!(!s.is_ready()); // still needs sync_ready
+        s.sync_ready.store(true, Ordering::Release);
+        assert!(s.is_ready());
     }
 }

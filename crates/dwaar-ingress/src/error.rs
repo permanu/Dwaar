@@ -5,33 +5,52 @@
 // Licensed under the Business Source License 1.1
 
 //! Error types for the ingress controller.
+//!
+//! `AdminApiError` covers HTTP communication with the Dwaar admin API.
+//! `WatcherError` covers Kubernetes informer and reconciliation failures.
+//! Both use `thiserror` so they compose cleanly in library code without
+//! carrying an `anyhow` dependency into the hot reconciliation paths.
 
-use thiserror::Error;
-
-/// Errors that can occur when calling the Dwaar admin API.
-///
-/// `reqwest::Error` covers transport failures, timeouts, and JSON
-/// deserialization failures from `.json()` calls — so we don't need a
-/// separate `Deserialize` variant.
-#[derive(Debug, Error)]
+/// Errors from the Dwaar admin REST API client.
+#[derive(Debug, thiserror::Error)]
 pub enum AdminApiError {
-    /// The HTTP request failed or the response body could not be decoded.
-    #[error("HTTP error: {0}")]
-    Transport(#[from] reqwest::Error),
+    /// The HTTP request itself failed (network error, timeout, etc.).
+    #[error("admin API HTTP error: {0}")]
+    Http(#[from] reqwest::Error),
 
-    /// The admin API returned a non-2xx status code.
-    #[error("admin API returned status {status}: {body}")]
-    Status { status: u16, body: String },
+    /// The server returned a non-2xx status for a route mutation.
+    #[error("admin API returned {status} for {method} {path}")]
+    Status {
+        status: u16,
+        method: &'static str,
+        path: String,
+    },
+
+    /// The server returned a non-2xx status during `list_routes`.
+    #[error("admin API list_routes returned {status}")]
+    ListStatus { status: u16 },
+
+    /// Response body could not be parsed as the expected JSON shape.
+    #[error("admin API response parse error: {0}")]
+    Parse(#[from] serde_json::Error),
 }
 
-/// Errors that can occur in the Kubernetes watcher.
-#[derive(Debug, Error)]
+/// Errors from the Kubernetes informer / watcher subsystem.
+#[derive(Debug, thiserror::Error)]
 pub enum WatcherError {
-    /// The underlying kube watch stream encountered an error.
-    #[error("kube watcher error: {0}")]
+    /// The kube-rs watcher stream emitted an error event.
+    #[error("Kubernetes watcher error: {0}")]
     Kube(#[from] kube::Error),
 
-    /// An error was received on the watch stream itself.
-    #[error("watch stream error: {0}")]
-    Stream(String),
+    /// The reflector store is in a transient state and the object is not yet visible.
+    #[error("Service {name}/{namespace} not found in local store — cache may be warming")]
+    ServiceNotFound { name: String, namespace: String },
+
+    /// An Ingress resource has an incomplete or malformed spec.
+    #[error("malformed Ingress {name}: {reason}")]
+    MalformedIngress { name: String, reason: String },
+
+    /// Leader election Lease could not be created or renewed.
+    #[error("lease operation failed: {0}")]
+    Lease(String),
 }
