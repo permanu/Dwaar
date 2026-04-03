@@ -1,0 +1,15 @@
+# Copyright (C) 2026 Permanu
+# SPDX-License-Identifier: BSL-1.1
+
+[package]
+name = "hello-world-plugin"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# wit-bindgen generates the guest-side bindings from the WIT file.
+# Version must match the host's wasmtime-wit-bindgen version (see workspace Cargo.lock).
+wit-bindgen = "0.51"

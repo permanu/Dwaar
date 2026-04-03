@@ -25,6 +25,7 @@
 - [Compression](./features/compression.md)
 - [Docker Integration](./features/docker.md)
 - [Security Headers](./features/security-headers.md)
+- [WASM Plugins](./features/wasm-plugins.md)
 
 # Architecture
 
