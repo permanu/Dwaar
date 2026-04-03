@@ -33,12 +33,13 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["net", "io-util", "time"] }
+tokio = { workspace = true, features = ["net", "io-util", "time", "rt"] }
 zeroize = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
 proptest = { workspace = true }
+wat = { workspace = true }
 
 [[bench]]
 name = "bot_detect"

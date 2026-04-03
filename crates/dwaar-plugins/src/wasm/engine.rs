@@ -4,161 +4,90 @@
 // This file is part of Dwaar — https://dwaar.dev
 // Licensed under the Business Source License 1.1
 
-//! Wasmtime engine initialization and configuration.
+//! Shared wasmtime `Engine` for all WASM plugins.
 //!
-//! [`WasmEngine`] wraps [`wasmtime::Engine`] with the settings required for
-//! Dwaar's plugin runtime. Create one instance at startup and share it across
-//! all worker threads — `Engine` is internally `Arc`'d so cloning is cheap.
+//! One `Engine` is created at startup and shared (via `Arc`) across every
+//! plugin and every worker thread. wasmtime's `Engine` is `Send + Sync` and
+//! caches compiled code — re-use is essential for performance.
+//!
+//! Engine configuration:
+//! - **Component model** disabled for now (we use core Wasm modules). Will be
+//!   enabled when host bindings are ready (ISSUE-037).
+//! - **Fuel metering** enabled — lets us enforce per-call instruction budgets.
+//! - **Epoch interruption** enabled — lets us enforce wall-clock timeouts.
+//! - **Async** disabled — plugin hooks are synchronous (called from
+//!   Pingora's synchronous filter methods).
+
+use std::sync::Arc;
 
 use thiserror::Error;
-use wasmtime::{Config, Engine, OptLevel};
+use wasmtime::Config;
 
-/// Errors that can occur while initializing the WASM engine.
+use super::limits::EpochTicker;
+
+/// Errors that can occur when building the shared engine.
 #[derive(Debug, Error)]
 pub enum EngineError {
-    /// Wasmtime rejected the engine configuration.
-    ///
-    /// This should not happen with our fixed config; it indicates a build
-    /// environment incompatibility (e.g., unsupported CPU feature).
-    #[error("failed to create wasmtime engine: {0}")]
-    Init(String),
+    /// wasmtime rejected the engine configuration.
+    #[error("failed to create WASM engine: {0}")]
+    Config(#[from] wasmtime::Error),
 }
 
-/// Wasmtime engine configured for Dwaar's plugin runtime.
+/// The shared wasmtime engine, plus the background epoch-ticker task.
 ///
-/// Shared across all Pingora worker threads. [`wasmtime::Engine`] is
-/// internally reference-counted so `clone()` increments a counter — it does
-/// not duplicate compilation state.
-#[derive(Clone)]
+/// Clone the `Arc<wasmtime::Engine>` to share it across threads — do NOT
+/// create multiple `WasmEngine` instances.
+///
+/// Drop `WasmEngine` to stop the epoch ticker and clean up.
+#[derive(Debug)]
 pub struct WasmEngine {
-    inner: Engine,
-}
-
-impl std::fmt::Debug for WasmEngine {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Engine has no public debug representation; surface what matters.
-        f.debug_struct("WasmEngine").finish_non_exhaustive()
-    }
+    /// The underlying wasmtime engine (cheap to clone — reference-counted internally).
+    pub engine: Arc<wasmtime::Engine>,
+    /// Drives epoch interruption — must stay alive as long as the engine runs.
+    _ticker: EpochTicker,
 }
 
 impl WasmEngine {
-    /// Build a new engine with Dwaar's required settings.
+    /// Build the shared engine with fuel + epoch interruption enabled.
     ///
-    /// Call once at process startup, then share the returned value via `Arc`
-    /// or by cloning (both are O(1)).
+    /// Spawns the epoch-ticker background task. Must be called inside a
+    /// Tokio runtime (Pingora's `run_forever` satisfies this in production;
+    /// `#[tokio::test]` satisfies it in tests).
     ///
-    /// # Configuration
+    /// # Errors
     ///
-    /// - **Speed optimisation** — Cranelift compiles modules at `Speed` level
-    ///   so hot plugin paths run at near-native throughput.
-    /// - **Component model** — required for WIT-based plugins that use typed
-    ///   imports/exports across language boundaries.
-    /// - **Epoch interruption** — lets the proxy cancel runaway plugins by
-    ///   incrementing the engine epoch from a background task.
-    /// - **1 MB memory reservation** — pre-maps virtual address space for the
-    ///   default linear memory so the first growth doesn't fault on a hot path.
+    /// Returns [`EngineError::Config`] if wasmtime rejects the configuration
+    /// (e.g. unsupported CPU target). This should not happen on any
+    /// reasonably modern x86-64 or aarch64 host.
     pub fn new() -> Result<Self, EngineError> {
-        let mut config = Config::new();
+        let mut cfg = Config::new();
 
-        // Cranelift at `Speed` trades slightly longer compile time for faster
-        // execution. Modules are compiled once at load time, not per request.
-        config.cranelift_opt_level(OptLevel::Speed);
+        // Fuel metering — wasmtime deducts fuel per instruction.
+        // Exhaustion traps the store (fail-open: host continues).
+        cfg.consume_fuel(true);
 
-        // Component model is mandatory: plugins are distributed as `.wasm`
-        // components with typed WIT interfaces, not raw core modules.
-        config.wasm_component_model(true);
+        // Epoch interruption — background task ticks every 1 ms.
+        // Each store sets its deadline via `set_epoch_deadline`.
+        cfg.epoch_interruption(true);
 
-        // Epoch interruption is the recommended way to time-limit WASM guests
-        // in wasmtime. The proxy increments the epoch on a timer; guests that
-        // exceed their budget are trapped instead of blocking the thread.
-        config.epoch_interruption(true);
+        // Use Cranelift for native-speed compilation of Wasm modules.
+        // Modules are compiled once and cached in the engine.
+        cfg.strategy(wasmtime::Strategy::Cranelift);
 
-        // Reserve 1 MB of virtual address space up front. Linear memory grows
-        // in page-sized increments; pre-mapping avoids a mmap fault on the
-        // first allocation in the common path.
-        config.memory_reservation(1 << 20);
+        let engine = wasmtime::Engine::new(&cfg)?;
+        let engine = Arc::new(engine);
 
-        let engine = Engine::new(&config).map_err(|e| EngineError::Init(e.to_string()))?;
+        // Spawn the epoch ticker — passes a clone of the engine handle.
+        let ticker = EpochTicker::spawn((*engine).clone());
 
-        Ok(Self { inner: engine })
+        Ok(Self {
+            engine,
+            _ticker: ticker,
+        })
     }
 
-    /// Return a reference to the underlying [`wasmtime::Engine`].
-    ///
-    /// Pass this to [`wasmtime::component::Component::new`] when compiling a
-    /// plugin module, and to [`wasmtime::Store::new`] when instantiating one.
-    pub fn engine(&self) -> &Engine {
-        &self.inner
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn engine_creation_succeeds() {
-        WasmEngine::new().expect("engine should initialise with valid config");
-    }
-
-    /// `Clone` must compile and both handles must remain independently usable.
-    ///
-    /// The compile-time check (implicit in the bound below) is what matters;
-    /// the runtime check confirms neither clone panics.
-    #[test]
-    fn engine_is_clone() {
-        fn requires_clone<T: Clone>(v: &T) -> T {
-            v.clone()
-        }
-        let a = WasmEngine::new().expect("engine init");
-        let b = requires_clone(&a);
-        // Both handles must be usable after cloning.
-        let _: &Engine = a.engine();
-        let _: &Engine = b.engine();
-    }
-
-    #[test]
-    fn engine_is_send_and_sync() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<WasmEngine>();
-    }
-
-    #[test]
-    fn engine_accessor_returns_inner() {
-        let e = WasmEngine::new().expect("engine init");
-        // Verify the accessor compiles and returns something we can use —
-        // the real proof is that module compilation later will succeed.
-        let _inner: &Engine = e.engine();
-    }
-
-    /// Verify epoch interruption is active by confirming `increment_epoch`
-    /// exists and doesn't panic — it's a no-op if interruption is disabled,
-    /// but it's part of the public API regardless.
-    ///
-    /// The real enforcement test lives in the store/instance layer (ISSUE-096),
-    /// where a deadline is set and a trapped guest confirms the mechanism works
-    /// end-to-end.
-    #[test]
-    fn epoch_interruption_configured() {
-        let e = WasmEngine::new().expect("engine init");
-        // `increment_epoch` is always safe to call; we just confirm the engine
-        // was built without panicking and the method is reachable.
-        e.engine().increment_epoch();
-    }
-
-    /// Verify the component model is enabled by compiling a minimal WAT
-    /// component. A core module would succeed either way; a component (with
-    /// the `(component ...)` form) requires the feature to be on.
-    #[test]
-    fn component_model_enabled() {
-        let e = WasmEngine::new().expect("engine init");
-
-        // Minimal valid WAT component — empty, no imports, no exports.
-        let wat = "(component)";
-        let result = wasmtime::component::Component::new(e.engine(), wat.as_bytes());
-        assert!(
-            result.is_ok(),
-            "component compilation failed — component model may not be enabled"
-        );
+    /// Return a cheap reference to the underlying engine.
+    pub fn inner(&self) -> &wasmtime::Engine {
+        &self.engine
     }
 }

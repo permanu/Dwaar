@@ -629,6 +629,9 @@ fn parse_directive(t: &mut Tokenizer<'_>) -> Result<Directive, ParseError> {
             observe::parse_copy_response_headers(t, &name_tok)?,
         )),
 
+        // ── WASM plugins ────────────────────────────────────────────────────
+        "wasm_plugin" => Ok(Directive::WasmPlugin(directives::parse_wasm_plugin(t)?)),
+
         // ── Simple flags ────────────────────────────────────────────────────
         "abort" => Ok(Directive::Abort),
         "skip_log" | "log_skip" => Ok(Directive::SkipLog),

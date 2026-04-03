@@ -14,7 +14,7 @@ use crate::model::{
     Directive, FileServerDirective, ForwardAuthDirective, HandleDirective, HandleErrorsDirective,
     HandlePathDirective, LbPolicy, PhpFastcgiDirective, RedirDirective, RespondDirective,
     ReverseProxyDirective, RewriteDirective, RootDirective, RouteDirective, ScaleToZeroDirective,
-    TryFilesDirective, UriDirective, UriOperation,
+    TryFilesDirective, UriDirective, UriOperation, WasmPluginDirective,
 };
 use crate::token::{TokenKind, Tokenizer};
 
@@ -874,6 +874,236 @@ fn parse_scale_to_zero_block(t: &mut Tokenizer<'_>) -> Result<ScaleToZeroDirecti
         wake_timeout_secs,
         wake_command,
     })
+}
+
+/// `wasm_plugin /path/to/plugin.wasm { priority 50; fuel 1000000; ... }`
+///
+/// The path comes first, then an optional `{ }` block with subdirectives.
+/// All block fields are optional; defaults are applied at compile/runtime.
+///
+/// Validation: `priority` must be 1–65535. `config` may repeat.
+///
+/// # Example
+///
+/// ```text
+/// wasm_plugin /plugins/shape.wasm {
+///     priority 50
+///     fuel 500000
+///     memory 8
+///     timeout 25
+///     config region=eu-west
+/// }
+/// ```
+pub(super) fn parse_wasm_plugin(t: &mut Tokenizer<'_>) -> Result<WasmPluginDirective, ParseError> {
+    // Read the required module path.
+    let path_tok = t.next_token();
+    let (TokenKind::Word(module_path) | TokenKind::QuotedString(module_path)) = path_tok.kind
+    else {
+        return Err(ParseError {
+            line: path_tok.line,
+            col: path_tok.col,
+            kind: ParseErrorKind::InvalidValue {
+                directive: "wasm_plugin".to_string(),
+                message: "expected path to .wasm module".to_string(),
+            },
+        });
+    };
+
+    // All block subdirective fields default to None / unset.
+    let mut priority: Option<u16> = None;
+    let mut fuel: Option<u64> = None;
+    let mut memory_mb: Option<u32> = None;
+    let mut timeout_ms: Option<u64> = None;
+    let mut config: Vec<(String, String)> = Vec::new();
+
+    // The `{ }` block is optional — bare `wasm_plugin /path.wasm` is valid.
+    if matches!(t.peek().kind, TokenKind::OpenBrace) {
+        t.next_token(); // consume `{`
+        parse_wasm_plugin_block(
+            t,
+            &mut priority,
+            &mut fuel,
+            &mut memory_mb,
+            &mut timeout_ms,
+            &mut config,
+        )?;
+    }
+
+    Ok(WasmPluginDirective {
+        module_path,
+        // Default priority 50 when the block is omitted or `priority` is not set.
+        priority: priority.unwrap_or(50),
+        fuel,
+        memory_mb,
+        timeout_ms,
+        config,
+    })
+}
+
+/// Returns true if `w` is a known `wasm_plugin` block subdirective.
+fn is_wasm_subdirective(w: &str) -> bool {
+    matches!(w, "priority" | "fuel" | "memory" | "timeout" | "config")
+}
+
+/// Parse the `{ ... }` body of a `wasm_plugin` block, populating the mutable
+/// output fields. Extracted to keep the outer function under 100 lines.
+fn parse_wasm_plugin_block(
+    t: &mut Tokenizer<'_>,
+    priority: &mut Option<u16>,
+    fuel: &mut Option<u64>,
+    memory_mb: &mut Option<u32>,
+    timeout_ms: &mut Option<u64>,
+    config: &mut Vec<(String, String)>,
+) -> Result<(), ParseError> {
+    loop {
+        let tok = t.peek();
+        match &tok.kind {
+            TokenKind::CloseBrace => {
+                t.next_token();
+                break;
+            }
+            TokenKind::Eof => {
+                return Err(ParseError {
+                    line: tok.line,
+                    col: tok.col,
+                    kind: ParseErrorKind::UnexpectedEof {
+                        expected: "'}' to close wasm_plugin block".to_string(),
+                    },
+                });
+            }
+            TokenKind::Word(w) => match w.as_str() {
+                "priority" => {
+                    t.next_token();
+                    *priority = Some(parse_wasm_priority(t)?);
+                }
+                "fuel" => {
+                    t.next_token();
+                    *fuel = Some(parse_wasm_u64(t, "fuel", "a positive integer")?);
+                }
+                "memory" => {
+                    t.next_token();
+                    let mb = parse_wasm_u64(t, "memory", "a positive integer (MiB)")?;
+                    *memory_mb = Some(mb as u32);
+                }
+                "timeout" => {
+                    t.next_token();
+                    *timeout_ms = Some(parse_wasm_u64(t, "timeout", "a positive integer (ms)")?);
+                }
+                "config" => {
+                    t.next_token();
+                    config.push(parse_wasm_config_kv(t)?);
+                }
+                // Unknown subdirective — skip until the next known keyword or `}`.
+                _ => {
+                    t.next_token();
+                    loop {
+                        match t.peek().kind {
+                            TokenKind::CloseBrace | TokenKind::Eof => break,
+                            TokenKind::Word(ref kw) if is_wasm_subdirective(kw) => break,
+                            _ => {
+                                t.next_token();
+                            }
+                        }
+                    }
+                }
+            },
+            _ => {
+                t.next_token();
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Parse the `priority <n>` value (1–65535).
+fn parse_wasm_priority(t: &mut Tokenizer<'_>) -> Result<u16, ParseError> {
+    let val_tok = t.next_token();
+    let (line, col) = (val_tok.line, val_tok.col);
+    let TokenKind::Word(raw) = val_tok.kind else {
+        return Err(ParseError {
+            line,
+            col,
+            kind: ParseErrorKind::InvalidValue {
+                directive: "wasm_plugin".to_string(),
+                message: "priority must be an integer (1–65535)".to_string(),
+            },
+        });
+    };
+    let p: u16 = raw.parse().map_err(|_| ParseError {
+        line,
+        col,
+        kind: ParseErrorKind::InvalidValue {
+            directive: "wasm_plugin".to_string(),
+            message: format!("priority must be an integer 1–65535, got '{raw}'"),
+        },
+    })?;
+    if p == 0 {
+        return Err(ParseError {
+            line,
+            col,
+            kind: ParseErrorKind::InvalidValue {
+                directive: "wasm_plugin".to_string(),
+                message: "priority must be ≥ 1 (0 is reserved)".to_string(),
+            },
+        });
+    }
+    Ok(p)
+}
+
+/// Parse a bare `<u64>` word for `fuel`, `memory`, or `timeout` subdirectives.
+fn parse_wasm_u64(
+    t: &mut Tokenizer<'_>,
+    subdirective: &str,
+    what: &str,
+) -> Result<u64, ParseError> {
+    let val_tok = t.next_token();
+    let (line, col) = (val_tok.line, val_tok.col);
+    let TokenKind::Word(raw) = val_tok.kind else {
+        return Err(ParseError {
+            line,
+            col,
+            kind: ParseErrorKind::InvalidValue {
+                directive: "wasm_plugin".to_string(),
+                message: format!("{subdirective} must be {what}"),
+            },
+        });
+    };
+    raw.parse().map_err(|_| ParseError {
+        line,
+        col,
+        kind: ParseErrorKind::InvalidValue {
+            directive: "wasm_plugin".to_string(),
+            message: format!("{subdirective} must be {what}, got '{raw}'"),
+        },
+    })
+}
+
+/// Parse a `key=value` pair for the `config` subdirective.
+fn parse_wasm_config_kv(t: &mut Tokenizer<'_>) -> Result<(String, String), ParseError> {
+    let kv_tok = t.next_token();
+    let (line, col) = (kv_tok.line, kv_tok.col);
+    let (TokenKind::Word(kv) | TokenKind::QuotedString(kv)) = kv_tok.kind else {
+        return Err(ParseError {
+            line,
+            col,
+            kind: ParseErrorKind::InvalidValue {
+                directive: "wasm_plugin".to_string(),
+                message: "config expects 'key=value'".to_string(),
+            },
+        });
+    };
+    // Split on the first `=`.
+    let Some((k, v)) = kv.split_once('=') else {
+        return Err(ParseError {
+            line,
+            col,
+            kind: ParseErrorKind::InvalidValue {
+                directive: "wasm_plugin".to_string(),
+                message: format!("config value '{kv}' must be in 'key=value' form"),
+            },
+        });
+    };
+    Ok((k.to_string(), v.to_string()))
 }
 
 /// Parse a brace-delimited block of directives — the core of `handle`/`handle_path`/`route`.

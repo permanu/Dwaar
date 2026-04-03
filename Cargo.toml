@@ -129,7 +129,12 @@ h3-quinn = "0.0.10"
 
 # WASM plugin runtime (optional — only pulled in when `wasm` feature is enabled).
 # `runtime` and `cranelift` required for wasmtime::component. `std` for basic functionality.
-wasmtime = { version = "30", features = ["component-model", "runtime", "cranelift", "std"], default-features = false }
+# `pooling-allocator` for bounded instance pools, `addr2line` for trap backtraces.
+wasmtime = { version = "30", default-features = false, features = [
+    "component-model", "runtime", "cranelift", "std",
+    "pooling-allocator", "addr2line", "wat",
+] }
+wat = "1"
 
 # K8s ingress controller (ISSUE-084)
 kube = { version = "0.98", default-features = false, features = ["runtime", "derive", "client", "rustls-tls"] }
