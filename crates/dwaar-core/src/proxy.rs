@@ -1076,6 +1076,45 @@ impl ProxyHttp for DwaarProxy {
             (false, String::new(), None, None)
         };
 
+        // Scale-to-zero (ISSUE-082): if the pool has a scale_to_zero config,
+        // probe the upstream with a quick TCP connect. If it fails, trigger the
+        // wake cycle (coalesced — only one wake command per upstream) and wait
+        // for the backend to become reachable before returning the peer.
+        if let Some(ref pool) = ctx.upstream_pool
+            && let Some(s2z) = pool.scale_to_zero()
+        {
+            // Quick TCP probe with a short timeout — if the backend is already
+            // running this adds only ~1ms. If it's down, we enter the wake path.
+            let probe = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                tokio::net::TcpStream::connect(upstream),
+            )
+            .await;
+
+            // Backend is down if the connect was refused or the probe timed out.
+            let is_up = matches!(probe, Ok(Ok(_)));
+
+            if !is_up {
+                debug!(
+                    request_id = %ctx.request_id(),
+                    %upstream,
+                    "upstream unreachable, triggering scale-to-zero wake"
+                );
+                if let Err(e) = s2z.wake_and_wait(upstream).await {
+                    warn!(
+                        request_id = %ctx.request_id(),
+                        %upstream,
+                        error = %e,
+                        "scale-to-zero wake failed — returning 504"
+                    );
+                    return Err(Error::explain(
+                        HTTPStatus(504),
+                        format!("upstream {upstream} failed to wake: {e}"),
+                    ));
+                }
+            }
+        }
+
         debug!(
             upstream = %upstream,
             tls = use_tls,

@@ -805,7 +805,8 @@ fn compile_reverse_proxy_handler(rp: &ReverseProxyDirective, location: &str) -> 
         || rp.transport_tls
         || rp.tls_server_name.is_some()
         || rp.tls_client_auth.is_some()
-        || rp.tls_trusted_ca_certs.is_some();
+        || rp.tls_trusted_ca_certs.is_some()
+        || rp.scale_to_zero.is_some();
 
     if rp.upstreams.len() <= 1 && !is_block_form {
         // Common single-upstream case — zero overhead path.
@@ -872,7 +873,21 @@ fn compile_reverse_proxy_handler(rp: &ReverseProxyDirective, location: &str) -> 
         })
         .collect();
 
-    let pool = UpstreamPool::new(backends, policy, rp.health_uri.clone(), rp.health_interval);
+    let pool = if let Some(ref s2z) = rp.scale_to_zero {
+        let s2z_config = dwaar_core::wake::ScaleToZeroConfig::new(
+            std::time::Duration::from_secs(s2z.wake_timeout_secs),
+            s2z.wake_command.clone(),
+        );
+        UpstreamPool::new_with_scale_to_zero(
+            backends,
+            policy,
+            rp.health_uri.clone(),
+            rp.health_interval,
+            s2z_config,
+        )
+    } else {
+        UpstreamPool::new(backends, policy, rp.health_uri.clone(), rp.health_interval)
+    };
 
     Some(Handler::ReverseProxyPool {
         pool: Arc::new(pool),
@@ -1235,6 +1250,7 @@ mod tests {
             tls_server_name: None,
             tls_client_auth: None,
             tls_trusted_ca_certs: None,
+            scale_to_zero: None,
         })
     }
 
@@ -1253,6 +1269,7 @@ mod tests {
             tls_server_name: None,
             tls_client_auth: None,
             tls_trusted_ca_certs: None,
+            scale_to_zero: None,
         })
     }
 
@@ -1268,6 +1285,7 @@ mod tests {
             tls_server_name: None,
             tls_client_auth: None,
             tls_trusted_ca_certs: None,
+            scale_to_zero: None,
         })
     }
 
@@ -1354,6 +1372,7 @@ mod tests {
                     tls_server_name: None,
                     tls_client_auth: None,
                     tls_trusted_ca_certs: None,
+                    scale_to_zero: None,
                 })],
             }],
         };

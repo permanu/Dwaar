@@ -13,8 +13,8 @@ use crate::error::{ParseError, ParseErrorKind};
 use crate::model::{
     Directive, FileServerDirective, ForwardAuthDirective, HandleDirective, HandleErrorsDirective,
     HandlePathDirective, LbPolicy, PhpFastcgiDirective, RedirDirective, RespondDirective,
-    ReverseProxyDirective, RewriteDirective, RootDirective, RouteDirective, TryFilesDirective,
-    UriDirective, UriOperation,
+    ReverseProxyDirective, RewriteDirective, RootDirective, RouteDirective, ScaleToZeroDirective,
+    TryFilesDirective, UriDirective, UriOperation,
 };
 use crate::token::{TokenKind, Tokenizer};
 
@@ -91,6 +91,7 @@ fn parse_reverse_proxy_inline(t: &mut Tokenizer<'_>) -> Result<ReverseProxyDirec
         tls_server_name: None,
         tls_client_auth: None,
         tls_trusted_ca_certs: None,
+        scale_to_zero: None,
     })
 }
 
@@ -107,6 +108,7 @@ fn is_reverse_proxy_subdirective(w: &str) -> bool {
             | "fail_duration"
             | "max_conns"
             | "transport"
+            | "scale_to_zero"
     )
 }
 
@@ -126,6 +128,7 @@ fn parse_reverse_proxy_block(t: &mut Tokenizer<'_>) -> Result<ReverseProxyDirect
     let mut tls_server_name: Option<String> = None;
     let mut tls_client_auth: Option<(String, String)> = None;
     let mut tls_trusted_ca_certs: Option<String> = None;
+    let mut scale_to_zero: Option<ScaleToZeroDirective> = None;
 
     loop {
         let tok = t.next_token();
@@ -281,6 +284,9 @@ fn parse_reverse_proxy_block(t: &mut Tokenizer<'_>) -> Result<ReverseProxyDirect
                         }
                     }
                 }
+                "scale_to_zero" => {
+                    scale_to_zero = Some(parse_scale_to_zero_block(t)?);
+                }
                 // Unknown sub-directive — skip tokens until the next known
                 // subdirective keyword or the closing brace. This keeps the parser
                 // forward-compatible with future `reverse_proxy` block options.
@@ -322,6 +328,7 @@ fn parse_reverse_proxy_block(t: &mut Tokenizer<'_>) -> Result<ReverseProxyDirect
         tls_server_name,
         tls_client_auth,
         tls_trusted_ca_certs,
+        scale_to_zero,
     })
 }
 
@@ -795,6 +802,78 @@ pub(super) fn parse_try_files(t: &mut Tokenizer<'_>) -> Result<TryFilesDirective
     }
 
     Ok(TryFilesDirective { files })
+}
+
+/// Parse a `scale_to_zero { ... }` block inside `reverse_proxy`.
+///
+/// Recognized subdirectives:
+/// - `wake_timeout <seconds>` — max time to wait for backend (default 30s)
+/// - `wake_command "<shell command>"` — command to run to wake the backend
+fn parse_scale_to_zero_block(t: &mut Tokenizer<'_>) -> Result<ScaleToZeroDirective, ParseError> {
+    if !matches!(t.peek().kind, TokenKind::OpenBrace) {
+        let (line, col) = t.position();
+        return Err(ParseError {
+            line,
+            col,
+            kind: ParseErrorKind::Expected {
+                expected: "'{' to open scale_to_zero block".to_string(),
+                got: format!("{:?}", t.peek().kind),
+            },
+        });
+    }
+    t.next_token(); // consume `{`
+
+    let mut wake_timeout_secs: u64 = 30;
+    let mut wake_command: Option<String> = None;
+
+    loop {
+        let tok = t.next_token();
+        match tok.kind {
+            TokenKind::CloseBrace | TokenKind::Eof => break,
+            TokenKind::Word(ref kw) => match kw.as_str() {
+                "wake_timeout" => {
+                    let val = expect_word_or_quoted(t, "scale_to_zero", "timeout value")?;
+                    // Accept bare seconds or a duration suffix like "30s"
+                    let secs_str = val.strip_suffix('s').unwrap_or(&val);
+                    wake_timeout_secs = secs_str.parse().map_err(|_| ParseError {
+                        line: tok.line,
+                        col: tok.col,
+                        kind: ParseErrorKind::InvalidValue {
+                            directive: "scale_to_zero".to_string(),
+                            message: format!(
+                                "wake_timeout must be a positive integer (seconds), got '{val}'"
+                            ),
+                        },
+                    })?;
+                }
+                "wake_command" => {
+                    wake_command =
+                        Some(expect_word_or_quoted(t, "scale_to_zero", "shell command")?);
+                }
+                _ => {
+                    // Skip unknown subdirectives inside scale_to_zero
+                }
+            },
+            _ => {}
+        }
+    }
+
+    let wake_command = wake_command.ok_or_else(|| {
+        let (line, col) = t.position();
+        ParseError {
+            line,
+            col,
+            kind: ParseErrorKind::InvalidValue {
+                directive: "scale_to_zero".to_string(),
+                message: "wake_command is required".to_string(),
+            },
+        }
+    })?;
+
+    Ok(ScaleToZeroDirective {
+        wake_timeout_secs,
+        wake_command,
+    })
 }
 
 /// Parse a brace-delimited block of directives — the core of `handle`/`handle_path`/`route`.
