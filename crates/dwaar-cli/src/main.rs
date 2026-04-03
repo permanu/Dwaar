@@ -398,6 +398,10 @@ fn run_server(
         .as_ref()
         .is_some_and(|g| g.h3_enabled);
 
+    // Clone before moving into DwaarProxy — QUIC service needs the same Arcs.
+    let route_table_for_quic = Arc::clone(&route_table);
+    let plugin_chain_for_quic = Arc::clone(&plugin_chain);
+
     let proxy = DwaarProxy::new(
         route_table,
         challenge_solver.clone(),
@@ -476,6 +480,9 @@ fn run_server(
                 quic_addr,
                 &tls_cfg.cert_path,
                 &tls_cfg.key_path,
+                route_table_for_quic,
+                plugin_chain_for_quic,
+                None, // max_streams — use default (100)
             ) {
                 Ok(quic_service) => {
                     let quic_bg = pingora_core::services::background::background_service(
