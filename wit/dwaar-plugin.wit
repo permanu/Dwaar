@@ -1,0 +1,87 @@
+// Copyright (C) 2026 Permanu
+// SPDX-License-Identifier: BSL-1.1
+//
+// This file is part of Dwaar — https://dwaar.dev
+// Licensed under the Business Source License 1.1
+
+// WIT interface for Dwaar's WASM plugin system.
+//
+// Guest modules (WASM plugins) implement the `dwaar-plugin` world. The host
+// (Dwaar proxy) imports `host` functions and exports the three lifecycle hooks
+// that mirror the native `DwaarPlugin` trait hooks.
+package dwaar:plugin@0.1.0;
+
+// Shared data types passed between host and guest.
+interface types {
+    // A single HTTP header name/value pair.
+    record header {
+        name: string,
+        value: string,
+    }
+
+    // A short-circuit response a plugin wants to send to the client.
+    record plugin-response {
+        status: u16,
+        headers: list<header>,
+        // Raw response body bytes.
+        body: list<u8>,
+    }
+
+    // Controls chain execution after a plugin hook returns.
+    //
+    // - `continue`: pass to the next plugin
+    // - `respond`: stop the chain, send this response to the client
+    // - `skip`: stop the chain, continue normal proxy flow
+    variant plugin-action {
+        %continue,
+        respond(plugin-response),
+        skip,
+    }
+}
+
+// Functions the Dwaar host exposes to guest plugins.
+//
+// Guests call these to inspect the current request without the host having
+// to serialize the entire request into every hook call.
+interface host {
+    use types.{header};
+
+    // Look up a request header by name (case-insensitive).
+    get-header: func(name: string) -> option<string>;
+
+    // Return the client's IP address, if available.
+    get-client-ip: func() -> option<string>;
+
+    // Return the request path (e.g. `/api/v1/users`).
+    get-path: func() -> string;
+
+    // Return the HTTP method (e.g. `GET`, `POST`).
+    get-method: func() -> string;
+
+    // Return true if the downstream connection used TLS.
+    is-tls: func() -> bool;
+
+    // Emit an info-level log line to Dwaar's tracing output.
+    log-info: func(msg: string);
+
+    // Emit a warn-level log line to Dwaar's tracing output.
+    log-warn: func(msg: string);
+}
+
+// The world that every Dwaar WASM plugin module must implement.
+world dwaar-plugin {
+    import host;
+
+    use types.{header, plugin-action};
+
+    // Called during request_filter(). The full request header list is passed
+    // so plugins don't need to make individual get-header calls for bulk reads.
+    export on-request: func(headers: list<header>) -> plugin-action;
+
+    // Called during response_filter(). Plugins can inspect or modify response
+    // headers by returning a plugin-action with modified state.
+    export on-response: func(headers: list<header>) -> plugin-action;
+
+    // Called during response_body_filter() for each body chunk.
+    export on-body: func(chunk: list<u8>, end-of-stream: bool) -> plugin-action;
+}

@@ -123,12 +123,13 @@ quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2"
 
-# HTTP/3 request parsing (ISSUE-104) — bridges QUIC connections to HTTP semantics
-h3 = "0.0.6"
-h3-quinn = "0.0.7"
+# HTTP/3 request parsing (ISSUE-104) — h3 0.0.8 is latest stable, h3-quinn 0.0.10 is the quinn 0.11 adapter
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
 
-# WASM plugin runtime (ISSUE-095) — sandboxed user plugins via component model
-wasmtime = { version = "29", features = ["component-model"] }
+# WASM plugin runtime (optional — only pulled in when `wasm` feature is enabled).
+# `runtime` and `cranelift` required for wasmtime::component. `std` for basic functionality.
+wasmtime = { version = "30", features = ["component-model", "runtime", "cranelift", "std"], default-features = false }
 
 # K8s ingress controller (ISSUE-084)
 kube = { version = "0.98", default-features = false, features = ["runtime", "derive", "client", "rustls-tls"] }

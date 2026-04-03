@@ -39,12 +39,16 @@ fastrand = { workspace = true }
 quinn = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+h3 = { workspace = true }
+h3-quinn = { workspace = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }
 criterion = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+# rcgen generates self-signed certs in tests — no OpenSSL CLI required.
+rcgen = "0.14"
 
 [[bench]]
 name = "route_lookup"
