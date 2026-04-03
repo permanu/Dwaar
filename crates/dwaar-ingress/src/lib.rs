@@ -6,13 +6,11 @@
 
 //! dwaar-ingress — Kubernetes ingress controller for Dwaar.
 //!
-//! This crate is a binary (`dwaar-ingress`) that watches Kubernetes `Ingress`
-//! resources and syncs the declared routes to Dwaar's Admin API. The lib
-//! module exists so that integration tests can import `client` and `error`
-//! without going through the binary entry point.
+//! Watches Ingress, Service, Secret, and `IngressClass` resources and syncs
+//! routes to the Dwaar admin API.
 
 pub mod client;
 pub mod error;
-
-pub use client::AdminApiClient;
-pub use error::AdminApiError;
+pub mod health;
+pub mod metrics;
+pub mod watcher;
