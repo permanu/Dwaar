@@ -1,0 +1,11 @@
+# cargo-audit ignore list
+# These are all transitive dependencies from Pingora or quinn that we cannot
+# upgrade directly. Tracked upstream.
+
+[advisories]
+ignore = [
+    "RUSTSEC-2024-0437",  # protobuf recursion — pingora-core → prometheus → protobuf
+    "RUSTSEC-2025-0069",  # daemonize unmaintained — pingora-core dep
+    "RUSTSEC-2024-0388",  # derivative unmaintained — pingora-core dep
+    "RUSTSEC-2025-0134",  # rustls-pemfile unmaintained — used for QUIC cert loading
+]
