@@ -432,6 +432,21 @@ pub struct ReverseProxyDirective {
     pub tls_client_auth: Option<(String, String)>,
     /// Custom CA bundle path for upstream cert verification.
     pub tls_trusted_ca_certs: Option<String>,
+    /// Scale-to-zero config — wake a sleeping backend on first request (ISSUE-082).
+    pub scale_to_zero: Option<ScaleToZeroDirective>,
+}
+
+/// Scale-to-zero config inside a `reverse_proxy` block (ISSUE-082).
+///
+/// When the upstream is unreachable and this config is present, the proxy
+/// holds the request, runs a wake command (once per upstream, coalesced),
+/// polls health, and forwards the request once the backend responds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScaleToZeroDirective {
+    /// Max time to wait for the backend to wake up. Default: 30s.
+    pub wake_timeout_secs: u64,
+    /// Shell command to wake the backend (e.g. `"docker start myapp"`).
+    pub wake_command: String,
 }
 
 /// An upstream address — either a socket address or a host:port string
@@ -900,6 +915,7 @@ mod tests {
                     tls_server_name: None,
                     tls_client_auth: None,
                     tls_trusted_ca_certs: None,
+                    scale_to_zero: None,
                 }),
                 Directive::Tls(TlsDirective::Auto),
             ],
