@@ -1033,6 +1033,88 @@ fn reverse_proxy_block_transport_plain_tls() {
 }
 
 #[test]
+fn reverse_proxy_block_transport_tls_client_auth() {
+    let config = parse(
+        "a.com {
+            reverse_proxy {
+                to backend:8443
+                transport {
+                    tls
+                    tls_client_auth /path/to/client.pem /path/to/client-key.pem
+                    tls_server_name backend.internal
+                }
+            }
+        }",
+    )
+    .expect("should parse");
+    let Directive::ReverseProxy(rp) = &config.sites[0].directives[0] else {
+        panic!("expected ReverseProxy");
+    };
+    assert!(rp.transport_tls);
+    assert_eq!(rp.tls_server_name.as_deref(), Some("backend.internal"));
+    assert_eq!(
+        rp.tls_client_auth
+            .as_ref()
+            .map(|(c, k)| (c.as_str(), k.as_str())),
+        Some(("/path/to/client.pem", "/path/to/client-key.pem"))
+    );
+}
+
+#[test]
+fn reverse_proxy_block_transport_tls_trusted_ca() {
+    let config = parse(
+        "a.com {
+            reverse_proxy {
+                to backend:8443
+                transport {
+                    tls
+                    tls_trusted_ca_certs /path/to/ca.pem
+                }
+            }
+        }",
+    )
+    .expect("should parse");
+    let Directive::ReverseProxy(rp) = &config.sites[0].directives[0] else {
+        panic!("expected ReverseProxy");
+    };
+    assert!(rp.transport_tls);
+    assert_eq!(rp.tls_trusted_ca_certs.as_deref(), Some("/path/to/ca.pem"));
+}
+
+#[test]
+fn reverse_proxy_block_transport_full_mtls() {
+    let config = parse(
+        r#"a.com {
+            reverse_proxy {
+                to backend:8443
+                transport {
+                    tls
+                    tls_client_auth "/certs/client.pem" "/certs/client-key.pem"
+                    tls_server_name backend.internal
+                    tls_trusted_ca_certs "/certs/ca-bundle.pem"
+                }
+            }
+        }"#,
+    )
+    .expect("should parse");
+    let Directive::ReverseProxy(rp) = &config.sites[0].directives[0] else {
+        panic!("expected ReverseProxy");
+    };
+    assert!(rp.transport_tls);
+    assert_eq!(rp.tls_server_name.as_deref(), Some("backend.internal"));
+    assert_eq!(
+        rp.tls_client_auth
+            .as_ref()
+            .map(|(c, k)| (c.as_str(), k.as_str())),
+        Some(("/certs/client.pem", "/certs/client-key.pem"))
+    );
+    assert_eq!(
+        rp.tls_trusted_ca_certs.as_deref(),
+        Some("/certs/ca-bundle.pem")
+    );
+}
+
+#[test]
 fn reverse_proxy_block_multi_upstream() {
     let config = parse(
         "a.com {

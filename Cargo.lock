@@ -1009,6 +1009,7 @@ dependencies = [
  "criterion",
  "dwaar-core",
  "dwaar-plugins",
+ "dwaar-tls",
  "notify",
  "openssl",
  "pingora-core",
