@@ -1245,6 +1245,107 @@ fn reverse_proxy_block_unknown_lb_policy_is_error() {
     assert!(result.is_err(), "unknown lb_policy must be rejected");
 }
 
+// ── scale_to_zero parser tests (ISSUE-082) ──────────────────────────────────
+
+#[test]
+fn reverse_proxy_block_scale_to_zero_basic() {
+    let config = parse(
+        r#"a.com {
+            reverse_proxy {
+                to 127.0.0.1:8080
+                scale_to_zero {
+                    wake_timeout 30s
+                    wake_command "docker start myapp"
+                }
+            }
+        }"#,
+    )
+    .expect("should parse");
+    let Directive::ReverseProxy(rp) = &config.sites[0].directives[0] else {
+        panic!("expected ReverseProxy");
+    };
+    let s2z = rp
+        .scale_to_zero
+        .as_ref()
+        .expect("should have scale_to_zero");
+    assert_eq!(s2z.wake_timeout_secs, 30);
+    assert_eq!(s2z.wake_command, "docker start myapp");
+}
+
+#[test]
+fn reverse_proxy_block_scale_to_zero_bare_seconds() {
+    let config = parse(
+        r#"a.com {
+            reverse_proxy {
+                to 127.0.0.1:8080
+                scale_to_zero {
+                    wake_timeout 60
+                    wake_command "systemctl start myapp"
+                }
+            }
+        }"#,
+    )
+    .expect("should parse");
+    let Directive::ReverseProxy(rp) = &config.sites[0].directives[0] else {
+        panic!("expected ReverseProxy");
+    };
+    let s2z = rp
+        .scale_to_zero
+        .as_ref()
+        .expect("should have scale_to_zero");
+    assert_eq!(s2z.wake_timeout_secs, 60);
+}
+
+#[test]
+fn reverse_proxy_block_scale_to_zero_default_timeout() {
+    let config = parse(
+        r#"a.com {
+            reverse_proxy {
+                to 127.0.0.1:8080
+                scale_to_zero {
+                    wake_command "docker start myapp"
+                }
+            }
+        }"#,
+    )
+    .expect("should parse");
+    let Directive::ReverseProxy(rp) = &config.sites[0].directives[0] else {
+        panic!("expected ReverseProxy");
+    };
+    let s2z = rp
+        .scale_to_zero
+        .as_ref()
+        .expect("should have scale_to_zero");
+    assert_eq!(s2z.wake_timeout_secs, 30, "default should be 30s");
+}
+
+#[test]
+fn reverse_proxy_block_scale_to_zero_missing_command_is_error() {
+    let result = parse(
+        "a.com {
+            reverse_proxy {
+                to 127.0.0.1:8080
+                scale_to_zero {
+                    wake_timeout 10s
+                }
+            }
+        }",
+    );
+    assert!(
+        result.is_err(),
+        "scale_to_zero without wake_command must fail"
+    );
+}
+
+#[test]
+fn reverse_proxy_inline_has_no_scale_to_zero() {
+    let config = parse("a.com {\n    reverse_proxy 127.0.0.1:8080\n}").expect("should parse");
+    let Directive::ReverseProxy(rp) = &config.sites[0].directives[0] else {
+        panic!("expected ReverseProxy");
+    };
+    assert!(rp.scale_to_zero.is_none());
+}
+
 // ── Intercept / CopyResponseHeaders parser tests (ISSUE-067) ─────────────
 
 #[test]
