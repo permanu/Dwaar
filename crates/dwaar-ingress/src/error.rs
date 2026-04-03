@@ -5,48 +5,33 @@
 // Licensed under the Business Source License 1.1
 
 //! Error types for the ingress controller.
-//!
-//! We distinguish between transient failures (connection refused — the admin
-//! API is just restarting) and permanent ones (401 means the token is wrong;
-//! retrying won't help). Callers can match on the variant to decide whether to
-//! back off or abort immediately.
 
 use thiserror::Error;
 
-/// Every failure mode the `AdminApiClient` can surface.
+/// Errors that can occur when calling the Dwaar admin API.
+///
+/// `reqwest::Error` covers transport failures, timeouts, and JSON
+/// deserialization failures from `.json()` calls — so we don't need a
+/// separate `Deserialize` variant.
 #[derive(Debug, Error)]
 pub enum AdminApiError {
-    /// The admin API socket or TCP port refused the connection.
-    ///
-    /// This is transient — the proxy may still be starting up. The ingress
-    /// controller should back off and retry rather than crash.
-    #[error("connection refused to admin API at {url}")]
-    ConnectionRefused { url: String },
+    /// The HTTP request failed or the response body could not be decoded.
+    #[error("HTTP error: {0}")]
+    Transport(#[from] reqwest::Error),
 
-    /// The bearer token was rejected (HTTP 401).
-    ///
-    /// This is permanent until the operator fixes `DWAAR_ADMIN_TOKEN`.
-    #[error("unauthorized: admin API rejected the bearer token")]
-    Unauthorized,
+    /// The admin API returned a non-2xx status code.
+    #[error("admin API returned status {status}: {body}")]
+    Status { status: u16, body: String },
+}
 
-    /// The requested route domain does not exist (HTTP 404 on DELETE/GET).
-    #[error("route not found: {domain}")]
-    RouteNotFound { domain: String },
+/// Errors that can occur in the Kubernetes watcher.
+#[derive(Debug, Error)]
+pub enum WatcherError {
+    /// The underlying kube watch stream encountered an error.
+    #[error("kube watcher error: {0}")]
+    Kube(#[from] kube::Error),
 
-    /// The admin API returned an unexpected 5xx error.
-    #[error("admin API server error ({status}): {body}")]
-    ServerError { status: u16, body: String },
-
-    /// Any other HTTP error we didn't anticipate.
-    #[error("unexpected HTTP {status} from admin API: {body}")]
-    UnexpectedStatus { status: u16, body: String },
-
-    /// A network or serialization error from the underlying HTTP client.
-    #[error("HTTP client error: {0}")]
-    Http(#[from] reqwest::Error),
-
-    /// The `--admin-url` provided by the operator cannot be parsed or is
-    /// missing required components (scheme, host, socket path).
-    #[error("invalid admin URL: {reason}")]
-    InvalidUrl { reason: String },
+    /// An error was received on the watch stream itself.
+    #[error("watch stream error: {0}")]
+    Stream(String),
 }
