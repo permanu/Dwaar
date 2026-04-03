@@ -393,6 +393,11 @@ fn run_server(
 
     let timeouts = extract_timeouts(dwaar_config);
 
+    let h3_enabled = dwaar_config
+        .global_options
+        .as_ref()
+        .is_some_and(|g| g.h3_enabled);
+
     let proxy = DwaarProxy::new(
         route_table,
         challenge_solver.clone(),
@@ -405,6 +410,7 @@ fn run_server(
         cache_backend,
         u64::from(timeouts.keepalive_secs),
         u64::from(timeouts.body_secs),
+        h3_enabled,
     );
 
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, proxy);
@@ -458,6 +464,36 @@ fn run_server(
     }
 
     server.add_service(proxy_service);
+
+    // QUIC listener for HTTP/3 (ISSUE-079a). Uses the same PEM cert/key files
+    // as the TCP/TLS listener — both OpenSSL and rustls load PEM natively.
+    if h3_enabled {
+        let tls_configs = compile_tls_configs(dwaar_config);
+        if let Some((_domain, tls_cfg)) = tls_configs.iter().next() {
+            let quic_addr: std::net::SocketAddr =
+                "0.0.0.0:443".parse().expect("static addr is valid");
+            match dwaar_core::quic::QuicService::new(
+                quic_addr,
+                &tls_cfg.cert_path,
+                &tls_cfg.key_path,
+            ) {
+                Ok(quic_service) => {
+                    let quic_bg = pingora_core::services::background::background_service(
+                        "QUIC/HTTP3 listener",
+                        quic_service,
+                    );
+                    server.add_service(quic_bg);
+                    info!(listen = %quic_addr, protocol = "quic/h3", "QUIC listener registered");
+                }
+                Err(e) => {
+                    // QUIC is optional — warn but don't fail startup
+                    tracing::warn!(error = %e, "failed to start QUIC listener, HTTP/3 disabled");
+                }
+            }
+        } else {
+            tracing::warn!("h3 enabled but no TLS certs configured — QUIC listener not started");
+        }
+    }
 
     // Shared analytics metrics — created here so both AdminService and
     // AggregationService reference the same DashMap instance.

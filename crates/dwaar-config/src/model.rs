@@ -35,6 +35,10 @@ pub struct GlobalOptions {
     pub drain_timeout_secs: Option<u64>,
     /// Connection-level timeouts for slow loris protection (ISSUE-076).
     pub timeouts: Option<TimeoutsConfig>,
+    /// Enable HTTP/3 (QUIC) alongside HTTP/2. Configured via `servers { h3 on }`.
+    /// When enabled, Dwaar binds a UDP listener and advertises `Alt-Svc: h3`
+    /// on HTTP/2 responses so browsers can upgrade (ISSUE-079).
+    pub h3_enabled: bool,
     /// Options we recognized but don't act on — stored so we never error
     /// on valid Caddyfile syntax we haven't implemented yet.
     pub passthrough: Vec<(String, Vec<String>)>,
