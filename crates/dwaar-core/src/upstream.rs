@@ -68,6 +68,10 @@ pub(crate) struct Backend {
     pub(crate) tls: bool,
     /// SNI hostname for TLS. Empty string = use `addr.ip()` as SNI.
     pub(crate) tls_server_name: String,
+    /// Client cert+key for mTLS handshake with this backend (ISSUE-077).
+    pub(crate) client_cert_key: Option<Arc<pingora_core::utils::tls::CertKey>>,
+    /// Custom CA certs for verifying this backend's server cert (ISSUE-077).
+    pub(crate) trusted_ca: Option<Arc<pingora_core::protocols::tls::CaType>>,
 }
 
 /// The result of a successful backend selection.
@@ -76,6 +80,10 @@ pub struct SelectedUpstream {
     pub addr: SocketAddr,
     pub tls: bool,
     pub sni: String,
+    /// Client cert+key for mTLS (ISSUE-077). `None` for plain TLS.
+    pub client_cert_key: Option<Arc<pingora_core::utils::tls::CertKey>>,
+    /// Custom CA for upstream server cert verification (ISSUE-077).
+    pub trusted_ca: Option<Arc<pingora_core::protocols::tls::CaType>>,
 }
 
 impl UpstreamPool {
@@ -98,6 +106,8 @@ impl UpstreamPool {
                 max_conns: b.max_conns,
                 tls: b.tls,
                 tls_server_name: b.tls_server_name,
+                client_cert_key: b.client_cert_key,
+                trusted_ca: b.trusted_ca,
             })
             .collect();
 
@@ -157,6 +167,8 @@ impl UpstreamPool {
             addr: b.addr,
             tls: b.tls,
             sni: b.tls_server_name.clone(),
+            client_cert_key: b.client_cert_key.clone(),
+            trusted_ca: b.trusted_ca.clone(),
         })
     }
 
@@ -192,6 +204,8 @@ impl UpstreamPool {
             addr: best.addr,
             tls: best.tls,
             sni: best.tls_server_name.clone(),
+            client_cert_key: best.client_cert_key.clone(),
+            trusted_ca: best.trusted_ca.clone(),
         })
     }
 
@@ -216,6 +230,8 @@ impl UpstreamPool {
             addr: b.addr,
             tls: b.tls,
             sni: b.tls_server_name.clone(),
+            client_cert_key: b.client_cert_key.clone(),
+            trusted_ca: b.trusted_ca.clone(),
         })
     }
 
@@ -251,6 +267,8 @@ impl UpstreamPool {
                 addr: b.addr,
                 tls: b.tls,
                 sni: b.tls_server_name.clone(),
+                client_cert_key: b.client_cert_key.clone(),
+                trusted_ca: b.trusted_ca.clone(),
             });
         }
         None
@@ -356,6 +374,10 @@ pub struct BackendConfig {
     pub max_conns: Option<u32>,
     pub tls: bool,
     pub tls_server_name: String,
+    /// Pre-loaded client cert+key for mTLS (ISSUE-077). Compiled at config time.
+    pub client_cert_key: Option<Arc<pingora_core::utils::tls::CertKey>>,
+    /// Pre-loaded CA certs for upstream server verification (ISSUE-077).
+    pub trusted_ca: Option<Arc<pingora_core::protocols::tls::CaType>>,
 }
 
 // ── FNV-1a IP hash ────────────────────────────────────────────────────────────
@@ -558,6 +580,8 @@ mod tests {
                 max_conns: None,
                 tls: false,
                 tls_server_name: String::new(),
+                client_cert_key: None,
+                trusted_ca: None,
             })
             .collect();
         UpstreamPool::new(backends, policy, None, None)
@@ -570,6 +594,8 @@ mod tests {
                 max_conns: Some(max_conns),
                 tls: false,
                 tls_server_name: String::new(),
+                client_cert_key: None,
+                trusted_ca: None,
             }],
             LbPolicy::RoundRobin,
             None,

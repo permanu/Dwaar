@@ -427,6 +427,11 @@ pub struct ReverseProxyDirective {
     pub transport_tls: bool,
     /// SNI hostname to use for upstream TLS connections.
     pub tls_server_name: Option<String>,
+    /// Client cert+key paths for mutual TLS with the upstream.
+    /// `(cert_path, key_path)` — loaded and validated at compile time.
+    pub tls_client_auth: Option<(String, String)>,
+    /// Custom CA bundle path for upstream cert verification.
+    pub tls_trusted_ca_certs: Option<String>,
 }
 
 /// An upstream address — either a socket address or a host:port string
@@ -886,6 +891,8 @@ mod tests {
                     max_conns: None,
                     transport_tls: false,
                     tls_server_name: None,
+                    tls_client_auth: None,
+                    tls_trusted_ca_certs: None,
                 }),
                 Directive::Tls(TlsDirective::Auto),
             ],

@@ -12,6 +12,7 @@
 
 pub mod acme;
 pub mod cert_store;
+pub mod mtls;
 pub mod ocsp;
 pub mod sni;
 
