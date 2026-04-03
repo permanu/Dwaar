@@ -12,11 +12,12 @@ authors.workspace = true
 [features]
 # Enable the WASM plugin runtime (wasmtime + component model).
 # Off by default to keep the binary lean for deployments that don't use WASM plugins.
-wasm = ["dep:wasmtime", "dep:anyhow"]
+wasm = ["dep:wasmtime", "dep:anyhow", "dep:parking_lot"]
 
 [dependencies]
 wasmtime = { workspace = true, optional = true }
 anyhow = { workspace = true, optional = true }
+parking_lot = { workspace = true, optional = true }
 base64 = { workspace = true }
 ahash = { workspace = true }
 bcrypt = { workspace = true }
@@ -42,6 +43,7 @@ criterion = { workspace = true }
 proptest = { workspace = true }
 wat = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }
+tempfile = { workspace = true }
 
 [[bench]]
 name = "bot_detect"
