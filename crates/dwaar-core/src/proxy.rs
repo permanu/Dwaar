@@ -91,6 +91,9 @@ pub struct DwaarProxy {
     /// Downstream body read timeout (ISSUE-076). Applied after headers
     /// arrive so slow body senders get disconnected.
     body_timeout: std::time::Duration,
+    /// HTTP/3 (QUIC) enabled — when true, `response_filter` injects `Alt-Svc`
+    /// to advertise HTTP/3 availability to browsers (ISSUE-079b).
+    h3_enabled: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -107,6 +110,7 @@ impl DwaarProxy {
         cache_backend: Option<crate::cache::CacheBackend>,
         keepalive_secs: u64,
         body_timeout_secs: u64,
+        h3_enabled: bool,
     ) -> Self {
         Self {
             route_table,
@@ -120,6 +124,7 @@ impl DwaarProxy {
             cache_backend,
             keepalive_secs,
             body_timeout: std::time::Duration::from_secs(body_timeout_secs),
+            h3_enabled,
         }
     }
 }
@@ -1316,6 +1321,14 @@ impl ProxyHttp for DwaarProxy {
             .insert_header("X-Request-Id", ctx.request_id())
             .expect("UUID is valid header value");
 
+        // Advertise HTTP/3 when enabled (ISSUE-079b). Browsers use this to
+        // upgrade future requests to QUIC. `ma=86400` caches the hint for 24h.
+        if self.h3_enabled {
+            upstream_response
+                .insert_header("Alt-Svc", r#"h3=":443"; ma=86400"#)
+                .expect("static str is valid header value");
+        }
+
         // --- Cache status header (ISSUE-073f) ---
         if let Some(status) = ctx.cache_status {
             upstream_response
@@ -1674,8 +1687,9 @@ mod tests {
             chain,
             None,
             None,
-            60, // keepalive_secs
-            30, // body_timeout_secs
+            60,    // keepalive_secs
+            30,    // body_timeout_secs
+            false, // h3_enabled
         )
     }
 
