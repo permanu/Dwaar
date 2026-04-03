@@ -47,6 +47,7 @@ chrono = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "signal", "sync"] }
+tempfile = "3"
 
 [lints]
 workspace = true

@@ -18,20 +18,32 @@ use tracing::{debug, instrument};
 
 use crate::error::AdminApiError;
 
+/// The source tag stamped on every route this controller creates.
+///
+/// Used by the reconciler to distinguish controller-managed routes from routes
+/// created manually or by other controllers, so we never touch what isn't ours.
+pub const CONTROLLER_SOURCE: &str = "dwaar-ingress";
+
 /// Payload sent to `POST /routes` (upsert semantics — create or overwrite).
 #[derive(Debug, Serialize)]
 struct UpsertRouteRequest<'a> {
     domain: &'a str,
     upstream: &'a str,
     tls: bool,
+    /// Tags the route so the reconciler can identify controller-owned routes.
+    source: &'a str,
 }
 
 /// Minimal route descriptor returned by `GET /routes`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteEntry {
     pub domain: String,
     pub upstream: Option<String>,
     pub tls: bool,
+    /// Which component created this route. `None` for routes created before
+    /// the source field was introduced, or by other tools.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 /// REST client for the Dwaar admin API.
@@ -70,6 +82,7 @@ impl AdminApiClient {
             domain,
             upstream,
             tls,
+            source: CONTROLLER_SOURCE,
         };
 
         debug!(%domain, %upstream, tls, "upserting route");
@@ -143,11 +156,13 @@ mod tests {
             domain: "app.example.com",
             upstream: "10.0.0.5:8080",
             tls: true,
+            source: CONTROLLER_SOURCE,
         };
         let json = serde_json::to_string(&req).expect("serialize");
         assert!(json.contains("\"domain\":\"app.example.com\""));
         assert!(json.contains("\"upstream\":\"10.0.0.5:8080\""));
         assert!(json.contains("\"tls\":true"));
+        assert!(json.contains("\"source\":\"dwaar-ingress\""));
     }
 
     #[test]
