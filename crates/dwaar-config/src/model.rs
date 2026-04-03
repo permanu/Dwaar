@@ -455,6 +455,13 @@ pub enum TlsDirective {
     Internal,
     /// `tls /path/to/cert.pem /path/to/key.pem` — manual cert files
     Manual { cert_path: String, key_path: String },
+    /// `tls { dns cloudflare <token> }` — DNS-01 challenge for wildcard certs
+    DnsChallenge {
+        /// DNS provider name (e.g. "cloudflare")
+        provider: String,
+        /// API token for the DNS provider
+        api_token: String,
+    },
 }
 
 /// `header` — add, set, or remove a response header.
