@@ -126,6 +126,93 @@ fn parse_tls_variants() {
 }
 
 #[test]
+fn parse_tls_dns_challenge_literal_token() {
+    let config = parse(
+        "*.example.com {
+            tls {
+                dns cloudflare my-api-token-123
+            }
+        }",
+    )
+    .expect("parse");
+
+    if let Directive::Tls(TlsDirective::DnsChallenge {
+        ref provider,
+        ref api_token,
+    }) = config.sites[0].directives[0]
+    {
+        assert_eq!(provider, "cloudflare");
+        assert_eq!(api_token, "my-api-token-123");
+    } else {
+        panic!("expected DnsChallenge TLS directive");
+    }
+}
+
+#[test]
+#[allow(unsafe_code)]
+fn parse_tls_dns_challenge_env_var() {
+    // Set the env var for this test — unsafe in Rust 1.80+ but necessary
+    unsafe {
+        std::env::set_var("TEST_CF_TOKEN_080", "secret-token-from-env");
+    }
+
+    let config = parse(
+        "*.example.com {
+            tls {
+                dns cloudflare {env.TEST_CF_TOKEN_080}
+            }
+        }",
+    )
+    .expect("parse");
+
+    if let Directive::Tls(TlsDirective::DnsChallenge {
+        ref provider,
+        ref api_token,
+    }) = config.sites[0].directives[0]
+    {
+        assert_eq!(provider, "cloudflare");
+        assert_eq!(api_token, "secret-token-from-env");
+    } else {
+        panic!("expected DnsChallenge TLS directive");
+    }
+
+    unsafe {
+        std::env::remove_var("TEST_CF_TOKEN_080");
+    }
+}
+
+#[test]
+#[allow(unsafe_code)]
+fn parse_tls_dns_challenge_missing_env_var() {
+    // Make sure the env var doesn't exist
+    unsafe {
+        std::env::remove_var("NONEXISTENT_TOKEN_VAR_080");
+    }
+
+    let result = parse(
+        "*.example.com {
+            tls {
+                dns cloudflare {env.NONEXISTENT_TOKEN_VAR_080}
+            }
+        }",
+    );
+
+    assert!(result.is_err(), "should fail on missing env var");
+}
+
+#[test]
+fn parse_tls_dns_empty_block_fails() {
+    let result = parse(
+        "*.example.com {
+            tls {
+            }
+        }",
+    );
+
+    assert!(result.is_err(), "empty tls block should fail");
+}
+
+#[test]
 fn parse_header_set_and_delete() {
     let config = parse(
         r#"a.com {

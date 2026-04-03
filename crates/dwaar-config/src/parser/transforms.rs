@@ -20,10 +20,12 @@ use crate::token::{Token, TokenKind, Tokenizer};
 
 use super::helpers::{expect_word_or_quoted, is_directive_name, parse_size, skip_to_next_line};
 
-/// `tls auto` / `tls off` / `tls internal` / `tls /cert /key`
+/// `tls auto` / `tls off` / `tls internal` / `tls /cert /key` /
+/// `tls { dns cloudflare <token> }`
 pub(super) fn parse_tls(t: &mut Tokenizer<'_>) -> Result<TlsDirective, ParseError> {
     let tok = t.peek();
     match &tok.kind {
+        TokenKind::OpenBrace => parse_tls_block(t),
         TokenKind::Word(w) => {
             let w = w.clone();
             match w.as_str() {
@@ -88,6 +90,159 @@ pub(super) fn parse_tls(t: &mut Tokenizer<'_>) -> Result<TlsDirective, ParseErro
         }
         // No arg means auto (Caddy default)
         _ => Ok(TlsDirective::Auto),
+    }
+}
+
+/// Parse `tls { dns <provider> <token> }` block form for DNS-01 challenges.
+///
+/// The `{env.CF_API_TOKEN}` syntax is resolved here: the tokenizer splits it
+/// into `OpenBrace Word("env.CF_API_TOKEN") CloseBrace`, so we reassemble
+/// and look up the environment variable.
+fn parse_tls_block(t: &mut Tokenizer<'_>) -> Result<TlsDirective, ParseError> {
+    t.next_token(); // consume opening `{`
+
+    let mut result: Option<TlsDirective> = None;
+
+    loop {
+        let tok = t.peek();
+        match &tok.kind {
+            TokenKind::CloseBrace => {
+                t.next_token();
+                break;
+            }
+            TokenKind::Eof => {
+                return Err(ParseError {
+                    line: tok.line,
+                    col: tok.col,
+                    kind: ParseErrorKind::UnexpectedEof {
+                        expected: "'}' to close tls block".to_string(),
+                    },
+                });
+            }
+            TokenKind::Word(w) if w == "dns" => {
+                t.next_token(); // consume "dns"
+                let (provider, provider_tok) =
+                    read_tls_word(t, "dns provider name (e.g. cloudflare)")?;
+
+                // The token might be a literal string or an {env.VAR} placeholder.
+                let api_token = read_tls_token_value(t, &provider_tok)?;
+
+                result = Some(TlsDirective::DnsChallenge {
+                    provider,
+                    api_token,
+                });
+            }
+            _ => {
+                // Skip unknown subdirectives inside tls block
+                t.next_token();
+            }
+        }
+    }
+
+    result.ok_or_else(|| {
+        let (line, col) = t.position();
+        ParseError {
+            line,
+            col,
+            kind: ParseErrorKind::InvalidValue {
+                directive: "tls".to_string(),
+                message: "tls block must contain a subdirective (e.g. 'dns cloudflare <token>')"
+                    .to_string(),
+            },
+        }
+    })
+}
+
+/// Read a word or quoted string from the tokenizer, returning both the string
+/// and the token for error positioning.
+fn read_tls_word(t: &mut Tokenizer<'_>, what: &str) -> Result<(String, Token), ParseError> {
+    let tok = t.next_token();
+    match tok.kind {
+        TokenKind::Word(ref w) => Ok((w.clone(), tok)),
+        TokenKind::QuotedString(ref s) => Ok((s.clone(), tok)),
+        _ => Err(ParseError {
+            line: tok.line,
+            col: tok.col,
+            kind: ParseErrorKind::InvalidValue {
+                directive: "tls".to_string(),
+                message: format!("expected {what}"),
+            },
+        }),
+    }
+}
+
+/// Read a token value that might be a literal or an `{env.VAR}` placeholder.
+///
+/// The tokenizer splits `{env.CF_API_TOKEN}` into three tokens:
+/// `OpenBrace`, `Word("env.CF_API_TOKEN")`, `CloseBrace`. When we see
+/// an open brace after the provider name, we reassemble and resolve
+/// the environment variable.
+fn read_tls_token_value(t: &mut Tokenizer<'_>, _context_tok: &Token) -> Result<String, ParseError> {
+    let tok = t.peek();
+    match &tok.kind {
+        // `{env.VAR_NAME}` syntax — resolve environment variable
+        TokenKind::OpenBrace => {
+            t.next_token(); // consume `{`
+            let var_tok = t.next_token();
+            let TokenKind::Word(var_name) = &var_tok.kind else {
+                return Err(ParseError {
+                    line: var_tok.line,
+                    col: var_tok.col,
+                    kind: ParseErrorKind::InvalidValue {
+                        directive: "tls".to_string(),
+                        message: "expected env.VAR_NAME inside braces".to_string(),
+                    },
+                });
+            };
+
+            let env_key = var_name.strip_prefix("env.").ok_or_else(|| ParseError {
+                line: var_tok.line,
+                col: var_tok.col,
+                kind: ParseErrorKind::InvalidValue {
+                    directive: "tls".to_string(),
+                    message: format!("expected {{env.VAR_NAME}} syntax, got {{{var_name}}}"),
+                },
+            })?;
+
+            // Consume the closing `}` — but this is the inner brace of
+            // `{env.VAR}`, not the tls block's closing brace.
+            let close = t.next_token();
+            if !matches!(close.kind, TokenKind::CloseBrace) {
+                return Err(ParseError {
+                    line: close.line,
+                    col: close.col,
+                    kind: ParseErrorKind::Expected {
+                        expected: "'}' to close env variable".to_string(),
+                        got: format!("{:?}", close.kind),
+                    },
+                });
+            }
+
+            std::env::var(env_key).map_err(|_| ParseError {
+                line: var_tok.line,
+                col: var_tok.col,
+                kind: ParseErrorKind::InvalidValue {
+                    directive: "tls".to_string(),
+                    message: format!("environment variable '{env_key}' is not set"),
+                },
+            })
+        }
+        // Literal token string or quoted string
+        TokenKind::Word(_) | TokenKind::QuotedString(_) => {
+            let tok = t.next_token();
+            match tok.kind {
+                TokenKind::Word(w) | TokenKind::QuotedString(w) => Ok(w),
+                _ => unreachable!(),
+            }
+        }
+        _ => Err(ParseError {
+            line: tok.line,
+            col: tok.col,
+            kind: ParseErrorKind::InvalidValue {
+                directive: "tls".to_string(),
+                message: "expected API token value or {env.VAR_NAME}".to_string(),
+            },
+        }),
     }
 }
 

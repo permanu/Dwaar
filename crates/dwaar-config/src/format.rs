@@ -254,6 +254,12 @@ fn format_tls(out: &mut String, tls: &TlsDirective) {
             out.push_str(key_path);
             out.push('"');
         }
+        TlsDirective::DnsChallenge { provider, .. } => {
+            // Don't emit the API token in formatted output for security
+            out.push_str("tls {\n    dns ");
+            out.push_str(provider);
+            out.push_str(" <redacted>\n}");
+        }
     }
 }
 
