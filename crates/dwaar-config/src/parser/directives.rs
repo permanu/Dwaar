@@ -89,6 +89,8 @@ fn parse_reverse_proxy_inline(t: &mut Tokenizer<'_>) -> Result<ReverseProxyDirec
         max_conns: None,
         transport_tls: false,
         tls_server_name: None,
+        tls_client_auth: None,
+        tls_trusted_ca_certs: None,
     })
 }
 
@@ -122,6 +124,8 @@ fn parse_reverse_proxy_block(t: &mut Tokenizer<'_>) -> Result<ReverseProxyDirect
     let mut max_conns: Option<u32> = None;
     let mut transport_tls = false;
     let mut tls_server_name: Option<String> = None;
+    let mut tls_client_auth: Option<(String, String)> = None;
+    let mut tls_trusted_ca_certs: Option<String> = None;
 
     loop {
         let tok = t.next_token();
@@ -242,6 +246,27 @@ fn parse_reverse_proxy_block(t: &mut Tokenizer<'_>) -> Result<ReverseProxyDirect
                                         tls_server_name = Some(sni);
                                     }
                                 }
+                                TokenKind::Word(ref kw) if kw == "tls_client_auth" => {
+                                    transport_tls = true;
+                                    let cert_tok = t.next_token();
+                                    let key_tok = t.next_token();
+                                    if let (
+                                        TokenKind::Word(cert) | TokenKind::QuotedString(cert),
+                                        TokenKind::Word(key) | TokenKind::QuotedString(key),
+                                    ) = (cert_tok.kind, key_tok.kind)
+                                    {
+                                        tls_client_auth = Some((cert, key));
+                                    }
+                                }
+                                TokenKind::Word(ref kw) if kw == "tls_trusted_ca_certs" => {
+                                    transport_tls = true;
+                                    let ca_tok = t.next_token();
+                                    if let TokenKind::Word(ca) | TokenKind::QuotedString(ca) =
+                                        ca_tok.kind
+                                    {
+                                        tls_trusted_ca_certs = Some(ca);
+                                    }
+                                }
                                 // Skip unknown transport sub-directives gracefully
                                 _ => {}
                             }
@@ -295,6 +320,8 @@ fn parse_reverse_proxy_block(t: &mut Tokenizer<'_>) -> Result<ReverseProxyDirect
         max_conns,
         transport_tls,
         tls_server_name,
+        tls_client_auth,
+        tls_trusted_ca_certs,
     })
 }
 
