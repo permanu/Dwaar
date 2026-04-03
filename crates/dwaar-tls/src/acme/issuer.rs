@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use instant_acme::{
     Account, AccountCredentials, Authorization, AuthorizationStatus, ChallengeType, Identifier,
-    NewAccount, NewOrder, Order, OrderStatus,
+    KeyAuthorization, NewAccount, NewOrder, Order, OrderStatus,
 };
 use openssl::ec::{EcGroup, EcKey};
 use openssl::nid::Nid;
@@ -27,6 +27,7 @@ use super::account::{credentials_path, ensure_acme_dir, load_credentials, save_c
 use super::solver::ChallengeSolver;
 use super::{AcmeError, CHALLENGE_CLEANUP_DELAY};
 use crate::cert_store::CertStore;
+use crate::dns::DnsProvider;
 
 /// Manages ACME certificate issuance for one or more domains.
 #[derive(Debug)]
@@ -97,6 +98,159 @@ impl CertIssuer {
 
         info!(domain, ca = ca_id, "certificate issued and stored");
         Ok(())
+    }
+
+    /// Issue a wildcard certificate using DNS-01 challenge with the given provider.
+    ///
+    /// Same flow as `issue()` but uses DNS TXT records instead of HTTP tokens
+    /// for challenge validation. Required for wildcard domains (`*.example.com`).
+    pub async fn issue_dns01(
+        &self,
+        domain: &str,
+        directory_url: &str,
+        ca_id: &str,
+        dns_provider: &dyn DnsProvider,
+    ) -> Result<(), AcmeError> {
+        ensure_acme_dir(&self.acme_dir).await?;
+
+        let account = self.get_or_create_account(directory_url, ca_id).await?;
+
+        info!(
+            domain,
+            ca = ca_id,
+            dns_provider = dns_provider.name(),
+            "starting ACME DNS-01 order"
+        );
+
+        let identifier = Identifier::Dns(domain.to_string());
+        let mut order = account
+            .new_order(&NewOrder {
+                identifiers: &[identifier],
+            })
+            .await
+            .map_err(|e| AcmeError::OrderCreation(e.to_string()))?;
+
+        let record_ids = self
+            .solve_dns01_challenges(domain, &mut order, dns_provider)
+            .await?;
+
+        Self::poll_order_ready(domain, &mut order).await?;
+
+        let (private_key_pem, csr_der) =
+            generate_key_and_csr(domain).map_err(|e| AcmeError::Finalization(e.to_string()))?;
+
+        order
+            .finalize(&csr_der)
+            .await
+            .map_err(|e| AcmeError::Finalization(e.to_string()))?;
+
+        let cert_chain_pem = Self::poll_certificate(domain, &mut order).await?;
+
+        self.write_cert_files(domain, &cert_chain_pem, &private_key_pem)
+            .await?;
+
+        self.cert_store.invalidate(domain);
+
+        // Clean up DNS records after successful issuance
+        for record_id in &record_ids {
+            if let Err(e) = dns_provider.delete_txt_record(record_id).await {
+                // Non-fatal — log and continue
+                tracing::warn!(
+                    domain,
+                    record_id,
+                    error = %e,
+                    "failed to clean up DNS challenge record"
+                );
+            }
+        }
+
+        info!(
+            domain,
+            ca = ca_id,
+            "DNS-01 wildcard certificate issued and stored"
+        );
+        Ok(())
+    }
+
+    /// Process all authorizations using DNS-01 challenges.
+    ///
+    /// Creates TXT records via the DNS provider, waits for propagation, then
+    /// tells the ACME server to validate. Returns the record IDs for cleanup.
+    async fn solve_dns01_challenges(
+        &self,
+        domain: &str,
+        order: &mut Order,
+        dns_provider: &dyn DnsProvider,
+    ) -> Result<Vec<String>, AcmeError> {
+        let authorizations =
+            order
+                .authorizations()
+                .await
+                .map_err(|e| AcmeError::ChallengeValidation {
+                    domain: domain.to_string(),
+                    reason: e.to_string(),
+                })?;
+
+        let mut record_ids = Vec::new();
+
+        for authz in &authorizations {
+            if matches!(authz.status, AuthorizationStatus::Valid) {
+                continue;
+            }
+
+            if !matches!(authz.status, AuthorizationStatus::Pending) {
+                return Err(AcmeError::ChallengeValidation {
+                    domain: domain.to_string(),
+                    reason: format!("unexpected authorization status: {:?}", authz.status),
+                });
+            }
+
+            let challenge = authz
+                .challenges
+                .iter()
+                .find(|c| c.r#type == ChallengeType::Dns01)
+                .ok_or_else(|| AcmeError::ChallengeValidation {
+                    domain: domain.to_string(),
+                    reason: "no DNS-01 challenge offered by CA".to_string(),
+                })?;
+
+            let key_auth: KeyAuthorization = order.key_authorization(challenge);
+            let txt_value = key_auth.dns_value();
+
+            // Strip wildcard prefix for the challenge domain — the TXT record
+            // goes on `_acme-challenge.example.com`, not `_acme-challenge.*.example.com`
+            let challenge_domain = domain.strip_prefix("*.").unwrap_or(domain);
+
+            debug!(domain, challenge_domain, "creating DNS-01 TXT record");
+
+            let record_id = dns_provider
+                .create_txt_record(challenge_domain, &txt_value)
+                .await
+                .map_err(|e| AcmeError::ChallengeValidation {
+                    domain: domain.to_string(),
+                    reason: format!("DNS record creation failed: {e}"),
+                })?;
+
+            record_ids.push(record_id);
+
+            // Wait for DNS propagation before telling the CA to validate
+            crate::dns::wait_for_propagation(challenge_domain, &txt_value, 120)
+                .await
+                .map_err(|e| AcmeError::ChallengeValidation {
+                    domain: domain.to_string(),
+                    reason: format!("DNS propagation failed: {e}"),
+                })?;
+
+            order
+                .set_challenge_ready(&challenge.url)
+                .await
+                .map_err(|e| AcmeError::ChallengeValidation {
+                    domain: domain.to_string(),
+                    reason: e.to_string(),
+                })?;
+        }
+
+        Ok(record_ids)
     }
 
     /// Process all authorizations for the order, setting up HTTP-01 challenges.
