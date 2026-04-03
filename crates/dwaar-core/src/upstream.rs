@@ -29,6 +29,8 @@ use pingora_core::OrErr;
 use pingora_core::services::background::BackgroundService;
 use tracing::{debug, warn};
 
+use crate::wake::ScaleToZeroConfig;
+
 /// Which algorithm the pool uses to pick a backend on each request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LbPolicy {
@@ -52,6 +54,9 @@ pub struct UpstreamPool {
     pub(crate) health_uri: Option<String>,
     /// Seconds between health polls.
     pub(crate) health_interval: Duration,
+    /// Scale-to-zero config (ISSUE-082). When set, the proxy will attempt to wake
+    /// a sleeping backend on upstream connection failure instead of returning 502.
+    pub(crate) scale_to_zero: Option<Arc<ScaleToZeroConfig>>,
 }
 
 /// One backend server inside the pool.
@@ -117,7 +122,29 @@ impl UpstreamPool {
             counter: AtomicU64::new(0),
             health_uri,
             health_interval: Duration::from_secs(health_interval.unwrap_or(10)),
+            scale_to_zero: None,
         }
+    }
+
+    /// Build a pool with scale-to-zero support (ISSUE-082).
+    ///
+    /// Same as `new()` but attaches a `ScaleToZeroConfig` that enables
+    /// wake-on-first-request when the upstream is unreachable.
+    pub fn new_with_scale_to_zero(
+        backends: Vec<BackendConfig>,
+        policy: LbPolicy,
+        health_uri: Option<String>,
+        health_interval: Option<u64>,
+        scale_to_zero: ScaleToZeroConfig,
+    ) -> Self {
+        let mut pool = Self::new(backends, policy, health_uri, health_interval);
+        pool.scale_to_zero = Some(Arc::new(scale_to_zero));
+        pool
+    }
+
+    /// Returns the scale-to-zero config, if configured for this pool.
+    pub fn scale_to_zero(&self) -> Option<&Arc<ScaleToZeroConfig>> {
+        self.scale_to_zero.as_ref()
     }
 
     /// Returns `true` if this pool has a health check URI configured.
