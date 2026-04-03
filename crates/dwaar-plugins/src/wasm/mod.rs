@@ -11,5 +11,7 @@
 
 pub mod bindings;
 pub mod engine;
+pub mod limits;
 
 pub use engine::{EngineError, WasmEngine};
+pub use limits::WasmLimits;

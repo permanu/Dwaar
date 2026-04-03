@@ -19,6 +19,7 @@ use crate::model::{
     RedirDirective, RequestBodyDirective, RequestHeaderDirective, RespondDirective,
     ResponseBodyLimitDirective, ReverseProxyDirective, RewriteDirective, RootDirective,
     TlsDirective, TryFilesDirective, UpstreamAddr, UriDirective, UriOperation, VarsDirective,
+    WasmPluginDirective,
 };
 
 /// Format a parsed config into canonical Dwaarfile text.
@@ -139,6 +140,7 @@ fn format_directive_at_depth(out: &mut String, directive: &Directive, depth: usi
         Directive::Push(r) => format_recognized(out, "push", r),
         Directive::AcmeServer(r) => format_recognized(out, "acme_server", r),
         Directive::Cache(c) => format_cache(out, c, depth),
+        Directive::WasmPlugin(wp) => format_wasm_plugin(out, wp, depth),
     }
 }
 
@@ -865,6 +867,31 @@ fn format_recognized(out: &mut String, name: &str, r: &RecognizedDirective) {
     // Recognized directives don't have a block field — they just store args.
     // If they had a block, it would need to be formatted, but RecognizedDirective
     // only captures args for forward-compat round-tripping.
+}
+
+/// Format a `wasm_plugin` directive as a block form.
+///
+/// Always emits the block `{ }` form for clarity, even when all fields are
+/// at their defaults. This makes diffs readable — you can see exactly what
+/// limits apply to every plugin without needing to know the defaults.
+fn format_wasm_plugin(out: &mut String, wp: &WasmPluginDirective, depth: usize) {
+    use std::fmt::Write as _;
+    let indent = "\t".repeat(depth);
+    let _ = writeln!(out, "wasm_plugin {} {{", wp.module_path);
+    let _ = writeln!(out, "{indent}\t\tpriority {}", wp.priority);
+    if let Some(fuel) = wp.fuel {
+        let _ = writeln!(out, "{indent}\t\tfuel {fuel}");
+    }
+    if let Some(mb) = wp.memory_mb {
+        let _ = writeln!(out, "{indent}\t\tmemory {mb}");
+    }
+    if let Some(ms) = wp.timeout_ms {
+        let _ = writeln!(out, "{indent}\t\ttimeout {ms}");
+    }
+    for (k, v) in &wp.config {
+        let _ = writeln!(out, "{indent}\t\tconfig {k}={v}");
+    }
+    let _ = write!(out, "{indent}\t}}");
 }
 
 #[cfg(test)]
