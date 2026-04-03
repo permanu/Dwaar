@@ -1,0 +1,6 @@
+example.com {
+    wasm_plugin examples/wasm-plugins/hello-world/target/wasm32-wasip2/release/hello_world_plugin.wasm {
+        priority 50
+    }
+    reverse_proxy localhost:8080
+}
