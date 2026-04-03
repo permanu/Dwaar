@@ -17,17 +17,34 @@
 //! once the component is compiled. Fresh stores guarantee complete state
 //! isolation between requests — plugins cannot accumulate mutable globals.
 //!
+//! # Error isolation (ISSUE-103)
+//!
+//! A misbehaving WASM plugin must never crash the proxy. `with_instance` wraps
+//! every hook call and on failure:
+//! 1. Logs the trap reason with the plugin name.
+//! 2. Returns `Continue` (fail-open) so the request proceeds.
+//! 3. Increments a per-plugin `consecutive_traps` counter.
+//!
+//! After 10 consecutive traps the plugin is atomically disabled — all future
+//! hook calls are skipped immediately, logging once per disabled state. The
+//! counter and disabled flag are reset to zero on config reload when the user
+//! swaps in a fixed `.wasm` binary.
+//!
 //! # Thread safety
 //!
 //! `wasmtime::component::Component` is `Send + Sync` (immutable after compile).
-//! `WasmEngine` is `Clone + Send + Sync`. Therefore `WasmPlugin` is
-//! `Send + Sync` and can live in the `PluginChain` behind an `Arc`.
+//! `WasmEngine` is `Clone + Send + Sync`. `consecutive_traps` and `disabled`
+//! use atomics with `Relaxed` ordering — they are best-effort counters, not
+//! synchronisation barriers. Therefore `WasmPlugin` is `Send + Sync` and can
+//! live in the `PluginChain` behind an `Arc`.
 
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use bytes::Bytes;
 use pingora_http::{RequestHeader, ResponseHeader};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 use wasmtime::Store;
 use wasmtime::component::{Component, Linker};
 
@@ -37,6 +54,9 @@ use super::bindings::{
 use super::engine::WasmEngine;
 use super::error::WasmError;
 use crate::plugin::{DwaarPlugin, PluginAction, PluginCtx};
+
+/// Number of consecutive traps before a plugin is automatically disabled.
+const MAX_CONSECUTIVE_TRAPS: u32 = 10;
 
 // ---------------------------------------------------------------------------
 // Store data
@@ -89,13 +109,19 @@ impl PluginState {
 /// `PluginChain` and invoked for every request.
 pub struct WasmPlugin {
     /// Shared JIT engine handle — Arc clone from the process-wide engine.
-    engine: std::sync::Arc<wasmtime::Engine>,
+    engine: Arc<wasmtime::Engine>,
     /// Compiled component artifact. Immutable after compilation; `Send + Sync`.
     component: Component,
     /// Human-readable name derived from the filename, leaked for `'static`.
     name: &'static str,
     /// Execution priority — lower values run first in the plugin chain.
     priority: u16,
+    /// How many hook calls in a row have trapped. Reset to zero on success.
+    /// Uses Relaxed ordering — this is a best-effort counter, not a barrier.
+    consecutive_traps: AtomicU32,
+    /// Set to `true` after `MAX_CONSECUTIVE_TRAPS` consecutive failures.
+    /// All hook calls are skipped while this is set.
+    disabled: AtomicBool,
 }
 
 impl std::fmt::Debug for WasmPlugin {
@@ -104,6 +130,7 @@ impl std::fmt::Debug for WasmPlugin {
         f.debug_struct("WasmPlugin")
             .field("name", &self.name)
             .field("priority", &self.priority)
+            .field("disabled", &self.disabled.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
 }
@@ -139,6 +166,8 @@ impl WasmPlugin {
             component,
             name,
             priority,
+            consecutive_traps: AtomicU32::new(0),
+            disabled: AtomicBool::new(false),
         })
     }
 
@@ -163,47 +192,87 @@ impl WasmPlugin {
             component,
             name,
             priority,
+            consecutive_traps: AtomicU32::new(0),
+            disabled: AtomicBool::new(false),
         })
     }
 
-    /// Instantiate the component, run `f`, and map errors to `PluginAction::Continue`.
+    /// Whether the plugin has been auto-disabled after too many consecutive traps.
+    ///
+    /// Useful for diagnostics and tests. Re-enabled on config reload by
+    /// dropping and recreating the `WasmPlugin`.
+    pub fn is_disabled(&self) -> bool {
+        self.disabled.load(Ordering::Relaxed)
+    }
+
+    /// Instantiate the component, run `f`, and handle errors for reliability.
     ///
     /// A new store is created for every call — wasmtime linear memory and
     /// globals are reset between requests, preventing state leakage. Store
     /// creation is O(1) once the component is compiled.
     ///
-    /// If instantiation or the hook itself traps, we log a warning and return
-    /// `Continue` so one misbehaving plugin doesn't abort the entire chain.
+    /// # Error isolation (ISSUE-103)
+    ///
+    /// On trap or instantiation failure:
+    /// 1. Log a warning with the plugin name, hook name, and trap reason.
+    /// 2. Increment `consecutive_traps`.
+    /// 3. If traps hit `MAX_CONSECUTIVE_TRAPS`, atomically set `disabled`.
+    /// 4. Return `Continue` so the proxy serves traffic from the next plugin.
+    ///
+    /// On success: reset `consecutive_traps` to zero.
     fn with_instance<F>(&self, ctx: &PluginCtx, hook: &'static str, f: F) -> PluginAction
     where
         F: FnOnce(&mut Store<PluginState>, &WitInstance) -> Result<PluginAction, wasmtime::Error>,
     {
+        // Skip immediately if the plugin has been auto-disabled.
+        if self.disabled.load(Ordering::Relaxed) {
+            return PluginAction::Continue;
+        }
+
         let state = PluginState::from_ctx(ctx);
         let mut store = Store::new(&self.engine, state);
         let linker: Linker<PluginState> = Linker::new(&self.engine);
 
-        let instance = match WitInstance::instantiate(&mut store, &self.component, &linker) {
-            Ok(i) => i,
-            Err(e) => {
-                warn!(
-                    plugin = self.name,
-                    hook,
-                    error = %e,
-                    "WASM component instantiation failed — returning Continue"
-                );
-                return PluginAction::Continue;
-            }
-        };
+        let result = WitInstance::instantiate(&mut store, &self.component, &linker)
+            .and_then(|instance| f(&mut store, &instance));
 
-        match f(&mut store, &instance) {
-            Ok(action) => action,
+        match result {
+            Ok(action) => {
+                // Success — reset the trap counter so a transient error doesn't
+                // accumulate toward the disable threshold.
+                self.consecutive_traps.store(0, Ordering::Relaxed);
+                action
+            }
             Err(e) => {
-                warn!(
-                    plugin = self.name,
-                    hook,
-                    error = %e,
-                    "WASM hook trapped — returning Continue"
-                );
+                let traps = self.consecutive_traps.fetch_add(1, Ordering::Relaxed) + 1;
+
+                if traps >= MAX_CONSECUTIVE_TRAPS {
+                    // Flip the disabled flag exactly once (compare-and-swap so we
+                    // only log the "disabling" message once even under concurrent
+                    // calls from parallel worker threads).
+                    if self
+                        .disabled
+                        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        error!(
+                            plugin = self.name,
+                            hook,
+                            traps,
+                            "WASM plugin disabled after too many consecutive traps — \
+                             fix the module and reload config to re-enable"
+                        );
+                    }
+                } else {
+                    warn!(
+                        plugin = self.name,
+                        hook,
+                        consecutive_traps = traps,
+                        error = %e,
+                        "WASM hook trapped — returning Continue (fail-open)"
+                    );
+                }
+
                 PluginAction::Continue
             }
         }
@@ -220,6 +289,9 @@ impl DwaarPlugin for WasmPlugin {
     }
 
     fn on_request(&self, req: &RequestHeader, ctx: &mut PluginCtx) -> PluginAction {
+        if self.disabled.load(Ordering::Relaxed) {
+            return PluginAction::Continue;
+        }
         debug!(plugin = self.name, "on-request");
         let req_info = wit_types::RequestInfo {
             method: ctx.method.to_string(),
@@ -235,6 +307,9 @@ impl DwaarPlugin for WasmPlugin {
     }
 
     fn on_response(&self, resp: &mut ResponseHeader, ctx: &mut PluginCtx) -> PluginAction {
+        if self.disabled.load(Ordering::Relaxed) {
+            return PluginAction::Continue;
+        }
         debug!(plugin = self.name, "on-response");
         let resp_info = wit_types::ResponseInfo {
             status: resp.status.as_u16(),
@@ -247,6 +322,9 @@ impl DwaarPlugin for WasmPlugin {
     }
 
     fn on_body(&self, _body: &mut Option<Bytes>, eos: bool, ctx: &mut PluginCtx) -> PluginAction {
+        if self.disabled.load(Ordering::Relaxed) {
+            return PluginAction::Continue;
+        }
         debug!(plugin = self.name, eos, "on-body");
         self.with_instance(ctx, "on-body", |store, plugin| {
             let raw = plugin.call_on_body(store, eos)?;
@@ -475,6 +553,150 @@ mod tests {
         assert!(
             matches!(action, PluginAction::Continue),
             "failed instantiation must not propagate — got {action:?}"
+        );
+    }
+
+    // ── ISSUE-103: Error isolation tests ─────────────────────────────────────
+
+    /// A trap increments the consecutive counter and returns Continue.
+    #[tokio::test]
+    async fn trap_returns_continue_and_increments_counter() {
+        let empty_wat = "(component)";
+        let engine = WasmEngine::new().expect("engine");
+        let bytes = wat::parse_str(empty_wat).expect("parse");
+
+        let plugin = WasmPlugin::from_bytes(&engine, &bytes, "trapping-plugin", 50)
+            .expect("compile empty component");
+
+        let mut ctx = PluginCtx {
+            method: "GET".into(),
+            path: "/".into(),
+            ..Default::default()
+        };
+        let req = pingora_http::RequestHeader::build("GET", b"/", None).expect("req");
+
+        // Empty component → instantiation fails → trap counted.
+        let action = plugin.on_request(&req, &mut ctx);
+        assert!(
+            matches!(action, PluginAction::Continue),
+            "trap must return Continue"
+        );
+        assert_eq!(
+            plugin.consecutive_traps.load(Ordering::Relaxed),
+            1,
+            "counter must be 1 after first trap"
+        );
+        assert!(
+            !plugin.is_disabled(),
+            "plugin must not be disabled after 1 trap"
+        );
+    }
+
+    /// After `MAX_CONSECUTIVE_TRAPS` traps the plugin is disabled.
+    #[tokio::test]
+    async fn ten_consecutive_traps_disable_plugin() {
+        let empty_wat = "(component)";
+        let engine = WasmEngine::new().expect("engine");
+        let bytes = wat::parse_str(empty_wat).expect("parse");
+
+        let plugin =
+            WasmPlugin::from_bytes(&engine, &bytes, "failing-plugin", 50).expect("compile");
+
+        let mut ctx = PluginCtx {
+            method: "GET".into(),
+            path: "/".into(),
+            ..Default::default()
+        };
+        let req = pingora_http::RequestHeader::build("GET", b"/", None).expect("req");
+
+        for i in 1..=MAX_CONSECUTIVE_TRAPS {
+            let action = plugin.on_request(&req, &mut ctx);
+            assert!(
+                matches!(action, PluginAction::Continue),
+                "trap {i} must return Continue"
+            );
+        }
+
+        assert!(
+            plugin.is_disabled(),
+            "plugin must be disabled after {MAX_CONSECUTIVE_TRAPS} consecutive traps"
+        );
+    }
+
+    /// A successful call resets the consecutive trap counter.
+    #[tokio::test]
+    async fn successful_call_resets_trap_counter() {
+        let engine = WasmEngine::new().expect("engine");
+
+        let wasm_bytes = match wat::parse_str(noop_wat()) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("noop WAT parse failed — skipping: {e}");
+                return;
+            }
+        };
+        let plugin = match WasmPlugin::from_bytes(&engine, &wasm_bytes, "healthy-plugin", 50) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("noop compile failed — skipping: {e}");
+                return;
+            }
+        };
+
+        // Manually set the counter to simulate some prior traps.
+        plugin.consecutive_traps.store(5, Ordering::Relaxed);
+
+        let mut ctx = PluginCtx {
+            method: "GET".into(),
+            path: "/".into(),
+            ..Default::default()
+        };
+        let req = pingora_http::RequestHeader::build("GET", b"/", None).expect("req");
+
+        let action = plugin.on_request(&req, &mut ctx);
+        assert!(
+            matches!(action, PluginAction::Continue),
+            "successful call must return Continue"
+        );
+        assert_eq!(
+            plugin.consecutive_traps.load(Ordering::Relaxed),
+            0,
+            "counter must reset to zero after a successful call"
+        );
+    }
+
+    /// A disabled plugin returns Continue without attempting instantiation.
+    #[tokio::test]
+    async fn disabled_plugin_skips_execution() {
+        let empty_wat = "(component)";
+        let engine = WasmEngine::new().expect("engine");
+        let bytes = wat::parse_str(empty_wat).expect("parse");
+
+        let plugin = WasmPlugin::from_bytes(&engine, &bytes, "pre-disabled", 50).expect("compile");
+
+        // Disable the plugin directly (as if MAX_CONSECUTIVE_TRAPS already hit).
+        plugin.disabled.store(true, Ordering::Relaxed);
+
+        let mut ctx = PluginCtx {
+            method: "GET".into(),
+            path: "/".into(),
+            ..Default::default()
+        };
+        let req = pingora_http::RequestHeader::build("GET", b"/", None).expect("req");
+
+        // Even though the component is broken, disabled plugins must not
+        // increment the counter or attempt instantiation.
+        let counter_before = plugin.consecutive_traps.load(Ordering::Relaxed);
+        let action = plugin.on_request(&req, &mut ctx);
+
+        assert!(
+            matches!(action, PluginAction::Continue),
+            "disabled plugin must return Continue"
+        );
+        assert_eq!(
+            plugin.consecutive_traps.load(Ordering::Relaxed),
+            counter_before,
+            "disabled plugin must not touch the trap counter"
         );
     }
 }

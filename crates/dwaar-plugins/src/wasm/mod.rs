@@ -20,11 +20,13 @@
 
 pub mod adapter;
 pub mod bindings;
+pub mod cache;
 pub mod engine;
 pub mod error;
 pub mod limits;
 
 pub use adapter::WasmPlugin;
+pub use cache::ModuleCache;
 pub use engine::{EngineError, WasmEngine};
 pub use error::WasmError;
 pub use limits::WasmLimits;
