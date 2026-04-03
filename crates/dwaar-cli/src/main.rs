@@ -391,6 +391,8 @@ fn run_server(
         "feature flags resolved"
     );
 
+    let timeouts = extract_timeouts(dwaar_config);
+
     let proxy = DwaarProxy::new(
         route_table,
         challenge_solver.clone(),
@@ -401,9 +403,24 @@ fn run_server(
         plugin_chain,
         prometheus.clone(),
         cache_backend,
+        u64::from(timeouts.keepalive_secs),
+        u64::from(timeouts.body_secs),
     );
 
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, proxy);
+
+    // Slow loris protection (ISSUE-076): set max keepalive requests via Pingora's
+    // HttpServerOptions. This caps how many requests a single kept-alive connection
+    // can serve before Dwaar forces a reconnect — prevents per-connection memory
+    // accumulation from long-lived connections.
+    {
+        use pingora_core::apps::HttpServerOptions;
+        let mut opts = HttpServerOptions::default();
+        opts.keepalive_request_limit = Some(timeouts.max_requests);
+        if let Some(app) = proxy_service.app_logic_mut() {
+            app.server_options = Some(opts);
+        }
+    }
 
     // Bind listeners from the `bind` directive, falling back to 0.0.0.0:6188
     // when no site specifies one. Multiple workers each bind the same TCP
@@ -671,6 +688,18 @@ fn extract_drain_timeout(config: &dwaar_config::model::DwaarConfig) -> u64 {
         .as_ref()
         .and_then(|g| g.drain_timeout_secs)
         .unwrap_or(30)
+}
+
+/// Extract connection timeouts from the global options.
+/// Returns defaults (matching nginx) when not specified.
+fn extract_timeouts(
+    config: &dwaar_config::model::DwaarConfig,
+) -> dwaar_config::model::TimeoutsConfig {
+    config
+        .global_options
+        .as_ref()
+        .and_then(|g| g.timeouts.clone())
+        .unwrap_or_default()
 }
 
 fn setup_tls_listener(

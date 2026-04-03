@@ -33,9 +33,40 @@ pub struct GlobalOptions {
     /// How long to wait for in-flight requests before force-closing a
     /// removed route (ISSUE-075). Default: 30 seconds.
     pub drain_timeout_secs: Option<u64>,
+    /// Connection-level timeouts for slow loris protection (ISSUE-076).
+    pub timeouts: Option<TimeoutsConfig>,
     /// Options we recognized but don't act on — stored so we never error
     /// on valid Caddyfile syntax we haven't implemented yet.
     pub passthrough: Vec<(String, Vec<String>)>,
+}
+
+/// Connection-level timeouts for slow loris protection (ISSUE-076).
+///
+/// Controls how long Dwaar waits for slow or idle client connections.
+/// Values that map to Pingora's session-level APIs are applied per-request;
+/// `max_requests` maps to `HttpServerOptions::keepalive_request_limit`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimeoutsConfig {
+    /// Max seconds to receive complete request headers. Pingora's `read_timeout`
+    /// covers this phase on a fresh connection (default: 60s in Pingora).
+    pub header_secs: u32,
+    /// Max seconds to receive complete request body.
+    pub body_secs: u32,
+    /// Max idle seconds on a keep-alive connection between requests.
+    pub keepalive_secs: u32,
+    /// Max requests per keep-alive connection before forcing a reconnect.
+    pub max_requests: u32,
+}
+
+impl Default for TimeoutsConfig {
+    fn default() -> Self {
+        Self {
+            header_secs: 10,
+            body_secs: 30,
+            keepalive_secs: 60,
+            max_requests: 1000,
+        }
+    }
 }
 
 /// A fully parsed Dwaarfile — an optional global options block followed
