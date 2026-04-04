@@ -561,6 +561,28 @@ impl ProxyHttp for DwaarProxy {
                             // Always cache the pool so `upstream_peer()` can use the
                             // correct TLS settings even in the single-backend case.
                             ctx.upstream_pool = Some(pool.clone());
+
+                            // Atomically claim the connection slot. `select()` is a
+                            // pure read, so a concurrent request may have filled the
+                            // last slot between our check and this CAS. If we lose
+                            // that race, return 503 now rather than letting the
+                            // request hit the backend over its cap.
+                            if let Some(addr) = ctx.route_upstream
+                                && !pool.acquire_connection(addr)
+                            {
+                                warn!(
+                                    request_id = %ctx.request_id(),
+                                    upstream = %addr,
+                                    "upstream at max_conns — returning 503"
+                                );
+                                let mut resp = ResponseHeader::build(503, Some(0))?;
+                                resp.insert_header("Content-Length", "0")?;
+                                resp.insert_header("Retry-After", "1")?;
+                                session
+                                    .write_response_header(Box::new(resp), true)
+                                    .await?;
+                                return Ok(true);
+                            }
                         }
                         crate::route::Handler::FastCgi { upstream, root } => {
                             ctx.route_upstream = Some(*upstream);
@@ -1578,6 +1600,14 @@ impl ProxyHttp for DwaarProxy {
         // stays accurate for drain timeout decisions.
         if let Some(ref counter) = ctx.drain_counter {
             counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        // Release the upstream connection slot acquired in request_filter().
+        // logging() always runs — even on errors — so the counter stays accurate.
+        if let Some(ref pool) = ctx.upstream_pool
+            && let Some(addr) = ctx.route_upstream
+        {
+            pool.release_connection(addr);
         }
 
         let response_time_us = ctx.start_time.elapsed().as_micros() as u64;
