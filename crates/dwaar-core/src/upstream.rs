@@ -799,6 +799,70 @@ mod tests {
         assert_eq!(pool.backends[0].active_conns.load(Ordering::Relaxed), 0);
     }
 
+    /// Simulates the proxy lifecycle: select → acquire → (request) → release.
+    /// Verifies that active_conns tracks correctly through the full cycle and
+    /// that max_conns is enforced after acquire.
+    #[test]
+    fn proxy_lifecycle_select_acquire_release() {
+        let pool = make_pool_with_max(8080, 2);
+        let addr = make_addr(8080);
+
+        // Lifecycle 1: select → acquire → release
+        let sel = pool.select(None).expect("should select");
+        assert_eq!(sel.addr, addr);
+        assert!(pool.acquire_connection(addr), "first acquire should succeed");
+        assert_eq!(pool.backends[0].active_conns.load(Ordering::Relaxed), 1);
+
+        // Lifecycle 2: second concurrent request
+        assert!(pool.acquire_connection(addr), "second acquire should succeed");
+        assert_eq!(pool.backends[0].active_conns.load(Ordering::Relaxed), 2);
+
+        // Lifecycle 3: at cap — third acquire must fail (503 in proxy)
+        assert!(!pool.acquire_connection(addr), "third acquire should be rejected at max=2");
+
+        // First request completes
+        pool.release_connection(addr);
+        assert_eq!(pool.backends[0].active_conns.load(Ordering::Relaxed), 1);
+
+        // Now a new request can acquire again
+        assert!(pool.acquire_connection(addr), "should succeed after release");
+        assert_eq!(pool.backends[0].active_conns.load(Ordering::Relaxed), 2);
+
+        // Clean up both
+        pool.release_connection(addr);
+        pool.release_connection(addr);
+        assert_eq!(pool.backends[0].active_conns.load(Ordering::Relaxed), 0);
+    }
+
+    /// Verifies that concurrent threads cannot exceed max_conns via the
+    /// acquire CAS loop.
+    #[test]
+    fn concurrent_acquire_respects_max_conns() {
+        use std::sync::Arc;
+        let pool = Arc::new(make_pool_with_max(8080, 4));
+        let addr = make_addr(8080);
+        let barrier = Arc::new(std::sync::Barrier::new(32));
+
+        let handles: Vec<_> = (0..32)
+            .map(|_| {
+                let pool = pool.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    pool.acquire_connection(addr)
+                })
+            })
+            .collect();
+
+        let acquired = handles
+            .into_iter()
+            .filter_map(|h| h.join().ok().filter(|&ok| ok))
+            .count();
+
+        assert_eq!(acquired, 4, "exactly max_conns threads should have acquired");
+        assert_eq!(pool.backends[0].active_conns.load(Ordering::Relaxed), 4);
+    }
+
     // ── health mark ───────────────────────────────────────────────────────────
 
     #[test]
