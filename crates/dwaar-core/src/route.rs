@@ -79,6 +79,40 @@ pub fn is_valid_domain(s: &str) -> bool {
     })
 }
 
+/// Validate a route key, which may be a plain domain or a composite
+/// `host/path` string produced by the Ingress translator.
+///
+/// Accepts:
+/// - Plain domains (delegated to `is_valid_domain`)
+/// - Special keys: `_default` (catch-all used by Ingress)
+/// - Composite keys like `app.example.com/api/v1`
+///
+/// Rejects empty strings, null bytes, `..` path traversal, and control chars.
+pub fn is_valid_route_key(s: &str) -> bool {
+    if s.is_empty() || s.contains('\0') || s.contains("..") {
+        return false;
+    }
+
+    // Special catch-all key used by the Ingress translator.
+    if s == "_default" {
+        return true;
+    }
+
+    // If there's no slash, this is a plain domain.
+    let Some((host, path)) = s.split_once('/') else {
+        return is_valid_domain(s);
+    };
+
+    // Host part must be a valid domain.
+    if !is_valid_domain(host) {
+        return false;
+    }
+
+    // Path part: printable ASCII only, no control characters.
+    // The `..` check above already covers path traversal.
+    path.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
+}
+
 // ── Handler types ────────────────────────────────────────────
 
 /// What produces the response — the terminal action for a matched request.
@@ -1268,5 +1302,48 @@ mod tests {
         let table = RouteTable::new(vec![Route::new("api.example.com", addr(3000), false, None)]);
         assert!(table.get_exact("api.example.com").is_some());
         assert!(table.get_exact("other.com").is_none());
+    }
+
+    // ── is_valid_route_key tests ────────────────────────────────
+
+    #[test]
+    fn route_key_plain_domain() {
+        assert!(is_valid_route_key("app.example.com"));
+    }
+
+    #[test]
+    fn route_key_composite_with_path() {
+        assert!(is_valid_route_key("app.example.com/api/"));
+        assert!(is_valid_route_key("app.example.com/api/v1"));
+    }
+
+    #[test]
+    fn route_key_wildcard() {
+        assert!(is_valid_route_key("*"));
+    }
+
+    #[test]
+    fn route_key_default_catchall() {
+        assert!(is_valid_route_key("_default"));
+    }
+
+    #[test]
+    fn route_key_trailing_slash() {
+        assert!(is_valid_route_key("app.example.com/"));
+    }
+
+    #[test]
+    fn route_key_rejects_path_traversal() {
+        assert!(!is_valid_route_key("app.example.com/../etc/passwd"));
+    }
+
+    #[test]
+    fn route_key_rejects_null_byte() {
+        assert!(!is_valid_route_key("app.example.com/\0bad"));
+    }
+
+    #[test]
+    fn route_key_rejects_empty() {
+        assert!(!is_valid_route_key(""));
     }
 }

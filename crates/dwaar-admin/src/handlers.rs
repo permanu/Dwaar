@@ -13,7 +13,7 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use dwaar_analytics::aggregation::DomainMetrics;
 use dwaar_analytics::aggregation::snapshot::AnalyticsSnapshot;
-use dwaar_core::route::{Route, RouteTable, is_valid_domain};
+use dwaar_core::route::{Route, RouteTable, is_valid_route_key};
 use serde::Deserialize;
 
 /// Request body for `POST /routes`.
@@ -46,7 +46,7 @@ pub fn add_route(route_table: &ArcSwap<RouteTable>, body: &[u8]) -> Result<Strin
     let req: CreateRouteRequest =
         serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))?;
 
-    if !is_valid_domain(&req.domain) {
+    if !is_valid_route_key(&req.domain) {
         return Err(format!("invalid domain: {}", req.domain));
     }
 
