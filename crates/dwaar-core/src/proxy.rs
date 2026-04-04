@@ -938,6 +938,7 @@ impl ProxyHttp for DwaarProxy {
                 request_body: &body_buf,
                 server_name: host,
                 remote_addr: &client_ip,
+                is_tls: ctx.route_tls,
             };
             match crate::fastcgi::execute(&fcgi_req).await {
                 Ok(fcgi_resp) => {

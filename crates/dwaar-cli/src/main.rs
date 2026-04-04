@@ -272,7 +272,11 @@ fn main() -> anyhow::Result<()> {
         use rand::Rng;
         let mut buf = [0u8; 32];
         rand::rng().fill_bytes(&mut buf);
-        let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+        let hex = buf.iter().fold(String::with_capacity(64), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        });
         #[allow(unsafe_code)]
         // SAFETY: see comment above — single-threaded before fork.
         unsafe { std::env::set_var("DWAAR_UAM_SECRET", &hex) };

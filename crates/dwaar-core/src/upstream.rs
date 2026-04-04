@@ -180,13 +180,17 @@ impl UpstreamPool {
     }
 
     /// Fast path: single-backend pool — no selection overhead at all.
+    ///
+    /// This is a pure read: it does not increment `active_conns`. The caller is
+    /// responsible for calling `acquire_connection()` (which does the atomic CAS
+    /// increment) and `release_connection()` to bracket the request lifetime.
     fn select_single(&self) -> Option<SelectedUpstream> {
         let b = &self.backends[0];
         if !b.healthy.load(Ordering::Relaxed) {
             return None;
         }
         if let Some(max) = b.max_conns
-            && b.active_conns.load(Ordering::Relaxed) >= max
+            && b.active_conns.load(Ordering::Acquire) >= max
         {
             return None;
         }
@@ -216,6 +220,9 @@ impl UpstreamPool {
     /// We scan once (O(n)) — acceptable because backend counts are typically small
     /// (< 32) and the scan is cache-hot. Relaxed loads are fine: a slightly stale
     /// count won't cause correctness issues, only minor suboptimality.
+    ///
+    /// This is a pure read: it does not increment `active_conns`. The caller is
+    /// responsible for calling `acquire_connection()` / `release_connection()`.
     fn select_least_conn(&self) -> Option<SelectedUpstream> {
         let best = self
             .backends
@@ -237,6 +244,9 @@ impl UpstreamPool {
     }
 
     /// Random: choose a uniformly random healthy backend.
+    ///
+    /// This is a pure read: it does not increment `active_conns`. The caller is
+    /// responsible for calling `acquire_connection()` / `release_connection()`.
     fn select_random(&self) -> Option<SelectedUpstream> {
         let available: Vec<_> = self
             .backends
@@ -278,6 +288,9 @@ impl UpstreamPool {
     }
 
     /// Starting from `start`, scan the pool in order until an available backend is found.
+    ///
+    /// This is a pure read: it does not increment `active_conns`. The caller is
+    /// responsible for calling `acquire_connection()` / `release_connection()`.
     fn find_available_from(&self, start: usize) -> Option<SelectedUpstream> {
         let n = self.backends.len();
         for offset in 0..n {
@@ -286,7 +299,7 @@ impl UpstreamPool {
                 continue;
             }
             if let Some(max) = b.max_conns
-                && b.active_conns.load(Ordering::Relaxed) >= max
+                && b.active_conns.load(Ordering::Acquire) >= max
             {
                 continue;
             }

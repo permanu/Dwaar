@@ -119,7 +119,7 @@ impl AdminService {
     ///
     /// Uses a single global counter — the admin API is low-traffic and does
     /// not need per-IP accounting. The window resets atomically when it expires.
-    fn check_rate_limit(&self) -> Result<(), Response<Vec<u8>>> {
+    fn check_rate_limit(&self) -> Result<(), Box<Response<Vec<u8>>>> {
         let now = epoch_secs();
         let window = self.window_start.load(Ordering::Relaxed);
         if now.saturating_sub(window) >= RATE_LIMIT_WINDOW_SECS {
@@ -130,7 +130,7 @@ impl AdminService {
         }
         let count = self.request_count.fetch_add(1, Ordering::Relaxed) + 1;
         if count > RATE_LIMIT_MAX {
-            return Err(json_response(429, r#"{"error":"rate limit exceeded"}"#));
+            return Err(Box::new(json_response(429, r#"{"error":"rate limit exceeded"}"#)));
         }
         Ok(())
     }
@@ -200,7 +200,7 @@ impl ServeHttp for AdminService {
                 peer = peer_ip.as_deref().unwrap_or("unknown"),
                 "admin rate limit exceeded"
             );
-            return resp;
+            return *resp;
         }
 
         self.dispatch(session, &method, &path, source).await

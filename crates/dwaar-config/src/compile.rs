@@ -747,15 +747,19 @@ fn find_response_body_limit(directives: &[Directive]) -> Option<u64> {
 }
 
 /// Resolve the first usable upstream address from the list.
+///
+/// `to_socket_addrs` is a blocking syscall (getaddrinfo). We call this from
+/// the hot-reload path which runs on the tokio runtime, so we use
+/// `block_in_place` to avoid starving other async tasks during DNS lookups.
 fn resolve_upstream(upstreams: &[UpstreamAddr]) -> Option<SocketAddr> {
     for upstream in upstreams {
         match upstream {
             UpstreamAddr::SocketAddr(addr) => return Some(*addr),
             UpstreamAddr::HostPort(hp) => {
-                // DNS resolution — try to resolve host:port to a socket address
-                if let Ok(mut addrs) = hp.to_socket_addrs()
-                    && let Some(addr) = addrs.next()
-                {
+                let hp_clone = hp.clone();
+                let result =
+                    tokio::task::block_in_place(|| hp_clone.to_socket_addrs().ok()?.next());
+                if let Some(addr) = result {
                     return Some(addr);
                 }
                 warn!(upstream = %hp, "DNS resolution failed for upstream");
@@ -766,18 +770,22 @@ fn resolve_upstream(upstreams: &[UpstreamAddr]) -> Option<SocketAddr> {
 }
 
 /// Resolve all upstreams in the list, logging and skipping unresolvable entries.
+///
+/// Each `to_socket_addrs` call is a blocking syscall wrapped in `block_in_place`
+/// so the tokio executor stays responsive during config compilation.
 fn resolve_all_upstreams(upstreams: &[UpstreamAddr]) -> Vec<SocketAddr> {
     upstreams
         .iter()
         .filter_map(|u| match u {
             UpstreamAddr::SocketAddr(addr) => Some(*addr),
             UpstreamAddr::HostPort(hp) => {
-                if let Some(addr) = hp.to_socket_addrs().ok().and_then(|mut i| i.next()) {
-                    Some(addr)
-                } else {
+                let hp_clone = hp.clone();
+                let addr =
+                    tokio::task::block_in_place(|| hp_clone.to_socket_addrs().ok()?.next());
+                if addr.is_none() {
                     warn!(upstream = %hp, "DNS resolution failed for upstream, skipping");
-                    None
                 }
+                addr
             }
         })
         .collect()
