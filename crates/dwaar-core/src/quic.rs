@@ -891,7 +891,7 @@ fn build_rustls_config(
     let cert_pem = std::fs::read(cert_path)
         .map_err(|e| QuicSetupError::CertRead(cert_path.to_path_buf(), e))?;
     let key_pem =
-        std::fs::read(key_path).map_err(|e| QuicSetupError::KeyRead(key_path.to_path_buf(), e))?;
+        std::fs::read(key_path).map_err(QuicSetupError::KeyRead)?;
 
     let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
         rustls_pemfile::certs(&mut cert_pem.as_slice())
@@ -904,7 +904,7 @@ fn build_rustls_config(
 
     let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
         .map_err(QuicSetupError::KeyParse)?
-        .ok_or_else(|| QuicSetupError::NoKey(key_path.to_path_buf()))?;
+        .ok_or(QuicSetupError::NoKey)?;
 
     let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -935,8 +935,8 @@ pub enum QuicSetupError {
     #[error("failed to read TLS cert from {0}: {1}")]
     CertRead(std::path::PathBuf, std::io::Error),
 
-    #[error("failed to read TLS key from {0}: {1}")]
-    KeyRead(std::path::PathBuf, std::io::Error),
+    #[error("failed to read TLS key: {0}")]
+    KeyRead(std::io::Error),
 
     #[error("failed to parse PEM certificates: {0}")]
     CertParse(std::io::Error),
@@ -947,8 +947,8 @@ pub enum QuicSetupError {
     #[error("failed to parse PEM private key: {0}")]
     KeyParse(std::io::Error),
 
-    #[error("no private key found in {0}")]
-    NoKey(std::path::PathBuf),
+    #[error("no private key found in key file")]
+    NoKey,
 
     #[error("rustls configuration error: {0}")]
     Rustls(rustls::Error),
