@@ -412,6 +412,11 @@ impl LeaderElector {
     /// Clear the `leader_ready` flag and notify observers via `lost_tx`.
     fn lose_leadership(&self, lost_tx: &watch::Sender<bool>) {
         self.readiness.leader_ready.store(false, Ordering::Release);
+        // Reset sync_ready so the next tenure must complete a fresh informer
+        // sync before /readyz goes green. Without this, a reacquired lease
+        // inherits stale sync state and reports ready before the new watcher
+        // has reconciled.
+        self.readiness.sync_ready.store(false, Ordering::Release);
         self.metrics.inc_leader_lost();
         // Drop the cached resourceVersion — it's no longer valid for a lease
         // we don't hold.  The next acquisition will populate a fresh one.
