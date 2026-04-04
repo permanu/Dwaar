@@ -180,6 +180,13 @@ pub struct RequestContext {
     /// Cache outcome: "HIT", "MISS", "STALE", or None (cache disabled).
     /// Injected as `X-Cache` response header and logged in `RequestLog`.
     pub cache_status: Option<&'static str>,
+
+    /// Whether the resolved route can be served over QUIC (HTTP/3).
+    /// Only ReverseProxy and ReverseProxyPool handlers are supported by the
+    /// QUIC bridge — FileServer, StaticResponse, FastCgi are not. Alt-Svc h3
+    /// is only injected when this flag is true to avoid advertising a protocol
+    /// the server can't actually serve for this route.
+    pub quic_capable: bool,
 }
 
 impl RequestContext {
@@ -222,6 +229,7 @@ impl RequestContext {
             cache_enabled: false,
             cache_config: None,
             cache_status: None,
+            quic_capable: false,
         }
     }
 
