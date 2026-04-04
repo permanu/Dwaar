@@ -19,10 +19,11 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use compact_str::CompactString;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 /// Pre-compiled forward auth configuration.
@@ -39,8 +40,6 @@ pub struct ForwardAuthConfig {
     /// When `false`, responses travel in plaintext — an on-path attacker can
     /// forge a 2xx and inject `copy_headers` values (e.g. `Remote-User`).
     /// Set to `true` and configure a TLS-capable backend to close this gap.
-    ///
-    /// TODO: implement TLS subrequest transport via `tokio-rustls`.
     pub tls: bool,
 }
 
@@ -84,8 +83,6 @@ impl ForwardAuthConfig {
         original_uri: &str,
         client_ip: Option<&str>,
     ) -> Result<AuthResult, String> {
-        // Warn once if plaintext is in use — auth responses are not integrity-protected
-        // and an on-path attacker could forge a 2xx with injected headers.
         if !self.tls {
             tracing::warn!(
                 upstream = %self.upstream,
@@ -94,11 +91,26 @@ impl ForwardAuthConfig {
             );
         }
 
-        // Connect with timeout
-        let mut stream = tokio::time::timeout(AUTH_TIMEOUT, TcpStream::connect(self.upstream))
+        // Connect TCP with timeout
+        let tcp_stream = tokio::time::timeout(AUTH_TIMEOUT, TcpStream::connect(self.upstream))
             .await
             .map_err(|_| "auth service connection timed out".to_string())?
             .map_err(|e| format!("auth service connect failed: {e}"))?;
+
+        // Upgrade to TLS if configured, otherwise use plaintext.
+        // Boxing avoids a monomorphization explosion on a non-hot path (one
+        // subrequest per client request at most) — negligible vs. handshake cost.
+        let (mut reader, mut writer): (
+            Box<dyn AsyncRead + Unpin + Send>,
+            Box<dyn AsyncWrite + Unpin + Send>,
+        ) = if self.tls {
+            let tls_stream = tls_connect(tcp_stream, self.upstream).await?;
+            let (r, w) = tokio::io::split(tls_stream);
+            (Box::new(r), Box::new(w))
+        } else {
+            let (r, w) = tokio::io::split(tcp_stream);
+            (Box::new(r), Box::new(w))
+        };
 
         // Build GET request with forwarded metadata.
         // Sanitize all client-supplied values to prevent CRLF header injection.
@@ -120,8 +132,8 @@ impl ForwardAuthConfig {
 
         // Write with timeout
         tokio::time::timeout(AUTH_TIMEOUT, async {
-            stream.write_all(request.as_bytes()).await?;
-            stream.flush().await?;
+            writer.write_all(request.as_bytes()).await?;
+            writer.flush().await?;
             Ok::<_, std::io::Error>(())
         })
         .await
@@ -132,7 +144,7 @@ impl ForwardAuthConfig {
         let mut buf = Vec::with_capacity(4096);
         tokio::time::timeout(
             AUTH_TIMEOUT,
-            stream.take(MAX_AUTH_RESPONSE).read_to_end(&mut buf),
+            (&mut reader).take(MAX_AUTH_RESPONSE).read_to_end(&mut buf),
         )
         .await
         .map_err(|_| "auth service read timed out".to_string())?
@@ -177,4 +189,32 @@ impl ForwardAuthConfig {
             Ok(AuthResult::Denied { status, body })
         }
     }
+}
+
+/// Perform a TLS handshake over an established TCP connection.
+///
+/// Uses `webpki-roots` for certificate verification so we don't depend on
+/// the host OS trust store. SNI is derived from the socket address IP —
+/// the auth service certificate must cover that IP (common for internal
+/// services) or a hostname-based approach should be used instead.
+async fn tls_connect(
+    tcp: TcpStream,
+    addr: SocketAddr,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, String> {
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+
+    // Use IP-based SNI — rustls 0.23 supports `ServerName::from(IpAddr)`.
+    let server_name = rustls::pki_types::ServerName::from(addr.ip());
+
+    tokio::time::timeout(AUTH_TIMEOUT, connector.connect(server_name.to_owned(), tcp))
+        .await
+        .map_err(|_| "auth service TLS handshake timed out".to_string())?
+        .map_err(|e| format!("auth service TLS handshake failed: {e}"))
 }
