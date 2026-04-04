@@ -35,6 +35,7 @@
 //! ```
 
 use std::sync::atomic::Ordering;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use k8s_openapi::api::coordination::v1::Lease;
@@ -96,14 +97,17 @@ pub enum LeaderState {
 /// Runs forever until `shutdown` fires. Sets `readiness.leader_ready` when we
 /// acquire the lease and clears it immediately on loss or any renewal error.
 ///
-/// `on_leader` is called once when this instance becomes leader — callers use
-/// this to start the `IngressWatcher`. It receives a `watch::Sender<bool>`
-/// that fires when leadership is lost, so the watcher can gracefully stop.
+/// `on_leader_start` is called each time this instance becomes leader — callers
+/// use this to start the `IngressWatcher`. It receives a `watch::Receiver<bool>`
+/// that becomes `true` when leadership is lost, so the watcher can gracefully stop.
 pub struct LeaderElector {
     config: LeaderConfig,
     lease_api: Api<Lease>,
     readiness: ReadinessState,
     metrics: IngressMetrics,
+    /// The `resourceVersion` of the lease we currently hold, used to detect
+    /// concurrent modifications during renewal (optimistic concurrency).
+    current_resource_version: Mutex<Option<String>>,
 }
 
 impl std::fmt::Debug for LeaderElector {
@@ -123,35 +127,53 @@ impl LeaderElector {
         readiness: ReadinessState,
         metrics: IngressMetrics,
     ) -> Self {
+        // Reject non-positive lease durations up front so the expiry check
+        // never receives an invalid value. The Kubernetes default is 15 s;
+        // anything ≤ 0 is a misconfiguration.
+        assert!(
+            config.lease_duration_secs > 0,
+            "lease_duration_secs must be positive, got {}",
+            config.lease_duration_secs
+        );
         let lease_api: Api<Lease> = Api::namespaced(kube_client, &config.namespace);
         Self {
             config,
             lease_api,
             readiness,
             metrics,
+            current_resource_version: Mutex::new(None),
         }
     }
 
     /// Run the election loop until `shutdown` fires.
     ///
-    /// `on_leader_start` is an async callback invoked when this pod first
-    /// acquires leadership. It receives a `watch::Receiver<bool>` that becomes
-    /// `true` when leadership is lost — callers should stop processing when this
-    /// fires.
+    /// `on_leader_start` is an async callback that starts the watcher when
+    /// this pod acquires leadership. It receives a `watch::Receiver<bool>`
+    /// that becomes `true` when leadership is lost — the watcher should stop
+    /// when this fires.
+    ///
+    /// **Critical:** The callback is `tokio::spawn`ed, NOT awaited. The
+    /// elector loop must continue running to renew the lease. If we awaited
+    /// the watcher here, the lease would expire while the watcher runs,
+    /// causing split-brain where another controller acquires the lease while
+    /// the old leader's watcher is still reconciling.
     pub async fn run<F, Fut>(&self, mut shutdown: watch::Receiver<bool>, on_leader_start: F)
     where
         F: Fn(watch::Receiver<bool>) -> Fut,
-        Fut: std::future::Future<Output = ()>,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
     {
         let mut state = LeaderState::Candidate;
-        // Channel used to signal the watcher when we lose leadership.
-        let (lost_tx, lost_rx) = watch::channel(false);
-        let mut watcher_started = false;
+        let mut lost_tx: Option<watch::Sender<bool>> = None;
+        // Handle to the spawned watcher task — aborted on leadership loss.
+        let mut watcher_handle: Option<tokio::task::JoinHandle<()>> = None;
 
         loop {
-            // Check shutdown before each poll cycle
             if *shutdown.borrow() {
                 info!("leader elector shutting down");
+                // Stop the watcher if running.
+                if let Some(handle) = watcher_handle.take() {
+                    handle.abort();
+                }
                 self.set_not_ready();
                 return;
             }
@@ -168,19 +190,14 @@ impl LeaderElector {
                             self.metrics.inc_leader_acquired();
                             state = LeaderState::Leader;
 
-                            // Notify the watcher that we're now the leader.
-                            if watcher_started {
-                                // Re-acquired after a loss — signal the previously
-                                // stopped watcher to restart by re-invoking.
-                                // In practice, the caller loops on lost_rx changing.
-                                let _ = lost_tx.send(false);
-                            } else {
-                                watcher_started = true;
-                                on_leader_start(lost_rx.clone()).await;
-                            }
+                            let (tx, lost_rx) = watch::channel(false);
+                            lost_tx = Some(tx);
+
+                            // Spawn — don't await. The elector loop must
+                            // continue to the Leader branch to renew the lease.
+                            watcher_handle = Some(tokio::spawn(on_leader_start(lost_rx)));
                         }
                         Ok(false) => {
-                            // Someone else holds the lease — keep waiting.
                             debug!("lease held by another — waiting to retry");
                         }
                         Err(e) => {
@@ -188,7 +205,6 @@ impl LeaderElector {
                         }
                     }
 
-                    // Back off before the next candidate poll.
                     tokio::select! {
                         biased;
                         _ = shutdown.changed() => {}
@@ -197,7 +213,8 @@ impl LeaderElector {
                 }
 
                 LeaderState::Leader => {
-                    // Renew at the deadline interval.
+                    // Renew at the configured interval — this runs concurrently
+                    // with the spawned watcher task.
                     tokio::select! {
                         biased;
                         _ = shutdown.changed() => {}
@@ -210,7 +227,14 @@ impl LeaderElector {
                         }
                         Err(e) => {
                             error!(error = %e, "lease renewal failed — losing leadership");
-                            self.lose_leadership(&lost_tx);
+                            if let Some(tx) = lost_tx.as_ref() {
+                                self.lose_leadership(tx);
+                            }
+                            // Abort the watcher — it should also exit via
+                            // lost_rx.changed(), but abort is belt-and-suspenders.
+                            if let Some(handle) = watcher_handle.take() {
+                                handle.abort();
+                            }
                             state = LeaderState::Candidate;
                         }
                     }
@@ -238,8 +262,12 @@ impl LeaderElector {
         );
 
         match self.lease_api.create(&PostParams::default(), &lease).await {
-            Ok(_) => {
-                // We created the Lease — we are now the leader.
+            Ok(created) => {
+                // We created the Lease — we are now the leader.  Store the
+                // resourceVersion so the first renewal can use it.
+                self.store_resource_version(
+                    created.metadata.resource_version.as_deref(),
+                );
                 return Ok(true);
             }
             Err(kube::Error::Api(ae)) if ae.code == 409 => {
@@ -301,7 +329,12 @@ impl LeaderElector {
             )
             .await
         {
-            Ok(_) => Ok(true),
+            Ok(patched) => {
+                self.store_resource_version(
+                    patched.metadata.resource_version.as_deref(),
+                );
+                Ok(true)
+            }
             Err(kube::Error::Api(ae)) if ae.code == 409 => {
                 // Another pod won the race — back off and retry later.
                 Ok(false)
@@ -312,29 +345,60 @@ impl LeaderElector {
 
     /// Renew the lease by updating `renewTime`.
     ///
-    /// Uses a strategic merge patch with the current resource version to
-    /// detect concurrent modifications (e.g. another controller taking over).
+    /// Includes the `resourceVersion` we stored at acquisition/last renewal so
+    /// the API server rejects the patch with a 409 if another controller has
+    /// modified the lease in the meantime — giving us a clean signal to drop
+    /// back to candidate rather than silently renewing a lease we no longer own.
     async fn try_renew(&self) -> Result<(), WatcherError> {
         let now = utc_now();
+
+        // Read the stored resourceVersion under the lock and drop immediately.
+        let resource_version = self
+            .current_resource_version
+            .lock()
+            .expect("resource_version lock must not be poisoned")
+            .clone()
+            .unwrap_or_default();
 
         let patch_body = serde_json::json!({
             "apiVersion": "coordination.k8s.io/v1",
             "kind": "Lease",
+            "metadata": {
+                "name": self.config.lease_name,
+                "namespace": self.config.namespace,
+                "resourceVersion": resource_version,
+            },
             "spec": {
                 "holderIdentity": self.config.holder_identity,
                 "renewTime": now,
             }
         });
 
-        self.lease_api
+        match self
+            .lease_api
             .patch(
                 &self.config.lease_name,
                 &PatchParams::default(),
                 &Patch::Merge(patch_body),
             )
             .await
-            .map(|_| ())
-            .map_err(|e| WatcherError::Lease(e.to_string()))
+        {
+            Ok(renewed) => {
+                // Update the stored version so the next renewal uses it.
+                self.store_resource_version(
+                    renewed.metadata.resource_version.as_deref(),
+                );
+                Ok(())
+            }
+            Err(kube::Error::Api(ae)) if ae.code == 409 => {
+                // Conflict — another controller modified the lease while we held it.
+                // Treat this the same as a renewal failure so we drop to candidate.
+                Err(WatcherError::Lease(
+                    "renewal conflict (409): lease was modified by another holder".to_string(),
+                ))
+            }
+            Err(e) => Err(WatcherError::Lease(e.to_string())),
+        }
     }
 
     /// Check whether the current lease has exceeded its duration (holder is dead).
@@ -349,6 +413,12 @@ impl LeaderElector {
     fn lose_leadership(&self, lost_tx: &watch::Sender<bool>) {
         self.readiness.leader_ready.store(false, Ordering::Release);
         self.metrics.inc_leader_lost();
+        // Drop the cached resourceVersion — it's no longer valid for a lease
+        // we don't hold.  The next acquisition will populate a fresh one.
+        *self
+            .current_resource_version
+            .lock()
+            .expect("resource_version lock must not be poisoned") = None;
         // Notify the watcher that it should stop processing.
         let _ = lost_tx.send(true);
         info!(
@@ -360,6 +430,14 @@ impl LeaderElector {
     fn set_not_ready(&self) {
         self.readiness.leader_ready.store(false, Ordering::Release);
     }
+
+    /// Store the `resourceVersion` returned by the API server after a create or patch.
+    fn store_resource_version(&self, rv: Option<&str>) {
+        *self
+            .current_resource_version
+            .lock()
+            .expect("resource_version lock must not be poisoned") = rv.map(str::to_owned);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -370,7 +448,15 @@ impl LeaderElector {
 ///
 /// Extracted from `LeaderElector::is_lease_expired` so it can be unit-tested
 /// without constructing a real `kube::Client` (which requires a TLS stack).
+///
+/// A non-positive `duration_secs` is treated as "already expired" — a lease
+/// with a zero or negative duration is never valid.
 fn lease_is_expired(lease: &Lease, duration_secs: i32) -> bool {
+    // Guard: a non-positive duration means the lease can never be valid.
+    if duration_secs <= 0 {
+        return true;
+    }
+
     let Some(spec) = lease.spec.as_ref() else {
         // No spec at all → treat as expired (no holder is maintaining it).
         return true;
@@ -382,6 +468,7 @@ fn lease_is_expired(lease: &Lease, duration_secs: i32) -> bool {
     };
 
     let MicroTime(dt) = renew_time;
+    // Safe cast: duration_secs > 0 after the guard above.
     let duration = duration_secs as u64;
     let age_secs = chrono::Utc::now()
         .signed_duration_since(*dt)
@@ -486,6 +573,26 @@ mod tests {
         assert!(
             lease_is_expired(&lease, 15),
             "lease renewed 20s ago should be expired (duration=15s)"
+        );
+    }
+
+    #[test]
+    fn non_positive_duration_always_expired() {
+        // A lease with duration ≤ 0 is always considered expired regardless of
+        // how recently it was renewed. Negative values from the K8s API must
+        // not wrap around via `as u64`.
+        let lease = make_lease_with_renew_time(0); // just renewed
+        assert!(
+            lease_is_expired(&lease, 0),
+            "zero duration must be expired"
+        );
+        assert!(
+            lease_is_expired(&lease, -1),
+            "negative duration must be expired"
+        );
+        assert!(
+            lease_is_expired(&lease, i32::MIN),
+            "i32::MIN duration must be expired"
         );
     }
 

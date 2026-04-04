@@ -612,7 +612,7 @@ pub(super) fn parse_handle_errors(
                     col: tok.col,
                     kind: ParseErrorKind::Expected {
                         expected: "directive or '}'".to_string(),
-                        got: format!("{:?}", tok.kind),
+                        got: format!("{}", tok.kind),
                     },
                 });
             }
@@ -677,13 +677,28 @@ pub(super) fn parse_forward_auth(
             col: brace_tok.col,
             kind: ParseErrorKind::Expected {
                 expected: "'{' to start forward_auth block".to_string(),
-                got: format!("{:?}", brace_tok.kind),
+                got: format!("{}", brace_tok.kind),
             },
         });
     }
 
+    let (uri, copy_headers, tls) = parse_forward_auth_body(t)?;
+
+    Ok(ForwardAuthDirective {
+        upstream,
+        uri,
+        copy_headers,
+        tls,
+    })
+}
+
+/// Parse the body of a `forward_auth { ... }` block.
+fn parse_forward_auth_body(
+    t: &mut Tokenizer<'_>,
+) -> Result<(Option<String>, Vec<String>, bool), ParseError> {
     let mut uri = None;
     let mut copy_headers = Vec::new();
+    let mut tls = false;
 
     loop {
         let tok = t.peek();
@@ -704,61 +719,63 @@ pub(super) fn parse_forward_auth(
             TokenKind::Word(w) => match w.as_str() {
                 "uri" => {
                     t.next_token();
-                    uri = Some(expect_word_or_quoted(
-                        t,
-                        "forward_auth uri",
-                        "auth URI path",
-                    )?);
+                    uri = Some(expect_word_or_quoted(t, "forward_auth uri", "auth URI path")?);
                 }
                 "copy_headers" => {
                     t.next_token();
-                    // Read header names until next subdirective or closing brace
                     loop {
                         let next = t.peek();
                         match &next.kind {
                             TokenKind::Word(w)
-                                if !matches!(w.as_str(), "uri" | "copy_headers")
+                                if !matches!(w.as_str(), "uri" | "copy_headers" | "transport")
                                     && !matches!(next.kind, TokenKind::CloseBrace) =>
                             {
-                                let header =
-                                    expect_word_or_quoted(t, "copy_headers", "header name")?;
-                                copy_headers.push(header);
+                                copy_headers.push(
+                                    expect_word_or_quoted(t, "copy_headers", "header name")?,
+                                );
                             }
                             _ => break,
                         }
                     }
                 }
+                "transport" => {
+                    t.next_token();
+                    let proto = expect_word_or_quoted(t, "forward_auth transport", "protocol")?;
+                    if proto != "tls" {
+                        let (line, col) = t.position();
+                        return Err(ParseError {
+                            line, col,
+                            kind: ParseErrorKind::InvalidValue {
+                                directive: "forward_auth transport".to_string(),
+                                message: format!("unknown transport '{proto}' — expected 'tls'"),
+                            },
+                        });
+                    }
+                    tls = true;
+                }
                 other => {
                     return Err(ParseError {
-                        line: tok.line,
-                        col: tok.col,
+                        line: tok.line, col: tok.col,
                         kind: ParseErrorKind::InvalidValue {
                             directive: "forward_auth".to_string(),
-                            message: format!(
-                                "unknown subdirective '{other}' — expected 'uri' or 'copy_headers'"
-                            ),
+                            message: format!("unknown subdirective '{other}'"),
                         },
                     });
                 }
             },
             _ => {
                 return Err(ParseError {
-                    line: tok.line,
-                    col: tok.col,
+                    line: tok.line, col: tok.col,
                     kind: ParseErrorKind::Expected {
                         expected: "subdirective or '}'".to_string(),
-                        got: format!("{:?}", tok.kind),
+                        got: format!("{}", tok.kind),
                     },
                 });
             }
         }
     }
 
-    Ok(ForwardAuthDirective {
-        upstream,
-        uri,
-        copy_headers,
-    })
+    Ok((uri, copy_headers, tls))
 }
 
 /// `try_files /index.html /fallback.html`
@@ -817,7 +834,7 @@ fn parse_scale_to_zero_block(t: &mut Tokenizer<'_>) -> Result<ScaleToZeroDirecti
             col,
             kind: ParseErrorKind::Expected {
                 expected: "'{' to open scale_to_zero block".to_string(),
-                got: format!("{:?}", t.peek().kind),
+                got: format!("{}", t.peek().kind),
             },
         });
     }
@@ -1116,7 +1133,7 @@ pub(super) fn parse_directive_block(t: &mut Tokenizer<'_>) -> Result<Vec<Directi
             col: brace_tok.col,
             kind: ParseErrorKind::Expected {
                 expected: "'{'".to_string(),
-                got: format!("{:?}", brace_tok.kind),
+                got: format!("{}", brace_tok.kind),
             },
         });
     }

@@ -718,6 +718,8 @@ pub struct ForwardAuthDirective {
     pub uri: Option<String>,
     /// Headers to copy from auth response to upstream request.
     pub copy_headers: Vec<String>,
+    /// Use TLS when connecting to the auth service (`transport tls`).
+    pub tls: bool,
 }
 
 /// `root` — set the filesystem root for `file_server`.

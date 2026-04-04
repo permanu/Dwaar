@@ -93,7 +93,7 @@ pub(super) fn parse_log(t: &mut Tokenizer<'_>) -> Result<LogDirective, ParseErro
                     col: tok.col,
                     kind: ParseErrorKind::Expected {
                         expected: "log sub-directive or '}'".to_string(),
-                        got: format!("{:?}", tok.kind),
+                        got: format!("{}", tok.kind),
                     },
                 });
             }

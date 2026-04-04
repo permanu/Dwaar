@@ -25,7 +25,7 @@ impl Auth {
         let provided = header_value
             .strip_prefix("Bearer ")
             .ok_or("missing Bearer prefix")?;
-        if provided == expected {
+        if subtle::ConstantTimeEq::ct_eq(provided.as_bytes(), expected.as_bytes()).into() {
             Ok(())
         } else {
             Err("invalid token")

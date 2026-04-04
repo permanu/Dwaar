@@ -417,31 +417,19 @@ fn fnv_hash_ip(ip: std::net::IpAddr) -> usize {
     const FNV_OFFSET: u64 = 14_695_981_039_346_656_037;
     const FNV_PRIME: u64 = 1_099_511_628_211;
 
+    // octets() returns a stack-allocated fixed array, so this is zero-allocation.
     let mut hash = FNV_OFFSET;
-    let bytes: &[u8] = match &ip {
-        std::net::IpAddr::V4(v4) => &v4.octets()[..],
-        std::net::IpAddr::V6(v6) => &v6.octets()[..],
-    };
-    // Can't use `bytes` borrow after the match arm — collect into fixed array
-    let hash = match ip {
-        std::net::IpAddr::V4(v4) => {
-            let bytes = v4.octets();
-            for &b in &bytes {
-                hash ^= u64::from(b);
-                hash = hash.wrapping_mul(FNV_PRIME);
-            }
-            hash
+    let apply = |mut h: u64, bytes: &[u8]| -> u64 {
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(FNV_PRIME);
         }
-        std::net::IpAddr::V6(v6) => {
-            let bytes = v6.octets();
-            for &b in &bytes {
-                hash ^= u64::from(b);
-                hash = hash.wrapping_mul(FNV_PRIME);
-            }
-            hash
-        }
+        h
     };
-    let _ = bytes; // used in the match arms above
+    hash = match ip {
+        std::net::IpAddr::V4(v4) => apply(hash, &v4.octets()),
+        std::net::IpAddr::V6(v6) => apply(hash, &v6.octets()),
+    };
     hash as usize
 }
 

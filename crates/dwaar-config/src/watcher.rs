@@ -16,6 +16,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use dwaar_core::route::{Route, RouteTable};
+use dwaar_tls::sni::DomainConfigMap;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use openssl::hash::MessageDigest;
 use pingora_core::server::ShutdownWatch;
@@ -24,7 +25,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::MAX_CONFIG_SIZE;
-use crate::compile::compile_routes;
+use crate::compile::{compile_routes, compile_tls_configs};
 use crate::parser;
 
 const DEBOUNCE_INTERVAL: Duration = Duration::from_millis(500);
@@ -33,7 +34,7 @@ const DEBOUNCE_INTERVAL: Duration = Duration::from_millis(500);
 pub struct ConfigWatcher {
     config_path: PathBuf,
     route_table: Arc<ArcSwap<RouteTable>>,
-    last_hash: std::sync::Mutex<Vec<u8>>,
+    last_hash: std::sync::Mutex<[u8; 32]>,
     /// When Docker mode is active, store compiled routes here instead of
     /// writing to `route_table` directly. `DockerWatcher` handles the merge.
     dwaarfile_snapshot: Option<Arc<ArcSwap<Vec<Route>>>>,
@@ -42,6 +43,11 @@ pub struct ConfigWatcher {
     /// How long to wait for in-flight requests on removed routes before
     /// force-dropping them (ISSUE-075). Default: 30 seconds.
     drain_timeout: Duration,
+    /// Shared map of explicit per-domain cert paths (from `tls /cert /key`
+    /// directives).  On reload we swap in a freshly compiled map so that
+    /// `SniResolver` picks up new or changed manual TLS entries without
+    /// a restart.  `None` when the proxy runs without TLS.
+    sni_domain_map: Option<DomainConfigMap>,
 }
 
 impl std::fmt::Debug for ConfigWatcher {
@@ -60,7 +66,7 @@ impl ConfigWatcher {
     pub fn new(
         config_path: PathBuf,
         route_table: Arc<ArcSwap<RouteTable>>,
-        initial_hash: Vec<u8>,
+        initial_hash: [u8; 32],
     ) -> Self {
         Self {
             config_path,
@@ -69,6 +75,7 @@ impl ConfigWatcher {
             dwaarfile_snapshot: None,
             config_notify: None,
             drain_timeout: Duration::from_secs(30),
+            sni_domain_map: None,
         }
     }
 
@@ -83,6 +90,18 @@ impl ConfigWatcher {
     #[must_use]
     pub fn with_reload_notify(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
         self.config_notify = Some(notify);
+        self
+    }
+
+    /// Attach the shared SNI domain-config map so hot-reload keeps explicit
+    /// `tls /cert /key` entries in sync.
+    ///
+    /// Call [`SniResolver::shared_domain_map`] at startup and pass the result
+    /// here.  On every successful reload the watcher will swap in a freshly
+    /// compiled map.
+    #[must_use]
+    pub fn with_sni_domain_map(mut self, map: DomainConfigMap) -> Self {
+        self.sni_domain_map = Some(map);
         self
     }
 
@@ -130,7 +149,11 @@ impl ConfigWatcher {
 
         // Content hash comparison
         let new_hash = match openssl::hash::hash(MessageDigest::sha256(), content.as_bytes()) {
-            Ok(h) => h.to_vec(),
+            Ok(h) => {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&h);
+                arr
+            }
             Err(e) => {
                 warn!(error = %e, "failed to hash config content");
                 return;
@@ -180,6 +203,8 @@ impl ConfigWatcher {
             return;
         }
 
+        refresh_sni_map(self.sni_domain_map.as_ref(), &config);
+
         if let Some(ref snapshot) = self.dwaarfile_snapshot {
             // Docker mode: update snapshot, notify DockerWatcher to re-merge
             snapshot.store(Arc::new(new_table.all_routes()));
@@ -198,6 +223,15 @@ impl ConfigWatcher {
             self.route_table.store(Arc::new(new_table));
             info!(path = %self.config_path.display(), "config reloaded successfully");
         }
+
+        // Warn about components that are NOT refreshed by hot-reload.
+        // These require a full restart to pick up config changes.
+        // Tracked in ISSUE-109 (health pools), ISSUE-110 (ACME domains), ISSUE-111 (cache sizing).
+        warn!(
+            "reload refreshed routes and TLS domain map; \
+             health-check pools, ACME domain list, and cache sizing \
+             require a full restart to update"
+        );
 
         // Update hash — must run in both branches
         let mut last = self
@@ -382,11 +416,39 @@ fn log_route_diff(old: &RouteTable, new: &RouteTable) {
     }
 }
 
+/// Swap in a freshly compiled set of explicit TLS cert paths.
+///
+/// Called on every successful reload so that `SniResolver` picks up new or
+/// changed `tls /cert /key` entries. Does nothing when TLS is disabled.
+fn refresh_sni_map(
+    sni_map: Option<&DomainConfigMap>,
+    config: &crate::model::DwaarConfig,
+) {
+    let Some(map) = sni_map else { return };
+    let new_tls = compile_tls_configs(config);
+    let domain_map: std::collections::HashMap<String, dwaar_tls::sni::DomainTlsConfig> = new_tls
+        .into_iter()
+        .map(|(domain, cfg)| {
+            (
+                domain,
+                dwaar_tls::sni::DomainTlsConfig {
+                    cert_path: cfg.cert_path,
+                    key_path: cfg.key_path,
+                },
+            )
+        })
+        .collect();
+    map.store(Arc::new(domain_map));
+    debug!("SNI domain-config map refreshed");
+}
+
 /// Compute SHA-256 hash of file content. Used at startup to seed the watcher.
-pub fn hash_content(content: &[u8]) -> Vec<u8> {
-    openssl::hash::hash(MessageDigest::sha256(), content)
-        .map(|d| d.to_vec())
-        .unwrap_or_default()
+pub fn hash_content(content: &[u8]) -> [u8; 32] {
+    let digest = openssl::hash::hash(MessageDigest::sha256(), content)
+        .expect("SHA-256 is always available");
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
 }
 
 #[cfg(test)]
@@ -401,8 +463,10 @@ mod tests {
 
     #[test]
     fn hash_content_produces_32_bytes() {
-        let hash = hash_content(b"hello world");
-        assert_eq!(hash.len(), 32);
+        let hash: [u8; 32] = hash_content(b"hello world");
+        // SHA-256("hello world") starts with 0xb9 — verify we got a real hash
+        assert_eq!(hash[0], 0xb9, "first byte should be 0xb9");
+        assert!(!hash.iter().all(|&b| b == 0), "hash should not be all zeros");
     }
 
     #[test]

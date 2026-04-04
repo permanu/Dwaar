@@ -53,6 +53,7 @@ use super::bindings::{
 };
 use super::engine::WasmEngine;
 use super::error::WasmError;
+use super::limits::{MemoryLimiter, WasmLimits, apply_limits};
 use crate::plugin::{DwaarPlugin, PluginAction, PluginCtx};
 
 /// Number of consecutive traps before a plugin is automatically disabled.
@@ -70,6 +71,10 @@ const MAX_CONSECUTIVE_TRAPS: u32 = 10;
 /// an action, with no host callbacks needed yet. Host function support
 /// (e.g., letting plugins call back into Dwaar for rate-limit state) is
 /// tracked in ISSUE-097.
+///
+/// `memory_limiter` is here because wasmtime's `store.limiter()` closure must
+/// return a `&mut dyn ResourceLimiter` from the store's data — the limiter
+/// must live inside the store, not alongside it.
 pub(crate) struct PluginState {
     /// Human-readable plugin name (used in log fields by host functions).
     pub(crate) plugin_name: String,
@@ -85,6 +90,14 @@ pub(crate) struct PluginState {
     pub(crate) request_headers: Vec<(String, String)>,
     /// Snapshot of response headers for the current hook call.
     pub(crate) response_headers: Vec<(String, String)>,
+    /// Memory growth limiter — consulted by wasmtime on every `memory.grow`.
+    pub(crate) memory_limiter: MemoryLimiter,
+}
+
+impl AsMut<MemoryLimiter> for PluginState {
+    fn as_mut(&mut self) -> &mut MemoryLimiter {
+        &mut self.memory_limiter
+    }
 }
 
 impl PluginState {
@@ -98,10 +111,51 @@ impl PluginState {
             is_tls: false,
             request_headers: Vec::new(),
             response_headers: Vec::new(),
+            memory_limiter: MemoryLimiter::new(WasmLimits::default().memory_mb),
         }
     }
 
-    fn from_ctx(ctx: &PluginCtx, plugin_name: &str) -> Self {
+    /// Construct state from a `PluginCtx`, populating request headers from the
+    /// actual `RequestHeader`. Host functions like `get-header` read from these
+    /// snapshots, so they must be populated before the hook is invoked.
+    fn from_ctx_with_request(ctx: &PluginCtx, plugin_name: &str, req: &RequestHeader) -> Self {
+        let request_headers = req
+            .headers
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.as_str().to_lowercase(),
+                    v.to_str().unwrap_or("").to_owned(),
+                )
+            })
+            .collect();
+
+        Self {
+            plugin_name: plugin_name.to_owned(),
+            client_ip: ctx.client_ip,
+            method: ctx.method.to_string(),
+            path: ctx.path.to_string(),
+            is_tls: ctx.is_tls,
+            request_headers,
+            response_headers: Vec::new(),
+            memory_limiter: MemoryLimiter::new(WasmLimits::default().memory_mb),
+        }
+    }
+
+    /// Construct state from a `PluginCtx`, populating response headers from the
+    /// actual `ResponseHeader`. Used for `on_response` hook calls.
+    fn from_ctx_with_response(ctx: &PluginCtx, plugin_name: &str, resp: &ResponseHeader) -> Self {
+        let response_headers = resp
+            .headers
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.as_str().to_lowercase(),
+                    v.to_str().unwrap_or("").to_owned(),
+                )
+            })
+            .collect();
+
         Self {
             plugin_name: plugin_name.to_owned(),
             client_ip: ctx.client_ip,
@@ -109,7 +163,8 @@ impl PluginState {
             path: ctx.path.to_string(),
             is_tls: ctx.is_tls,
             request_headers: Vec::new(),
-            response_headers: Vec::new(),
+            response_headers,
+            memory_limiter: MemoryLimiter::new(WasmLimits::default().memory_mb),
         }
     }
 }
@@ -226,6 +281,9 @@ impl WasmPlugin {
     /// globals are reset between requests, preventing state leakage. Store
     /// creation is O(1) once the component is compiled.
     ///
+    /// The caller constructs the `PluginState` so they can populate the
+    /// correct header snapshot (request vs. response) before invocation.
+    ///
     /// # Error isolation (ISSUE-103)
     ///
     /// On trap or instantiation failure:
@@ -235,7 +293,7 @@ impl WasmPlugin {
     /// 4. Return `Continue` so the proxy serves traffic from the next plugin.
     ///
     /// On success: reset `consecutive_traps` to zero.
-    fn with_instance<F>(&self, ctx: &PluginCtx, hook: &'static str, f: F) -> PluginAction
+    fn with_instance<F>(&self, state: PluginState, hook: &'static str, f: F) -> PluginAction
     where
         F: FnOnce(&mut Store<PluginState>, &WitInstance) -> Result<PluginAction, wasmtime::Error>,
     {
@@ -244,8 +302,23 @@ impl WasmPlugin {
             return PluginAction::Continue;
         }
 
-        let state = PluginState::from_ctx(ctx, self.name);
         let mut store = Store::new(&self.engine, state);
+
+        // Attach the memory limiter so wasmtime consults it on every memory.grow.
+        store.limiter(|s| s as &mut dyn wasmtime::ResourceLimiter);
+
+        // Apply fuel budget and epoch deadline — must be called per invocation
+        // because both counters are consumed as the module runs.
+        if let Err(e) = apply_limits(&mut store, &WasmLimits::default()) {
+            warn!(
+                plugin = self.name,
+                hook,
+                error = %e,
+                "failed to apply WASM limits — returning Continue"
+            );
+            return PluginAction::Continue;
+        }
+
         let linker: Linker<PluginState> = Linker::new(&self.engine);
 
         let result = WitInstance::instantiate(&mut store, &self.component, &linker)
@@ -315,7 +388,9 @@ impl DwaarPlugin for WasmPlugin {
             is_tls: ctx.is_tls,
             client_ip: ctx.client_ip.map(|ip| ip.to_string()).unwrap_or_default(),
         };
-        self.with_instance(ctx, "on-request", |store, plugin| {
+        // Populate request_headers so host functions like get-header can read them.
+        let state = PluginState::from_ctx_with_request(ctx, self.name, req);
+        self.with_instance(state, "on-request", |store, plugin| {
             let raw = plugin.call_on_request(store, &req_info)?;
             Ok(wit_action_to_native(raw))
         })
@@ -330,7 +405,9 @@ impl DwaarPlugin for WasmPlugin {
             status: resp.status.as_u16(),
             headers: response_headers_to_wit(resp),
         };
-        self.with_instance(ctx, "on-response", |store, plugin| {
+        // Populate response_headers so host functions like get-header can read them.
+        let state = PluginState::from_ctx_with_response(ctx, self.name, resp);
+        self.with_instance(state, "on-response", |store, plugin| {
             let raw = plugin.call_on_response(store, &resp_info)?;
             Ok(wit_action_to_native(raw))
         })
@@ -341,7 +418,18 @@ impl DwaarPlugin for WasmPlugin {
             return PluginAction::Continue;
         }
         debug!(plugin = self.name, eos, "on-body");
-        self.with_instance(ctx, "on-body", |store, plugin| {
+        // Body hook has no headers to snapshot — use a bare ctx-based state.
+        let state = PluginState {
+            plugin_name: self.name.to_owned(),
+            client_ip: ctx.client_ip,
+            method: ctx.method.to_string(),
+            path: ctx.path.to_string(),
+            is_tls: ctx.is_tls,
+            request_headers: Vec::new(),
+            response_headers: Vec::new(),
+            memory_limiter: MemoryLimiter::new(WasmLimits::default().memory_mb),
+        };
+        self.with_instance(state, "on-body", |store, plugin| {
             let raw = plugin.call_on_body(store, eos)?;
             Ok(wit_action_to_native(raw))
         })

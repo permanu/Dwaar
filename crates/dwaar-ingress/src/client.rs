@@ -57,12 +57,35 @@ pub struct AdminApiClient {
     client: reqwest::Client,
 }
 
+/// Default request timeout for admin API calls.
+const ADMIN_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl AdminApiClient {
-    /// Create a new client pointing at `base_url` (e.g. `http://dwaar-admin:9000`).
+    /// Create a new client pointing at `base_url` (e.g. `http://dwaar-admin:6190`).
+    ///
+    /// If `token` is provided, it is sent as a `Bearer` token on every request.
+    /// A 10-second request timeout is applied to all calls.
     pub fn new(base_url: impl Into<String>) -> Self {
+        Self::new_with_token(base_url, None)
+    }
+
+    /// Create a client with an optional bearer token for authentication.
+    pub fn new_with_token(base_url: impl Into<String>, token: Option<&str>) -> Self {
+        let mut builder = reqwest::Client::builder()
+            .timeout(ADMIN_REQUEST_TIMEOUT)
+            .connect_timeout(std::time::Duration::from_secs(5));
+
+        if let Some(tok) = token {
+            let mut headers = reqwest::header::HeaderMap::new();
+            if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {tok}")) {
+                headers.insert(reqwest::header::AUTHORIZATION, val);
+            }
+            builder = builder.default_headers(headers);
+        }
+
         Self {
             base_url: base_url.into(),
-            client: reqwest::Client::new(),
+            client: builder.build().expect("reqwest client with valid TLS"),
         }
     }
 
@@ -105,9 +128,14 @@ impl AdminApiClient {
     /// Returns `Ok(())` whether or not the route existed — a 404 from the
     /// admin API is treated as success because the desired state (no route)
     /// already matches reality.
+    ///
+    /// Domain keys may include `/` for path-prefixed routes (e.g.
+    /// `example.com/api/`). We percent-encode `/` as `%2F` so the DELETE URL
+    /// has a single path segment and the admin API receives the correct key.
     #[instrument(skip(self), fields(domain))]
     pub async fn delete_route(&self, domain: &str) -> Result<(), AdminApiError> {
-        let url = format!("{}/routes/{}", self.base_url, domain);
+        let encoded_domain = domain.replace('/', "%2F");
+        let url = format!("{}/routes/{}", self.base_url, encoded_domain);
 
         debug!(%domain, "deleting route");
 
@@ -169,6 +197,21 @@ mod tests {
     fn client_constructs_correct_urls() {
         let client = AdminApiClient::new("http://dwaar-admin:9000");
         assert_eq!(client.base_url, "http://dwaar-admin:9000");
+    }
+
+    #[test]
+    fn delete_url_encodes_slash_in_domain_key() {
+        // Domain keys with path prefixes (e.g. "example.com/api/") would break
+        // the DELETE URL if the `/` is not percent-encoded. Verify the encoding
+        // logic directly — without making a real HTTP request.
+        let domain = "example.com/api/";
+        let encoded = domain.replace('/', "%2F");
+        assert_eq!(encoded, "example.com%2Fapi%2F");
+
+        // Plain domain (no slash) must be left unchanged.
+        let plain = "example.com";
+        let encoded_plain = plain.replace('/', "%2F");
+        assert_eq!(encoded_plain, "example.com");
     }
 
     #[test]

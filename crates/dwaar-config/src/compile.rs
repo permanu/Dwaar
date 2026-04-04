@@ -567,6 +567,7 @@ fn compile_forward_auth(directives: &[Directive]) -> Option<std::sync::Arc<Forwa
         upstream,
         auth_uri,
         copy_headers,
+        tls: fa.tls,
     }))
 }
 

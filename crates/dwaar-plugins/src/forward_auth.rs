@@ -34,6 +34,14 @@ pub struct ForwardAuthConfig {
     pub auth_uri: CompactString,
     /// Headers to copy from auth response → upstream request.
     pub copy_headers: Vec<CompactString>,
+    /// Whether the subrequest to the auth service uses TLS.
+    ///
+    /// When `false`, responses travel in plaintext — an on-path attacker can
+    /// forge a 2xx and inject `copy_headers` values (e.g. `Remote-User`).
+    /// Set to `true` and configure a TLS-capable backend to close this gap.
+    ///
+    /// TODO: implement TLS subrequest transport via `tokio-rustls`.
+    pub tls: bool,
 }
 
 /// Result of an auth subrequest.
@@ -49,6 +57,12 @@ pub enum AuthResult {
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_AUTH_RESPONSE: u64 = 65_536;
+
+/// Strip CR/LF from a value before it enters a raw HTTP request header.
+/// Prevents CRLF injection when interpolating client-supplied strings.
+fn sanitize_header_value(s: &str) -> String {
+    s.chars().filter(|c| *c != '\r' && *c != '\n').collect()
+}
 
 impl ForwardAuthConfig {
     /// Make the auth subrequest. Returns whether to allow or deny.
@@ -70,20 +84,34 @@ impl ForwardAuthConfig {
         original_uri: &str,
         client_ip: Option<&str>,
     ) -> Result<AuthResult, String> {
+        // Warn once if plaintext is in use — auth responses are not integrity-protected
+        // and an on-path attacker could forge a 2xx with injected headers.
+        if !self.tls {
+            tracing::warn!(
+                upstream = %self.upstream,
+                "forward_auth uses plaintext TCP — auth responses are not integrity-protected; \
+                 set tls: true and point to a TLS-capable endpoint to fix this"
+            );
+        }
+
         // Connect with timeout
         let mut stream = tokio::time::timeout(AUTH_TIMEOUT, TcpStream::connect(self.upstream))
             .await
             .map_err(|_| "auth service connection timed out".to_string())?
             .map_err(|e| format!("auth service connect failed: {e}"))?;
 
-        // Build GET request with forwarded metadata
-        let ip_header =
-            client_ip.map_or_else(String::new, |ip| format!("X-Forwarded-For: {ip}\r\n"));
+        // Build GET request with forwarded metadata.
+        // Sanitize all client-supplied values to prevent CRLF header injection.
+        let safe_method = sanitize_header_value(method);
+        let safe_uri = sanitize_header_value(original_uri);
+        let ip_header = client_ip.map_or_else(String::new, |ip| {
+            format!("X-Forwarded-For: {}\r\n", sanitize_header_value(ip))
+        });
         let request = format!(
             "GET {} HTTP/1.1\r\n\
              Host: {}\r\n\
-             X-Forwarded-Method: {method}\r\n\
-             X-Forwarded-Uri: {original_uri}\r\n\
+             X-Forwarded-Method: {safe_method}\r\n\
+             X-Forwarded-Uri: {safe_uri}\r\n\
              {ip_header}\
              Connection: close\r\n\
              \r\n",

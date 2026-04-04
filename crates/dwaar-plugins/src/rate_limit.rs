@@ -14,7 +14,7 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use pingora_limits::rate::{PROPORTIONAL_RATE_ESTIMATE_CALC_FN, Rate};
+use pingora_limits::rate::{PROPORTIONAL_RATE_ESTIMATE_CALC_FN as RATE_ESTIMATE_FN, Rate};
 
 use crate::plugin::{DwaarPlugin, PluginAction, PluginCtx, PluginResponse};
 
@@ -42,14 +42,14 @@ impl RateLimiter {
     ///
     /// Returns `true` if within the limit (allow), `false` if exceeded (reject).
     ///
-    /// Uses `rate_with(PROPORTIONAL_RATE_ESTIMATE_CALC_FN)` for a proper
-    /// sliding-window estimate that interpolates between current and previous
-    /// intervals. This avoids the one-second lag of the plain `rate()` method.
+    /// Uses `rate_with(RATE_ESTIMATE_FN)` for a proper sliding-window estimate
+    /// that interpolates between current and previous intervals. This avoids
+    /// the one-second lag of the plain `rate()` method.
     pub fn check(&self, key: &str, limit: u32) -> bool {
         self.rate.observe(&key, 1);
         let current_rate = self
             .rate
-            .rate_with(&key, PROPORTIONAL_RATE_ESTIMATE_CALC_FN);
+            .rate_with(&key, RATE_ESTIMATE_FN);
         current_rate <= f64::from(limit)
     }
 }
