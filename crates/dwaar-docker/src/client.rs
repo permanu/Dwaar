@@ -278,29 +278,10 @@ fn encode_filters(pairs: &[(&str, &str)]) -> String {
         map.entry(key).or_default().push(val);
     }
 
-    // Serialize manually to avoid pulling in another dep for URL encoding.
-    // The JSON is simple enough: {"key":["val",...], ...}
-    let mut json = String::from('{');
-    for (i, (key, vals)) in map.iter().enumerate() {
-        if i > 0 {
-            json.push(',');
-        }
-        json.push('"');
-        json.push_str(key);
-        json.push_str("\":[");
-        for (j, val) in vals.iter().enumerate() {
-            if j > 0 {
-                json.push(',');
-            }
-            json.push('"');
-            json.push_str(val);
-            json.push('"');
-        }
-        json.push(']');
-    }
-    json.push('}');
-
-    // Percent-encode the JSON for use in a URL query string
+    // Serialize to JSON via serde_json then percent-encode for the query string.
+    // The map contains only simple string arrays, so serialization is infallible
+    // in practice; unwrap_or_default is a safe fallback returning an empty query.
+    let json = serde_json::to_string(&map).unwrap_or_default();
     url_encode(&json)
 }
 
@@ -329,9 +310,16 @@ fn url_encode(s: &str) -> String {
 
 /// Read a line from the buffered reader, enforcing the max line length.
 /// Strips the trailing `\r\n` or `\n`.
+///
+/// Uses `take(MAX_LINE_BYTES + 1)` so the underlying read is bounded before
+/// any size check — a line without a newline can't grow beyond the cap.
 async fn read_bounded_line(reader: &mut BufReader<UnixStream>) -> Result<String, DockerError> {
     let mut line = String::new();
-    let n = reader.read_line(&mut line).await?;
+    // Wrap in a Take so BufReader::read_line stops at the byte cap.
+    // +1 lets us detect an overlong line (n == MAX_LINE_BYTES + 1 means no \n
+    // was found before the limit).
+    let mut bounded = BufReader::new(reader.take((MAX_LINE_BYTES + 1) as u64));
+    let n = bounded.read_line(&mut line).await?;
     if n > MAX_LINE_BYTES {
         return Err(DockerError::LineTooLong {
             len: n,

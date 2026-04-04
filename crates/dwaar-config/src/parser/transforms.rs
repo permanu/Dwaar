@@ -213,7 +213,7 @@ fn read_tls_token_value(t: &mut Tokenizer<'_>, _context_tok: &Token) -> Result<S
                     col: close.col,
                     kind: ParseErrorKind::Expected {
                         expected: "'}' to close env variable".to_string(),
-                        got: format!("{:?}", close.kind),
+                        got: format!("{}", close.kind),
                     },
                 });
             }
@@ -412,7 +412,7 @@ pub(super) fn parse_basicauth(t: &mut Tokenizer<'_>) -> Result<BasicAuthDirectiv
             col: brace_tok.col,
             kind: ParseErrorKind::Expected {
                 expected: "'{' to start basicauth block".to_string(),
-                got: format!("{:?}", brace_tok.kind),
+                got: format!("{}", brace_tok.kind),
             },
         });
     }
@@ -589,7 +589,7 @@ pub(super) fn parse_ip_filter(
                     col: tok.col,
                     kind: ParseErrorKind::Expected {
                         expected: "ip_filter sub-directive (allow/deny/default) or '}'".to_string(),
-                        got: format!("{:?}", tok.kind),
+                        got: format!("{}", tok.kind),
                     },
                 });
             }
@@ -699,7 +699,7 @@ pub(super) fn parse_request_body(
                     col: tok.col,
                     kind: ParseErrorKind::Expected {
                         expected: "request_body sub-directive or '}'".to_string(),
-                        got: format!("{:?}", tok.kind),
+                        got: format!("{}", tok.kind),
                     },
                 });
             }
@@ -962,7 +962,7 @@ pub(super) fn parse_cache(
                     col: tok.col,
                     kind: ParseErrorKind::Expected {
                         expected: "cache sub-directive or '}'".to_string(),
-                        got: format!("{:?}", tok.kind),
+                        got: format!("{}", tok.kind),
                     },
                 });
             }

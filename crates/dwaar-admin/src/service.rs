@@ -28,7 +28,6 @@ use crate::handlers;
 const MAX_BODY_SIZE: usize = 65_536;
 
 /// The admin API service.
-#[allow(missing_debug_implementations)]
 pub struct AdminService {
     route_table: Arc<ArcSwap<RouteTable>>,
     metrics: Arc<DashMap<String, DomainMetrics>>,
@@ -42,6 +41,18 @@ pub struct AdminService {
     prometheus: Option<Arc<PrometheusMetrics>>,
     /// Cache storage for PURGE endpoint (ISSUE-073). `None` = cache disabled.
     cache_storage: Option<&'static pingora_cache::MemCache>,
+}
+
+impl std::fmt::Debug for AdminService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Omit auth (contains sensitive token data) and cache_storage
+        // (&'static reference doesn't implement Debug).
+        f.debug_struct("AdminService")
+            .field("reload_notify", &self.reload_notify.is_some())
+            .field("prometheus", &self.prometheus.is_some())
+            .field("cache_storage", &self.cache_storage.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl AdminService {
@@ -140,6 +151,7 @@ impl ServeHttp for AdminService {
 
 impl AdminService {
     /// Route the authenticated request to the appropriate handler.
+    #[allow(clippy::too_many_lines)]
     async fn dispatch(
         &self,
         session: &mut ServerSession,
@@ -150,18 +162,18 @@ impl AdminService {
         match (method, path) {
             ("GET", "/routes") => match handlers::list_routes(&self.route_table) {
                 Ok(json) => json_response(200, &json),
-                Err(e) => json_response(500, &format!(r#"{{"error":"{e}"}}"#)),
+                Err(e) => json_error(500, &e),
             },
             ("POST", "/routes") => {
                 let body = read_body(session, MAX_BODY_SIZE).await;
                 match body {
-                    Err((status, msg)) => json_response(status, &format!(r#"{{"error":"{msg}"}}"#)),
+                    Err((status, msg)) => json_error(status, &msg),
                     Ok(data) => match handlers::add_route(&self.route_table, &data) {
                         Ok(json) => {
                             info!(source, "route added/updated via admin API");
                             json_response(201, &json)
                         }
-                        Err(e) => json_response(400, &format!(r#"{{"error":"{e}"}}"#)),
+                        Err(e) => json_error(400, &e),
                     },
                 }
             }
@@ -176,14 +188,14 @@ impl AdminService {
                 match handlers::delete_route(&self.route_table, domain) {
                     Some(deleted) => {
                         info!(source, domain = %deleted, "route deleted via admin API");
-                        json_response(200, &format!(r#"{{"deleted":"{deleted}"}}"#))
+                        json_deleted(&deleted)
                     }
                     None => json_response(404, r#"{"error":"route not found"}"#),
                 }
             }
             ("GET", "/analytics") => match handlers::list_all_analytics(&self.metrics) {
                 Ok(json) => json_response(200, &json),
-                Err(e) => json_response(500, &format!(r#"{{"error":"{e}"}}"#)),
+                Err(e) => json_error(500, &e),
             },
             ("GET", _) if path.starts_with("/analytics/") => {
                 let domain = path
@@ -208,7 +220,7 @@ impl AdminService {
             },
             ("POST", "/reload") => match &self.reload_notify {
                 Some(notify) => {
-                    notify.notify_one();
+                    notify.notify_waiters();
                     info!(source, "config reload triggered via admin API");
                     json_response(200, r#"{"message":"config reload triggered"}"#)
                 }
@@ -240,9 +252,56 @@ impl AdminService {
                     None => json_response(501, r#"{"error":"cache not enabled"}"#),
                 }
             }
-            _ => json_response(405, r#"{"error":"method not allowed"}"#),
+            _ => {
+                // Add an Allow header so clients know which methods are valid
+                // for this endpoint (RFC 9110 §15.5.6 requirement).
+                let allow = allowed_methods_for(path);
+                Response::builder()
+                    .status(405)
+                    .header("Content-Type", "application/json")
+                    .header("Allow", allow)
+                    .body(br#"{"error":"method not allowed"}"#.to_vec())
+                    .expect("valid response")
+            }
         }
     }
+}
+
+/// Return the `Allow` header value for a given path — used in 405 responses.
+fn allowed_methods_for(path: &str) -> &'static str {
+    if path == "/health" {
+        "GET"
+    } else if path == "/routes" {
+        "GET, POST"
+    } else if path.starts_with("/routes/") {
+        "DELETE"
+    } else if path == "/analytics"
+        || path.starts_with("/analytics/")
+        || path == "/metrics"
+    {
+        "GET"
+    } else if path == "/reload" {
+        "POST"
+    } else if path.starts_with("/cache/") {
+        "PURGE"
+    } else {
+        ""
+    }
+}
+
+/// Build a `{"error": "…"}` JSON response, properly escaping the message.
+///
+/// Uses `serde_json` to escape any quotes or backslashes in the message so
+/// injected strings can't break out of the JSON value.
+fn json_error(status: u16, message: &str) -> Response<Vec<u8>> {
+    let body = serde_json::json!({"error": message}).to_string();
+    json_response(status, &body)
+}
+
+/// Build a `{"deleted": "…"}` JSON response, properly escaping the value.
+fn json_deleted(domain: &str) -> Response<Vec<u8>> {
+    let body = serde_json::json!({"deleted": domain}).to_string();
+    json_response(200, &body)
 }
 
 /// Build a Prometheus text exposition response.
@@ -259,6 +318,7 @@ fn json_response(status: u16, body: &str) -> Response<Vec<u8>> {
     Response::builder()
         .status(status)
         .header("Content-Type", "application/json")
+        .header("Content-Length", body.len())
         .body(body.as_bytes().to_vec())
         .expect("valid response")
 }

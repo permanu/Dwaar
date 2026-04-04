@@ -22,6 +22,10 @@ pub struct CreateRouteRequest {
     pub domain: String,
     pub upstream: String,
     pub tls: bool,
+    /// Which component owns this route (e.g. "dwaar-ingress").
+    /// Used by reconcilers to identify their own routes.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 /// Build the health check response body.
@@ -51,7 +55,7 @@ pub fn add_route(route_table: &ArcSwap<RouteTable>, body: &[u8]) -> Result<Strin
         .parse()
         .map_err(|e| format!("invalid upstream address: {e}"))?;
 
-    let route = Route::new(&req.domain, upstream, req.tls, None);
+    let route = Route::with_source(&req.domain, upstream, req.tls, None, req.source);
 
     route_table.rcu(|current| {
         let mut routes = current.all_routes();

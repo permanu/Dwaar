@@ -94,12 +94,14 @@ pub fn translate_ingress(ingress: &Ingress, service_store: &Store<Service>) -> V
     if let Some(default_backend) = spec.default_backend.as_ref() {
         match resolve_backend(default_backend, namespace, service_store) {
             Some(upstream) => {
-                // Use `*` as a catch-all domain sentinel. The admin API can
-                // store it as-is; the proxy uses wildcard resolution for matching.
+                // Use `_default` as the catch-all domain key for the default
+                // backend. This avoids a collision with no-host rules that also
+                // emit `*` — two entries with the same key would silently
+                // overwrite each other in the admin API.
                 let tls = false; // default backend is not per-host, so no TLS entry
                 debug!(ingress = %name, upstream = %upstream, "adding default backend catch-all");
                 routes.push(ResolvedRoute {
-                    domain: "*".to_string(),
+                    domain: "_default".to_string(),
                     upstream,
                     tls,
                 });
@@ -690,8 +692,74 @@ mod tests {
 
         let routes = translate_ingress(&ingress, &store);
         assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].domain, "*");
+        // Default backend uses "_default" key to avoid collision with no-host rules.
+        assert_eq!(routes[0].domain, "_default");
         assert_eq!(routes[0].upstream, "10.0.0.99:8080");
+    }
+
+    #[test]
+    fn no_host_rule_and_default_backend_do_not_collide() {
+        use k8s_openapi::api::networking::v1::{
+            HTTPIngressPath, HTTPIngressRuleValue, IngressBackend, IngressRule,
+            IngressServiceBackend, IngressSpec, ServiceBackendPort,
+        };
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+
+        let svc_a = make_service("backend-a", "default", "10.0.0.1", 8080);
+        let svc_b = make_service("backend-b", "default", "10.0.0.2", 9090);
+        let store = make_store(vec![svc_a, svc_b]);
+
+        // An Ingress with both a no-host rule and a default backend.
+        let ingress = Ingress {
+            metadata: ObjectMeta {
+                name: Some("both".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: Some(IngressSpec {
+                rules: Some(vec![IngressRule {
+                    host: None, // no-host rule → wildcard
+                    http: Some(HTTPIngressRuleValue {
+                        paths: vec![HTTPIngressPath {
+                            path: Some("/".to_string()),
+                            path_type: "Prefix".to_string(),
+                            backend: IngressBackend {
+                                service: Some(IngressServiceBackend {
+                                    name: "backend-a".to_string(),
+                                    port: Some(ServiceBackendPort {
+                                        number: Some(8080),
+                                        name: None,
+                                    }),
+                                }),
+                                resource: None,
+                            },
+                        }],
+                    }),
+                }]),
+                default_backend: Some(IngressBackend {
+                    service: Some(IngressServiceBackend {
+                        name: "backend-b".to_string(),
+                        port: Some(ServiceBackendPort {
+                            number: Some(9090),
+                            name: None,
+                        }),
+                    }),
+                    resource: None,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let routes = translate_ingress(&ingress, &store);
+        assert_eq!(routes.len(), 2, "both routes must be produced");
+        let domains: Vec<&str> = routes.iter().map(|r| r.domain.as_str()).collect();
+        // No-host rule uses "*"; default backend uses "_default" — no collision.
+        assert!(domains.contains(&"*"), "no-host rule must produce '*'");
+        assert!(
+            domains.contains(&"_default"),
+            "default backend must produce '_default'"
+        );
     }
 
     #[test]

@@ -233,6 +233,9 @@ impl RequestContext {
 }
 
 impl Default for RequestContext {
+    /// Side effects are intentional: every call generates a fresh UUID v7 and
+    /// captures the current instant. That's the whole point — each request context
+    /// needs a unique identity and a precise start time.
     fn default() -> Self {
         Self::new()
     }

@@ -83,9 +83,15 @@ pub async fn execute(req: &FastCgiRequest<'_>) -> Result<FastCgiResponse, String
     params.insert("SERVER_PROTOCOL", "HTTP/1.1".to_string());
     params.insert("GATEWAY_INTERFACE", "CGI/1.1".to_string());
 
-    // PATH_INFO splitting on .php
-    if let Some(php_pos) = req.request_path.find(".php") {
-        let split = php_pos + 4;
+    // PATH_INFO splitting on .php — require a boundary after the extension
+    // to avoid matching .phpx, .phpinfo, etc.
+    let php_split = req.request_path.find(".php").and_then(|pos| {
+        let split = pos + 4;
+        let is_boundary = split >= req.request_path.len()
+            || matches!(req.request_path.as_bytes().get(split), Some(b'/' | b'?'));
+        is_boundary.then_some(split)
+    });
+    if let Some(split) = php_split {
         let script = &req.request_path[..split];
         let path_info = &req.request_path[split..];
         params.insert("SCRIPT_NAME", script.to_string());

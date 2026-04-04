@@ -55,14 +55,29 @@ impl CompressEncoding {
 
 /// Parse `Accept-Encoding` header and pick the best encoding we support.
 ///
-/// Priority: brotli > gzip. Respects `q=0` (explicitly disabled).
+/// Priority: brotli > gzip > zstd. Respects `q=0` (explicitly disabled).
+/// A wildcard `*` is treated as accepting any encoding at the specified quality
+/// (RFC 9110 §12.5.3), so `Accept-Encoding: *` picks the best we offer (brotli).
 /// Returns `None` if the client doesn't accept anything we support.
 pub fn negotiate_encoding(accept_encoding: &str) -> Option<CompressEncoding> {
     let mut best: Option<(CompressEncoding, f32, u8)> = None;
+    // Wildcard token quality, if seen. None = not present.
+    let mut wildcard_quality: Option<f32> = None;
+    // Encoding names explicitly listed by the client (used to skip wildcard expansion).
+    let mut explicit = std::collections::HashSet::new();
 
     for part in accept_encoding.split(',') {
         let part = part.trim();
         let (name, quality) = parse_encoding_with_quality(part);
+
+        if name == "*" {
+            wildcard_quality = Some(quality);
+            continue;
+        }
+
+        // Track all explicit tokens regardless of quality, so wildcard
+        // expansion can skip them (the client already made an explicit choice).
+        explicit.insert(name);
 
         if quality <= 0.0 {
             continue;
@@ -88,6 +103,31 @@ pub fn negotiate_encoding(accept_encoding: &str) -> Option<CompressEncoding> {
         });
         if dominated {
             best = Some((encoding, quality, priority));
+        }
+    }
+
+    // Expand wildcard to our supported encodings that the client hasn't named.
+    if let Some(wq) = wildcard_quality
+        && wq > 0.0
+    {
+        for &(enc_name, encoding, priority) in &[
+            ("br", CompressEncoding::Brotli, 3u8),
+            ("gzip", CompressEncoding::Gzip, 2u8),
+            ("zstd", CompressEncoding::Zstd, 1u8),
+        ] {
+            if explicit.contains(enc_name) || (enc_name == "gzip" && explicit.contains("x-gzip")) {
+                continue;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let q_int = (wq * 1000.0) as i32;
+            let dominated = best.as_ref().is_none_or(|(_, bq, bp)| {
+                #[allow(clippy::cast_possible_truncation)]
+                let bq_int = (*bq * 1000.0) as i32;
+                q_int > bq_int || (q_int == bq_int && priority > *bp)
+            });
+            if dominated {
+                best = Some((encoding, wq, priority));
+            }
         }
     }
 
@@ -504,6 +544,27 @@ mod tests {
     #[test]
     fn negotiate_x_gzip() {
         assert_eq!(negotiate_encoding("x-gzip"), Some(CompressEncoding::Gzip));
+    }
+
+    #[test]
+    fn negotiate_wildcard_picks_best() {
+        // Bare * should resolve to brotli (our highest-priority encoding)
+        assert_eq!(negotiate_encoding("*"), Some(CompressEncoding::Brotli));
+    }
+
+    #[test]
+    fn negotiate_wildcard_excludes_explicit() {
+        // br is explicitly disabled with q=0; wildcard should fall back to gzip
+        assert_eq!(
+            negotiate_encoding("br;q=0, *"),
+            Some(CompressEncoding::Gzip)
+        );
+    }
+
+    #[test]
+    fn negotiate_wildcard_q_zero_no_match() {
+        // *;q=0 means reject everything not named; no named encodings given
+        assert_eq!(negotiate_encoding("*;q=0"), None);
     }
 
     // ── Content type checks ────────────────────────────────────────

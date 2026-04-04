@@ -32,6 +32,18 @@ pub(crate) enum TokenKind {
     Eof,
 }
 
+impl std::fmt::Display for TokenKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TokenKind::Word(w) => write!(f, "'{w}'"),
+            TokenKind::QuotedString(s) => write!(f, "\"{s}\""),
+            TokenKind::OpenBrace => write!(f, "'{{'"),
+            TokenKind::CloseBrace => write!(f, "'}}'"),
+            TokenKind::Eof => write!(f, "end of file"),
+        }
+    }
+}
+
 /// Tokenizes Dwaarfile input into a sequence of tokens.
 ///
 /// Skips whitespace and comments (`# ...` to end of line).

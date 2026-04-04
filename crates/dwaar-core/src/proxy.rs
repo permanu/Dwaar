@@ -48,10 +48,15 @@ use crate::template::TemplateContext;
 /// Transfer-Encoding, etc.) are required for correct message framing.
 /// Stripping them based on user config would break the HTTP layer.
 fn is_essential_header(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "content-type" | "content-length" | "transfer-encoding" | "connection" | "date" | "server"
-    )
+    const ESSENTIAL: &[&str] = &[
+        "content-type",
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "date",
+        "server",
+    ];
+    ESSENTIAL.iter().any(|h| name.eq_ignore_ascii_case(h))
 }
 
 /// Sanitize a request path for use in a redirect Location header.
@@ -191,10 +196,11 @@ impl DwaarProxy {
         if let Some(ref sender) = self.beacon_sender {
             let mut body = Vec::with_capacity(1024);
             while let Ok(Some(chunk)) = session.downstream_session.read_request_body().await {
-                body.extend_from_slice(&chunk);
-                if body.len() > beacon::MAX_BEACON_SIZE {
+                // Check before extending so we never allocate beyond the limit.
+                if body.len().saturating_add(chunk.len()) > beacon::MAX_BEACON_SIZE {
                     break;
                 }
+                body.extend_from_slice(&chunk);
             }
 
             match beacon::parse_beacon(&body) {
@@ -478,7 +484,13 @@ impl ProxyHttp for DwaarProxy {
         // Look up the route before running plugins so rate_limit_rps and
         // under_attack flags are available to the plugin chain.
         if let Some(ref host) = ctx.plugin_ctx.host {
-            let host_stripped = host.split(':').next().unwrap_or(host);
+            let host_stripped = if host.starts_with('[') {
+                // IPv6 bracket notation: [::1]:8080
+                host.split(']').next().unwrap_or(host).trim_start_matches('[')
+            } else {
+                // IPv4 or hostname: example.com:8080
+                host.rsplit_once(':').map_or(host.as_str(), |(h, _)| h)
+            };
             let table = self.route_table.load();
             if let Some(route) = table.resolve(host_stripped) {
                 // Route is being drained (removed in a config reload but still
@@ -770,27 +782,43 @@ impl ProxyHttp for DwaarProxy {
                     );
                 }
                 dwaar_plugins::forward_auth::AuthResult::Denied { status, body } => {
-                    debug!(
-                        request_id = %ctx.request_id(),
-                        status,
-                        "forward auth denied"
-                    );
+                    // Log the raw auth body server-side only — never relay it to the
+                    // client, which could leak internal error messages or stack traces.
+                    if body.is_empty() {
+                        debug!(
+                            request_id = %ctx.request_id(),
+                            status,
+                            "forward auth denied"
+                        );
+                    } else {
+                        debug!(
+                            request_id = %ctx.request_id(),
+                            status,
+                            body = %String::from_utf8_lossy(&body),
+                            "forward auth denied (auth service body suppressed from client)"
+                        );
+                    }
+                    // Send a generic response body — auth service internals stay server-side.
+                    let generic_body: &[u8] = if status == 401 {
+                        b"Unauthorized"
+                    } else {
+                        b"Forbidden"
+                    };
                     let mut resp = ResponseHeader::build(status, Some(1))?;
-                    let end_of_body = body.is_empty();
-                    if !end_of_body {
-                        resp.insert_header("Content-Length", body.len().to_string())
-                            .map_err(|e| {
-                                Error::explain(HTTPStatus(status), format!("bad header: {e}"))
-                            })?;
-                    }
+                    resp.insert_header("Content-Length", generic_body.len().to_string())
+                        .map_err(|e| {
+                            Error::explain(HTTPStatus(status), format!("bad header: {e}"))
+                        })?;
+                    resp.insert_header("Content-Type", "text/plain")
+                        .map_err(|e| {
+                            Error::explain(HTTPStatus(status), format!("bad header: {e}"))
+                        })?;
                     session
-                        .write_response_header(Box::new(resp), end_of_body)
+                        .write_response_header(Box::new(resp), false)
                         .await?;
-                    if !end_of_body {
-                        session
-                            .write_response_body(Some(Bytes::from(body)), true)
-                            .await?;
-                    }
+                    session
+                        .write_response_body(Some(Bytes::from_static(generic_body)), true)
+                        .await?;
                     return Ok(true);
                 }
                 dwaar_plugins::forward_auth::AuthResult::Error(msg) => {
@@ -1219,6 +1247,8 @@ impl ProxyHttp for DwaarProxy {
                 .insert_header("X-Real-IP", ip_str)
                 .expect("IP string is valid header value");
 
+            // Replace (not append) — client-supplied XFF is stripped to prevent
+            // IP spoofing. Only the direct connection IP is trusted.
             upstream_request.remove_header("X-Forwarded-For");
             upstream_request
                 .insert_header("X-Forwarded-For", ip_str)
@@ -1323,6 +1353,10 @@ impl ProxyHttp for DwaarProxy {
 
         // Advertise HTTP/3 when enabled (ISSUE-079b). Browsers use this to
         // upgrade future requests to QUIC. `ma=86400` caches the hint for 24h.
+        // NOTE: the H3 path currently buffers full request/response bodies and
+        // opens a fresh TCP connection per request (no pooling). For
+        // latency-sensitive traffic, HTTP/1.1 or HTTP/2 is preferable until
+        // streaming upstream bridge is implemented (ISSUE-108).
         if self.h3_enabled {
             upstream_response
                 .insert_header("Alt-Svc", r#"h3=":443"; ma=86400"#)

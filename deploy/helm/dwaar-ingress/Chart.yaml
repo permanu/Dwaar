@@ -1,0 +1,6 @@
+apiVersion: v2
+name: dwaar-ingress
+description: Dwaar Ingress Controller for Kubernetes
+version: 0.1.0
+appVersion: "0.1.0"
+type: application

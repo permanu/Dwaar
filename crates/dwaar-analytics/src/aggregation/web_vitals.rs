@@ -108,15 +108,21 @@ impl WebVitals {
     }
 
     pub fn record_lcp(&mut self, ms: f64) {
-        self.lcp.record(ms);
+        if ms.is_finite() && ms >= 0.0 {
+            self.lcp.record(ms);
+        }
     }
 
     pub fn record_cls(&mut self, score: f64) {
-        self.cls.record(score);
+        if score.is_finite() && score >= 0.0 {
+            self.cls.record(score);
+        }
     }
 
     pub fn record_inp(&mut self, ms: f64) {
-        self.inp.record(ms);
+        if ms.is_finite() && ms >= 0.0 {
+            self.inp.record(ms);
+        }
     }
 
     pub fn lcp_percentiles(&mut self) -> Percentiles {

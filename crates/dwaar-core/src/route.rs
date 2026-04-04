@@ -499,6 +499,12 @@ pub struct Route {
     /// When true, this route is being drained — new requests get 502,
     /// but in-flight requests continue until complete or drain timeout.
     pub draining: Arc<AtomicBool>,
+
+    /// Which component created this route (e.g. "dwaar-ingress", "docker").
+    /// `None` for routes created from the Dwaarfile or manually via admin API
+    /// without specifying a source. Used by the reconciler to identify
+    /// controller-owned routes and avoid touching foreign ones.
+    pub source: Option<String>,
 }
 
 impl Route {
@@ -507,6 +513,17 @@ impl Route {
     /// Wraps the upstream in a single `HandlerBlock { Any, ReverseProxy }`.
     /// This is the common case for flat Dwaarfiles with no `handle` blocks.
     pub fn new(domain: &str, upstream: SocketAddr, tls: bool, rate_limit_rps: Option<u32>) -> Self {
+        Self::with_source(domain, upstream, tls, rate_limit_rps, None)
+    }
+
+    /// Create a route with an explicit source tag for ownership tracking.
+    pub fn with_source(
+        domain: &str,
+        upstream: SocketAddr,
+        tls: bool,
+        rate_limit_rps: Option<u32>,
+        source: Option<String>,
+    ) -> Self {
         Self {
             domain: domain.to_lowercase(),
             tls,
@@ -535,6 +552,7 @@ impl Route {
             var_defaults: VarSlots::default(),
             active_connections: Arc::new(AtomicU32::new(0)),
             draining: Arc::new(AtomicBool::new(false)),
+            source,
         }
     }
 
@@ -571,7 +589,13 @@ impl Route {
             var_defaults,
             active_connections: Arc::new(AtomicU32::new(0)),
             draining: Arc::new(AtomicBool::new(false)),
+            source: None, // Dwaarfile-compiled routes have no external source
         }
+    }
+
+    /// The source tag, if any.
+    pub fn source(&self) -> Option<&str> {
+        self.source.as_deref()
     }
 
     /// The default upstream address — zero-cost inline read for flat routes.
@@ -617,12 +641,13 @@ impl Route {
 impl serde::Serialize for Route {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("Route", 5)?;
+        let mut s = serializer.serialize_struct("Route", 6)?;
         s.serialize_field("domain", &self.domain)?;
         s.serialize_field("upstream", &self.upstream().map(|a| a.to_string()))?;
         s.serialize_field("tls", &self.tls)?;
         s.serialize_field("rate_limit_rps", &self.rate_limit_rps())?;
         s.serialize_field("under_attack", &self.under_attack())?;
+        s.serialize_field("source", &self.source)?;
         s.end()
     }
 }

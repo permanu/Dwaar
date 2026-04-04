@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use openssl::ssl::NameType;
 use pingora_core::listeners::TlsAccept;
@@ -47,26 +48,43 @@ pub struct DomainTlsConfig {
     pub key_path: PathBuf,
 }
 
+/// Shared, hot-reloadable map of explicit per-domain cert paths.
+///
+/// `ConfigWatcher` holds a clone of this Arc and swaps in a new map on
+/// every successful config reload. `SniResolver` loads the current snapshot
+/// on each TLS handshake via `ArcSwap::load()` — zero-copy, lock-free.
+pub type DomainConfigMap = Arc<ArcSwap<HashMap<String, DomainTlsConfig>>>;
+
+/// Create an empty [`DomainConfigMap`].
+pub fn domain_config_map_empty() -> DomainConfigMap {
+    Arc::new(ArcSwap::from_pointee(HashMap::new()))
+}
+
 /// SNI-based certificate resolver.
 ///
-/// Holds a reference to the cert store and a map of domain-specific
-/// TLS configs (from `tls /cert /key` directives in the Dwaarfile).
-/// Falls back to a default cert when no SNI is provided (e.g.,
-/// clients connecting by IP address).
+/// Holds a reference to the cert store and a shared, live map of
+/// domain-specific TLS configs (from `tls /cert /key` directives in the
+/// Dwaarfile).  The map is wrapped in `ArcSwap` so that `ConfigWatcher`
+/// can swap in a new map on hot-reload without touching this struct.
+/// Falls back to a default cert when no SNI is provided (e.g. clients
+/// connecting by IP address).
 #[derive(Debug)]
 pub struct SniResolver {
     cert_store: Arc<CertStore>,
-    /// Explicit cert paths from `tls /cert /key` directives
-    domain_configs: HashMap<String, DomainTlsConfig>,
+    /// Explicit cert paths — hot-reloadable via shared `ArcSwap`.
+    domain_configs: DomainConfigMap,
     /// Domain to use when client doesn't send SNI (IP-based connections)
     default_domain: Option<String>,
 }
 
 impl SniResolver {
+    /// Create a new resolver.  Domain configs start empty; use
+    /// [`add_domain`](Self::add_domain) or [`shared_domain_map`](Self::shared_domain_map)
+    /// to populate.
     pub fn new(cert_store: Arc<CertStore>) -> Self {
         Self {
             cert_store,
-            domain_configs: HashMap::new(),
+            domain_configs: domain_config_map_empty(),
             default_domain: None,
         }
     }
@@ -78,8 +96,23 @@ impl SniResolver {
     }
 
     /// Register an explicit cert/key path for a domain.
+    ///
+    /// This replaces the entire inner map with a new one containing this entry
+    /// in addition to any previously added entries — use [`shared_domain_map`]
+    /// for bulk updates at startup, and [`ConfigWatcher`] for hot-reload updates.
     pub fn add_domain(&mut self, domain: &str, config: DomainTlsConfig) {
-        self.domain_configs.insert(domain.to_lowercase(), config);
+        // Load current map, clone it, insert, store back.
+        let mut map = HashMap::clone(&self.domain_configs.load());
+        map.insert(domain.to_lowercase(), config);
+        self.domain_configs.store(Arc::new(map));
+    }
+
+    /// Return a clone of the shared [`DomainConfigMap`].
+    ///
+    /// Pass this to [`ConfigWatcher::with_sni_domain_map`] so that hot-reload
+    /// can update the cert map without restarting.
+    pub fn shared_domain_map(&self) -> DomainConfigMap {
+        Arc::clone(&self.domain_configs)
     }
 
     /// Resolve cert for a domain — tries explicit config first,
@@ -92,8 +125,12 @@ impl SniResolver {
 
         let sni_lower = sni.to_lowercase();
 
+        // Load the current domain map — this is a single atomic pointer load,
+        // no lock required.
+        let configs = self.domain_configs.load();
+
         // Try explicit cert path for this exact domain
-        if let Some(config) = self.domain_configs.get(&sni_lower) {
+        if let Some(config) = configs.get(&sni_lower) {
             return self
                 .cert_store
                 .get_or_load(&sni_lower, &config.cert_path, &config.key_path);
@@ -108,7 +145,7 @@ impl SniResolver {
         if let Some(dot_pos) = sni_lower.find('.') {
             let wildcard = format!("*{}", &sni_lower[dot_pos..]);
 
-            if let Some(config) = self.domain_configs.get(&wildcard) {
+            if let Some(config) = configs.get(&wildcard) {
                 return self
                     .cert_store
                     .get_or_load(&wildcard, &config.cert_path, &config.key_path);
@@ -184,9 +221,53 @@ mod tests {
             },
         );
 
-        // Domain config is registered (cert loading will fail since paths don't exist,
-        // but the config lookup itself works)
-        assert!(resolver.domain_configs.contains_key("example.com"));
+        // Domain config is registered — verify the shared map was updated
+        assert!(resolver
+            .domain_configs
+            .load()
+            .contains_key("example.com"));
+    }
+
+    #[test]
+    fn shared_domain_map_reflects_add_domain() {
+        let store = Arc::new(CertStore::new("/tmp/nonexistent", 100));
+        let mut resolver = SniResolver::new(store);
+        let shared = resolver.shared_domain_map();
+
+        resolver.add_domain(
+            "test.com",
+            DomainTlsConfig {
+                cert_path: PathBuf::from("/certs/test.com.pem"),
+                key_path: PathBuf::from("/certs/test.com.key"),
+            },
+        );
+
+        // The shared Arc sees the updated map because both point to the same ArcSwap
+        assert!(shared.load().contains_key("test.com"));
+    }
+
+    #[test]
+    fn hot_reload_via_shared_map() {
+        let store = Arc::new(CertStore::new("/tmp/nonexistent", 100));
+        let resolver = SniResolver::new(store);
+        let shared = resolver.shared_domain_map();
+
+        // Simulate a hot-reload: swap in a new map with a different domain
+        let mut new_map = HashMap::new();
+        new_map.insert(
+            "reloaded.com".to_string(),
+            DomainTlsConfig {
+                cert_path: PathBuf::from("/certs/reloaded.com.pem"),
+                key_path: PathBuf::from("/certs/reloaded.com.key"),
+            },
+        );
+        shared.store(Arc::new(new_map));
+
+        // resolver.domain_configs is the same ArcSwap — load sees the new map
+        assert!(resolver
+            .domain_configs
+            .load()
+            .contains_key("reloaded.com"));
     }
 
     #[test]

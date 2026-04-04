@@ -39,8 +39,8 @@ pub(super) fn parse_matcher_def(t: &mut Tokenizer<'_>) -> Result<MatcherDef, Par
     let name_tok = t.next_token();
     let name = match &name_tok.kind {
         TokenKind::Word(w) => {
-            // Strip the leading '@' — we validated the prefix in parse_site_block.
-            w.trim_start_matches('@').to_string()
+            // Strip exactly one leading '@' — we validated the prefix in parse_site_block.
+            w.strip_prefix('@').unwrap_or(w).to_string()
         }
         _ => {
             return Err(ParseError {
@@ -48,7 +48,7 @@ pub(super) fn parse_matcher_def(t: &mut Tokenizer<'_>) -> Result<MatcherDef, Par
                 col: name_tok.col,
                 kind: ParseErrorKind::Expected {
                     expected: "matcher name starting with '@'".to_string(),
-                    got: format!("{:?}", name_tok.kind),
+                    got: format!("{}", name_tok.kind),
                 },
             });
         }
@@ -85,7 +85,7 @@ pub(super) fn parse_matcher_def(t: &mut Tokenizer<'_>) -> Result<MatcherDef, Par
                             col: tok.col,
                             kind: ParseErrorKind::Expected {
                                 expected: "matcher condition or '}'".to_string(),
-                                got: format!("{:?}", tok.kind),
+                                got: format!("{}", tok.kind),
                             },
                         });
                     }
@@ -117,7 +117,7 @@ fn parse_matcher_condition(t: &mut Tokenizer<'_>) -> Result<MatcherCondition, Pa
                 col: kw_tok.col,
                 kind: ParseErrorKind::Expected {
                     expected: "matcher condition keyword".to_string(),
-                    got: format!("{:?}", kw_tok.kind),
+                    got: format!("{}", kw_tok.kind),
                 },
             });
         }
@@ -238,7 +238,7 @@ fn parse_not_condition(t: &mut Tokenizer<'_>) -> Result<MatcherCondition, ParseE
             col: brace.col,
             kind: ParseErrorKind::Expected {
                 expected: "'{' after 'not'".to_string(),
-                got: format!("{:?}", brace.kind),
+                got: format!("{}", brace.kind),
             },
         });
     }
@@ -269,7 +269,7 @@ fn parse_not_condition(t: &mut Tokenizer<'_>) -> Result<MatcherCondition, ParseE
                     col: tok.col,
                     kind: ParseErrorKind::Expected {
                         expected: "matcher condition or '}'".to_string(),
-                        got: format!("{:?}", tok.kind),
+                        got: format!("{}", tok.kind),
                     },
                 });
             }
@@ -287,7 +287,7 @@ fn parse_file_condition(t: &mut Tokenizer<'_>) -> Result<MatcherCondition, Parse
             col: brace.col,
             kind: ParseErrorKind::Expected {
                 expected: "'{' after 'file'".to_string(),
-                got: format!("{:?}", brace.kind),
+                got: format!("{}", brace.kind),
             },
         });
     }
@@ -327,7 +327,7 @@ fn parse_file_condition(t: &mut Tokenizer<'_>) -> Result<MatcherCondition, Parse
                     col: tok.col,
                     kind: ParseErrorKind::Expected {
                         expected: "'try_files' or '}'".to_string(),
-                        got: format!("{:?}", tok.kind),
+                        got: format!("{}", tok.kind),
                     },
                 });
             }

@@ -10,6 +10,8 @@
 //! `/readyz`  — readiness: 200 only when this pod holds the leader lease and
 //!              has finished its initial sync. Non-leaders return 503 so that
 //!              the K8s service load balancer routes traffic elsewhere.
+//! `/metrics` — Prometheus text exposition (counters for sync operations,
+//!              leader lease events, and service lookup misses).
 //!
 //! The `ReadinessState` is shared between this module and `leader.rs` via
 //! `Arc<AtomicBool>`. Leader election sets/clears it; the health server reads it.
@@ -21,6 +23,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::net::TcpListener;
 use tracing::{info, warn};
+
+use crate::metrics::IngressMetrics;
 
 /// Shared readiness state.
 ///
@@ -57,12 +61,17 @@ impl Default for ReadinessState {
 
 /// Run the health/readiness HTTP server until `shutdown` is cancelled.
 ///
-/// The server listens on `addr` and handles two paths:
+/// The server listens on `addr` and handles three paths:
 /// - `GET /healthz` → always 200 (`{"status":"alive"}`)
 /// - `GET /readyz`  → 200 if ready, 503 otherwise (`{"status":"not-ready"}`)
+/// - `GET /metrics` → Prometheus text format
 ///
 /// Everything else returns 404.
-pub async fn serve(addr: SocketAddr, state: ReadinessState) -> Result<(), std::io::Error> {
+pub async fn serve(
+    addr: SocketAddr,
+    state: ReadinessState,
+    metrics: IngressMetrics,
+) -> Result<(), std::io::Error> {
     let listener = TcpListener::bind(addr).await?;
     info!(%addr, "health server listening");
 
@@ -76,23 +85,25 @@ pub async fn serve(addr: SocketAddr, state: ReadinessState) -> Result<(), std::i
         };
 
         let state = state.clone();
+        let metrics = metrics.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, &state).await {
+            if let Err(e) = handle_connection(stream, &state, &metrics).await {
                 warn!(%peer, error = %e, "health connection error");
             }
         });
     }
 }
 
-/// Minimal HTTP/1.1 handler — no external dependency needed for two routes.
+/// Minimal HTTP/1.1 handler — no external dependency needed for three routes.
 ///
 /// We read just enough of the request to extract the method and path, then
 /// write a static response. This avoids pulling in a full HTTP framework for
-/// what is essentially two string comparisons.
+/// what is essentially three string comparisons.
 async fn handle_connection(
     mut stream: tokio::net::TcpStream,
     state: &ReadinessState,
+    metrics: &IngressMetrics,
 ) -> Result<(), std::io::Error> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -112,12 +123,12 @@ async fn handle_connection(
         }
     }
 
-    let response = build_response(request_line.trim(), state);
+    let response = build_response(request_line.trim(), state, metrics);
     stream.write_all(response.as_bytes()).await?;
     Ok(())
 }
 
-fn build_response(request_line: &str, state: &ReadinessState) -> String {
+fn build_response(request_line: &str, state: &ReadinessState, metrics: &IngressMetrics) -> String {
     // Expect: "GET /path HTTP/1.1"
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
@@ -136,8 +147,18 @@ fn build_response(request_line: &str, state: &ReadinessState) -> String {
                 http_response(503, r#"{"status":"not-ready"}"#)
             }
         }
+        "/metrics" => metrics_response(metrics),
         _ => http_response(404, r#"{"error":"not found"}"#),
     }
+}
+
+fn metrics_response(metrics: &IngressMetrics) -> String {
+    let body = metrics.render();
+    let reason = "OK";
+    format!(
+        "HTTP/1.1 200 {reason}\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
 }
 
 fn http_response(status: u16, body: &str) -> String {
@@ -169,10 +190,14 @@ mod tests {
         s
     }
 
+    fn no_metrics() -> crate::metrics::IngressMetrics {
+        crate::metrics::IngressMetrics::new()
+    }
+
     #[test]
     fn healthz_always_200() {
         let state = make_state(false, false);
-        let resp = build_response("GET /healthz HTTP/1.1", &state);
+        let resp = build_response("GET /healthz HTTP/1.1", &state, &no_metrics());
         assert!(resp.starts_with("HTTP/1.1 200"));
         assert!(resp.contains("alive"));
     }
@@ -181,7 +206,7 @@ mod tests {
     fn readyz_503_when_not_ready() {
         // Neither flag set
         let state = make_state(false, false);
-        let resp = build_response("GET /readyz HTTP/1.1", &state);
+        let resp = build_response("GET /readyz HTTP/1.1", &state, &no_metrics());
         assert!(resp.starts_with("HTTP/1.1 503"));
         assert!(resp.contains("not-ready"));
     }
@@ -190,7 +215,7 @@ mod tests {
     fn readyz_503_when_only_leader() {
         // Leader but no sync yet
         let state = make_state(true, false);
-        let resp = build_response("GET /readyz HTTP/1.1", &state);
+        let resp = build_response("GET /readyz HTTP/1.1", &state, &no_metrics());
         assert!(resp.starts_with("HTTP/1.1 503"));
     }
 
@@ -198,14 +223,14 @@ mod tests {
     fn readyz_503_when_only_sync() {
         // Sync done but not leader (e.g. just lost the lease)
         let state = make_state(false, true);
-        let resp = build_response("GET /readyz HTTP/1.1", &state);
+        let resp = build_response("GET /readyz HTTP/1.1", &state, &no_metrics());
         assert!(resp.starts_with("HTTP/1.1 503"));
     }
 
     #[test]
     fn readyz_200_when_both_ready() {
         let state = make_state(true, true);
-        let resp = build_response("GET /readyz HTTP/1.1", &state);
+        let resp = build_response("GET /readyz HTTP/1.1", &state, &no_metrics());
         assert!(resp.starts_with("HTTP/1.1 200"));
         assert!(resp.contains("\"status\":\"ready\""));
     }
@@ -213,15 +238,29 @@ mod tests {
     #[test]
     fn unknown_path_returns_404() {
         let state = make_state(true, true);
-        let resp = build_response("GET /unknown HTTP/1.1", &state);
+        let resp = build_response("GET /unknown HTTP/1.1", &state, &no_metrics());
         assert!(resp.starts_with("HTTP/1.1 404"));
     }
 
     #[test]
     fn non_get_returns_405() {
         let state = make_state(true, true);
-        let resp = build_response("POST /healthz HTTP/1.1", &state);
+        let resp = build_response("POST /healthz HTTP/1.1", &state, &no_metrics());
         assert!(resp.starts_with("HTTP/1.1 405"));
+    }
+
+    #[test]
+    fn metrics_returns_prometheus_format() {
+        let metrics = crate::metrics::IngressMetrics::new();
+        metrics.inc_routes_upserted();
+        metrics.inc_routes_upserted();
+        metrics.inc_routes_deleted();
+        let state = make_state(true, true);
+        let resp = build_response("GET /metrics HTTP/1.1", &state, &metrics);
+        assert!(resp.starts_with("HTTP/1.1 200"));
+        assert!(resp.contains("text/plain"));
+        assert!(resp.contains("dwaar_ingress_routes_upserted_total 2"));
+        assert!(resp.contains("dwaar_ingress_routes_deleted_total 1"));
     }
 
     #[test]

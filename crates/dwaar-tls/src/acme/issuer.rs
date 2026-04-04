@@ -424,6 +424,15 @@ impl CertIssuer {
         cert_pem: &str,
         key_pem: &str,
     ) -> Result<(), AcmeError> {
+        // Reject any domain that could escape the cert directory via traversal.
+        // A valid DNS hostname never contains '/', '..', or null bytes.
+        if domain.contains('/') || domain.contains("..") || domain.contains('\0') {
+            return Err(AcmeError::CertWrite(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("domain '{domain}' contains unsafe characters for file path use"),
+            )));
+        }
+
         let cert_path = self.cert_dir.join(format!("{domain}.pem"));
         let key_path = self.cert_dir.join(format!("{domain}.key"));
 

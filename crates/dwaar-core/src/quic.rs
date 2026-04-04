@@ -36,6 +36,18 @@
 //!   OPTIONS) are accepted over 0-RTT; POST/PUT/DELETE are rejected with 425.
 //!   Detection uses a shared `AtomicBool` that flips `false` once the full
 //!   TLS handshake completes (`ZeroRttAccepted` future resolved).
+//!
+//! ## Known limitations
+//!
+//! The current H3 implementation is a functional but non-streaming fallback:
+//! - Request bodies are fully buffered before forwarding (memory: `O(request_size)`)
+//! - A fresh TCP connection is opened per upstream request (no connection pooling)
+//! - Response bodies are fully read before replying (TTFB = upstream response time)
+//! - No Pingora session integration (tracked in ISSUE-108)
+//!
+//! For latency-sensitive traffic, prefer HTTP/1.1 or HTTP/2. The H3 path is
+//! suitable for small-body requests where QUIC's transport benefits (0-RTT,
+//! multiplexing) outweigh the buffering overhead.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -58,6 +70,16 @@ use crate::route::{Handler, RouteTable};
 
 /// Maximum concurrent HTTP/3 request streams per QUIC connection.
 const DEFAULT_MAX_STREAMS: u32 = 100;
+
+/// Cap on client request body size. Clients exceeding this receive 413.
+const MAX_REQUEST_BODY: usize = 10 * 1024 * 1024; // 10 MB
+
+/// Cap on upstream response body size. Upstream responses exceeding this are
+/// dropped and the client receives 502.
+const MAX_UPSTREAM_RESPONSE: usize = 100 * 1024 * 1024; // 100 MB
+
+/// Timeout for the full upstream round-trip (connect + write + read).
+const UPSTREAM_TIMEOUT_SECS: u64 = 30;
 
 /// Background service that accepts QUIC connections and drives HTTP/3 sessions.
 ///
@@ -344,10 +366,17 @@ where
     };
 
     // Read the request body from the h3 stream.
-    let body = drain_request_body(&mut stream).await.unwrap_or_else(|e| {
-        debug!(error = %e, "failed to drain request body");
-        Bytes::new()
-    });
+    let body = match drain_request_body(&mut stream).await {
+        Ok(b) => b,
+        Err(BodyDrainError::TooLarge) => {
+            send_error_response(&mut stream, 413, "request body too large").await;
+            return Ok(());
+        }
+        Err(BodyDrainError::Stream(e)) => {
+            debug!(error = ?e, "failed to drain request body");
+            Bytes::new()
+        }
+    };
 
     // Forward the request to the upstream over plain HTTP/1.1 TCP.
     // No reqwest (forbidden by Guardrail dep policy) — raw Tokio TCP.
@@ -530,10 +559,11 @@ pub fn h3_to_pingora_headers(
 /// Read all request body chunks from the h3 stream into a single [`Bytes`].
 ///
 /// HTTP/3 body arrives as a sequence of DATA frames. We read until the peer
-/// signals end-of-stream (`recv_data` returns `None`).
+/// signals end-of-stream (`recv_data` returns `None`), or until the accumulated
+/// size exceeds [`MAX_REQUEST_BODY`], whichever comes first.
 async fn drain_request_body<S, B>(
     stream: &mut RequestStream<S, B>,
-) -> Result<Bytes, h3::error::StreamError>
+) -> Result<Bytes, BodyDrainError>
 where
     S: h3::quic::RecvStream,
     B: bytes::Buf,
@@ -541,10 +571,12 @@ where
 {
     use bytes::BufMut;
     let mut buf = bytes::BytesMut::new();
-    while let Some(chunk) = stream.recv_data().await? {
-        // Copy chunk bytes into our accumulator.
+    while let Some(chunk) = stream.recv_data().await.map_err(BodyDrainError::Stream)? {
         use bytes::Buf;
         let remaining = chunk.remaining();
+        if buf.len() + remaining > MAX_REQUEST_BODY {
+            return Err(BodyDrainError::TooLarge);
+        }
         let mut tmp = bytes::BytesMut::with_capacity(remaining);
         tmp.put(chunk);
         buf.put(tmp.freeze());
@@ -559,7 +591,26 @@ where
 /// (which requires an established downstream session to construct). This is the
 /// minimal working proxy path; deeper Pingora session integration is tracked
 /// in ISSUE-108.
+///
+/// The entire round-trip (connect + write + read) is bounded by
+/// [`UPSTREAM_TIMEOUT_SECS`] to prevent a slow upstream from holding a QUIC
+/// stream open indefinitely.
 async fn forward_to_upstream(
+    upstream_addr: SocketAddr,
+    method: &http::Method,
+    uri: &http::Uri,
+    req_headers: &http::HeaderMap,
+    body: Bytes,
+) -> Result<Http1Response, UpstreamError> {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(UPSTREAM_TIMEOUT_SECS),
+        forward_to_upstream_inner(upstream_addr, method, uri, req_headers, body),
+    )
+    .await
+    .map_err(|_| UpstreamError::Timeout)?
+}
+
+async fn forward_to_upstream_inner(
     upstream_addr: SocketAddr,
     method: &http::Method,
     uri: &http::Uri,
@@ -610,10 +661,18 @@ async fn forward_to_upstream(
     }
 
     // Read the full response — `Connection: close` means we read until EOF.
+    // Cap at MAX_UPSTREAM_RESPONSE to prevent a malicious upstream from
+    // exhausting memory.
     let mut resp_bytes = Vec::new();
-    tcp.read_to_end(&mut resp_bytes)
+    let n = tcp
+        .take(MAX_UPSTREAM_RESPONSE as u64 + 1)
+        .read_to_end(&mut resp_bytes)
         .await
         .map_err(UpstreamError::Read)?;
+
+    if n > MAX_UPSTREAM_RESPONSE {
+        return Err(UpstreamError::ResponseTooLarge);
+    }
 
     parse_http1_response(&resp_bytes).map_err(UpstreamError::Parse)
 }
@@ -631,7 +690,7 @@ fn parse_http1_response(raw: &[u8]) -> Result<Http1Response, String> {
 
     let head = std::str::from_utf8(&raw[..split_pos])
         .map_err(|e| format!("non-UTF-8 response head: {e}"))?;
-    let body = Bytes::copy_from_slice(&raw[split_pos + 4..]);
+    let raw_body = &raw[split_pos + 4..];
 
     let mut lines = head.lines();
     let status_line = lines.next().ok_or("empty response")?;
@@ -644,13 +703,71 @@ fn parse_http1_response(raw: &[u8]) -> Result<Http1Response, String> {
         .ok_or_else(|| format!("invalid status line: {status_line}"))?;
 
     let mut headers = Vec::new();
+    let mut is_chunked = false;
     for line in lines {
         if let Some((name, value)) = line.split_once(':') {
-            headers.push((name.trim().to_string(), value.trim().to_string()));
+            let name = name.trim();
+            let value = value.trim();
+            if name.eq_ignore_ascii_case("transfer-encoding")
+                && value.eq_ignore_ascii_case("chunked")
+            {
+                is_chunked = true;
+            }
+            headers.push((name.to_string(), value.to_string()));
         }
     }
 
+    let body = if is_chunked {
+        decode_chunked(raw_body)?
+    } else {
+        Bytes::copy_from_slice(raw_body)
+    };
+
     Ok((status_code, headers, body))
+}
+
+/// Decode a chunked transfer-encoded body per RFC 9112 §7.1.
+///
+/// Reads `<hex-size>\r\n<data>\r\n` chunks until the terminal `0\r\n\r\n`.
+/// Chunk extensions and trailers are ignored — they carry no meaning for our
+/// upstream probe use-case and are rare in practice.
+fn decode_chunked(mut input: &[u8]) -> Result<Bytes, String> {
+    let mut out = Vec::new();
+
+    loop {
+        // Find the end of the chunk-size line.
+        let crlf = input
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .ok_or_else(|| "chunked: missing CRLF after chunk size".to_string())?;
+
+        let size_line = std::str::from_utf8(&input[..crlf])
+            .map_err(|_| "chunked: non-UTF-8 chunk size line".to_string())?;
+
+        // Strip optional chunk extensions (`;ext=value`).
+        let size_str = size_line.split(';').next().unwrap_or("").trim();
+        let chunk_size = usize::from_str_radix(size_str, 16)
+            .map_err(|_| format!("chunked: invalid chunk size: {size_str:?}"))?;
+
+        input = &input[crlf + 2..]; // advance past size line CRLF
+
+        if chunk_size == 0 {
+            break; // terminal chunk
+        }
+
+        if input.len() < chunk_size + 2 {
+            return Err(format!(
+                "chunked: truncated chunk (expected {} + 2 bytes, got {})",
+                chunk_size,
+                input.len()
+            ));
+        }
+
+        out.extend_from_slice(&input[..chunk_size]);
+        input = &input[chunk_size + 2..]; // advance past data + trailing CRLF
+    }
+
+    Ok(Bytes::from(out))
 }
 
 /// Send a best-effort error response over the h3 stream.
@@ -746,17 +863,14 @@ fn pingora_resp_to_h3(
 /// These headers describe the single-hop connection and lose meaning when
 /// the proxy terminates the connection and opens a new one upstream.
 fn is_hop_by_hop(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "connection"
-            | "keep-alive"
-            | "transfer-encoding"
-            | "te"
-            | "trailer"
-            | "proxy-authorization"
-            | "proxy-authenticate"
-            | "upgrade"
-    )
+    name.eq_ignore_ascii_case("connection")
+        || name.eq_ignore_ascii_case("keep-alive")
+        || name.eq_ignore_ascii_case("transfer-encoding")
+        || name.eq_ignore_ascii_case("te")
+        || name.eq_ignore_ascii_case("trailer")
+        || name.eq_ignore_ascii_case("proxy-authorization")
+        || name.eq_ignore_ascii_case("proxy-authenticate")
+        || name.eq_ignore_ascii_case("upgrade")
 }
 
 // ── TLS setup ────────────────────────────────────────────────────────────────
@@ -897,6 +1011,22 @@ pub enum UpstreamError {
 
     #[error("failed to parse upstream HTTP/1.1 response: {0}")]
     Parse(String),
+
+    #[error("upstream response exceeded {MAX_UPSTREAM_RESPONSE} byte limit")]
+    ResponseTooLarge,
+
+    #[error("upstream did not respond within {UPSTREAM_TIMEOUT_SECS}s")]
+    Timeout,
+}
+
+/// Errors that can occur while draining an h3 request body.
+#[derive(Debug, thiserror::Error)]
+pub enum BodyDrainError {
+    #[error("request body exceeded {MAX_REQUEST_BODY} byte limit")]
+    TooLarge,
+
+    #[error("h3 stream error while reading body: {0:?}")]
+    Stream(h3::error::StreamError),
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

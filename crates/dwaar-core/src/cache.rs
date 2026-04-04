@@ -111,7 +111,23 @@ impl std::fmt::Debug for CacheBackend {
 /// allocated and leaked so that Pingora can hold `&'static` references.
 /// This is intentional — we call it once at startup and the allocations
 /// live until the process exits.
+///
+/// # Panics
+///
+/// Panics if called more than once per process.  Cache storage is process-global
+/// and there is no safe way to replace the `'static` references Pingora already
+/// holds.  Call this exactly once during server startup.
 pub fn init_cache_backend(max_size: usize) -> CacheBackend {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static CALLED: AtomicBool = AtomicBool::new(false);
+
+    // Swap true in atomically; if something already set it we have a double-init.
+    let already = CALLED.swap(true, Ordering::SeqCst);
+    assert!(
+        !already,
+        "init_cache_backend called more than once — cache backend is process-global"
+    );
+
     // Pre-allocate capacity for ~1024 items per shard (16 shards).
     let eviction = Box::leak(Box::new(LruManager::<16>::with_capacity(max_size, 1024)));
     let storage = Box::leak(Box::new(MemCache::new()));
