@@ -163,7 +163,9 @@ fn load_pem_pair(cert_path: &Path, key_path: &Path) -> Option<CachedCert> {
     let key_pem = match std::fs::read(key_path) {
         Ok(data) => data,
         Err(e) => {
-            warn!(path = %key_path.display(), error = %e, "failed to read key file");
+            // Log cert path (not key path) — Guardrail #18 forbids exposing
+            // private key filesystem locations in logs.
+            warn!(cert = %cert_path.display(), error = %e, "failed to read key file");
             return None;
         }
     };
@@ -190,7 +192,7 @@ fn load_pem_pair(cert_path: &Path, key_path: &Path) -> Option<CachedCert> {
     let key = match PKey::private_key_from_pem(&key_pem) {
         Ok(k) => k,
         Err(e) => {
-            warn!(path = %key_path.display(), error = %e, "invalid key PEM");
+            warn!(cert = %cert_path.display(), error = %e, "invalid key PEM");
             return None;
         }
     };
@@ -201,7 +203,6 @@ fn load_pem_pair(cert_path: &Path, key_path: &Path) -> Option<CachedCert> {
             if !cert_pubkey.public_eq(&key) {
                 warn!(
                     cert = %cert_path.display(),
-                    key = %key_path.display(),
                     "cert/key mismatch — the private key does not match the certificate"
                 );
                 return None;
