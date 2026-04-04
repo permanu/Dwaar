@@ -1066,11 +1066,13 @@ impl ProxyHttp for DwaarProxy {
             addr
         } else {
             // Defensive fallback — should not happen in normal flow
-            let host = ctx
-                .plugin_ctx
-                .host
-                .as_deref()
-                .map_or("", |h| h.split(':').next().unwrap_or(h));
+            let host = ctx.plugin_ctx.host.as_deref().map_or("", |h| {
+                if h.starts_with('[') {
+                    h.split(']').next().unwrap_or(h).trim_start_matches('[')
+                } else {
+                    h.rsplit_once(':').map_or(h, |(host, _)| host)
+                }
+            });
             let table = self.route_table.load();
             let route = table.resolve(host).ok_or_else(|| {
                 warn!(host = %host, request_id = %ctx.request_id(), "no route for host");

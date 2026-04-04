@@ -6,8 +6,9 @@
 
 //! Admin API service implementing Pingora's `ServeHttp`.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -27,6 +28,13 @@ use crate::handlers;
 /// Maximum request body size (64 KB).
 const MAX_BODY_SIZE: usize = 65_536;
 
+/// Rate limit: at most this many requests per window before returning 429.
+const RATE_LIMIT_MAX: u64 = 60;
+/// Rate limit window length in seconds.
+const RATE_LIMIT_WINDOW_SECS: u64 = 60;
+/// Minimum seconds between consecutive `/reload` triggers.
+const RELOAD_COOLDOWN_SECS: u64 = 5;
+
 /// The admin API service.
 pub struct AdminService {
     route_table: Arc<ArcSwap<RouteTable>>,
@@ -41,6 +49,12 @@ pub struct AdminService {
     prometheus: Option<Arc<PrometheusMetrics>>,
     /// Cache storage for PURGE endpoint (ISSUE-073). `None` = cache disabled.
     cache_storage: Option<&'static pingora_cache::MemCache>,
+    /// Number of authenticated requests seen in the current rate-limit window.
+    request_count: AtomicU64,
+    /// Start of the current rate-limit window as Unix epoch seconds.
+    window_start: AtomicU64,
+    /// Unix epoch seconds when `/reload` was last successfully triggered.
+    last_reload: AtomicU64,
 }
 
 impl std::fmt::Debug for AdminService {
@@ -73,6 +87,9 @@ impl AdminService {
             reload_notify: None,
             prometheus: None,
             cache_storage: None,
+            request_count: AtomicU64::new(0),
+            window_start: AtomicU64::new(0),
+            last_reload: AtomicU64::new(0),
         }
     }
 
@@ -95,6 +112,27 @@ impl AdminService {
     pub fn with_cache_storage(mut self, storage: &'static pingora_cache::MemCache) -> Self {
         self.cache_storage = Some(storage);
         self
+    }
+
+    /// Check global rate limit. Returns `Err(Response)` with a 429 if the
+    /// caller has exceeded 60 authenticated requests per 60-second window.
+    ///
+    /// Uses a single global counter — the admin API is low-traffic and does
+    /// not need per-IP accounting. The window resets atomically when it expires.
+    fn check_rate_limit(&self) -> Result<(), Response<Vec<u8>>> {
+        let now = epoch_secs();
+        let window = self.window_start.load(Ordering::Relaxed);
+        if now.saturating_sub(window) >= RATE_LIMIT_WINDOW_SECS {
+            // Window expired — reset counter and start a new one.
+            self.window_start.store(now, Ordering::Relaxed);
+            self.request_count.store(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        let count = self.request_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if count > RATE_LIMIT_MAX {
+            return Err(json_response(429, r#"{"error":"rate limit exceeded"}"#));
+        }
+        Ok(())
     }
 }
 
@@ -130,6 +168,11 @@ impl ServeHttp for AdminService {
 
         let is_uds = is_trusted_transport(session);
         let source = if is_uds { "uds" } else { "tcp" };
+        // Capture peer IP once for logging; unavailable on UDS (unnamed socket).
+        let peer_ip = session
+            .client_addr()
+            .and_then(|a| a.as_inet())
+            .map(|a| a.ip().to_string());
         debug!(source, method = %method, path = %path, "admin request");
 
         // Health check — no auth required
@@ -141,8 +184,23 @@ impl ServeHttp for AdminService {
         // UDS connections are trusted — OS filesystem permissions on the socket
         // file control access. TCP connections require a bearer token.
         if !is_uds && let Err(reason) = self.auth.check(&auth_header) {
-            warn!(source, reason, "admin auth failed");
+            warn!(
+                source,
+                reason,
+                peer = peer_ip.as_deref().unwrap_or("unknown"),
+                "admin auth failed"
+            );
             return json_response(401, r#"{"error":"unauthorized"}"#);
+        }
+
+        // Authenticated path — enforce global rate limit before dispatch.
+        if let Err(resp) = self.check_rate_limit() {
+            warn!(
+                source,
+                peer = peer_ip.as_deref().unwrap_or("unknown"),
+                "admin rate limit exceeded"
+            );
+            return resp;
         }
 
         self.dispatch(session, &method, &path, source).await
@@ -220,6 +278,24 @@ impl AdminService {
             },
             ("POST", "/reload") => match &self.reload_notify {
                 Some(notify) => {
+                    let now = epoch_secs();
+                    let last = self.last_reload.load(Ordering::Relaxed);
+                    let elapsed = now.saturating_sub(last);
+                    if last != 0 && elapsed < RELOAD_COOLDOWN_SECS {
+                        let remaining = RELOAD_COOLDOWN_SECS - elapsed;
+                        return Response::builder()
+                            .status(429)
+                            .header("Content-Type", "application/json")
+                            .header("Retry-After", remaining.to_string())
+                            .body(
+                                format!(
+                                    r#"{{"error":"reload too soon","retry_after":{remaining}}}"#
+                                )
+                                .into_bytes(),
+                            )
+                            .expect("valid response");
+                    }
+                    self.last_reload.store(now, Ordering::Relaxed);
                     notify.notify_waiters();
                     info!(source, "config reload triggered via admin API");
                     json_response(200, r#"{"message":"config reload triggered"}"#)
@@ -321,6 +397,16 @@ fn json_response(status: u16, body: &str) -> Response<Vec<u8>> {
         .header("Content-Length", body.len())
         .body(body.as_bytes().to_vec())
         .expect("valid response")
+}
+
+/// Current Unix epoch time in whole seconds. Used for rate-limit windows and
+/// reload cooldown tracking. Monotonicity is not required here — wall-clock
+/// time is fine because we only care about elapsed seconds between events.
+fn epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// Read the request body up to `max_size` bytes.
