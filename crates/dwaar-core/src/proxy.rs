@@ -550,8 +550,10 @@ impl ProxyHttp for DwaarProxy {
                         }
                         crate::route::Handler::ReverseProxy { upstream } => {
                             ctx.route_upstream = Some(*upstream);
+                            ctx.quic_capable = true;
                         }
                         crate::route::Handler::ReverseProxyPool { pool } => {
+                            ctx.quic_capable = true;
                             // Resolve the upstream now using the LB policy.
                             // Cache the selected address in `route_upstream` so
                             // `upstream_peer()` doesn't need to call `select()` again
@@ -1376,13 +1378,12 @@ impl ProxyHttp for DwaarProxy {
             .insert_header("X-Request-Id", ctx.request_id())
             .expect("UUID is valid header value");
 
-        // Advertise HTTP/3 when enabled (ISSUE-079b). Browsers use this to
-        // upgrade future requests to QUIC. `ma=86400` caches the hint for 24h.
-        // NOTE: the H3 path currently buffers full request/response bodies and
-        // opens a fresh TCP connection per request (no pooling). For
-        // latency-sensitive traffic, HTTP/1.1 or HTTP/2 is preferable until
-        // streaming upstream bridge is implemented (ISSUE-108).
-        if self.h3_enabled {
+        // Advertise HTTP/3 only for routes the QUIC bridge can serve
+        // (ReverseProxy and ReverseProxyPool). FileServer, StaticResponse,
+        // and FastCgi are not yet supported over H3 (ISSUE-107), so
+        // advertising Alt-Svc for those routes would cause clients to
+        // attempt QUIC and get a 502.
+        if self.h3_enabled && ctx.quic_capable {
             upstream_response
                 .insert_header("Alt-Svc", r#"h3=":443"; ma=86400"#)
                 .expect("static str is valid header value");
