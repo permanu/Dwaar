@@ -89,8 +89,12 @@ pub async fn run_reconciler<F>(
         tokio::select! {
             biased;
 
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
+            result = shutdown.changed() => {
+                // Treat both an explicit `true` value and a closed channel
+                // (sender dropped) as shutdown. The sender drops when the
+                // watcher's `run()` method exits — e.g. on lease loss — so
+                // a closed channel means "stop immediately".
+                if result.is_err() || *shutdown.borrow() {
                     info!("reconciler shutting down");
                     return;
                 }
