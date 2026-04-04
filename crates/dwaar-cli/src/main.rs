@@ -257,6 +257,27 @@ fn main() -> anyhow::Result<()> {
         WorkerCount::Count(n) => n,
     };
 
+    // Generate the UAM secret once here, before any fork, so all worker
+    // processes share the same value. Workers that receive a challenge token
+    // from a sibling can still validate it — without this, each fork would
+    // produce its own secret and tokens would fail across workers.
+    //
+    // We encode as hex and store in the environment so forked children inherit
+    // it automatically via the OS copy-on-write page tables.
+    //
+    // SAFETY: set_var is unsafe in Rust 2024 because it is not thread-safe.
+    // This is called before fork() and before any tokio/Pingora threads exist,
+    // so the process is still strictly single-threaded here.
+    {
+        use rand::Rng;
+        let mut buf = [0u8; 32];
+        rand::rng().fill_bytes(&mut buf);
+        let hex: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+        #[allow(unsafe_code)]
+        // SAFETY: see comment above — single-threaded before fork.
+        unsafe { std::env::set_var("DWAAR_UAM_SECRET", &hex) };
+    }
+
     // Single-process mode skips forking — same behavior as before.
     if worker_count <= 1 {
         return run_server(&cli, &dwaar_config, config_path, drain_timeout, 0, 1);
@@ -386,15 +407,25 @@ fn run_server(
     };
 
     // Build the plugin chain with all built-in plugins, sorted by priority.
-    // Under Attack Mode uses a random secret — in production this should
-    // come from config or environment for persistence across restarts.
+    // The UAM secret is inherited from the supervisor via DWAAR_UAM_SECRET so
+    // all workers share one secret and can validate each other's tokens. If the
+    // env var is absent (e.g. direct invocation in tests) we fall back to a
+    // fresh random secret — acceptable for single-process use.
     let plugin_chain = if cli.plugins_enabled() {
-        let under_attack_secret: Vec<u8> = {
-            use rand::Rng;
-            let mut buf = vec![0u8; 32];
-            rand::rng().fill_bytes(&mut buf);
-            buf
-        };
+        let under_attack_secret: Vec<u8> = std::env::var("DWAAR_UAM_SECRET")
+            .ok()
+            .and_then(|hex| {
+                (0..hex.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                use rand::Rng;
+                let mut buf = vec![0u8; 32];
+                rand::rng().fill_bytes(&mut buf);
+                buf
+            });
         Arc::new(dwaar_plugins::plugin::PluginChain::new(vec![
             Box::new(dwaar_plugins::bot_detect::BotDetectPlugin::new()),
             Box::new(dwaar_plugins::under_attack::UnderAttackPlugin::new(
