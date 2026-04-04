@@ -132,18 +132,25 @@ impl IngressWatcher {
         let (desired_tx, desired_rx) =
             tokio::sync::watch::channel::<Vec<DesiredRoute>>(Vec::new());
 
-        // Clone what the reconciler task needs before moving `self` into the loop.
+        // The reconciler must stop when this method returns — whether from an
+        // explicit shutdown signal or from being dropped on lease loss. We create
+        // a dedicated channel whose sender lives in `run()` scope; when the
+        // sender is dropped the reconciler sees a closed channel and exits.
+        let (_reconciler_stop_tx, reconciler_stop_rx) = watch::channel(false);
+
         let reconciler_client = self.api_client.clone();
-        let reconciler_shutdown = shutdown.clone();
         tokio::spawn(async move {
             run_reconciler(
                 reconciler_client,
                 ReconcilerConfig::default(),
-                reconciler_shutdown,
+                reconciler_stop_rx,
                 move || desired_rx.borrow().clone(),
             )
             .await;
         });
+
+        // `reconciler_stop_tx` stays alive in this scope. When `run()` returns
+        // (shutdown or lease loss), it drops and the reconciler exits.
 
         info!("IngressWatcher started");
 
