@@ -121,8 +121,9 @@ impl ConfigWatcher {
 
     /// Process a file change: hash -> compare -> parse -> compile -> swap.
     fn try_reload(&self, shutdown: &ShutdownWatch) {
-        // Read file with size check
-        let metadata = match std::fs::metadata(&self.config_path) {
+        // File I/O is blocking — move it off the async executor so we don't
+        // stall other tokio tasks during hot-reload.
+        let metadata = match tokio::task::block_in_place(|| std::fs::metadata(&self.config_path)) {
             Ok(m) => m,
             Err(e) => {
                 warn!(path = %self.config_path.display(), error = %e, "failed to stat config");
@@ -139,13 +140,14 @@ impl ConfigWatcher {
             return;
         }
 
-        let content = match std::fs::read_to_string(&self.config_path) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(path = %self.config_path.display(), error = %e, "failed to read config");
-                return;
-            }
-        };
+        let content =
+            match tokio::task::block_in_place(|| std::fs::read_to_string(&self.config_path)) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(path = %self.config_path.display(), error = %e, "failed to read config");
+                    return;
+                }
+            };
 
         // Content hash comparison
         let new_hash = match openssl::hash::hash(MessageDigest::sha256(), content.as_bytes()) {

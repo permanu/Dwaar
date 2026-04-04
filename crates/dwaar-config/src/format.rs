@@ -918,22 +918,23 @@ fn format_recognized(out: &mut String, name: &str, r: &RecognizedDirective) {
 /// limits apply to every plugin without needing to know the defaults.
 fn format_wasm_plugin(out: &mut String, wp: &WasmPluginDirective, depth: usize) {
     use std::fmt::Write as _;
-    let indent = "\t".repeat(depth);
+    let outer = "    ".repeat(depth);
+    let inner = "    ".repeat(depth + 1);
     let _ = writeln!(out, "wasm_plugin {} {{", wp.module_path);
-    let _ = writeln!(out, "{indent}\t\tpriority {}", wp.priority);
+    let _ = writeln!(out, "{inner}priority {}", wp.priority);
     if let Some(fuel) = wp.fuel {
-        let _ = writeln!(out, "{indent}\t\tfuel {fuel}");
+        let _ = writeln!(out, "{inner}fuel {fuel}");
     }
     if let Some(mb) = wp.memory_mb {
-        let _ = writeln!(out, "{indent}\t\tmemory {mb}");
+        let _ = writeln!(out, "{inner}memory {mb}");
     }
     if let Some(ms) = wp.timeout_ms {
-        let _ = writeln!(out, "{indent}\t\ttimeout {ms}");
+        let _ = writeln!(out, "{inner}timeout {ms}");
     }
     for (k, v) in &wp.config {
-        let _ = writeln!(out, "{indent}\t\tconfig {k}={v}");
+        let _ = writeln!(out, "{inner}config {k}={v}");
     }
-    let _ = write!(out, "{indent}\t}}");
+    let _ = write!(out, "{outer}}}");
 }
 
 #[cfg(test)]

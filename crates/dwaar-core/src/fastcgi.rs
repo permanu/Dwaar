@@ -53,6 +53,7 @@ pub struct FastCgiRequest<'a> {
     pub request_body: &'a [u8],
     pub server_name: &'a str,
     pub remote_addr: &'a str,
+    pub is_tls: bool,
 }
 
 /// Execute a `FastCGI` request to `php-fpm` and return the parsed HTTP response.
@@ -73,7 +74,7 @@ pub async fn execute(req: &FastCgiRequest<'_>) -> Result<FastCgiResponse, String
         format!("{}?{}", req.request_path, req.query_string),
     );
     params.insert("SERVER_NAME", req.server_name.to_string());
-    params.insert("SERVER_PORT", "80".to_string());
+    params.insert("SERVER_PORT", if req.is_tls { "443" } else { "80" }.to_string());
     params.insert("REMOTE_ADDR", req.remote_addr.to_string());
     params.insert("CONTENT_LENGTH", req.request_body.len().to_string());
     params.insert(
@@ -145,10 +146,10 @@ pub async fn execute(req: &FastCgiRequest<'_>) -> Result<FastCgiResponse, String
         let record = read_record(&mut stream).await?;
         match record.record_type {
             FCGI_STDOUT => {
-                stdout_buf.extend_from_slice(&record.content);
-                if stdout_buf.len() > MAX_RESPONSE_SIZE {
+                if stdout_buf.len() + record.content.len() > MAX_RESPONSE_SIZE {
                     return Err("FastCGI response too large".to_string());
                 }
+                stdout_buf.extend_from_slice(&record.content);
             }
             FCGI_STDERR => {
                 // Log stderr but don't fail
