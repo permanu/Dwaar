@@ -167,9 +167,9 @@ impl BackgroundService for QuicService {
         let endpoint = self
             .endpoint
             .lock()
-            .expect("QuicService lock poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .take()
-            .expect("QuicService::start called more than once");
+            .expect("QuicService::start() must only be called once (Pingora guarantees this)");
 
         info!("HTTP/3 listener accepting connections");
 

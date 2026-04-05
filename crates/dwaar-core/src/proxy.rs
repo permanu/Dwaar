@@ -1598,9 +1598,15 @@ impl ProxyHttp for DwaarProxy {
     {
         // Decrement the route's active connection counter (ISSUE-075).
         // This runs for every request, even failed ones, so the counter
-        // stays accurate for drain timeout decisions.
+        // stays accurate for drain timeout decisions. Use fetch_update to
+        // prevent underflow — a zero counter means no active connections
+        // and subtracting further would wrap to u32::MAX.
         if let Some(ref counter) = ctx.drain_counter {
-            counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            let _ = counter.fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |n| n.checked_sub(1),
+            );
         }
 
         // Release the upstream connection slot acquired in request_filter().
