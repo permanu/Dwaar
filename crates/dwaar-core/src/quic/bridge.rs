@@ -594,16 +594,14 @@ pub fn try_decode_one_chunk(raw: &[u8]) -> Result<Option<(Vec<u8>, usize, bool)>
         .map_err(|_| UpstreamError::Parse(format!("chunked: bad size: {size_str:?}")))?;
 
     if chunk_size == 0 {
-        // Terminal chunk — consume `0\r\n` (+ optional trailers + `\r\n`).
-        // For simplicity, consume up to the first `\r\n` after `0\r\n`.
-        let consumed = crlf + 2; // the `0\r\n`
-        // Optionally consume trailing `\r\n` if present.
-        let consumed = if raw.len() > consumed + 1 && &raw[consumed..consumed + 2] == b"\r\n" {
-            consumed + 2
-        } else {
-            consumed
-        };
-        return Ok(Some((vec![], consumed, true)));
+        // Terminal chunk: `0\r\n\r\n`. We must consume the trailing CRLF
+        // before declaring done — otherwise the 2 leftover bytes corrupt
+        // the next request on a pooled keep-alive connection.
+        let after_size = crlf + 2; // past `0\r\n`
+        if raw.len() < after_size + 2 {
+            return Ok(None); // trailing CRLF not yet received
+        }
+        return Ok(Some((vec![], after_size + 2, true)));
     }
 
     // Need chunk_size + 2 bytes (data + trailing CRLF) after the size line.
@@ -666,6 +664,28 @@ mod tests {
     fn try_decode_one_chunk_partial() {
         let raw = b"5\r\nhel"; // incomplete
         assert!(try_decode_one_chunk(raw).expect("ok").is_none());
+    }
+
+    #[test]
+    fn try_decode_terminal_chunk_needs_trailing_crlf() {
+        // `0\r\n` without the trailing `\r\n` — must return None (need more
+        // data), NOT terminal. Otherwise 2 bytes are left in the TCP stream
+        // and the next request on a pooled connection sees `\r\nHTTP/1.1 ...`.
+        let raw = b"0\r\n";
+        assert!(
+            try_decode_one_chunk(raw).expect("ok").is_none(),
+            "terminal chunk without trailing CRLF should request more data"
+        );
+    }
+
+    #[test]
+    fn try_decode_terminal_chunk_complete() {
+        let raw = b"0\r\n\r\n";
+        let (payload, consumed, terminal) =
+            try_decode_one_chunk(raw).expect("ok").expect("complete");
+        assert!(payload.is_empty());
+        assert!(terminal);
+        assert_eq!(consumed, 5, "must consume the full 0\\r\\n\\r\\n sequence");
     }
 
     #[tokio::test]
