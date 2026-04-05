@@ -66,6 +66,7 @@ libc = "0.2"
 
 # HTTP types
 http = "1.4.0"
+httparse = "1"
 
 # UUID
 uuid = { version = "1.23.0", features = ["v7"] }

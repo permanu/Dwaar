@@ -41,6 +41,7 @@ rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 h3 = { workspace = true }
 h3-quinn = { workspace = true }
+httparse = { workspace = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }
