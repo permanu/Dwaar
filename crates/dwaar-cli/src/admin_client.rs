@@ -51,7 +51,10 @@ fn request(
     // Add auth token if set
     let auth_header = std::env::var("DWAAR_ADMIN_TOKEN")
         .ok()
-        .map_or_else(String::new, |t| format!("Authorization: Bearer {t}\r\n"));
+        .map_or_else(String::new, |t| {
+            let sanitized: String = t.chars().filter(|c| *c != '\r' && *c != '\n').collect();
+            format!("Authorization: Bearer {sanitized}\r\n")
+        });
 
     let content_length = body.map_or(0, str::len);
     let req = format!(
