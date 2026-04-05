@@ -93,7 +93,15 @@ fn start_dwaar_with_config(config: Option<&std::path::Path>) -> std::process::Ch
     }
     let child = cmd.spawn().expect("failed to start dwaar");
 
-    thread::sleep(Duration::from_secs(2));
+    // Poll until the proxy is accepting connections (or timeout after 10s).
+    let start = std::time::Instant::now();
+    let addr = "127.0.0.1:8080".parse::<std::net::SocketAddr>().unwrap();
+    while start.elapsed() < Duration::from_secs(10) {
+        if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
     child
 }
 
@@ -125,9 +133,12 @@ fn stop_dwaar(mut child: std::process::Child) {
 
     // Kill any orphan worker processes that Pingora forked.
     // Workers inherit the listen socket and survive SIGTERM to the parent.
-    let _ = std::process::Command::new("pkill")
-        .args(["-9", "-f", "target/debug/dwaar"])
-        .output();
+    // Use negative PID to kill the entire process group, scoped to this
+    // test's Dwaar instance instead of system-wide pkill.
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
     thread::sleep(Duration::from_millis(500));
 }
 
