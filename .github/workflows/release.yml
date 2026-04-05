@@ -124,23 +124,36 @@ jobs:
           name: dwaar-linux-amd64
           path: dist/
 
+      - uses: actions/download-artifact@v8
+        with:
+          name: dwaar-linux-arm64
+          path: dist/
+
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push Docker image
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push multi-arch Docker image
         run: |
           TAG="${GITHUB_REF#refs/tags/v}"
-          chmod +x dist/dwaar-linux-amd64
+          chmod +x dist/dwaar-linux-amd64 dist/dwaar-linux-arm64
 
           cat > Dockerfile.release <<'DOCKERFILE'
           FROM gcr.io/distroless/cc-debian12:nonroot
-          COPY dist/dwaar-linux-amd64 /usr/local/bin/dwaar
+          ARG TARGETARCH
+          COPY dist/dwaar-linux-${TARGETARCH} /usr/local/bin/dwaar
           ENTRYPOINT ["dwaar"]
           DOCKERFILE
 
-          docker build -f Dockerfile.release -t ghcr.io/permanu/dwaar:${TAG} -t ghcr.io/permanu/dwaar:latest .
-          docker push ghcr.io/permanu/dwaar:${TAG}
-          docker push ghcr.io/permanu/dwaar:latest
+          # Rename binaries to match TARGETARCH values (amd64/arm64)
+          docker buildx build --platform linux/amd64,linux/arm64 \
+            -f Dockerfile.release \
+            -t ghcr.io/permanu/dwaar:${TAG} \
+            -t ghcr.io/permanu/dwaar:latest \
+            --push .

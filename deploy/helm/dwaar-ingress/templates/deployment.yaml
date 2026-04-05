@@ -74,10 +74,15 @@ spec:
             - name: cert-dir
               mountPath: {{ .Values.controller.certDir }}
       volumes:
-        # TLS PEM files are written here by the watcher and read by Dwaar.
-        # An emptyDir is sufficient — the controller re-materialises certs on startup.
         - name: cert-dir
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "dwaar-ingress.fullname" . }}-certs
+          {{- else }}
+          # TLS PEM files are written here by the watcher and read by Dwaar.
+          # An emptyDir is sufficient — the controller re-materialises certs on startup.
           emptyDir: {}
+          {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
