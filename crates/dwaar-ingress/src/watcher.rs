@@ -106,6 +106,12 @@ struct ReconcileState {
     ingress_specs: HashMap<String, Ingress>,
     prev_ingress_domains: Option<HashMap<String, Vec<String>>>,
     prev_ingress_tls_bases: Option<HashMap<String, Vec<String>>>,
+    /// Reverse index: `"namespace/service_name" → [ingress_key]`.
+    /// Narrows Service-change re-reconciliation to affected Ingresses only,
+    /// avoiding O(events × ingresses) churn in large clusters.
+    service_to_ingresses: HashMap<String, Vec<String>>,
+    /// Reverse index: `"namespace/secret_name" → [ingress_key]`.
+    secret_to_ingresses: HashMap<String, Vec<String>>,
 }
 
 impl IngressWatcher {
@@ -124,6 +130,8 @@ impl IngressWatcher {
             ingress_specs: HashMap::new(),
             prev_ingress_domains: None,
             prev_ingress_tls_bases: None,
+            service_to_ingresses: HashMap::new(),
+            secret_to_ingresses: HashMap::new(),
         };
 
         // The periodic reconciler needs a snapshot of desired routes on each
@@ -191,18 +199,26 @@ impl IngressWatcher {
                             warn!(error = %e, "Service watcher stream error — continuing");
                         }
                         Ok(event) => {
-                            // Extract the service name from the event so we can
-                            // log which Ingresses are being re-evaluated.
                             let svc_name = service_name_from_event(&event);
-                            debug!(service = %svc_name, "Service store updated — re-evaluating affected Ingresses");
-                            self.rereconcile_all_ingresses(
-                                &service_store,
-                                &secret_store,
-                                &mut rs.ingress_domains,
-                                &mut rs.ingress_tls_bases,
-                                &rs.ingress_specs,
-                            ).await;
-                            push_desired_snapshot(&rs.ingress_domains, &rs.ingress_specs, &service_store, &desired_tx);
+                            let svc_key = service_key_from_event(&event);
+                            let affected = rs.service_to_ingresses
+                                .get(&svc_key)
+                                .cloned()
+                                .unwrap_or_default();
+                            if affected.is_empty() {
+                                debug!(service = %svc_name, "Service store updated — no Ingresses reference it");
+                            } else {
+                                debug!(service = %svc_name, count = affected.len(), "Service store updated — re-evaluating affected Ingresses");
+                                self.rereconcile_ingresses(
+                                    &affected,
+                                    &service_store,
+                                    &secret_store,
+                                    &mut rs.ingress_domains,
+                                    &mut rs.ingress_tls_bases,
+                                    &rs.ingress_specs,
+                                ).await;
+                                push_desired_snapshot(&rs.ingress_domains, &rs.ingress_specs, &service_store, &desired_tx);
+                            }
                         }
                     }
                 }
@@ -214,15 +230,25 @@ impl IngressWatcher {
                         }
                         Ok(event) => {
                             let secret_name = secret_name_from_event(&event);
-                            debug!(secret = %secret_name, "Secret store updated — re-evaluating affected Ingresses");
-                            self.rereconcile_all_ingresses(
-                                &service_store,
-                                &secret_store,
-                                &mut rs.ingress_domains,
-                                &mut rs.ingress_tls_bases,
-                                &rs.ingress_specs,
-                            ).await;
-                            push_desired_snapshot(&rs.ingress_domains, &rs.ingress_specs, &service_store, &desired_tx);
+                            let secret_key = secret_key_from_event(&event);
+                            let affected = rs.secret_to_ingresses
+                                .get(&secret_key)
+                                .cloned()
+                                .unwrap_or_default();
+                            if affected.is_empty() {
+                                debug!(secret = %secret_name, "Secret store updated — no Ingresses reference it");
+                            } else {
+                                debug!(secret = %secret_name, count = affected.len(), "Secret store updated — re-evaluating affected Ingresses");
+                                self.rereconcile_ingresses(
+                                    &affected,
+                                    &service_store,
+                                    &secret_store,
+                                    &mut rs.ingress_domains,
+                                    &mut rs.ingress_tls_bases,
+                                    &rs.ingress_specs,
+                                ).await;
+                                push_desired_snapshot(&rs.ingress_domains, &rs.ingress_specs, &service_store, &desired_tx);
+                            }
                         }
                     }
                 }
@@ -328,8 +354,11 @@ impl IngressWatcher {
                         &ingress, service_store, secret_store,
                         &mut state.ingress_domains, &mut state.ingress_tls_bases,
                     ).await;
+                    // Update reverse indexes for targeted re-reconciliation.
+                    update_reverse_indexes(&ingress, &key, &mut state.service_to_ingresses, &mut state.secret_to_ingresses);
                     state.ingress_specs.insert(key, ingress);
                 } else if state.ingress_specs.remove(&key).is_some() {
+                    remove_from_reverse_indexes(&key, &mut state.service_to_ingresses, &mut state.secret_to_ingresses);
                     self.handle_deleted(
                         &ingress, service_store,
                         &mut state.ingress_domains, &mut state.ingress_tls_bases,
@@ -339,6 +368,7 @@ impl IngressWatcher {
             Event::Delete(ingress) => {
                 let key = translator::ingress_key(&ingress);
                 state.ingress_specs.remove(&key);
+                remove_from_reverse_indexes(&key, &mut state.service_to_ingresses, &mut state.secret_to_ingresses);
                 self.handle_deleted(
                     &ingress, service_store,
                     &mut state.ingress_domains, &mut state.ingress_tls_bases,
@@ -384,6 +414,9 @@ impl IngressWatcher {
                 state.prev_ingress_domains = Some(std::mem::take(&mut state.ingress_domains));
                 state.prev_ingress_tls_bases = Some(std::mem::take(&mut state.ingress_tls_bases));
                 state.ingress_specs.clear();
+                // Reverse indexes are rebuilt from InitApply events during the resync.
+                state.service_to_ingresses.clear();
+                state.secret_to_ingresses.clear();
             }
         }
     }
@@ -487,22 +520,26 @@ impl IngressWatcher {
         }
     }
 
-    /// Re-run `handle_applied` for every tracked Ingress.
+    /// Re-run `handle_applied` for the specified Ingress keys only.
     ///
-    /// Called when the Service or Secret store changes so that stale upstream
-    /// addresses (e.g. after a Service `ClusterIP` reassignment) or rotated certs
-    /// are propagated into the route table without waiting for the next Ingress event.
-    async fn rereconcile_all_ingresses(
+    /// Called when a Service or Secret changes — only the Ingresses that
+    /// reference the changed resource are re-evaluated, not the entire set.
+    /// This reduces admin API churn from O(events × ingresses) to
+    /// O(events × affected_ingresses).
+    async fn rereconcile_ingresses(
         &self,
+        ingress_keys: &[String],
         service_store: &Store<Service>,
         secret_store: &Store<Secret>,
         ingress_domains: &mut HashMap<String, Vec<String>>,
         ingress_tls_bases: &mut HashMap<String, Vec<String>>,
         ingress_specs: &HashMap<String, Ingress>,
     ) {
-        for ingress in ingress_specs.values() {
-            self.handle_applied(ingress, service_store, secret_store, ingress_domains, ingress_tls_bases)
-                .await;
+        for key in ingress_keys {
+            if let Some(ingress) = ingress_specs.get(key) {
+                self.handle_applied(ingress, service_store, secret_store, ingress_domains, ingress_tls_bases)
+                    .await;
+            }
         }
     }
 
@@ -599,6 +636,130 @@ fn secret_name_from_event(event: &Event<Secret>) -> String {
 /// Each `spec.tls[].secretName` entry names a Secret that holds the cert/key
 /// material. We pair it with the Ingress namespace so that `sync_tls_secrets`
 /// can look it up in the Secret store.
+/// Update the reverse indexes for an Ingress that was just applied.
+///
+/// Removes old entries for this Ingress key, then adds fresh ones derived
+/// from the current spec. This handles both initial inserts and updates
+/// (where the Ingress may now reference different services/secrets).
+fn update_reverse_indexes(
+    ingress: &Ingress,
+    ingress_key: &str,
+    service_to_ingresses: &mut HashMap<String, Vec<String>>,
+    secret_to_ingresses: &mut HashMap<String, Vec<String>>,
+) {
+    // Remove stale entries first (handles spec changes).
+    remove_from_reverse_indexes(ingress_key, service_to_ingresses, secret_to_ingresses);
+
+    // Add fresh entries.
+    for svc_key in services_from_ingress(ingress) {
+        service_to_ingresses
+            .entry(svc_key)
+            .or_default()
+            .push(ingress_key.to_owned());
+    }
+    for secret_key in secrets_from_ingress(ingress) {
+        secret_to_ingresses
+            .entry(secret_key)
+            .or_default()
+            .push(ingress_key.to_owned());
+    }
+}
+
+/// Remove an Ingress key from all reverse index entries.
+fn remove_from_reverse_indexes(
+    ingress_key: &str,
+    service_to_ingresses: &mut HashMap<String, Vec<String>>,
+    secret_to_ingresses: &mut HashMap<String, Vec<String>>,
+) {
+    for values in service_to_ingresses.values_mut() {
+        values.retain(|k| k != ingress_key);
+    }
+    // Clean up empty entries to prevent unbounded map growth.
+    service_to_ingresses.retain(|_, v| !v.is_empty());
+
+    for values in secret_to_ingresses.values_mut() {
+        values.retain(|k| k != ingress_key);
+    }
+    secret_to_ingresses.retain(|_, v| !v.is_empty());
+}
+
+/// Build a `"namespace/name"` key from a Service watcher event.
+fn service_key_from_event(event: &Event<Service>) -> String {
+    let svc = match event {
+        Event::Apply(s) | Event::InitApply(s) | Event::Delete(s) => s,
+        Event::Init | Event::InitDone => return String::new(),
+    };
+    let ns = svc.metadata.namespace.as_deref().unwrap_or("default");
+    let name = svc.metadata.name.as_deref().unwrap_or("<unknown>");
+    format!("{ns}/{name}")
+}
+
+/// Build a `"namespace/name"` key from a Secret watcher event.
+fn secret_key_from_event(event: &Event<Secret>) -> String {
+    let secret = match event {
+        Event::Apply(s) | Event::InitApply(s) | Event::Delete(s) => s,
+        Event::Init | Event::InitDone => return String::new(),
+    };
+    let ns = secret.metadata.namespace.as_deref().unwrap_or("default");
+    let name = secret.metadata.name.as_deref().unwrap_or("<unknown>");
+    format!("{ns}/{name}")
+}
+
+/// Extract `"namespace/service_name"` keys referenced by this Ingress's backends.
+///
+/// Used to build the reverse index for targeted Service-change re-reconciliation.
+fn services_from_ingress(ingress: &Ingress) -> Vec<String> {
+    let namespace = ingress
+        .metadata
+        .namespace
+        .as_deref()
+        .unwrap_or("default");
+
+    let mut services = Vec::new();
+
+    if let Some(spec) = ingress.spec.as_ref() {
+        // Default backend
+        if let Some(backend) = spec.default_backend.as_ref() {
+            if let Some(svc) = backend.service.as_ref() {
+                services.push(format!("{namespace}/{}", svc.name));
+            }
+        }
+        // Per-rule backends
+        for rule in spec.rules.iter().flatten() {
+            if let Some(http) = rule.http.as_ref() {
+                for path in &http.paths {
+                    if let Some(svc) = path.backend.service.as_ref() {
+                        services.push(format!("{namespace}/{}", svc.name));
+                    }
+                }
+            }
+        }
+    }
+
+    services.sort();
+    services.dedup();
+    services
+}
+
+/// Extract `"namespace/secret_name"` keys referenced by this Ingress's TLS blocks.
+///
+/// Used to build the reverse index for targeted Secret-change re-reconciliation.
+fn secrets_from_ingress(ingress: &Ingress) -> Vec<String> {
+    let namespace = ingress
+        .metadata
+        .namespace
+        .as_deref()
+        .unwrap_or("default");
+
+    ingress
+        .spec
+        .iter()
+        .flat_map(|s| s.tls.iter().flatten())
+        .filter_map(|t| t.secret_name.as_ref())
+        .map(|name| format!("{namespace}/{name}"))
+        .collect()
+}
+
 fn tls_blocks_from_ingress(ingress: &Ingress) -> Vec<(String, String)> {
     let namespace = ingress
         .metadata
