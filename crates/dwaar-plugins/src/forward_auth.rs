@@ -41,6 +41,11 @@ pub struct ForwardAuthConfig {
     /// forge a 2xx and inject `copy_headers` values (e.g. `Remote-User`).
     /// Set to `true` and configure a TLS-capable backend to close this gap.
     pub tls: bool,
+    /// Original hostname from the config (e.g., `authelia` from `authelia:9091`).
+    /// Used as TLS SNI when present, so certs issued to the hostname verify
+    /// correctly even though we connect to the resolved IP address.
+    /// `None` when the upstream was a literal IP address.
+    pub sni_hostname: Option<CompactString>,
 }
 
 /// Result of an auth subrequest.
@@ -104,7 +109,7 @@ impl ForwardAuthConfig {
             Box<dyn AsyncRead + Unpin + Send>,
             Box<dyn AsyncWrite + Unpin + Send>,
         ) = if self.tls {
-            let tls_stream = tls_connect(tcp_stream, self.upstream).await?;
+            let tls_stream = tls_connect(tcp_stream, self.upstream, self.sni_hostname.as_deref()).await?;
             let (r, w) = tokio::io::split(tls_stream);
             (Box::new(r), Box::new(w))
         } else {
@@ -193,13 +198,14 @@ impl ForwardAuthConfig {
 
 /// Perform a TLS handshake over an established TCP connection.
 ///
-/// Uses `webpki-roots` for certificate verification so we don't depend on
-/// the host OS trust store. SNI is derived from the socket address IP —
-/// the auth service certificate must cover that IP (common for internal
-/// services) or a hostname-based approach should be used instead.
+/// Uses `webpki-roots` for certificate verification. When `sni_hostname` is
+/// provided (upstream was configured as a DNS name like `authelia:9091`), it's
+/// used as the SNI server name so that hostname-based certificates verify
+/// correctly. Falls back to IP-based SNI for literal IP upstreams.
 async fn tls_connect(
     tcp: TcpStream,
     addr: SocketAddr,
+    sni_hostname: Option<&str>,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, String> {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -210,8 +216,13 @@ async fn tls_connect(
 
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
 
-    // Use IP-based SNI — rustls 0.23 supports `ServerName::from(IpAddr)`.
-    let server_name = rustls::pki_types::ServerName::from(addr.ip());
+    // Prefer the original hostname for SNI so certs issued to DNS names
+    // verify correctly. Fall back to IP when the upstream was a literal addr.
+    let server_name = match sni_hostname {
+        Some(hostname) => rustls::pki_types::ServerName::try_from(hostname.to_owned())
+            .map_err(|e| format!("invalid SNI hostname '{hostname}': {e}"))?,
+        None => rustls::pki_types::ServerName::from(addr.ip()),
+    };
 
     tokio::time::timeout(AUTH_TIMEOUT, connector.connect(server_name.to_owned(), tcp))
         .await
