@@ -546,7 +546,10 @@ where
     let mut buf = vec![0u8; BRIDGE_CHUNK_SIZE];
 
     loop {
-        // Try to decode a complete chunk from `raw`.
+        // Drain all complete chunks from the buffer before hitting the network.
+        // A single TCP read can carry multiple HTTP chunks — we must decode all
+        // of them before blocking on the next read.
+        #[allow(clippy::needless_continue)]
         if let Some((payload, consumed, is_terminal)) = try_decode_one_chunk(&raw)? {
             raw.drain(..consumed);
 
@@ -558,9 +561,10 @@ where
             if !payload.is_empty() {
                 on_chunk(Bytes::from(payload), false).await?;
             }
+            continue;
         }
 
-        // Need more data from the network.
+        // Buffer exhausted — read more from the network.
         let n = tcp.read(&mut buf).await.map_err(UpstreamError::Read)?;
         if n == 0 {
             return Err(UpstreamError::Parse(
@@ -686,6 +690,53 @@ mod tests {
         assert!(payload.is_empty());
         assert!(terminal);
         assert_eq!(consumed, 5, "must consume the full 0\\r\\n\\r\\n sequence");
+    }
+
+    #[tokio::test]
+    async fn stream_chunked_body_drains_all_chunks_from_single_read() {
+        // Upstream sends multiple chunks + terminal in a single TCP write.
+        // Without the `continue` after decoding, the decoder blocks on a
+        // network read instead of draining the buffer — and hangs forever
+        // on a keep-alive connection.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            use tokio::io::AsyncWriteExt;
+            // All chunks in one write.
+            sock.write_all(b"5\r\nhello\r\n3\r\nfoo\r\n0\r\n\r\n")
+                .await
+                .expect("write");
+            // Keep connection open — don't drop or shutdown.
+            // If the decoder wrongly does a network read after the first chunk,
+            // it will hang here instead of completing.
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        });
+
+        let mut tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+
+        let mut chunks = Vec::new();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            stream_chunked_body(&mut tcp, &[], |chunk, is_last| {
+                chunks.push((chunk.to_vec(), is_last));
+                async { Ok(()) }
+            }),
+        )
+        .await;
+
+        let reusable = result
+            .expect("should not timeout — all chunks were in the buffer")
+            .expect("decode should succeed");
+
+        assert!(reusable, "chunked body with terminal chunk is reusable");
+        assert_eq!(chunks.len(), 3, "hello + foo + terminal");
+        assert_eq!(chunks[0].0, b"hello");
+        assert_eq!(chunks[1].0, b"foo");
+        assert!(chunks[2].1, "last chunk should be final");
     }
 
     #[tokio::test]
