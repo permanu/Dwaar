@@ -13,7 +13,10 @@
 
 use std::time::Duration;
 
+use std::fmt::Write;
+
 use bytes::Bytes;
+use compact_str::CompactString;
 use pingora_limits::rate::{PROPORTIONAL_RATE_ESTIMATE_CALC_FN as RATE_ESTIMATE_FN, Rate};
 
 use crate::plugin::{DwaarPlugin, PluginAction, PluginCtx, PluginResponse};
@@ -112,8 +115,11 @@ impl DwaarPlugin for RateLimitPlugin {
             return PluginAction::Continue;
         };
 
-        // Composite key: "{ip}:{domain}" for per-route isolation
-        let key = format!("{ip}:{domain}");
+        // Composite key: "{ip}:{domain}" for per-route isolation.
+        // CompactString inlines up to 24 bytes, avoiding heap allocation for
+        // short IP:domain combos; falls back to heap for longer keys.
+        let mut key = CompactString::with_capacity(64);
+        let _ = write!(key, "{ip}:{domain}");
         if self.limiter.check(&key, limit) {
             return PluginAction::Continue;
         }
