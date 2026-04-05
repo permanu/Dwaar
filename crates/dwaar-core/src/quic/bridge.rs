@@ -308,7 +308,13 @@ pub async fn write_request_head(
 
     for (name, value) in req_headers {
         let name_str = name.as_str();
-        if name_str.starts_with(':') || is_hop_by_hop(name_str) {
+        // Skip pseudo-headers, hop-by-hop, and Content-Length (we set our
+        // own framing — forwarding the h3 client's Content-Length would
+        // conflict with chunked encoding on the TCP side).
+        if name_str.starts_with(':')
+            || is_hop_by_hop(name_str)
+            || name_str.eq_ignore_ascii_case("content-length")
+        {
             continue;
         }
         if let Ok(v) = value.to_str() {
@@ -323,7 +329,6 @@ pub async fn write_request_head(
         use std::fmt::Write as _;
         let _ = write!(head, "Content-Length: {len}\r\n");
     } else if method != http::Method::GET && method != http::Method::HEAD {
-        // Only add chunked for methods that may have a body.
         head.push_str("Transfer-Encoding: chunked\r\n");
     }
 
