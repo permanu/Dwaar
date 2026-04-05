@@ -232,8 +232,6 @@ where
     S: h3::quic::SendStream<B> + h3::quic::RecvStream,
     B: bytes::Buf + From<Bytes> + Send + 'static,
 {
-    use tokio::io::AsyncWriteExt;
-
     // Acquire upstream connection (pool or fresh).
     let mut tcp = if let Some(pooled) = conn_pool.take(upstream_addr) {
         debug!(upstream = %upstream_addr, "reusing pooled connection");
@@ -244,20 +242,18 @@ where
             .map_err(|e| StreamProxyError::Upstream(UpstreamError::Connect(upstream_addr, e)))?
     };
 
-    let content_length: Option<u64> = headers
-        .get(http::header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse().ok());
+    // Always use chunked encoding to the upstream. The h3 Content-Length
+    // is between the h3 client and us — we can't trust it to match the
+    // actual bytes delivered by recv_data(). Forwarding it as-is and then
+    // writing raw bytes would corrupt the TCP stream if the counts diverge.
+    // Chunked encoding is self-framing: each DATA frame becomes a chunk,
+    // the terminal 0-chunk signals end-of-body, no byte count to enforce.
+    let has_body = *method != http::Method::GET && *method != http::Method::HEAD;
 
-    // Write request headers.
-    bridge::write_request_head(&mut tcp, method, uri, headers, content_length)
+    bridge::write_request_head(&mut tcp, method, uri, headers, None)
         .await
         .map_err(StreamProxyError::Upstream)?;
 
-    // Stream request body chunks from h3 to upstream.
-    let uses_chunked = content_length.is_none()
-        && *method != http::Method::GET
-        && *method != http::Method::HEAD;
     let mut total_body = 0usize;
 
     while let Some(chunk) = h3_stream.recv_data().await.map_err(StreamProxyError::H3RecvData)? {
@@ -271,18 +267,14 @@ where
         bytes::BufMut::put(&mut data, chunk);
         let frozen = data.freeze();
 
-        if uses_chunked {
+        if has_body {
             bridge::write_chunked_data(&mut tcp, &frozen)
                 .await
                 .map_err(StreamProxyError::Upstream)?;
-        } else {
-            tcp.write_all(&frozen)
-                .await
-                .map_err(|e| StreamProxyError::Upstream(UpstreamError::Write(e)))?;
         }
     }
 
-    if uses_chunked {
+    if has_body {
         bridge::write_chunked_end(&mut tcp)
             .await
             .map_err(StreamProxyError::Upstream)?;
