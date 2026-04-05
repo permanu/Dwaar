@@ -553,6 +553,19 @@ fn compile_forward_auth(directives: &[Directive]) -> Option<std::sync::Arc<Forwa
     })?;
 
     let upstream = resolve_upstream(std::slice::from_ref(&fa.upstream))?;
+
+    // Preserve the original hostname for TLS SNI when the upstream was
+    // specified as a DNS name (e.g. `authelia:9091`). Without this, the
+    // TLS client would use the resolved IP as SNI, and hostname-based
+    // certificates would fail verification.
+    let sni_hostname = match &fa.upstream {
+        UpstreamAddr::HostPort(hp) => {
+            let host = hp.split(':').next().unwrap_or(hp);
+            Some(CompactString::from(host))
+        }
+        UpstreamAddr::SocketAddr(_) => None,
+    };
+
     let auth_uri = fa
         .uri
         .as_deref()
@@ -568,6 +581,7 @@ fn compile_forward_auth(directives: &[Directive]) -> Option<std::sync::Arc<Forwa
         auth_uri,
         copy_headers,
         tls: fa.tls,
+        sni_hostname,
     }))
 }
 
