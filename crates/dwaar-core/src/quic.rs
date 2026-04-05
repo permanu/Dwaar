@@ -74,9 +74,12 @@ const DEFAULT_MAX_STREAMS: u32 = 100;
 /// Cap on client request body size. Clients exceeding this receive 413.
 const MAX_REQUEST_BODY: usize = 10 * 1024 * 1024; // 10 MB
 
-/// Cap on upstream response body size. Upstream responses exceeding this are
-/// dropped and the client receives 502.
-const MAX_UPSTREAM_RESPONSE: usize = 100 * 1024 * 1024; // 100 MB
+/// Cap on upstream response body size over the QUIC scaffold path.
+/// Intentionally lower than the HTTP/1-2 path (100 MB) because this path
+/// buffers the full response in memory. Streaming (ISSUE-108) removes
+/// this limit entirely. Until then, 10 MB matches the request body cap
+/// and prevents excessive memory use per H3 request.
+const MAX_UPSTREAM_RESPONSE: usize = 10 * 1024 * 1024; // 10 MB
 
 /// Timeout for the full upstream round-trip (connect + write + read).
 const UPSTREAM_TIMEOUT_SECS: u64 = 30;

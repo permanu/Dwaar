@@ -24,13 +24,14 @@ rules:
     verbs: ["get", "list", "watch"]
 
   # Read Secrets to load TLS certificates referenced by Ingress rules.
-  # Requires cluster-wide access because Ingresses in any namespace can
-  # reference Secrets. This matches the RBAC model used by nginx-ingress
-  # and Traefik controllers. To limit scope, use --namespace to restrict
-  # the controller to a single namespace, then use a namespaced Role instead.
+  # When watchNamespace is set, secrets access is scoped to that namespace
+  # via a separate Role (see role-secrets.yaml). Cluster-wide access is
+  # only granted when watching all namespaces.
+  {{- if not .Values.controller.watchNamespace }}
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list", "watch"]
+  {{- end }}
 
   # Leader election: create, read, and update Lease objects in kube-system.
   - apiGroups: ["coordination.k8s.io"]
