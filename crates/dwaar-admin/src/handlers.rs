@@ -90,20 +90,23 @@ pub fn list_all_analytics(metrics: &DashMap<String, DomainMetrics>) -> Result<St
 /// Delete a route by domain. Returns the deleted domain or None if not found.
 pub fn delete_route(route_table: &ArcSwap<RouteTable>, domain: &str) -> Option<String> {
     let domain_lower = domain.to_lowercase();
-    let table = route_table.load();
+    let mut existed = false;
 
-    table.resolve(&domain_lower)?;
-
+    // Atomically filter the route inside rcu — the closure may retry on
+    // CAS failure, but the last execution (the one that commits) sets
+    // `existed` to its final correct value.
     route_table.rcu(|current| {
-        let routes: Vec<Route> = current
-            .all_routes()
+        let old_routes = current.all_routes();
+        let old_len = old_routes.len();
+        let routes: Vec<Route> = old_routes
             .into_iter()
             .filter(|r| r.domain != domain_lower)
             .collect();
+        existed = routes.len() < old_len;
         Arc::new(RouteTable::new(routes))
     });
 
-    Some(domain_lower)
+    existed.then_some(domain_lower)
 }
 
 /// Purge a single cache entry by host/path key.
