@@ -56,6 +56,17 @@ pub fn parse_container(inspect: &serde_json::Value) -> Option<ContainerRoute> {
         });
 
     let ip = resolve_container_ip(inspect, &id)?;
+
+    if is_loopback_or_link_local(&ip) {
+        warn!(
+            container_id = %id,
+            upstream_ip = %ip,
+            "container upstream resolves to a loopback or link-local address — skipping \
+             (host-networking containers are not routable from the proxy; use a bridge network)"
+        );
+        return None;
+    }
+
     let upstream = SocketAddr::new(ip, port);
 
     Some(ContainerRoute {
@@ -95,6 +106,16 @@ fn resolve_container_ip(inspect: &serde_json::Value, container_id: &str) -> Opti
 
     // All networks had empty IPs — host networking variant
     Some(IpAddr::from([127, 0, 0, 1]))
+}
+
+/// Returns `true` for addresses that must not be used as public upstreams:
+/// IPv4 loopback (127.0.0.0/8), IPv4 link-local (169.254.0.0/16),
+/// IPv6 loopback (`::1`), and IPv6 link-local (`fe80::/10`).
+fn is_loopback_or_link_local(addr: &IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_link_local(),
+        IpAddr::V6(v6) => v6.is_loopback() || (v6.segments()[0] & 0xffc0) == 0xfe80,
+    }
 }
 
 /// Returns `Ok(Some(ip))` for a valid IP, `Ok(None)` for an empty string
@@ -208,13 +229,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_ip_falls_back_to_localhost() {
+    fn empty_ip_falls_back_to_localhost_and_is_rejected() {
+        // host-networking containers resolve to 127.0.0.1 — must be skipped
         let inspect = make_inspect("example.com", "8080", "");
-        let cr = parse_container(&inspect).expect("should parse");
-        assert_eq!(
-            cr.route.upstream().expect("has upstream").ip().to_string(),
-            "127.0.0.1"
-        );
+        assert!(parse_container(&inspect).is_none());
     }
 
     #[test]
@@ -224,16 +242,25 @@ mod tests {
     }
 
     #[test]
-    fn host_networking_no_networks() {
+    fn host_networking_no_networks_is_rejected() {
+        // empty Networks map also resolves to 127.0.0.1 — must be skipped
         let inspect = json!({
             "Id": "abc123",
             "Config": { "Labels": { "dwaar.domain": "example.com", "dwaar.port": "8080" } },
             "NetworkSettings": { "Networks": {} }
         });
-        let cr = parse_container(&inspect).expect("should parse");
-        assert_eq!(
-            cr.route.upstream().expect("has upstream").ip().to_string(),
-            "127.0.0.1"
-        );
+        assert!(parse_container(&inspect).is_none());
+    }
+
+    #[test]
+    fn loopback_ip_rejected() {
+        let inspect = make_inspect("example.com", "8080", "127.0.0.1");
+        assert!(parse_container(&inspect).is_none());
+    }
+
+    #[test]
+    fn link_local_ip_rejected() {
+        let inspect = make_inspect("example.com", "8080", "169.254.1.1");
+        assert!(parse_container(&inspect).is_none());
     }
 }

@@ -48,7 +48,7 @@ use dwaar_tls::acme::ChallengeSolver;
 use dwaar_tls::acme::issuer::CertIssuer;
 use dwaar_tls::acme::service::TlsBackgroundService;
 use dwaar_tls::cert_store::CertStore;
-use dwaar_tls::sni::{DomainTlsConfig, SniResolver};
+use dwaar_tls::sni::{DomainConfigMap, DomainTlsConfig, SniResolver, domain_config_map_empty};
 
 /// Returned by `fork_workers` to tell the caller whether it is the supervisor
 /// or one of the worker children.
@@ -96,14 +96,41 @@ fn fork_workers(count: usize) -> anyhow::Result<WorkerRole> {
 
     info!(workers = count, "supervisor: all worker processes started");
 
+    // Track worker ID by PID so restarts preserve the logical ID.
+    let mut pid_to_id: std::collections::HashMap<libc::pid_t, usize> =
+        children.iter().enumerate().map(|(i, &p)| (p, i)).collect();
+
+    // Install signal handlers — propagate SIGTERM/SIGINT to workers.
+    // SAFETY: signal handler only sets an atomic flag.
+    unsafe {
+        libc::signal(libc::SIGTERM, handle_shutdown as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGINT, handle_shutdown as *const () as libc::sighandler_t);
+    }
+
+    // Backoff for crash loops.
+    let max_backoff = std::time::Duration::from_secs(30);
+    let crash_window = std::time::Duration::from_secs(5);
+    let stable_run = std::time::Duration::from_secs(30);
+    let mut backoff = std::time::Duration::from_secs(1);
+    let mut worker_started: std::collections::HashMap<libc::pid_t, std::time::Instant> =
+        children.iter().map(|&p| (p, std::time::Instant::now())).collect();
+
     // Supervisor loop — restart any worker that exits.
     loop {
+        if SHUTTING_DOWN.load(std::sync::atomic::Ordering::Relaxed) {
+            info!("supervisor: shutdown signal received, terminating workers");
+            for &pid in &children {
+                // SAFETY: sending SIGTERM to known child PIDs.
+                unsafe { libc::kill(pid, libc::SIGTERM); }
+            }
+            break;
+        }
+
         let mut status: libc::c_int = 0;
         // SAFETY: standard waitpid call; -1 means "any child".
         let exited_pid = unsafe { libc::waitpid(-1, &raw mut status, 0) };
 
         if exited_pid <= 0 {
-            // No more children left to wait for — all workers must have exited.
             break;
         }
 
@@ -115,17 +142,33 @@ fn fork_workers(count: usize) -> anyhow::Result<WorkerRole> {
             "unknown".to_string()
         };
 
+        // Backoff if the worker crashed quickly.
+        if let Some(&start) = worker_started.get(&exited_pid) {
+            if start.elapsed() < crash_window {
+                tracing::warn!(
+                    pid = exited_pid,
+                    reason,
+                    backoff_ms = backoff.as_millis(),
+                    "supervisor: worker crashed quickly — backing off"
+                );
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(max_backoff);
+            } else if start.elapsed() >= stable_run {
+                backoff = std::time::Duration::from_secs(1);
+            }
+        }
+
         tracing::warn!(
             pid = exited_pid,
             reason,
             "supervisor: worker exited — restarting"
         );
 
-        // Remove the dead PID so we can track the new child.
+        // Recover the dead worker's logical ID.
+        let dead_id = pid_to_id.remove(&exited_pid).unwrap_or(children.len());
         children.retain(|&p| p != exited_pid);
+        worker_started.remove(&exited_pid);
 
-        // Restart with a new worker ID derived from slot position.
-        let id = children.len(); // rough slot index for log labelling
         // SAFETY: same single-threaded fork guarantee as above.
         let pid = unsafe { libc::fork() };
         match pid {
@@ -134,15 +177,26 @@ fn fork_workers(count: usize) -> anyhow::Result<WorkerRole> {
                 tracing::error!(error = %err, "supervisor: restart fork failed");
             }
             0 => {
-                return Ok(WorkerRole::Worker(id));
+                return Ok(WorkerRole::Worker(dead_id));
             }
             child_pid => {
                 children.push(child_pid);
+                pid_to_id.insert(child_pid, dead_id);
+                worker_started.insert(child_pid, std::time::Instant::now());
             }
         }
     }
 
     Ok(WorkerRole::Supervisor)
+}
+
+/// Supervisor shutdown flag — set by SIGTERM/SIGINT handler.
+static SHUTTING_DOWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Signal handler for SIGTERM/SIGINT — sets shutdown flag.
+extern "C" fn handle_shutdown(_sig: libc::c_int) {
+    SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn main() -> anyhow::Result<()> {
@@ -202,6 +256,31 @@ fn main() -> anyhow::Result<()> {
         WorkerCount::Auto => cpu_count,
         WorkerCount::Count(n) => n,
     };
+
+    // Generate the UAM secret once here, before any fork, so all worker
+    // processes share the same value. Workers that receive a challenge token
+    // from a sibling can still validate it — without this, each fork would
+    // produce its own secret and tokens would fail across workers.
+    //
+    // We encode as hex and store in the environment so forked children inherit
+    // it automatically via the OS copy-on-write page tables.
+    //
+    // SAFETY: set_var is unsafe in Rust 2024 because it is not thread-safe.
+    // This is called before fork() and before any tokio/Pingora threads exist,
+    // so the process is still strictly single-threaded here.
+    {
+        use rand::Rng;
+        let mut buf = [0u8; 32];
+        rand::rng().fill_bytes(&mut buf);
+        let hex = buf.iter().fold(String::with_capacity(64), |mut s, b| {
+            use std::fmt::Write;
+            let _ = write!(s, "{b:02x}");
+            s
+        });
+        #[allow(unsafe_code)]
+        // SAFETY: see comment above — single-threaded before fork.
+        unsafe { std::env::set_var("DWAAR_UAM_SECRET", &hex) };
+    }
 
     // Single-process mode skips forking — same behavior as before.
     if worker_count <= 1 {
@@ -273,9 +352,9 @@ fn run_server(
     }
     info!(routes = route_table.len(), "route table compiled");
 
-    // Collect upstream pools that have health URIs before wrapping the table.
-    // This must happen before ArcSwap wrapping because collect_pools borrows the table.
-    let health_pools = collect_pools(&route_table);
+    // Collect upstream pools that have health URIs. Wrapped in ArcSwap so
+    // ConfigWatcher can swap in new pools on hot-reload.
+    let health_pools = Arc::new(ArcSwap::from_pointee(collect_pools(&route_table)));
 
     // Capture initial routes before wrapping — DockerWatcher needs a
     // separate snapshot of Dwaarfile routes for merge operations.
@@ -289,8 +368,10 @@ fn run_server(
         Arc::new(ArcSwap::from_pointee(initial_routes));
     let config_notify = Arc::new(tokio::sync::Notify::new());
 
-    let acme_domains = compile_acme_domains(dwaar_config);
-    let challenge_solver = if acme_domains.is_empty() {
+    // ACME domain list — wrapped in ArcSwap so ConfigWatcher can swap in
+    // new domains on hot-reload.
+    let acme_domains = Arc::new(ArcSwap::from_pointee(compile_acme_domains(dwaar_config)));
+    let challenge_solver = if acme_domains.load().is_empty() {
         None
     } else {
         Some(Arc::new(ChallengeSolver::new()))
@@ -328,15 +409,29 @@ fn run_server(
     };
 
     // Build the plugin chain with all built-in plugins, sorted by priority.
-    // Under Attack Mode uses a random secret — in production this should
-    // come from config or environment for persistence across restarts.
+    // The UAM secret is inherited from the supervisor via DWAAR_UAM_SECRET so
+    // all workers share one secret and can validate each other's tokens. If the
+    // env var is absent (e.g. direct invocation in tests) we fall back to a
+    // fresh random secret — acceptable for single-process use.
     let plugin_chain = if cli.plugins_enabled() {
-        let under_attack_secret: Vec<u8> = {
-            use rand::Rng;
-            let mut buf = vec![0u8; 32];
-            rand::rng().fill_bytes(&mut buf);
-            buf
-        };
+        let under_attack_secret: Vec<u8> = std::env::var("DWAAR_UAM_SECRET")
+            .ok()
+            .and_then(|hex| {
+                if hex.len() % 2 != 0 {
+                    tracing::warn!("DWAAR_UAM_SECRET has odd length — ignoring");
+                    return None;
+                }
+                (0..hex.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                use rand::Rng;
+                let mut buf = vec![0u8; 32];
+                rand::rng().fill_bytes(&mut buf);
+                buf
+            });
         Arc::new(dwaar_plugins::plugin::PluginChain::new(vec![
             Box::new(dwaar_plugins::bot_detect::BotDetectPlugin::new()),
             Box::new(dwaar_plugins::under_attack::UnderAttackPlugin::new(
@@ -362,6 +457,8 @@ fn run_server(
     };
 
     // Cache backend (ISSUE-073): find max cache size from all routes, init once.
+    // NOTE: Cache sizing is startup-only — not refreshed on reload.
+    // Tracked in ISSUE-111.
     let cache_backend = if cli.cache_enabled() {
         let max_cache_size = route_table
             .load()
@@ -397,6 +494,10 @@ fn run_server(
         .global_options
         .as_ref()
         .is_some_and(|g| g.h3_enabled);
+
+    // Clone before moving into DwaarProxy — QUIC service needs the same Arcs.
+    let route_table_for_quic = Arc::clone(&route_table);
+    let plugin_chain_for_quic = Arc::clone(&plugin_chain);
 
     let proxy = DwaarProxy::new(
         route_table,
@@ -454,14 +555,19 @@ fn run_server(
 
     let cert_store = Arc::new(CertStore::new("/etc/dwaar/certs", 1000));
 
-    if has_tls_sites(dwaar_config) {
+    // sni_domain_map is shared between SniResolver (which reads it on every
+    // TLS handshake) and ConfigWatcher (which swaps in a new map on reload).
+    // When TLS is disabled the map stays empty and is never written to.
+    let sni_domain_map: DomainConfigMap = if has_tls_sites(dwaar_config) {
         setup_tls_listener(
             dwaar_config,
             &mut proxy_service,
             &cert_store,
             worker_count > 1,
-        )?;
-    }
+        )?
+    } else {
+        domain_config_map_empty()
+    };
 
     server.add_service(proxy_service);
 
@@ -476,6 +582,9 @@ fn run_server(
                 quic_addr,
                 &tls_cfg.cert_path,
                 &tls_cfg.key_path,
+                route_table_for_quic,
+                plugin_chain_for_quic,
+                None, // max_streams — use default (100)
             ) {
                 Ok(quic_service) => {
                     let quic_bg = pingora_core::services::background::background_service(
@@ -524,32 +633,38 @@ fn run_server(
 
     let mut admin_listening =
         pingora_core::services::listening::Service::new("admin API".to_string(), admin_service);
-    admin_listening.add_tcp("127.0.0.1:6190");
 
-    if let Some(ref socket_path) = cli.admin_socket {
-        let path_str = socket_path
-            .to_str()
-            .context("admin socket path must be valid UTF-8")?;
+    // Only worker 0 binds the admin listeners. Other workers must not attempt
+    // to bind the same TCP port or UDS path — there is no SO_REUSEPORT here,
+    // so every additional bind races to EADDRINUSE or corrupts the socket file.
+    if worker_id == 0 {
+        admin_listening.add_tcp("127.0.0.1:6190");
 
-        // Stale socket cleanup — a leftover file from a crash blocks bind
-        match std::fs::remove_file(socket_path) {
-            Ok(()) => tracing::debug!("removed stale admin socket"),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => bail!("cannot remove stale admin socket {path_str}: {e}"),
+        if let Some(ref socket_path) = cli.admin_socket {
+            let path_str = socket_path
+                .to_str()
+                .context("admin socket path must be valid UTF-8")?;
+
+            // Stale socket cleanup — a leftover file from a crash blocks bind
+            match std::fs::remove_file(socket_path) {
+                Ok(()) => tracing::debug!("removed stale admin socket"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => bail!("cannot remove stale admin socket {path_str}: {e}"),
+            }
+
+            admin_listening.add_uds(path_str, Some(Permissions::from_mode(0o600)));
+            info!(socket = path_str, "admin API UDS listener registered");
         }
 
-        admin_listening.add_uds(path_str, Some(Permissions::from_mode(0o660)));
-        info!(socket = path_str, "admin API UDS listener registered");
+        info!(listen = "127.0.0.1:6190", "admin API registered");
     }
 
     server.add_service(admin_listening);
-    info!(listen = "127.0.0.1:6190", "admin API registered");
 
     register_background_services(
         &mut server,
         cli,
         challenge_solver.as_ref(),
-        &acme_domains,
         &cert_store,
         log_receiver,
         config_path,
@@ -562,7 +677,9 @@ fn run_server(
         &route_table_for_agg,
         &agg_metrics,
         health_pools,
+        acme_domains,
         drain_timeout,
+        sni_domain_map,
     );
 
     info!("entering run loop, waiting for connections or signals");
@@ -574,7 +691,6 @@ fn register_background_services(
     server: &mut Server,
     cli: &Cli,
     challenge_solver: Option<&Arc<ChallengeSolver>>,
-    acme_domains: &[String],
     cert_store: &Arc<CertStore>,
     log_receiver: Option<dwaar_log::LogReceiver>,
     config_path: &std::path::Path,
@@ -586,13 +702,16 @@ fn register_background_services(
     agg_receiver: Option<aggregation::AggReceiver>,
     route_table_for_agg: &Arc<ArcSwap<dwaar_core::route::RouteTable>>,
     agg_metrics: &Arc<DashMap<String, dwaar_analytics::aggregation::DomainMetrics>>,
-    health_pools: Vec<Arc<dwaar_core::upstream::UpstreamPool>>,
+    health_pools: Arc<ArcSwap<Vec<Arc<dwaar_core::upstream::UpstreamPool>>>>,
+    acme_domains: Arc<ArcSwap<Vec<String>>>,
     drain_timeout: std::time::Duration,
+    sni_domain_map: DomainConfigMap,
 ) {
-    // Upstream health checker — only registered when there are pools with health URIs.
-    // Per Guardrail #20: all async background work must be a BackgroundService.
-    if !health_pools.is_empty() {
-        let checker = dwaar_core::upstream::HealthChecker::new(health_pools);
+    // Upstream health checker — runs as a BackgroundService (Guardrail #20).
+    // Always registered; it will sleep if the pool list is empty and wake up
+    // when pools are swapped in via hot-reload.
+    {
+        let checker = dwaar_core::upstream::HealthChecker::new(Arc::clone(&health_pools));
         let health_bg =
             pingora_core::services::background::background_service("health checker", checker);
         server.add_service(health_bg);
@@ -608,7 +727,7 @@ fn register_background_services(
             Arc::clone(cert_store),
         ));
         let tls_service = TlsBackgroundService::new(
-            acme_domains.to_vec(),
+            Arc::clone(&acme_domains),
             "/etc/dwaar/certs",
             issuer,
             Arc::clone(cert_store),
@@ -620,7 +739,7 @@ fn register_background_services(
         );
         server.add_service(bg);
         info!(
-            domains = acme_domains.len(),
+            domains = acme_domains.load().len(),
             "TLS background service registered"
         );
     }
@@ -645,7 +764,10 @@ fn register_background_services(
         initial_hash,
     )
     .with_drain_timeout(drain_timeout)
-    .with_reload_notify(Arc::clone(config_notify));
+    .with_reload_notify(Arc::clone(config_notify))
+    .with_sni_domain_map(sni_domain_map)
+    .with_health_pools(health_pools)
+    .with_acme_domains(acme_domains);
     let config_watcher = if cli.docker_socket.is_some() {
         config_watcher.with_docker_mode(Arc::clone(dwaarfile_snapshot), Arc::clone(config_notify))
     } else {
@@ -745,7 +867,7 @@ fn setup_tls_listener(
     >,
     cert_store: &Arc<CertStore>,
     use_reuseport: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<DomainConfigMap> {
     let tls_configs = compile_tls_configs(config);
 
     let mut sni_resolver = SniResolver::new(Arc::clone(cert_store));
@@ -764,6 +886,11 @@ fn setup_tls_listener(
         );
         info!(domain, cert = %tls_config.cert_path.display(), "TLS cert registered");
     }
+
+    // Keep a handle to the shared domain-config map before moving the resolver
+    // into Pingora's TLS machinery.  ConfigWatcher holds a clone of this Arc
+    // so it can swap in new explicit cert paths on hot-reload.
+    let sni_domain_map = sni_resolver.shared_domain_map();
 
     let mut tls_settings = TlsSettings::with_callbacks(Box::new(sni_resolver))
         .context("failed to create TLS settings")?;
@@ -795,7 +922,7 @@ fn setup_tls_listener(
         protocol = "https",
         "TLS listener registered"
     );
-    Ok(())
+    Ok(sni_domain_map)
 }
 
 fn fmt_config(path: &std::path::Path, check: bool) -> anyhow::Result<()> {
@@ -1063,6 +1190,32 @@ fn cmd_upgrade(binary: Option<&std::path::Path>, pid_file: &std::path::Path) -> 
         bail!("binary not found: {}", binary_path.display());
     }
 
+    // Verify PID file is owned by us and not world-writable to prevent
+    // an attacker from substituting an arbitrary PID.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(pid_file)
+            .with_context(|| format!("cannot stat PID file: {}", pid_file.display()))?;
+        // SAFETY: getuid returns the real user ID of the calling process.
+        #[allow(unsafe_code)]
+        let uid = unsafe { libc::getuid() };
+        if meta.uid() != uid {
+            bail!(
+                "PID file {} is owned by UID {} (expected {})",
+                pid_file.display(),
+                meta.uid(),
+                uid
+            );
+        }
+        if meta.mode() & 0o002 != 0 {
+            bail!(
+                "PID file {} is world-writable — refusing to trust its contents",
+                pid_file.display()
+            );
+        }
+    }
+
     // Read the PID of the old process
     let pid_str = std::fs::read_to_string(pid_file)
         .with_context(|| format!("cannot read PID file: {}", pid_file.display()))?;
@@ -1073,34 +1226,42 @@ fn cmd_upgrade(binary: Option<&std::path::Path>, pid_file: &std::path::Path) -> 
 
     writeln!(out, "upgrading dwaar (old PID: {old_pid})")?;
 
-    // Collect the arguments the new process should use — same config as old
-    // but with --upgrade to trigger Pingora's FD transfer.
-    let mut args: Vec<String> = std::env::args().collect();
-    // Remove "upgrade" subcommand and its arguments from the args
-    // The new process should run in server mode with --upgrade
-    args.truncate(1); // Keep just the binary name placeholder
-    args[0] = binary_path.display().to_string();
-    args.push("--upgrade".to_string());
+    // Preserve original CLI args (--config, --workers, etc.) for the new process.
+    let original_args: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|a| a != "upgrade" && a != "--upgrade")
+        .collect();
 
     writeln!(
         out,
-        "starting new process: {} --upgrade",
-        binary_path.display()
+        "starting new process: {} --upgrade {}",
+        binary_path.display(),
+        original_args.join(" ")
     )?;
 
     let child = std::process::Command::new(&binary_path)
         .arg("--upgrade")
+        .args(&original_args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
         .spawn()
         .with_context(|| format!("failed to start new process: {}", binary_path.display()))?;
 
-    writeln!(out, "new process started (PID: {})", child.id())?;
+    let new_pid = child.id().cast_signed();
+    writeln!(out, "new process started (PID: {new_pid})")?;
 
-    // Give the new process time to connect to the upgrade socket and
-    // receive file descriptors before we signal the old process.
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    // Poll for up to 10 seconds to verify new process is running.
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let mut status: libc::c_int = 0;
+        // SAFETY: checking if child is still alive via non-blocking waitpid.
+        #[allow(unsafe_code)]
+        let result = unsafe { libc::waitpid(new_pid, &raw mut status, libc::WNOHANG) };
+        if result != 0 {
+            anyhow::bail!("new process (PID {new_pid}) exited before becoming ready");
+        }
+    }
 
     // Send SIGQUIT to the old process for graceful shutdown.
     // SIGQUIT triggers Pingora's graceful drain — it stops accepting new

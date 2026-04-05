@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "dwaar-ingress.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "dwaar-ingress.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "dwaar-ingress.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.httpPort }}
+      targetPort: {{ .Values.service.httpTargetPort | default .Values.service.httpPort }}
+      protocol: TCP
+    - name: https
+      port: {{ .Values.service.httpsPort }}
+      targetPort: {{ .Values.service.httpsTargetPort | default .Values.service.httpsPort }}
+      protocol: TCP

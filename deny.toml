@@ -8,7 +8,7 @@ ignore = [
     "RUSTSEC-2025-0069",  # daemonize unmaintained — Pingora dep
     "RUSTSEC-2024-0388",  # derivative unmaintained — Pingora dep
     "RUSTSEC-2024-0384",  # instant unmaintained — Pingora transitive
-    "RUSTSEC-2024-0437",  # protobuf recursion — Pingora tracing dep
+    "RUSTSEC-2024-0437",  # protobuf recursion DoS — transitive dep via Pingora's tracing-opentelemetry; not directly exposed to untrusted input. Dwaar does not parse protobuf from client requests.
     "RUSTSEC-2025-0134",  # rustls-pemfile unmaintained — used for QUIC cert loading
 ]
 

@@ -179,7 +179,7 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
                 log_append_fields: compile_log_append(&site.directives, &var_registry),
                 log_name: find_log_name(&site.directives),
                 handler: Handler::FileServer {
-                    root: root_path,
+                    root: root_path.canonicalize().unwrap_or(root_path),
                     browse: fs_directive.browse,
                 },
                 intercepts: intercepts.clone(),
@@ -509,7 +509,7 @@ fn compile_single_block(
         let root_path = find_root(inner_directives)
             .map_or_else(|| PathBuf::from("."), |r| PathBuf::from(&r.path));
         Handler::FileServer {
-            root: root_path,
+            root: root_path.canonicalize().unwrap_or(root_path),
             browse: fs.browse,
         }
     } else if let Some(fcgi) = find_php_fastcgi(inner_directives) {
@@ -553,6 +553,19 @@ fn compile_forward_auth(directives: &[Directive]) -> Option<std::sync::Arc<Forwa
     })?;
 
     let upstream = resolve_upstream(std::slice::from_ref(&fa.upstream))?;
+
+    // Preserve the original hostname for TLS SNI when the upstream was
+    // specified as a DNS name (e.g. `authelia:9091`). Without this, the
+    // TLS client would use the resolved IP as SNI, and hostname-based
+    // certificates would fail verification.
+    let sni_hostname = match &fa.upstream {
+        UpstreamAddr::HostPort(hp) => {
+            let host = hp.split(':').next().unwrap_or(hp);
+            Some(CompactString::from(host))
+        }
+        UpstreamAddr::SocketAddr(_) => None,
+    };
+
     let auth_uri = fa
         .uri
         .as_deref()
@@ -567,6 +580,8 @@ fn compile_forward_auth(directives: &[Directive]) -> Option<std::sync::Arc<Forwa
         upstream,
         auth_uri,
         copy_headers,
+        tls: fa.tls,
+        sni_hostname,
     }))
 }
 
@@ -746,15 +761,19 @@ fn find_response_body_limit(directives: &[Directive]) -> Option<u64> {
 }
 
 /// Resolve the first usable upstream address from the list.
+///
+/// `to_socket_addrs` is a blocking syscall (getaddrinfo). We call this from
+/// the hot-reload path which runs on the tokio runtime, so we use
+/// `block_in_place` to avoid starving other async tasks during DNS lookups.
 fn resolve_upstream(upstreams: &[UpstreamAddr]) -> Option<SocketAddr> {
     for upstream in upstreams {
         match upstream {
             UpstreamAddr::SocketAddr(addr) => return Some(*addr),
             UpstreamAddr::HostPort(hp) => {
-                // DNS resolution — try to resolve host:port to a socket address
-                if let Ok(mut addrs) = hp.to_socket_addrs()
-                    && let Some(addr) = addrs.next()
-                {
+                let hp_clone = hp.clone();
+                let result =
+                    tokio::task::block_in_place(|| hp_clone.to_socket_addrs().ok()?.next());
+                if let Some(addr) = result {
                     return Some(addr);
                 }
                 warn!(upstream = %hp, "DNS resolution failed for upstream");
@@ -765,18 +784,22 @@ fn resolve_upstream(upstreams: &[UpstreamAddr]) -> Option<SocketAddr> {
 }
 
 /// Resolve all upstreams in the list, logging and skipping unresolvable entries.
+///
+/// Each `to_socket_addrs` call is a blocking syscall wrapped in `block_in_place`
+/// so the tokio executor stays responsive during config compilation.
 fn resolve_all_upstreams(upstreams: &[UpstreamAddr]) -> Vec<SocketAddr> {
     upstreams
         .iter()
         .filter_map(|u| match u {
             UpstreamAddr::SocketAddr(addr) => Some(*addr),
             UpstreamAddr::HostPort(hp) => {
-                if let Some(addr) = hp.to_socket_addrs().ok().and_then(|mut i| i.next()) {
-                    Some(addr)
-                } else {
+                let hp_clone = hp.clone();
+                let addr =
+                    tokio::task::block_in_place(|| hp_clone.to_socket_addrs().ok()?.next());
+                if addr.is_none() {
                     warn!(upstream = %hp, "DNS resolution failed for upstream, skipping");
-                    None
                 }
+                addr
             }
         })
         .collect()

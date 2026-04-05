@@ -96,9 +96,10 @@ impl ScaleToZeroConfig {
                 match result {
                     Ok(()) => {
                         self.state.store(STATE_READY, Ordering::Release);
-                        self.notify.notify_waiters();
-                        // Reset to idle for the next cold start cycle.
+                        // Reset to idle BEFORE notifying — prevents woken waiters
+                        // from seeing stale READY on the fast path.
                         self.state.store(STATE_IDLE, Ordering::Release);
+                        self.notify.notify_waiters();
                         Ok(())
                     }
                     Err(e) => {

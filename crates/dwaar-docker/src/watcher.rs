@@ -298,17 +298,23 @@ impl BackgroundService for DockerWatcher {
             match self.run_loop(&shutdown).await {
                 Ok(()) => return, // clean shutdown
                 Err(e) => {
+                    // Add up to 500 ms of random jitter so multiple watcher
+                    // instances don't all hammer the daemon socket simultaneously
+                    // after a shared failure.
+                    let jitter = Duration::from_millis(fastrand::u64(0..=500));
+                    let delay = backoff + jitter;
+
                     error!(
                         error = %e,
-                        backoff_secs = backoff.as_secs(),
+                        backoff_secs = delay.as_secs_f32(),
                         "Docker watcher error, reconnecting"
                     );
 
-                    // Wait for backoff or shutdown, whichever comes first
+                    // Wait for backoff (+ jitter) or shutdown, whichever comes first
                     tokio::select! {
                         biased;
                         () = shutdown_signal(&shutdown) => return,
-                        () = tokio::time::sleep(backoff) => {}
+                        () = tokio::time::sleep(delay) => {}
                     }
 
                     backoff = (backoff * 2).min(max_backoff);

@@ -345,6 +345,10 @@ pub enum Directive {
 
     /// `acme_server` — internal ACME CA server (not yet implemented).
     AcmeServer(RecognizedDirective),
+
+    // ── ISSUE-101: WASM plugin directive ─────────────────────────────────────
+    /// `wasm_plugin /path/to/plugin.wasm { priority 50; fuel 1000000; ... }`
+    WasmPlugin(WasmPluginDirective),
 }
 
 /// `cache { max_size 1g; match_path /static/* /assets/*; default_ttl 3600; stale_while_revalidate 60 }`
@@ -714,6 +718,8 @@ pub struct ForwardAuthDirective {
     pub uri: Option<String>,
     /// Headers to copy from auth response to upstream request.
     pub copy_headers: Vec<String>,
+    /// Use TLS when connecting to the auth service (`transport tls`).
+    pub tls: bool,
 }
 
 /// `root` — set the filesystem root for `file_server`.
@@ -872,6 +878,46 @@ pub struct CopyResponseHeadersDirective {
 pub struct RecognizedDirective {
     /// Positional arguments after the directive name.
     pub args: Vec<String>,
+}
+
+/// `wasm_plugin /path/to/plugin.wasm { priority 50; fuel 1000000; memory 16; timeout 50; config k=v }`
+///
+/// Registers a WASM plugin that participates in the proxy request lifecycle.
+/// Plugins are executed in `priority` order (lower = earlier). Resource limits
+/// default to safe values when omitted; any combination may be specified.
+///
+/// # Example
+///
+/// ```text
+/// wasm_plugin /plugins/rate_shape.wasm {
+///     priority 50
+///     fuel 1000000
+///     memory 16
+///     timeout 50
+///     config key1=value1
+///     config key2=value2
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmPluginDirective {
+    /// Filesystem path to the `.wasm` binary (absolute or relative to the Dwaarfile).
+    pub module_path: String,
+
+    /// Execution priority — lower values run first. Must be 1–65535.
+    pub priority: u16,
+
+    /// Instruction budget per hook call. `None` defaults to 1,000,000.
+    pub fuel: Option<u64>,
+
+    /// Linear memory cap in MiB. `None` defaults to 16 MiB.
+    pub memory_mb: Option<u32>,
+
+    /// Wall-clock deadline per hook call in milliseconds. `None` defaults to 50 ms.
+    pub timeout_ms: Option<u64>,
+
+    /// Opaque key=value pairs forwarded to the plugin as startup configuration.
+    /// Plugins receive these via the host API during initialisation.
+    pub config: Vec<(String, String)>,
 }
 
 impl DwaarConfig {

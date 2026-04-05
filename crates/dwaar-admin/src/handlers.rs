@@ -13,7 +13,7 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use dwaar_analytics::aggregation::DomainMetrics;
 use dwaar_analytics::aggregation::snapshot::AnalyticsSnapshot;
-use dwaar_core::route::{Route, RouteTable, is_valid_domain};
+use dwaar_core::route::{Route, RouteTable, is_valid_route_key};
 use serde::Deserialize;
 
 /// Request body for `POST /routes`.
@@ -22,6 +22,10 @@ pub struct CreateRouteRequest {
     pub domain: String,
     pub upstream: String,
     pub tls: bool,
+    /// Which component owns this route (e.g. "dwaar-ingress").
+    /// Used by reconcilers to identify their own routes.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 /// Build the health check response body.
@@ -42,7 +46,7 @@ pub fn add_route(route_table: &ArcSwap<RouteTable>, body: &[u8]) -> Result<Strin
     let req: CreateRouteRequest =
         serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))?;
 
-    if !is_valid_domain(&req.domain) {
+    if !is_valid_route_key(&req.domain) {
         return Err(format!("invalid domain: {}", req.domain));
     }
 
@@ -51,7 +55,7 @@ pub fn add_route(route_table: &ArcSwap<RouteTable>, body: &[u8]) -> Result<Strin
         .parse()
         .map_err(|e| format!("invalid upstream address: {e}"))?;
 
-    let route = Route::new(&req.domain, upstream, req.tls, None);
+    let route = Route::with_source(&req.domain, upstream, req.tls, None, req.source);
 
     route_table.rcu(|current| {
         let mut routes = current.all_routes();
@@ -86,20 +90,23 @@ pub fn list_all_analytics(metrics: &DashMap<String, DomainMetrics>) -> Result<St
 /// Delete a route by domain. Returns the deleted domain or None if not found.
 pub fn delete_route(route_table: &ArcSwap<RouteTable>, domain: &str) -> Option<String> {
     let domain_lower = domain.to_lowercase();
-    let table = route_table.load();
+    let mut existed = false;
 
-    table.resolve(&domain_lower)?;
-
+    // Atomically filter the route inside rcu — the closure may retry on
+    // CAS failure, but the last execution (the one that commits) sets
+    // `existed` to its final correct value.
     route_table.rcu(|current| {
-        let routes: Vec<Route> = current
-            .all_routes()
+        let old_routes = current.all_routes();
+        let old_len = old_routes.len();
+        let routes: Vec<Route> = old_routes
             .into_iter()
             .filter(|r| r.domain != domain_lower)
             .collect();
+        existed = routes.len() < old_len;
         Arc::new(RouteTable::new(routes))
     });
 
-    Some(domain_lower)
+    existed.then_some(domain_lower)
 }
 
 /// Purge a single cache entry by host/path key.

@@ -12,6 +12,7 @@
 //! only runs during background cert provisioning, never on the hot path.
 
 use async_trait::async_trait;
+use tokio::io::AsyncWriteExt as _;
 use tracing::{debug, warn};
 
 use crate::dns::{DnsError, DnsProvider};
@@ -32,6 +33,51 @@ impl CloudflareDnsProvider {
         Self {
             api_token: api_token.into(),
         }
+    }
+
+    /// Run a curl command with the auth token passed via stdin, never via argv.
+    ///
+    /// The `-H @-` flag tells curl to read one extra header line from stdin.
+    /// This keeps the token out of the process argument list (visible via `ps aux`).
+    /// `--connect-timeout` and `--max-time` guard against hung connections
+    /// during background cert provisioning.
+    async fn run_curl(&self, args: &[&str]) -> Result<Vec<u8>, DnsError> {
+        use std::process::Stdio;
+
+        let mut child = tokio::process::Command::new("curl")
+            .args(args)
+            .args(["--connect-timeout", "10", "--max-time", "30"])
+            // Read one extra header line from stdin so the token never appears in argv
+            .args(["-H", "@-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| DnsError::ApiRequest(format!("curl failed to start: {e}")))?;
+
+        // Write the auth header to the child's stdin, then close it
+        if let Some(mut stdin) = child.stdin.take() {
+            let header = format!("Authorization: Bearer {}\n", self.api_token);
+            stdin
+                .write_all(header.as_bytes())
+                .await
+                .map_err(|e| DnsError::ApiRequest(format!("curl stdin write failed: {e}")))?;
+        }
+
+        let out = child
+            .wait_with_output()
+            .await
+            .map_err(|e| DnsError::ApiRequest(format!("curl failed: {e}")))?;
+
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(DnsError::ApiRequest(format!(
+                "curl exited with {}: {}",
+                out.status, stderr
+            )));
+        }
+
+        Ok(out.stdout)
     }
 
     /// Look up the Cloudflare zone ID for a domain by walking up the labels.
@@ -65,27 +111,10 @@ impl CloudflareDnsProvider {
     async fn try_zone_lookup(&self, name: &str) -> Result<Option<String>, DnsError> {
         let url = format!("{CF_API_BASE}/zones?name={name}&status=active");
 
-        let output = tokio::process::Command::new("curl")
-            .args([
-                "-s",
-                "-H",
-                &format!("Authorization: Bearer {}", self.api_token),
-                "-H",
-                "Content-Type: application/json",
-                &url,
-            ])
-            .output()
-            .await
-            .map_err(|e| DnsError::ApiRequest(format!("curl failed: {e}")))?;
-
-        let body = String::from_utf8_lossy(&output.stdout);
-
-        if !output.status.success() {
-            return Err(DnsError::ApiRequest(format!(
-                "curl exited with {}: {}",
-                output.status, body
-            )));
-        }
+        let stdout = self
+            .run_curl(&["-s", "-H", "Content-Type: application/json", &url])
+            .await?;
+        let body = String::from_utf8_lossy(&stdout);
 
         // Parse minimal JSON to extract zone ID. We use serde_json to avoid
         // adding another dependency.
@@ -127,25 +156,21 @@ impl CloudflareDnsProvider {
             "content": value,
             "ttl": 120
         });
+        let payload_str = payload.to_string();
 
-        let output = tokio::process::Command::new("curl")
-            .args([
+        let stdout = self
+            .run_curl(&[
                 "-s",
                 "-X",
                 "POST",
                 "-H",
-                &format!("Authorization: Bearer {}", self.api_token),
-                "-H",
                 "Content-Type: application/json",
                 "-d",
-                &payload.to_string(),
+                &payload_str,
                 &url,
             ])
-            .output()
-            .await
-            .map_err(|e| DnsError::ApiRequest(format!("curl failed: {e}")))?;
-
-        let body = String::from_utf8_lossy(&output.stdout);
+            .await?;
+        let body = String::from_utf8_lossy(&stdout);
 
         let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
             DnsError::ApiRequest(format!("failed to parse Cloudflare response: {e}"))
@@ -170,22 +195,17 @@ impl CloudflareDnsProvider {
     async fn delete_record(&self, zone_id: &str, record_id: &str) -> Result<(), DnsError> {
         let url = format!("{CF_API_BASE}/zones/{zone_id}/dns_records/{record_id}");
 
-        let output = tokio::process::Command::new("curl")
-            .args([
+        let stdout = self
+            .run_curl(&[
                 "-s",
                 "-X",
                 "DELETE",
                 "-H",
-                &format!("Authorization: Bearer {}", self.api_token),
-                "-H",
                 "Content-Type: application/json",
                 &url,
             ])
-            .output()
-            .await
-            .map_err(|e| DnsError::ApiRequest(format!("curl failed: {e}")))?;
-
-        let body = String::from_utf8_lossy(&output.stdout);
+            .await?;
+        let body = String::from_utf8_lossy(&stdout);
 
         let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
             DnsError::ApiRequest(format!("failed to parse Cloudflare response: {e}"))

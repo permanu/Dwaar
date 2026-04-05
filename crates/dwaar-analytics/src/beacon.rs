@@ -7,10 +7,29 @@
 //! Beacon collection — parses and enriches analytics events from the
 //! client-side JavaScript beacon sent to `/_dwaar/collect`.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+/// Anonymize an IP address for GDPR compliance.
+/// IPv4: mask to /24 (zero last octet). IPv6: mask to /48 (zero last 80 bits).
+pub fn anonymize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(v4) => {
+            let mut octets = v4.octets();
+            octets[3] = 0;
+            IpAddr::V4(Ipv4Addr::from(octets))
+        }
+        IpAddr::V6(v6) => {
+            let mut segments = v6.segments();
+            for s in &mut segments[3..] {
+                *s = 0;
+            }
+            IpAddr::V6(Ipv6Addr::from(segments))
+        }
+    }
+}
 
 /// Maximum beacon body size in bytes. Rejects payloads larger than this
 /// to prevent memory exhaustion from oversized POSTs.
@@ -85,7 +104,7 @@ impl BeaconEvent {
             cls: raw.cls,
             inp_ms: raw.inp,
             time_on_page_ms: raw.tp,
-            client_ip,
+            client_ip: anonymize_ip(client_ip),
             country: None, // Populated by GeoIP in ISSUE-034
             is_bot: false, // Populated by bot detection in ISSUE-030
             host,
@@ -187,7 +206,8 @@ mod tests {
         };
         let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
         let event = BeaconEvent::from_raw(raw, ip, "example.com".to_string());
-        assert_eq!(event.client_ip, ip);
+        // IP is anonymized to /24 — last octet zeroed
+        assert_eq!(event.client_ip, IpAddr::V4(Ipv4Addr::new(1, 2, 3, 0)));
         assert_eq!(event.host, "example.com");
         assert!(!event.is_bot);
         assert!(event.country.is_none());

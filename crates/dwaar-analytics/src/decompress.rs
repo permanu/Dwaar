@@ -48,6 +48,11 @@ impl Encoding {
 /// 10 MB is generous for HTML responses (injection only applies to HTML).
 const MAX_BUFFER_SIZE: usize = 10 * 1024 * 1024;
 
+/// Max decompressed output size — prevents decompression bombs where a small
+/// compressed payload expands to gigabytes. 100 MB matches Guardrail #28's
+/// response body cap.
+const MAX_DECOMPRESSED_SIZE: usize = 100 * 1024 * 1024;
+
 /// Streaming decompressor for response body chunks.
 ///
 /// Buffers compressed data internally and attempts decompression on each
@@ -156,6 +161,9 @@ impl Decompressor {
     }
 
     /// Decompress a byte slice using the configured encoding.
+    ///
+    /// Output is capped at [`MAX_DECOMPRESSED_SIZE`] to prevent
+    /// decompression bombs (small compressed input expanding to gigabytes).
     fn decompress_bytes(&self, data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
         if data.is_empty() {
             return Ok(Vec::new());
@@ -163,24 +171,42 @@ impl Decompressor {
 
         match self.encoding {
             Encoding::Gzip => {
-                let mut decoder = GzDecoder::new(data);
-                let mut output = Vec::new();
-                decoder.read_to_end(&mut output)?;
-                Ok(output)
+                let decoder = GzDecoder::new(data);
+                read_bounded(decoder)
             }
             Encoding::Deflate => {
-                let mut decoder = DeflateDecoder::new(data);
-                let mut output = Vec::new();
-                decoder.read_to_end(&mut output)?;
-                Ok(output)
+                let decoder = DeflateDecoder::new(data);
+                read_bounded(decoder)
             }
             Encoding::Brotli => {
-                let mut output = Vec::new();
-                brotli::BrotliDecompress(&mut std::io::Cursor::new(data), &mut output)?;
-                Ok(output)
+                let cursor = std::io::Cursor::new(data);
+                let decoder = brotli::Decompressor::new(cursor, 4096);
+                read_bounded(decoder)
             }
         }
     }
+}
+
+/// Read from a decoder into a `Vec<u8>`, aborting if the output exceeds
+/// [`MAX_DECOMPRESSED_SIZE`]. Prevents decompression bombs from consuming
+/// unbounded memory.
+fn read_bounded<R: Read>(mut reader: R) -> Result<Vec<u8>, std::io::Error> {
+    let mut output = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        if output.len() + n > MAX_DECOMPRESSED_SIZE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "decompressed output exceeds MAX_DECOMPRESSED_SIZE",
+            ));
+        }
+        output.extend_from_slice(&buf[..n]);
+    }
+    Ok(output)
 }
 
 #[cfg(test)]

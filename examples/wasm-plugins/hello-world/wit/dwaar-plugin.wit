@@ -1,0 +1,60 @@
+// Dwaar WASM Plugin Interface
+//
+// WASM plugins implement this interface to hook into Dwaar's request lifecycle.
+// Each hook corresponds to one of the three proxy phases: request, response, body.
+
+package dwaar:plugin@0.1.0;
+
+/// Per-request context passed to every plugin hook.
+///
+/// Populated by the proxy engine before the plugin chain runs. Strings are
+/// passed as values (not references) because WASM memory is isolated — the host
+/// copies data in when calling, then reads mutations out when the call returns.
+world dwaar-plugin {
+    /// The action a plugin hook returns to control chain execution.
+    enum plugin-action {
+        /// Pass control to the next plugin in the chain.
+        continue,
+        /// Stop the chain and return a synthetic response (status embedded via
+        /// the out-param channel — future; for now plugins return 503 on stop).
+        respond,
+        /// Stop the chain but continue normal proxy flow (no response sent).
+        skip,
+    }
+
+    /// An HTTP header name/value pair.
+    record header-entry {
+        name: string,
+        value: string,
+    }
+
+    /// Snapshot of the inbound request, passed to on-request.
+    record request-info {
+        method: string,
+        path: string,
+        /// Raw headers — all names lowercased for uniform matching.
+        headers: list<header-entry>,
+        /// True when the downstream connection used TLS.
+        is-tls: bool,
+        /// Client IP as a string (empty if unavailable).
+        client-ip: string,
+    }
+
+    /// Snapshot of the upstream response, passed to on-response.
+    record response-info {
+        status: u16,
+        headers: list<header-entry>,
+    }
+
+    /// Called during request_filter(). Inspect request headers, return the
+    /// desired action. Use `respond` to short-circuit with an error.
+    export on-request: func(req: request-info) -> plugin-action;
+
+    /// Called during response_filter(). Inspect or modify response headers.
+    /// Returning `respond` or `skip` both stop the chain.
+    export on-response: func(resp: response-info) -> plugin-action;
+
+    /// Called during response_body_filter() for each body chunk.
+    /// `eos` is true on the final chunk.
+    export on-body: func(eos: bool) -> plugin-action;
+}

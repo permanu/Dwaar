@@ -1,0 +1,38 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "dwaar-ingress.fullname" . }}
+  labels:
+    {{- include "dwaar-ingress.labels" . | nindent 4 }}
+rules:
+  # Read and watch Ingress resources and update their status.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses/status"]
+    verbs: ["update", "patch"]
+
+  # Read IngressClass resources to identify which class this controller owns.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingressclasses"]
+    verbs: ["get", "list", "watch"]
+
+  # Read Services to resolve upstream addresses for each Ingress backend.
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch"]
+
+  # Read Secrets to load TLS certificates referenced by Ingress rules.
+  # Requires cluster-wide access because Ingresses in any namespace can
+  # reference Secrets. This matches the RBAC model used by nginx-ingress
+  # and Traefik controllers. To limit scope, use --namespace to restrict
+  # the controller to a single namespace, then use a namespaced Role instead.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+
+  # Leader election: create, read, and update Lease objects in kube-system.
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]

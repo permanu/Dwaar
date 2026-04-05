@@ -1695,3 +1695,120 @@ fn servers_block_unknown_keys_skipped() {
     let opts = config.global_options.as_ref().expect("has global options");
     assert!(opts.h3_enabled);
 }
+
+// ── ISSUE-101: wasm_plugin directive ────────────────────────────────────────
+
+/// Parse a `wasm_plugin` directive with all optional fields specified.
+#[test]
+fn parse_wasm_plugin_all_fields() {
+    let config = parse(
+        "example.com {
+            wasm_plugin /plugins/shape.wasm {
+                priority 75
+                fuel 500000
+                memory 8
+                timeout 25
+                config region=eu-west
+                config tier=pro
+            }
+        }",
+    )
+    .expect("should parse");
+
+    let Directive::WasmPlugin(ref wp) = config.sites[0].directives[0] else {
+        panic!("expected WasmPlugin directive");
+    };
+    assert_eq!(wp.module_path, "/plugins/shape.wasm");
+    assert_eq!(wp.priority, 75);
+    assert_eq!(wp.fuel, Some(500_000));
+    assert_eq!(wp.memory_mb, Some(8));
+    assert_eq!(wp.timeout_ms, Some(25));
+    assert_eq!(
+        wp.config,
+        vec![
+            ("region".to_string(), "eu-west".to_string()),
+            ("tier".to_string(), "pro".to_string()),
+        ]
+    );
+}
+
+/// Parse a minimal `wasm_plugin` — path only, no block. Defaults applied.
+#[test]
+fn parse_wasm_plugin_minimal() {
+    let config = parse(
+        "example.com {
+            wasm_plugin /plugins/simple.wasm
+        }",
+    )
+    .expect("should parse");
+
+    let Directive::WasmPlugin(ref wp) = config.sites[0].directives[0] else {
+        panic!("expected WasmPlugin directive");
+    };
+    assert_eq!(wp.module_path, "/plugins/simple.wasm");
+    // Default priority 50 when block is omitted.
+    assert_eq!(wp.priority, 50);
+    assert!(wp.fuel.is_none());
+    assert!(wp.memory_mb.is_none());
+    assert!(wp.timeout_ms.is_none());
+    assert!(wp.config.is_empty());
+}
+
+/// Parse a `wasm_plugin` with only some fields set — others should be None.
+#[test]
+fn parse_wasm_plugin_partial_fields() {
+    let config = parse(
+        "example.com {
+            wasm_plugin /plugins/partial.wasm {
+                priority 10
+                fuel 1000000
+            }
+        }",
+    )
+    .expect("should parse");
+
+    let Directive::WasmPlugin(ref wp) = config.sites[0].directives[0] else {
+        panic!("expected WasmPlugin directive");
+    };
+    assert_eq!(wp.priority, 10);
+    assert_eq!(wp.fuel, Some(1_000_000));
+    assert!(wp.memory_mb.is_none());
+    assert!(wp.timeout_ms.is_none());
+}
+
+/// `priority 0` is rejected — 0 is reserved.
+#[test]
+fn parse_wasm_plugin_priority_zero_rejected() {
+    let result = parse(
+        "example.com {
+            wasm_plugin /plugins/shape.wasm {
+                priority 0
+            }
+        }",
+    );
+    assert!(result.is_err(), "priority 0 should be rejected");
+    let err = result.expect_err("must be error");
+    assert!(
+        err.to_string().contains("priority"),
+        "error should mention priority, got: {err}"
+    );
+}
+
+/// Unknown block subdirectives are silently skipped (forward compat).
+#[test]
+fn parse_wasm_plugin_unknown_subdirective_skipped() {
+    let config = parse(
+        "example.com {
+            wasm_plugin /plugins/future.wasm {
+                priority 20
+                future_option some_value
+            }
+        }",
+    )
+    .expect("unknown subdirectives should not cause a parse error");
+
+    let Directive::WasmPlugin(ref wp) = config.sites[0].directives[0] else {
+        panic!("expected WasmPlugin directive");
+    };
+    assert_eq!(wp.priority, 20);
+}

@@ -90,7 +90,7 @@ fn parse_config(t: &mut Tokenizer<'_>) -> Result<DwaarConfig, ParseError> {
                     col: tok.col,
                     kind: ParseErrorKind::Expected {
                         expected: "site address (e.g. 'example.com')".to_string(),
-                        got: format!("{:?}", tok.kind),
+                        got: format!("{}", tok.kind),
                     },
                 });
             }
@@ -219,7 +219,15 @@ fn peek_consume_word_or_quoted(t: &mut Tokenizer<'_>) -> String {
             match tok.kind {
                 TokenKind::Word(w) => w,
                 TokenKind::QuotedString(s) => s,
-                _ => unreachable!(),
+                // peek() and next_token() are always consistent; this arm
+                // can only fire if the tokenizer has a bug.
+                other => {
+                    debug_assert!(
+                        false,
+                        "tokenizer returned unexpected variant after peek: {other:?}"
+                    );
+                    String::new()
+                }
             }
         }
         _ => String::new(),
@@ -480,7 +488,7 @@ fn parse_site_block(t: &mut Tokenizer<'_>) -> Result<SiteBlock, ParseError> {
             col: addr_tok.col,
             kind: ParseErrorKind::Expected {
                 expected: "site address".to_string(),
-                got: format!("{:?}", addr_tok.kind),
+                got: format!("{}", addr_tok.kind),
             },
         });
     };
@@ -493,7 +501,7 @@ fn parse_site_block(t: &mut Tokenizer<'_>) -> Result<SiteBlock, ParseError> {
             col: brace.col,
             kind: ParseErrorKind::Expected {
                 expected: "'{'".to_string(),
-                got: format!("{:?}", brace.kind),
+                got: format!("{}", brace.kind),
             },
         });
     }
@@ -531,7 +539,7 @@ fn parse_site_block(t: &mut Tokenizer<'_>) -> Result<SiteBlock, ParseError> {
                     col: tok.col,
                     kind: ParseErrorKind::Expected {
                         expected: "directive, matcher (@name), or '}'".to_string(),
-                        got: format!("{:?}", tok.kind),
+                        got: format!("{}", tok.kind),
                     },
                 });
             }
@@ -556,7 +564,7 @@ fn parse_directive(t: &mut Tokenizer<'_>) -> Result<Directive, ParseError> {
                 col: name_tok.col,
                 kind: ParseErrorKind::Expected {
                     expected: "directive name".to_string(),
-                    got: format!("{:?}", name_tok.kind),
+                    got: format!("{}", name_tok.kind),
                 },
             });
         }
@@ -628,6 +636,9 @@ fn parse_directive(t: &mut Tokenizer<'_>) -> Result<Directive, ParseError> {
         "copy_response_headers" => Ok(Directive::CopyResponseHeaders(
             observe::parse_copy_response_headers(t, &name_tok)?,
         )),
+
+        // ── WASM plugins ────────────────────────────────────────────────────
+        "wasm_plugin" => Ok(Directive::WasmPlugin(directives::parse_wasm_plugin(t)?)),
 
         // ── Simple flags ────────────────────────────────────────────────────
         "abort" => Ok(Directive::Abort),

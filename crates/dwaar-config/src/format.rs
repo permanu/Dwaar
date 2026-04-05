@@ -19,6 +19,7 @@ use crate::model::{
     RedirDirective, RequestBodyDirective, RequestHeaderDirective, RespondDirective,
     ResponseBodyLimitDirective, ReverseProxyDirective, RewriteDirective, RootDirective,
     TlsDirective, TryFilesDirective, UpstreamAddr, UriDirective, UriOperation, VarsDirective,
+    WasmPluginDirective,
 };
 
 /// Format a parsed config into canonical Dwaarfile text.
@@ -52,7 +53,7 @@ fn format_directive_at_depth(out: &mut String, directive: &Directive, depth: usi
     let indent = "    ".repeat(depth);
     out.push_str(&indent);
     match directive {
-        Directive::ReverseProxy(rp) => format_reverse_proxy(out, rp),
+        Directive::ReverseProxy(rp) => format_reverse_proxy(out, rp, depth),
         Directive::Tls(tls) => format_tls(out, tls),
         Directive::Header(h) => format_header(out, h),
         Directive::Redir(r) => format_redir(out, r),
@@ -139,10 +140,11 @@ fn format_directive_at_depth(out: &mut String, directive: &Directive, depth: usi
         Directive::Push(r) => format_recognized(out, "push", r),
         Directive::AcmeServer(r) => format_recognized(out, "acme_server", r),
         Directive::Cache(c) => format_cache(out, c, depth),
+        Directive::WasmPlugin(wp) => format_wasm_plugin(out, wp, depth),
     }
 }
 
-fn format_reverse_proxy(out: &mut String, rp: &ReverseProxyDirective) {
+fn format_reverse_proxy(out: &mut String, rp: &ReverseProxyDirective, depth: usize) {
     let has_block_options = rp.lb_policy.is_some()
         || rp.health_uri.is_some()
         || rp.health_interval.is_some()
@@ -155,10 +157,13 @@ fn format_reverse_proxy(out: &mut String, rp: &ReverseProxyDirective) {
         || rp.upstreams.len() > 1;
 
     if has_block_options {
+        let inner = "    ".repeat(depth + 1);
+        let outer = "    ".repeat(depth);
+
         // Block form — one upstream per line under `to`, then options
         out.push_str("reverse_proxy {\n");
-        out.push('\t');
-        out.push_str("\tto");
+        out.push_str(&inner);
+        out.push_str("to");
         for upstream in &rp.upstreams {
             out.push(' ');
             match upstream {
@@ -169,7 +174,8 @@ fn format_reverse_proxy(out: &mut String, rp: &ReverseProxyDirective) {
         out.push('\n');
 
         if let Some(policy) = rp.lb_policy {
-            out.push_str("\t\tlb_policy ");
+            out.push_str(&inner);
+            out.push_str("lb_policy ");
             out.push_str(match policy {
                 LbPolicy::RoundRobin => "round_robin",
                 LbPolicy::LeastConn => "least_conn",
@@ -179,52 +185,33 @@ fn format_reverse_proxy(out: &mut String, rp: &ReverseProxyDirective) {
             out.push('\n');
         }
         if let Some(ref uri) = rp.health_uri {
-            out.push_str("\t\thealth_uri ");
+            out.push_str(&inner);
+            out.push_str("health_uri ");
             out.push_str(uri);
             out.push('\n');
         }
         if let Some(interval) = rp.health_interval {
-            out.push_str("\t\thealth_interval ");
+            out.push_str(&inner);
+            out.push_str("health_interval ");
             out.push_str(&interval.to_string());
             out.push('\n');
         }
         if let Some(dur) = rp.fail_duration {
-            out.push_str("\t\tfail_duration ");
+            out.push_str(&inner);
+            out.push_str("fail_duration ");
             out.push_str(&dur.to_string());
             out.push('\n');
         }
         if let Some(max) = rp.max_conns {
-            out.push_str("\t\tmax_conns ");
+            out.push_str(&inner);
+            out.push_str("max_conns ");
             out.push_str(&max.to_string());
             out.push('\n');
         }
-        let has_transport = rp.transport_tls
-            || rp.tls_server_name.is_some()
-            || rp.tls_client_auth.is_some()
-            || rp.tls_trusted_ca_certs.is_some();
-        if has_transport {
-            out.push_str("\t\ttransport {\n");
-            out.push_str("\t\t\ttls\n");
-            if let Some(ref sni) = rp.tls_server_name {
-                out.push_str("\t\t\ttls_server_name ");
-                out.push_str(sni);
-                out.push('\n');
-            }
-            if let Some((ref cert, ref key)) = rp.tls_client_auth {
-                out.push_str("\t\t\ttls_client_auth ");
-                out.push_str(cert);
-                out.push(' ');
-                out.push_str(key);
-                out.push('\n');
-            }
-            if let Some(ref ca) = rp.tls_trusted_ca_certs {
-                out.push_str("\t\t\ttls_trusted_ca_certs ");
-                out.push_str(ca);
-                out.push('\n');
-            }
-            out.push_str("\t\t}\n");
-        }
-        out.push('\t');
+
+        format_reverse_proxy_transport(out, rp, depth);
+
+        out.push_str(&outer);
         out.push('}');
     } else {
         // Inline form — space-separated upstreams on one line
@@ -237,6 +224,45 @@ fn format_reverse_proxy(out: &mut String, rp: &ReverseProxyDirective) {
             }
         }
     }
+}
+
+/// Emit the `transport { tls ... }` block for `reverse_proxy` when TLS options are present.
+fn format_reverse_proxy_transport(out: &mut String, rp: &ReverseProxyDirective, depth: usize) {
+    let has_transport = rp.transport_tls
+        || rp.tls_server_name.is_some()
+        || rp.tls_client_auth.is_some()
+        || rp.tls_trusted_ca_certs.is_some();
+    if !has_transport {
+        return;
+    }
+    let inner = "    ".repeat(depth + 1);
+    let inner2 = "    ".repeat(depth + 2);
+    out.push_str(&inner);
+    out.push_str("transport {\n");
+    out.push_str(&inner2);
+    out.push_str("tls\n");
+    if let Some(ref sni) = rp.tls_server_name {
+        out.push_str(&inner2);
+        out.push_str("tls_server_name ");
+        out.push_str(sni);
+        out.push('\n');
+    }
+    if let Some((ref cert, ref key)) = rp.tls_client_auth {
+        out.push_str(&inner2);
+        out.push_str("tls_client_auth ");
+        out.push_str(cert);
+        out.push(' ');
+        out.push_str(key);
+        out.push('\n');
+    }
+    if let Some(ref ca) = rp.tls_trusted_ca_certs {
+        out.push_str(&inner2);
+        out.push_str("tls_trusted_ca_certs ");
+        out.push_str(ca);
+        out.push('\n');
+    }
+    out.push_str(&inner);
+    out.push_str("}\n");
 }
 
 fn format_tls(out: &mut String, tls: &TlsDirective) {
@@ -419,6 +445,10 @@ fn format_forward_auth(out: &mut String, fa: &ForwardAuthDirective, depth: usize
         }
         out.push('\n');
     }
+    if fa.tls {
+        out.push_str(&inner);
+        out.push_str("transport tls\n");
+    }
     out.push_str(&outer);
     out.push('}');
 }
@@ -451,7 +481,7 @@ fn format_matcher_def(out: &mut String, m: &MatcherDef) {
             out.push_str("    @");
             out.push_str(&m.name);
             out.push(' ');
-            format_matcher_condition_inline(out, single);
+            format_matcher_condition_inline(out, single, 1);
             out.push('\n');
         }
         _ => {
@@ -461,7 +491,7 @@ fn format_matcher_def(out: &mut String, m: &MatcherDef) {
             out.push_str(" {\n");
             for cond in &m.conditions {
                 out.push_str("        ");
-                format_matcher_condition_inline(out, cond);
+                format_matcher_condition_inline(out, cond, 2);
                 out.push('\n');
             }
             out.push_str("    }\n");
@@ -470,7 +500,10 @@ fn format_matcher_def(out: &mut String, m: &MatcherDef) {
 }
 
 /// Format a single matcher condition as a single line (no leading indent).
-fn format_matcher_condition_inline(out: &mut String, cond: &MatcherCondition) {
+///
+/// `depth` is the current indentation level of the line that will hold this
+/// condition — used to indent the bodies of nested blocks (`not`, `file`).
+fn format_matcher_condition_inline(out: &mut String, cond: &MatcherCondition, depth: usize) {
     match cond {
         MatcherCondition::Path(paths) => format_word_list(out, "path", paths),
         MatcherCondition::Host(hosts) => format_word_list(out, "host", hosts),
@@ -506,12 +539,12 @@ fn format_matcher_condition_inline(out: &mut String, cond: &MatcherCondition) {
             out.push_str("protocol ");
             out.push_str(proto);
         }
-        MatcherCondition::Not(inner) => format_not_condition(out, inner),
+        MatcherCondition::Not(inner) => format_not_condition(out, inner, depth),
         MatcherCondition::Expression(expr) => {
             out.push_str("expression ");
             out.push_str(expr);
         }
-        MatcherCondition::File { try_files } => format_file_condition(out, try_files),
+        MatcherCondition::File { try_files } => format_file_condition(out, try_files, depth),
         MatcherCondition::Unknown { keyword, args } => {
             out.push_str(keyword);
             for a in args {
@@ -532,26 +565,37 @@ fn format_word_list(out: &mut String, keyword: &str, words: &[String]) {
 }
 
 /// Format a `not { ... }` condition block.
-fn format_not_condition(out: &mut String, inner: &[MatcherCondition]) {
+///
+/// `depth` is the indentation level of the `not` keyword itself.
+fn format_not_condition(out: &mut String, inner: &[MatcherCondition], depth: usize) {
+    let inner_indent = "    ".repeat(depth + 1);
+    let close_indent = "    ".repeat(depth);
     out.push_str("not {\n");
     for cond in inner {
-        out.push_str("            ");
-        format_matcher_condition_inline(out, cond);
+        out.push_str(&inner_indent);
+        format_matcher_condition_inline(out, cond, depth + 1);
         out.push('\n');
     }
-    out.push_str("        }");
+    out.push_str(&close_indent);
+    out.push('}');
 }
 
 /// Format a `file { try_files ... }` condition block.
-fn format_file_condition(out: &mut String, try_files: &[String]) {
+///
+/// `depth` is the indentation level of the `file` keyword itself.
+fn format_file_condition(out: &mut String, try_files: &[String], depth: usize) {
+    let inner_indent = "    ".repeat(depth + 1);
+    let close_indent = "    ".repeat(depth);
     out.push_str("file {\n");
-    out.push_str("            try_files");
+    out.push_str(&inner_indent);
+    out.push_str("try_files");
     for f in try_files {
         out.push(' ');
         out.push_str(f);
     }
     out.push('\n');
-    out.push_str("        }");
+    out.push_str(&close_indent);
+    out.push('}');
 }
 
 // ── New directive formatters (Phase 3 + 4) ───────────────────────────────────
@@ -865,6 +909,32 @@ fn format_recognized(out: &mut String, name: &str, r: &RecognizedDirective) {
     // Recognized directives don't have a block field — they just store args.
     // If they had a block, it would need to be formatted, but RecognizedDirective
     // only captures args for forward-compat round-tripping.
+}
+
+/// Format a `wasm_plugin` directive as a block form.
+///
+/// Always emits the block `{ }` form for clarity, even when all fields are
+/// at their defaults. This makes diffs readable — you can see exactly what
+/// limits apply to every plugin without needing to know the defaults.
+fn format_wasm_plugin(out: &mut String, wp: &WasmPluginDirective, depth: usize) {
+    use std::fmt::Write as _;
+    let outer = "    ".repeat(depth);
+    let inner = "    ".repeat(depth + 1);
+    let _ = writeln!(out, "wasm_plugin {} {{", wp.module_path);
+    let _ = writeln!(out, "{inner}priority {}", wp.priority);
+    if let Some(fuel) = wp.fuel {
+        let _ = writeln!(out, "{inner}fuel {fuel}");
+    }
+    if let Some(mb) = wp.memory_mb {
+        let _ = writeln!(out, "{inner}memory {mb}");
+    }
+    if let Some(ms) = wp.timeout_ms {
+        let _ = writeln!(out, "{inner}timeout {ms}");
+    }
+    for (k, v) in &wp.config {
+        let _ = writeln!(out, "{inner}config {k}={v}");
+    }
+    let _ = write!(out, "{outer}}}");
 }
 
 #[cfg(test)]

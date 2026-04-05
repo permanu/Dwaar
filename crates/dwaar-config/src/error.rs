@@ -146,6 +146,7 @@ pub fn suggest_directive(input: &str) -> Option<&'static str> {
         "fs",
         "copy_response",
         "copy_response_headers",
+        "wasm_plugin",
     ];
 
     KNOWN
