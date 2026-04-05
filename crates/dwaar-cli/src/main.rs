@@ -1190,6 +1190,32 @@ fn cmd_upgrade(binary: Option<&std::path::Path>, pid_file: &std::path::Path) -> 
         bail!("binary not found: {}", binary_path.display());
     }
 
+    // Verify PID file is owned by us and not world-writable to prevent
+    // an attacker from substituting an arbitrary PID.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(pid_file)
+            .with_context(|| format!("cannot stat PID file: {}", pid_file.display()))?;
+        // SAFETY: getuid returns the real user ID of the calling process.
+        #[allow(unsafe_code)]
+        let uid = unsafe { libc::getuid() };
+        if meta.uid() != uid {
+            bail!(
+                "PID file {} is owned by UID {} (expected {})",
+                pid_file.display(),
+                meta.uid(),
+                uid
+            );
+        }
+        if meta.mode() & 0o002 != 0 {
+            bail!(
+                "PID file {} is world-writable — refusing to trust its contents",
+                pid_file.display()
+            );
+        }
+    }
+
     // Read the PID of the old process
     let pid_str = std::fs::read_to_string(pid_file)
         .with_context(|| format!("cannot read PID file: {}", pid_file.display()))?;
