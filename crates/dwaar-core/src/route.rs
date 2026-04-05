@@ -79,6 +79,40 @@ pub fn is_valid_domain(s: &str) -> bool {
     })
 }
 
+/// Validate a route key, which may be a plain domain or a composite
+/// `host/path` string produced by the Ingress translator.
+///
+/// Accepts:
+/// - Plain domains (delegated to `is_valid_domain`)
+/// - Special keys: `_default` (catch-all used by Ingress)
+/// - Composite keys like `app.example.com/api/v1`
+///
+/// Rejects empty strings, null bytes, `..` path traversal, and control chars.
+pub fn is_valid_route_key(s: &str) -> bool {
+    if s.is_empty() || s.contains('\0') || s.contains("..") {
+        return false;
+    }
+
+    // Special catch-all key used by the Ingress translator.
+    if s == "_default" {
+        return true;
+    }
+
+    // If there's no slash, this is a plain domain.
+    let Some((host, path)) = s.split_once('/') else {
+        return is_valid_domain(s);
+    };
+
+    // Host part must be a valid domain.
+    if !is_valid_domain(host) {
+        return false;
+    }
+
+    // Path part: printable ASCII only, no control characters.
+    // The `..` check above already covers path traversal.
+    path.bytes().all(|b| b.is_ascii_graphic() || b == b' ')
+}
+
 // ── Handler types ────────────────────────────────────────────
 
 /// What produces the response — the terminal action for a matched request.
@@ -499,6 +533,12 @@ pub struct Route {
     /// When true, this route is being drained — new requests get 502,
     /// but in-flight requests continue until complete or drain timeout.
     pub draining: Arc<AtomicBool>,
+
+    /// Which component created this route (e.g. "dwaar-ingress", "docker").
+    /// `None` for routes created from the Dwaarfile or manually via admin API
+    /// without specifying a source. Used by the reconciler to identify
+    /// controller-owned routes and avoid touching foreign ones.
+    pub source: Option<String>,
 }
 
 impl Route {
@@ -507,6 +547,17 @@ impl Route {
     /// Wraps the upstream in a single `HandlerBlock { Any, ReverseProxy }`.
     /// This is the common case for flat Dwaarfiles with no `handle` blocks.
     pub fn new(domain: &str, upstream: SocketAddr, tls: bool, rate_limit_rps: Option<u32>) -> Self {
+        Self::with_source(domain, upstream, tls, rate_limit_rps, None)
+    }
+
+    /// Create a route with an explicit source tag for ownership tracking.
+    pub fn with_source(
+        domain: &str,
+        upstream: SocketAddr,
+        tls: bool,
+        rate_limit_rps: Option<u32>,
+        source: Option<String>,
+    ) -> Self {
         Self {
             domain: domain.to_lowercase(),
             tls,
@@ -535,6 +586,7 @@ impl Route {
             var_defaults: VarSlots::default(),
             active_connections: Arc::new(AtomicU32::new(0)),
             draining: Arc::new(AtomicBool::new(false)),
+            source,
         }
     }
 
@@ -571,7 +623,13 @@ impl Route {
             var_defaults,
             active_connections: Arc::new(AtomicU32::new(0)),
             draining: Arc::new(AtomicBool::new(false)),
+            source: None, // Dwaarfile-compiled routes have no external source
         }
+    }
+
+    /// The source tag, if any.
+    pub fn source(&self) -> Option<&str> {
+        self.source.as_deref()
     }
 
     /// The default upstream address — zero-cost inline read for flat routes.
@@ -617,12 +675,13 @@ impl Route {
 impl serde::Serialize for Route {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("Route", 5)?;
+        let mut s = serializer.serialize_struct("Route", 6)?;
         s.serialize_field("domain", &self.domain)?;
         s.serialize_field("upstream", &self.upstream().map(|a| a.to_string()))?;
         s.serialize_field("tls", &self.tls)?;
         s.serialize_field("rate_limit_rps", &self.rate_limit_rps())?;
         s.serialize_field("under_attack", &self.under_attack())?;
+        s.serialize_field("source", &self.source)?;
         s.end()
     }
 }
@@ -1243,5 +1302,48 @@ mod tests {
         let table = RouteTable::new(vec![Route::new("api.example.com", addr(3000), false, None)]);
         assert!(table.get_exact("api.example.com").is_some());
         assert!(table.get_exact("other.com").is_none());
+    }
+
+    // ── is_valid_route_key tests ────────────────────────────────
+
+    #[test]
+    fn route_key_plain_domain() {
+        assert!(is_valid_route_key("app.example.com"));
+    }
+
+    #[test]
+    fn route_key_composite_with_path() {
+        assert!(is_valid_route_key("app.example.com/api/"));
+        assert!(is_valid_route_key("app.example.com/api/v1"));
+    }
+
+    #[test]
+    fn route_key_wildcard() {
+        assert!(is_valid_route_key("*"));
+    }
+
+    #[test]
+    fn route_key_default_catchall() {
+        assert!(is_valid_route_key("_default"));
+    }
+
+    #[test]
+    fn route_key_trailing_slash() {
+        assert!(is_valid_route_key("app.example.com/"));
+    }
+
+    #[test]
+    fn route_key_rejects_path_traversal() {
+        assert!(!is_valid_route_key("app.example.com/../etc/passwd"));
+    }
+
+    #[test]
+    fn route_key_rejects_null_byte() {
+        assert!(!is_valid_route_key("app.example.com/\0bad"));
+    }
+
+    #[test]
+    fn route_key_rejects_empty() {
+        assert!(!is_valid_route_key(""));
     }
 }

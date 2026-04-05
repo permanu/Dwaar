@@ -1,0 +1,63 @@
+[package]
+name = "dwaar-ingress"
+version = "0.1.0"
+description = "Kubernetes ingress controller — watches Ingress resources and syncs routes to Dwaar"
+edition.workspace = true
+publish = false
+rust-version.workspace = true
+license-file = "../../LICENSE"
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "dwaar-ingress"
+path = "src/main.rs"
+
+[dependencies]
+# Kubernetes client and runtime
+kube = { version = "0.98", features = ["runtime", "client", "derive"] }
+k8s-openapi = { version = "0.24", features = ["v1_32"] }
+
+# Async runtime
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "signal", "sync"] }
+
+# Stream combinators (kube-runtime uses futures internally; we need StreamExt)
+futures = { version = "0.3", default-features = false, features = ["async-await"] }
+
+# HTTP client (json feature required for .json() body helpers)
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# Time (for Lease renewTime handling)
+chrono = { workspace = true }
+
+[features]
+# Enable the K8s integration test suite. Requires a reachable cluster (e.g. kind).
+# Run with: cargo test -p dwaar-ingress --features k8s-integration -- --test-threads=1
+k8s-integration = []
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "signal", "sync"] }
+tempfile = "3"
+# Used by the k8s-integration tests to construct expired Lease timestamps.
+chrono = { workspace = true }
+serde_json = { workspace = true }
+# Required to install the CryptoProvider for kube-rs in integration tests.
+rustls = { workspace = true }
+
+[lints]
+workspace = true

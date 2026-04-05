@@ -29,7 +29,7 @@
 
 use std::fmt;
 use std::net::IpAddr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use hmac::{Hmac, Mac};
@@ -89,7 +89,7 @@ impl UnderAttackPlugin {
     fn generate_challenge(&self, ip: IpAddr) -> String {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("system clock after epoch")
+            .unwrap_or(Duration::ZERO)
             .as_secs();
         // 5-minute window
         let window = now / 300;
@@ -116,7 +116,7 @@ impl UnderAttackPlugin {
     fn sign_cookie(&self, ip: IpAddr) -> String {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("system clock after epoch")
+            .unwrap_or(Duration::ZERO)
             .as_secs();
         let timestamp_hex = format!("{now:x}");
 
@@ -142,7 +142,7 @@ impl UnderAttackPlugin {
         // Check expiry
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("system clock after epoch")
+            .unwrap_or(Duration::ZERO)
             .as_secs();
         if now > timestamp + self.ttl_secs {
             return false;
@@ -388,20 +388,32 @@ fn get_param(query: &str, name: &str) -> Option<String> {
 }
 
 /// Minimal URL decode for the query parameter values we generate ourselves.
+///
+/// Invalid percent sequences (truncated or non-hex digits) are passed through
+/// verbatim rather than silently dropped, so callers can observe them.
 fn url_decode(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
-    let mut chars = s.bytes();
-    while let Some(b) = chars.next() {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
         if b == b'%' {
-            let hi = chars.next().and_then(hex_digit);
-            let lo = chars.next().and_then(hex_digit);
+            let hi = bytes.get(i + 1).copied().and_then(hex_digit);
+            let lo = bytes.get(i + 2).copied().and_then(hex_digit);
             if let (Some(h), Some(l)) = (hi, lo) {
                 result.push(char::from(h << 4 | l));
+                i += 3;
+            } else {
+                // Invalid percent sequence — pass through verbatim.
+                result.push('%');
+                i += 1;
             }
         } else if b == b'+' {
             result.push(' ');
+            i += 1;
         } else {
             result.push(char::from(b));
+            i += 1;
         }
     }
     result
@@ -661,5 +673,15 @@ mod tests {
         assert_eq!(url_decode("hello%20world"), "hello world");
         assert_eq!(url_decode("a%2Fb"), "a/b");
         assert_eq!(url_decode("plain"), "plain");
+    }
+
+    #[test]
+    fn url_decode_passes_through_invalid_sequences() {
+        // Truncated sequence at end of string
+        assert_eq!(url_decode("bad%2"), "bad%2");
+        // Non-hex digits
+        assert_eq!(url_decode("bad%ZZ"), "bad%ZZ");
+        // Lone percent at end
+        assert_eq!(url_decode("100%"), "100%");
     }
 }

@@ -53,6 +53,7 @@ pub struct FastCgiRequest<'a> {
     pub request_body: &'a [u8],
     pub server_name: &'a str,
     pub remote_addr: &'a str,
+    pub is_tls: bool,
 }
 
 /// Execute a `FastCGI` request to `php-fpm` and return the parsed HTTP response.
@@ -73,7 +74,7 @@ pub async fn execute(req: &FastCgiRequest<'_>) -> Result<FastCgiResponse, String
         format!("{}?{}", req.request_path, req.query_string),
     );
     params.insert("SERVER_NAME", req.server_name.to_string());
-    params.insert("SERVER_PORT", "80".to_string());
+    params.insert("SERVER_PORT", if req.is_tls { "443" } else { "80" }.to_string());
     params.insert("REMOTE_ADDR", req.remote_addr.to_string());
     params.insert("CONTENT_LENGTH", req.request_body.len().to_string());
     params.insert(
@@ -83,9 +84,15 @@ pub async fn execute(req: &FastCgiRequest<'_>) -> Result<FastCgiResponse, String
     params.insert("SERVER_PROTOCOL", "HTTP/1.1".to_string());
     params.insert("GATEWAY_INTERFACE", "CGI/1.1".to_string());
 
-    // PATH_INFO splitting on .php
-    if let Some(php_pos) = req.request_path.find(".php") {
-        let split = php_pos + 4;
+    // PATH_INFO splitting on .php — require a boundary after the extension
+    // to avoid matching .phpx, .phpinfo, etc.
+    let php_split = req.request_path.find(".php").and_then(|pos| {
+        let split = pos + 4;
+        let is_boundary = split >= req.request_path.len()
+            || matches!(req.request_path.as_bytes().get(split), Some(b'/' | b'?'));
+        is_boundary.then_some(split)
+    });
+    if let Some(split) = php_split {
         let script = &req.request_path[..split];
         let path_info = &req.request_path[split..];
         params.insert("SCRIPT_NAME", script.to_string());
@@ -139,10 +146,10 @@ pub async fn execute(req: &FastCgiRequest<'_>) -> Result<FastCgiResponse, String
         let record = read_record(&mut stream).await?;
         match record.record_type {
             FCGI_STDOUT => {
-                stdout_buf.extend_from_slice(&record.content);
-                if stdout_buf.len() > MAX_RESPONSE_SIZE {
+                if stdout_buf.len() + record.content.len() > MAX_RESPONSE_SIZE {
                     return Err("FastCGI response too large".to_string());
                 }
+                stdout_buf.extend_from_slice(&record.content);
             }
             FCGI_STDERR => {
                 // Log stderr but don't fail

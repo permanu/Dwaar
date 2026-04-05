@@ -19,10 +19,11 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use compact_str::CompactString;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 /// Pre-compiled forward auth configuration.
@@ -34,6 +35,17 @@ pub struct ForwardAuthConfig {
     pub auth_uri: CompactString,
     /// Headers to copy from auth response → upstream request.
     pub copy_headers: Vec<CompactString>,
+    /// Whether the subrequest to the auth service uses TLS.
+    ///
+    /// When `false`, responses travel in plaintext — an on-path attacker can
+    /// forge a 2xx and inject `copy_headers` values (e.g. `Remote-User`).
+    /// Set to `true` and configure a TLS-capable backend to close this gap.
+    pub tls: bool,
+    /// Original hostname from the config (e.g., `authelia` from `authelia:9091`).
+    /// Used as TLS SNI when present, so certs issued to the hostname verify
+    /// correctly even though we connect to the resolved IP address.
+    /// `None` when the upstream was a literal IP address.
+    pub sni_hostname: Option<CompactString>,
 }
 
 /// Result of an auth subrequest.
@@ -49,6 +61,12 @@ pub enum AuthResult {
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_AUTH_RESPONSE: u64 = 65_536;
+
+/// Strip CR/LF from a value before it enters a raw HTTP request header.
+/// Prevents CRLF injection when interpolating client-supplied strings.
+fn sanitize_header_value(s: &str) -> String {
+    s.chars().filter(|c| *c != '\r' && *c != '\n').collect()
+}
 
 impl ForwardAuthConfig {
     /// Make the auth subrequest. Returns whether to allow or deny.
@@ -70,20 +88,47 @@ impl ForwardAuthConfig {
         original_uri: &str,
         client_ip: Option<&str>,
     ) -> Result<AuthResult, String> {
-        // Connect with timeout
-        let mut stream = tokio::time::timeout(AUTH_TIMEOUT, TcpStream::connect(self.upstream))
+        if !self.tls {
+            tracing::warn!(
+                upstream = %self.upstream,
+                "forward_auth uses plaintext TCP — auth responses are not integrity-protected; \
+                 set tls: true and point to a TLS-capable endpoint to fix this"
+            );
+        }
+
+        // Connect TCP with timeout
+        let tcp_stream = tokio::time::timeout(AUTH_TIMEOUT, TcpStream::connect(self.upstream))
             .await
             .map_err(|_| "auth service connection timed out".to_string())?
             .map_err(|e| format!("auth service connect failed: {e}"))?;
 
-        // Build GET request with forwarded metadata
-        let ip_header =
-            client_ip.map_or_else(String::new, |ip| format!("X-Forwarded-For: {ip}\r\n"));
+        // Upgrade to TLS if configured, otherwise use plaintext.
+        // Boxing avoids a monomorphization explosion on a non-hot path (one
+        // subrequest per client request at most) — negligible vs. handshake cost.
+        let (mut reader, mut writer): (
+            Box<dyn AsyncRead + Unpin + Send>,
+            Box<dyn AsyncWrite + Unpin + Send>,
+        ) = if self.tls {
+            let tls_stream = tls_connect(tcp_stream, self.upstream, self.sni_hostname.as_deref()).await?;
+            let (r, w) = tokio::io::split(tls_stream);
+            (Box::new(r), Box::new(w))
+        } else {
+            let (r, w) = tokio::io::split(tcp_stream);
+            (Box::new(r), Box::new(w))
+        };
+
+        // Build GET request with forwarded metadata.
+        // Sanitize all client-supplied values to prevent CRLF header injection.
+        let safe_method = sanitize_header_value(method);
+        let safe_uri = sanitize_header_value(original_uri);
+        let ip_header = client_ip.map_or_else(String::new, |ip| {
+            format!("X-Forwarded-For: {}\r\n", sanitize_header_value(ip))
+        });
         let request = format!(
             "GET {} HTTP/1.1\r\n\
              Host: {}\r\n\
-             X-Forwarded-Method: {method}\r\n\
-             X-Forwarded-Uri: {original_uri}\r\n\
+             X-Forwarded-Method: {safe_method}\r\n\
+             X-Forwarded-Uri: {safe_uri}\r\n\
              {ip_header}\
              Connection: close\r\n\
              \r\n",
@@ -92,8 +137,8 @@ impl ForwardAuthConfig {
 
         // Write with timeout
         tokio::time::timeout(AUTH_TIMEOUT, async {
-            stream.write_all(request.as_bytes()).await?;
-            stream.flush().await?;
+            writer.write_all(request.as_bytes()).await?;
+            writer.flush().await?;
             Ok::<_, std::io::Error>(())
         })
         .await
@@ -104,7 +149,7 @@ impl ForwardAuthConfig {
         let mut buf = Vec::with_capacity(4096);
         tokio::time::timeout(
             AUTH_TIMEOUT,
-            stream.take(MAX_AUTH_RESPONSE).read_to_end(&mut buf),
+            (&mut reader).take(MAX_AUTH_RESPONSE).read_to_end(&mut buf),
         )
         .await
         .map_err(|_| "auth service read timed out".to_string())?
@@ -149,4 +194,38 @@ impl ForwardAuthConfig {
             Ok(AuthResult::Denied { status, body })
         }
     }
+}
+
+/// Perform a TLS handshake over an established TCP connection.
+///
+/// Uses `webpki-roots` for certificate verification. When `sni_hostname` is
+/// provided (upstream was configured as a DNS name like `authelia:9091`), it's
+/// used as the SNI server name so that hostname-based certificates verify
+/// correctly. Falls back to IP-based SNI for literal IP upstreams.
+async fn tls_connect(
+    tcp: TcpStream,
+    addr: SocketAddr,
+    sni_hostname: Option<&str>,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, String> {
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+
+    // Prefer the original hostname for SNI so certs issued to DNS names
+    // verify correctly. Fall back to IP when the upstream was a literal addr.
+    let server_name = match sni_hostname {
+        Some(hostname) => rustls::pki_types::ServerName::try_from(hostname.to_owned())
+            .map_err(|e| format!("invalid SNI hostname '{hostname}': {e}"))?,
+        None => rustls::pki_types::ServerName::from(addr.ip()),
+    };
+
+    tokio::time::timeout(AUTH_TIMEOUT, connector.connect(server_name.to_owned(), tcp))
+        .await
+        .map_err(|_| "auth service TLS handshake timed out".to_string())?
+        .map_err(|e| format!("auth service TLS handshake failed: {e}"))
 }

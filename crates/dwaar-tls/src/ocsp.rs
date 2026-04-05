@@ -167,7 +167,7 @@ async fn http_post_ocsp(url: &str, body: &[u8]) -> Result<Vec<u8>, OcspError> {
 
     let status_line_end = response_buf.iter().position(|&b| b == b'\r').unwrap_or(0);
     let status_line = std::str::from_utf8(&response_buf[..status_line_end]).unwrap_or("");
-    if !status_line.contains("200") {
+    if status_line.split_whitespace().nth(1) != Some("200") {
         return Err(OcspError::HttpFetch(format!(
             "OCSP responder returned: {status_line}"
         )));

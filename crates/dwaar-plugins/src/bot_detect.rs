@@ -148,14 +148,16 @@ impl BotDetector {
             return None;
         }
 
-        // Lowercase once — all stored patterns are already lowercase.
-        // ASCII-safe for User-Agent headers which are always ASCII.
-        let ua_lower = user_agent.to_ascii_lowercase();
+        // Lowercase once as bytes — all stored patterns are already lowercase.
+        // Uses Vec<u8> + make_ascii_lowercase to avoid the UTF-8 re-validation
+        // cost of str::to_ascii_lowercase (User-Agent headers are always ASCII).
+        let mut ua_bytes = user_agent.as_bytes().to_vec();
+        ua_bytes.make_ascii_lowercase();
 
         // Find all overlapping matches and take the lowest pattern index
         // (highest priority). Anchored patterns must start at position 0.
         self.automaton
-            .find_overlapping_iter(&ua_lower)
+            .find_overlapping_iter(&ua_bytes)
             .filter(|m| {
                 let idx = m.value();
                 !self.anchored[idx] || m.start() == 0

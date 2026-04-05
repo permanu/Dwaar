@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use pingora_core::OrErr;
 use pingora_core::services::background::BackgroundService;
@@ -180,13 +181,17 @@ impl UpstreamPool {
     }
 
     /// Fast path: single-backend pool — no selection overhead at all.
+    ///
+    /// This is a pure read: it does not increment `active_conns`. The caller is
+    /// responsible for calling `acquire_connection()` (which does the atomic CAS
+    /// increment) and `release_connection()` to bracket the request lifetime.
     fn select_single(&self) -> Option<SelectedUpstream> {
         let b = &self.backends[0];
         if !b.healthy.load(Ordering::Relaxed) {
             return None;
         }
         if let Some(max) = b.max_conns
-            && b.active_conns.load(Ordering::Relaxed) >= max
+            && b.active_conns.load(Ordering::Acquire) >= max
         {
             return None;
         }
@@ -216,6 +221,9 @@ impl UpstreamPool {
     /// We scan once (O(n)) — acceptable because backend counts are typically small
     /// (< 32) and the scan is cache-hot. Relaxed loads are fine: a slightly stale
     /// count won't cause correctness issues, only minor suboptimality.
+    ///
+    /// This is a pure read: it does not increment `active_conns`. The caller is
+    /// responsible for calling `acquire_connection()` / `release_connection()`.
     fn select_least_conn(&self) -> Option<SelectedUpstream> {
         let best = self
             .backends
@@ -237,6 +245,9 @@ impl UpstreamPool {
     }
 
     /// Random: choose a uniformly random healthy backend.
+    ///
+    /// This is a pure read: it does not increment `active_conns`. The caller is
+    /// responsible for calling `acquire_connection()` / `release_connection()`.
     fn select_random(&self) -> Option<SelectedUpstream> {
         let available: Vec<_> = self
             .backends
@@ -278,6 +289,9 @@ impl UpstreamPool {
     }
 
     /// Starting from `start`, scan the pool in order until an available backend is found.
+    ///
+    /// This is a pure read: it does not increment `active_conns`. The caller is
+    /// responsible for calling `acquire_connection()` / `release_connection()`.
     fn find_available_from(&self, start: usize) -> Option<SelectedUpstream> {
         let n = self.backends.len();
         for offset in 0..n {
@@ -286,7 +300,7 @@ impl UpstreamPool {
                 continue;
             }
             if let Some(max) = b.max_conns
-                && b.active_conns.load(Ordering::Relaxed) >= max
+                && b.active_conns.load(Ordering::Acquire) >= max
             {
                 continue;
             }
@@ -417,31 +431,19 @@ fn fnv_hash_ip(ip: std::net::IpAddr) -> usize {
     const FNV_OFFSET: u64 = 14_695_981_039_346_656_037;
     const FNV_PRIME: u64 = 1_099_511_628_211;
 
+    // octets() returns a stack-allocated fixed array, so this is zero-allocation.
     let mut hash = FNV_OFFSET;
-    let bytes: &[u8] = match &ip {
-        std::net::IpAddr::V4(v4) => &v4.octets()[..],
-        std::net::IpAddr::V6(v6) => &v6.octets()[..],
-    };
-    // Can't use `bytes` borrow after the match arm — collect into fixed array
-    let hash = match ip {
-        std::net::IpAddr::V4(v4) => {
-            let bytes = v4.octets();
-            for &b in &bytes {
-                hash ^= u64::from(b);
-                hash = hash.wrapping_mul(FNV_PRIME);
-            }
-            hash
+    let apply = |mut h: u64, bytes: &[u8]| -> u64 {
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(FNV_PRIME);
         }
-        std::net::IpAddr::V6(v6) => {
-            let bytes = v6.octets();
-            for &b in &bytes {
-                hash ^= u64::from(b);
-                hash = hash.wrapping_mul(FNV_PRIME);
-            }
-            hash
-        }
+        h
     };
-    let _ = bytes; // used in the match arms above
+    hash = match ip {
+        std::net::IpAddr::V4(v4) => apply(hash, &v4.octets()),
+        std::net::IpAddr::V6(v6) => apply(hash, &v6.octets()),
+    };
     hash as usize
 }
 
@@ -454,10 +456,11 @@ fn fnv_hash_ip(ip: std::net::IpAddr) -> usize {
 ///
 /// Per Guardrail #20: all async background work must be a `BackgroundService`,
 /// never a raw `tokio::spawn`.
+///
+/// The pool list is behind `ArcSwap` so that `ConfigWatcher` can swap in a new
+/// set of pools on hot-reload without restarting this service.
 pub struct HealthChecker {
-    /// Pools are moved in via `Mutex<Option<…>>` so `start()` can take ownership
-    /// from `&self` — Pingora calls `start()` exactly once.
-    pools: std::sync::Mutex<Option<Vec<Arc<UpstreamPool>>>>,
+    pools: Arc<ArcSwap<Vec<Arc<UpstreamPool>>>>,
 }
 
 impl std::fmt::Debug for HealthChecker {
@@ -467,53 +470,52 @@ impl std::fmt::Debug for HealthChecker {
 }
 
 impl HealthChecker {
-    /// Create a new checker with the given pools.
-    pub fn new(pools: Vec<Arc<UpstreamPool>>) -> Self {
-        Self {
-            pools: std::sync::Mutex::new(Some(pools)),
-        }
+    /// Create a new checker with a shared, hot-swappable pool list.
+    pub fn new(pools: Arc<ArcSwap<Vec<Arc<UpstreamPool>>>>) -> Self {
+        Self { pools }
     }
 }
 
 #[async_trait]
 impl BackgroundService for HealthChecker {
     async fn start(&self, mut shutdown: pingora_core::server::ShutdownWatch) {
-        // Take ownership of pools from the Mutex — this runs exactly once.
-        let pools = self
-            .pools
-            .lock()
-            .expect("HealthChecker lock not poisoned")
-            .take()
-            .unwrap_or_default();
-
-        // Filter to pools that have a health URI configured.
-        let active: Vec<Arc<UpstreamPool>> = pools
-            .into_iter()
-            .filter(|p| p.health_uri.is_some())
-            .collect();
-
-        if active.is_empty() {
-            debug!("health checker: no pools with health_uri configured, exiting");
-            return;
-        }
-
-        // Derive a common poll interval — use the smallest interval across all pools.
-        let interval = active
-            .iter()
-            .map(|p| p.health_interval)
-            .min()
-            .unwrap_or(Duration::from_secs(10));
-
         loop {
-            // Probe all backends across all pools.
+            // Reload the pool list from ArcSwap on every tick so hot-reloaded
+            // pools are picked up without restarting the service.
+            let all_pools = self.pools.load();
+            let active: Vec<Arc<UpstreamPool>> = all_pools
+                .iter()
+                .filter(|p| p.health_uri.is_some())
+                .cloned()
+                .collect();
+
+            if active.is_empty() {
+                // No pools need health checking right now. Sleep with a default
+                // interval and re-check after reload might have added some.
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_secs(10)) => { continue; }
+                    _ = shutdown.changed() => {
+                        debug!("health checker: shutdown signal received");
+                        return;
+                    }
+                }
+            }
+
+            // Derive poll interval from the smallest configured across active pools.
+            let interval = active
+                .iter()
+                .map(|p| p.health_interval)
+                .min()
+                .unwrap_or(Duration::from_secs(10));
+
+            // Probe all backends across all active pools.
             for pool in &active {
                 let Some(ref uri) = pool.health_uri else {
                     continue;
                 };
                 for backend in &pool.backends {
                     let addr = backend.addr;
-                    let probe_uri = uri.clone();
-                    match probe_backend(addr, &probe_uri).await {
+                    match probe_backend(addr, uri).await {
                         Ok(status) if (200..300).contains(&status) => {
                             pool.mark_healthy(addr);
                         }
@@ -529,7 +531,7 @@ impl BackgroundService for HealthChecker {
                 }
             }
 
-            // Wait for `interval` or shutdown signal.
+            // Wait for the poll interval or shutdown signal.
             tokio::select! {
                 () = tokio::time::sleep(interval) => {}
                 _ = shutdown.changed() => {
@@ -570,15 +572,27 @@ async fn probe_backend(
         .map_err(|_| "write timed out")?
         .or_err(pingora_error::ErrorType::WriteError, "health probe write")?;
 
-    // Read just enough to parse the status line — `HTTP/1.1 200 OK\r\n` is ~17 bytes.
+    // Read at least the status line — loop to handle partial reads.
     let mut buf = [0u8; 64];
-    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
-        .await
-        .map_err(|_| "read timed out")?
-        .or_err(pingora_error::ErrorType::ReadError, "health probe read")?;
+    let mut total = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout_at(deadline, stream.read(&mut buf[total..])).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => {
+                total += n;
+                // We have enough once we see \r\n (end of status line) or buffer is full.
+                if buf[..total].windows(2).any(|w| w == b"\r\n") || total >= buf.len() {
+                    break;
+                }
+            }
+            Ok(Err(e)) => return Err(Box::new(e)),
+            Err(_) => return Err("read timed out".into()),
+        }
+    }
 
     // Parse "HTTP/1.x NNN ..." — we only need the status code.
-    let response = std::str::from_utf8(&buf[..n])?;
+    let response = std::str::from_utf8(&buf[..total])?;
     let status = response
         .split_whitespace()
         .nth(1)
@@ -796,6 +810,70 @@ mod tests {
         // Release without acquire — must not panic or wrap around
         pool.release_connection(make_addr(8080));
         assert_eq!(pool.backends[0].active_conns.load(Ordering::Relaxed), 0);
+    }
+
+    /// Simulates the proxy lifecycle: select → acquire → (request) → release.
+    /// Verifies that active_conns tracks correctly through the full cycle and
+    /// that max_conns is enforced after acquire.
+    #[test]
+    fn proxy_lifecycle_select_acquire_release() {
+        let pool = make_pool_with_max(8080, 2);
+        let addr = make_addr(8080);
+
+        // Lifecycle 1: select → acquire → release
+        let sel = pool.select(None).expect("should select");
+        assert_eq!(sel.addr, addr);
+        assert!(pool.acquire_connection(addr), "first acquire should succeed");
+        assert_eq!(pool.backends[0].active_conns.load(Ordering::Relaxed), 1);
+
+        // Lifecycle 2: second concurrent request
+        assert!(pool.acquire_connection(addr), "second acquire should succeed");
+        assert_eq!(pool.backends[0].active_conns.load(Ordering::Relaxed), 2);
+
+        // Lifecycle 3: at cap — third acquire must fail (503 in proxy)
+        assert!(!pool.acquire_connection(addr), "third acquire should be rejected at max=2");
+
+        // First request completes
+        pool.release_connection(addr);
+        assert_eq!(pool.backends[0].active_conns.load(Ordering::Relaxed), 1);
+
+        // Now a new request can acquire again
+        assert!(pool.acquire_connection(addr), "should succeed after release");
+        assert_eq!(pool.backends[0].active_conns.load(Ordering::Relaxed), 2);
+
+        // Clean up both
+        pool.release_connection(addr);
+        pool.release_connection(addr);
+        assert_eq!(pool.backends[0].active_conns.load(Ordering::Relaxed), 0);
+    }
+
+    /// Verifies that concurrent threads cannot exceed max_conns via the
+    /// acquire CAS loop.
+    #[test]
+    fn concurrent_acquire_respects_max_conns() {
+        use std::sync::Arc;
+        let pool = Arc::new(make_pool_with_max(8080, 4));
+        let addr = make_addr(8080);
+        let barrier = Arc::new(std::sync::Barrier::new(32));
+
+        let handles: Vec<_> = (0..32)
+            .map(|_| {
+                let pool = pool.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    pool.acquire_connection(addr)
+                })
+            })
+            .collect();
+
+        let acquired = handles
+            .into_iter()
+            .filter_map(|h| h.join().ok().filter(|&ok| ok))
+            .count();
+
+        assert_eq!(acquired, 4, "exactly max_conns threads should have acquired");
+        assert_eq!(pool.backends[0].active_conns.load(Ordering::Relaxed), 4);
     }
 
     // ── health mark ───────────────────────────────────────────────────────────

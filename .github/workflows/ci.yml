@@ -30,7 +30,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   test:
     name: Test
@@ -44,6 +44,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
+      - name: Run ignored tests
+        run: cargo test --workspace -- --ignored --nocapture
+        timeout-minutes: 15
 
   build:
     name: Build

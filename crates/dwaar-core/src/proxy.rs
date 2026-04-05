@@ -48,10 +48,15 @@ use crate::template::TemplateContext;
 /// Transfer-Encoding, etc.) are required for correct message framing.
 /// Stripping them based on user config would break the HTTP layer.
 fn is_essential_header(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "content-type" | "content-length" | "transfer-encoding" | "connection" | "date" | "server"
-    )
+    const ESSENTIAL: &[&str] = &[
+        "content-type",
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "date",
+        "server",
+    ];
+    ESSENTIAL.iter().any(|h| name.eq_ignore_ascii_case(h))
 }
 
 /// Sanitize a request path for use in a redirect Location header.
@@ -191,10 +196,11 @@ impl DwaarProxy {
         if let Some(ref sender) = self.beacon_sender {
             let mut body = Vec::with_capacity(1024);
             while let Ok(Some(chunk)) = session.downstream_session.read_request_body().await {
-                body.extend_from_slice(&chunk);
-                if body.len() > beacon::MAX_BEACON_SIZE {
+                // Check before extending so we never allocate beyond the limit.
+                if body.len().saturating_add(chunk.len()) > beacon::MAX_BEACON_SIZE {
                     break;
                 }
+                body.extend_from_slice(&chunk);
             }
 
             match beacon::parse_beacon(&body) {
@@ -478,7 +484,13 @@ impl ProxyHttp for DwaarProxy {
         // Look up the route before running plugins so rate_limit_rps and
         // under_attack flags are available to the plugin chain.
         if let Some(ref host) = ctx.plugin_ctx.host {
-            let host_stripped = host.split(':').next().unwrap_or(host);
+            let host_stripped = if host.starts_with('[') {
+                // IPv6 bracket notation: [::1]:8080
+                host.split(']').next().unwrap_or(host).trim_start_matches('[')
+            } else {
+                // IPv4 or hostname: example.com:8080
+                host.rsplit_once(':').map_or(host.as_str(), |(h, _)| h)
+            };
             let table = self.route_table.load();
             if let Some(route) = table.resolve(host_stripped) {
                 // Route is being drained (removed in a config reload but still
@@ -538,8 +550,10 @@ impl ProxyHttp for DwaarProxy {
                         }
                         crate::route::Handler::ReverseProxy { upstream } => {
                             ctx.route_upstream = Some(*upstream);
+                            ctx.quic_capable = true;
                         }
                         crate::route::Handler::ReverseProxyPool { pool } => {
+                            ctx.quic_capable = true;
                             // Resolve the upstream now using the LB policy.
                             // Cache the selected address in `route_upstream` so
                             // `upstream_peer()` doesn't need to call `select()` again
@@ -549,6 +563,28 @@ impl ProxyHttp for DwaarProxy {
                             // Always cache the pool so `upstream_peer()` can use the
                             // correct TLS settings even in the single-backend case.
                             ctx.upstream_pool = Some(pool.clone());
+
+                            // Atomically claim the connection slot. `select()` is a
+                            // pure read, so a concurrent request may have filled the
+                            // last slot between our check and this CAS. If we lose
+                            // that race, return 503 now rather than letting the
+                            // request hit the backend over its cap.
+                            if let Some(addr) = ctx.route_upstream
+                                && !pool.acquire_connection(addr)
+                            {
+                                warn!(
+                                    request_id = %ctx.request_id(),
+                                    upstream = %addr,
+                                    "upstream at max_conns — returning 503"
+                                );
+                                let mut resp = ResponseHeader::build(503, Some(0))?;
+                                resp.insert_header("Content-Length", "0")?;
+                                resp.insert_header("Retry-After", "1")?;
+                                session
+                                    .write_response_header(Box::new(resp), true)
+                                    .await?;
+                                return Ok(true);
+                            }
                         }
                         crate::route::Handler::FastCgi { upstream, root } => {
                             ctx.route_upstream = Some(*upstream);
@@ -770,27 +806,43 @@ impl ProxyHttp for DwaarProxy {
                     );
                 }
                 dwaar_plugins::forward_auth::AuthResult::Denied { status, body } => {
-                    debug!(
-                        request_id = %ctx.request_id(),
-                        status,
-                        "forward auth denied"
-                    );
+                    // Log the raw auth body server-side only — never relay it to the
+                    // client, which could leak internal error messages or stack traces.
+                    if body.is_empty() {
+                        debug!(
+                            request_id = %ctx.request_id(),
+                            status,
+                            "forward auth denied"
+                        );
+                    } else {
+                        debug!(
+                            request_id = %ctx.request_id(),
+                            status,
+                            body = %String::from_utf8_lossy(&body),
+                            "forward auth denied (auth service body suppressed from client)"
+                        );
+                    }
+                    // Send a generic response body — auth service internals stay server-side.
+                    let generic_body: &[u8] = if status == 401 {
+                        b"Unauthorized"
+                    } else {
+                        b"Forbidden"
+                    };
                     let mut resp = ResponseHeader::build(status, Some(1))?;
-                    let end_of_body = body.is_empty();
-                    if !end_of_body {
-                        resp.insert_header("Content-Length", body.len().to_string())
-                            .map_err(|e| {
-                                Error::explain(HTTPStatus(status), format!("bad header: {e}"))
-                            })?;
-                    }
+                    resp.insert_header("Content-Length", generic_body.len().to_string())
+                        .map_err(|e| {
+                            Error::explain(HTTPStatus(status), format!("bad header: {e}"))
+                        })?;
+                    resp.insert_header("Content-Type", "text/plain")
+                        .map_err(|e| {
+                            Error::explain(HTTPStatus(status), format!("bad header: {e}"))
+                        })?;
                     session
-                        .write_response_header(Box::new(resp), end_of_body)
+                        .write_response_header(Box::new(resp), false)
                         .await?;
-                    if !end_of_body {
-                        session
-                            .write_response_body(Some(Bytes::from(body)), true)
-                            .await?;
-                    }
+                    session
+                        .write_response_body(Some(Bytes::from_static(generic_body)), true)
+                        .await?;
                     return Ok(true);
                 }
                 dwaar_plugins::forward_auth::AuthResult::Error(msg) => {
@@ -896,7 +948,7 @@ impl ProxyHttp for DwaarProxy {
             let mut body_buf = Vec::new();
             while let Ok(Some(chunk)) = session.downstream_session.read_request_body().await {
                 body_buf.extend_from_slice(&chunk);
-                if body_buf.len() > 10 * 1024 * 1024 {
+                if body_buf.len() as u64 > ctx.request_body_max_size {
                     break;
                 }
             }
@@ -910,6 +962,7 @@ impl ProxyHttp for DwaarProxy {
                 request_body: &body_buf,
                 server_name: host,
                 remote_addr: &client_ip,
+                is_tls: ctx.route_tls,
             };
             match crate::fastcgi::execute(&fcgi_req).await {
                 Ok(fcgi_resp) => {
@@ -1038,11 +1091,13 @@ impl ProxyHttp for DwaarProxy {
             addr
         } else {
             // Defensive fallback — should not happen in normal flow
-            let host = ctx
-                .plugin_ctx
-                .host
-                .as_deref()
-                .map_or("", |h| h.split(':').next().unwrap_or(h));
+            let host = ctx.plugin_ctx.host.as_deref().map_or("", |h| {
+                if h.starts_with('[') {
+                    h.split(']').next().unwrap_or(h).trim_start_matches('[')
+                } else {
+                    h.rsplit_once(':').map_or(h, |(host, _)| host)
+                }
+            });
             let table = self.route_table.load();
             let route = table.resolve(host).ok_or_else(|| {
                 warn!(host = %host, request_id = %ctx.request_id(), "no route for host");
@@ -1219,6 +1274,8 @@ impl ProxyHttp for DwaarProxy {
                 .insert_header("X-Real-IP", ip_str)
                 .expect("IP string is valid header value");
 
+            // Replace (not append) — client-supplied XFF is stripped to prevent
+            // IP spoofing. Only the direct connection IP is trusted.
             upstream_request.remove_header("X-Forwarded-For");
             upstream_request
                 .insert_header("X-Forwarded-For", ip_str)
@@ -1321,9 +1378,12 @@ impl ProxyHttp for DwaarProxy {
             .insert_header("X-Request-Id", ctx.request_id())
             .expect("UUID is valid header value");
 
-        // Advertise HTTP/3 when enabled (ISSUE-079b). Browsers use this to
-        // upgrade future requests to QUIC. `ma=86400` caches the hint for 24h.
-        if self.h3_enabled {
+        // Advertise HTTP/3 only for routes the QUIC bridge can serve
+        // (ReverseProxy and ReverseProxyPool). FileServer, StaticResponse,
+        // and FastCgi are not yet supported over H3 (ISSUE-107), so
+        // advertising Alt-Svc for those routes would cause clients to
+        // attempt QUIC and get a 502.
+        if self.h3_enabled && ctx.quic_capable {
             upstream_response
                 .insert_header("Alt-Svc", r#"h3=":443"; ma=86400"#)
                 .expect("static str is valid header value");
@@ -1538,9 +1598,23 @@ impl ProxyHttp for DwaarProxy {
     {
         // Decrement the route's active connection counter (ISSUE-075).
         // This runs for every request, even failed ones, so the counter
-        // stays accurate for drain timeout decisions.
+        // stays accurate for drain timeout decisions. Use fetch_update to
+        // prevent underflow — a zero counter means no active connections
+        // and subtracting further would wrap to u32::MAX.
         if let Some(ref counter) = ctx.drain_counter {
-            counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            let _ = counter.fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |n| n.checked_sub(1),
+            );
+        }
+
+        // Release the upstream connection slot acquired in request_filter().
+        // logging() always runs — even on errors — so the counter stays accurate.
+        if let Some(ref pool) = ctx.upstream_pool
+            && let Some(addr) = ctx.route_upstream
+        {
+            pool.release_connection(addr);
         }
 
         let response_time_us = ctx.start_time.elapsed().as_micros() as u64;

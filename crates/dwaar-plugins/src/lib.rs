@@ -15,3 +15,6 @@ pub mod plugin;
 pub mod rate_limit;
 pub mod security_headers;
 pub mod under_attack;
+
+#[cfg(feature = "wasm")]
+pub mod wasm;
