@@ -59,10 +59,11 @@ pub fn serve_file(root: &Path, request_path: &str, browse: bool) -> FileResponse
         return FileResponse::Forbidden;
     }
 
-    // Canonicalize root first — on macOS, /tmp symlinks to /private/tmp
-    let Ok(canonical_root) = root.canonicalize() else {
-        return FileResponse::NotFound;
-    };
+    // Root is expected to be pre-canonicalized at config compile time
+    // (see compile.rs). Use it directly to avoid a redundant syscall on
+    // every request. The candidate path below is still canonicalized to
+    // prevent traversal via symlinks inside the root.
+    let canonical_root = root;
 
     // Build candidate path and canonicalize to resolve symlinks + `..`
     let candidate = canonical_root.join(clean_path);
@@ -238,20 +239,22 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn setup_test_dir() -> tempfile::TempDir {
+    fn setup_test_dir() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().expect("create temp dir");
         fs::write(dir.path().join("index.html"), "<html>hello</html>").expect("write index");
         fs::write(dir.path().join("style.css"), "body{}").expect("write css");
         fs::create_dir(dir.path().join("sub")).expect("create subdir");
         fs::write(dir.path().join("sub/page.html"), "<html>sub</html>").expect("write sub");
         fs::write(dir.path().join(".env"), "SECRET=123").expect("write dotfile");
-        dir
+        // Pre-canonicalize like compile.rs does — resolves macOS /tmp -> /private/tmp
+        let canonical = dir.path().canonicalize().expect("canonicalize test dir");
+        (dir, canonical)
     }
 
     #[test]
     fn serves_existing_file() {
-        let dir = setup_test_dir();
-        let resp = serve_file(dir.path(), "/style.css", false);
+        let (_dir, root) = setup_test_dir();
+        let resp = serve_file(&root, "/style.css", false);
         match resp {
             FileResponse::Found {
                 content_type, body, ..
@@ -265,22 +268,22 @@ mod tests {
 
     #[test]
     fn serves_index_html_for_directory() {
-        let dir = setup_test_dir();
-        let resp = serve_file(dir.path(), "/", false);
+        let (_dir, root) = setup_test_dir();
+        let resp = serve_file(&root, "/", false);
         assert!(matches!(resp, FileResponse::Found { .. }));
     }
 
     #[test]
     fn not_found_for_missing_file() {
-        let dir = setup_test_dir();
-        let resp = serve_file(dir.path(), "/nonexistent.txt", false);
+        let (_dir, root) = setup_test_dir();
+        let resp = serve_file(&root, "/nonexistent.txt", false);
         assert!(matches!(resp, FileResponse::NotFound));
     }
 
     #[test]
     fn rejects_path_traversal() {
-        let dir = setup_test_dir();
-        let resp = serve_file(dir.path(), "/../../../etc/passwd", false);
+        let (_dir, root) = setup_test_dir();
+        let resp = serve_file(&root, "/../../../etc/passwd", false);
         assert!(matches!(
             resp,
             FileResponse::Forbidden | FileResponse::NotFound
@@ -289,22 +292,22 @@ mod tests {
 
     #[test]
     fn rejects_null_bytes() {
-        let dir = setup_test_dir();
-        let resp = serve_file(dir.path(), "/style.css\0.txt", false);
+        let (_dir, root) = setup_test_dir();
+        let resp = serve_file(&root, "/style.css\0.txt", false);
         assert!(matches!(resp, FileResponse::Forbidden));
     }
 
     #[test]
     fn rejects_dotfiles() {
-        let dir = setup_test_dir();
-        let resp = serve_file(dir.path(), "/.env", false);
+        let (_dir, root) = setup_test_dir();
+        let resp = serve_file(&root, "/.env", false);
         assert!(matches!(resp, FileResponse::Forbidden));
     }
 
     #[test]
     fn directory_listing_when_browse_enabled() {
-        let dir = setup_test_dir();
-        let resp = serve_file(dir.path(), "/sub/", true);
+        let (_dir, root) = setup_test_dir();
+        let resp = serve_file(&root, "/sub/", true);
         match resp {
             FileResponse::DirectoryListing { body } => {
                 let html = std::str::from_utf8(&body).expect("valid utf8");
@@ -317,23 +320,23 @@ mod tests {
 
     #[test]
     fn no_listing_when_browse_disabled() {
-        let dir = setup_test_dir();
+        let (_dir, root) = setup_test_dir();
         // /sub/ has page.html but no index.html — without browse, returns NotFound
-        let resp = serve_file(dir.path(), "/sub/", false);
+        let resp = serve_file(&root, "/sub/", false);
         assert!(matches!(resp, FileResponse::NotFound));
     }
 
     #[test]
     fn serves_subdirectory_file() {
-        let dir = setup_test_dir();
-        let resp = serve_file(dir.path(), "/sub/page.html", false);
+        let (_dir, root) = setup_test_dir();
+        let resp = serve_file(&root, "/sub/page.html", false);
         assert!(matches!(resp, FileResponse::Found { .. }));
     }
 
     #[test]
     fn etag_is_set() {
-        let dir = setup_test_dir();
-        if let FileResponse::Found { etag, .. } = serve_file(dir.path(), "/style.css", false) {
+        let (_dir, root) = setup_test_dir();
+        if let FileResponse::Found { etag, .. } = serve_file(&root, "/style.css", false) {
             assert!(etag.is_some());
             let tag = etag.expect("etag");
             assert!(tag.starts_with('"'));
