@@ -79,6 +79,10 @@ service:
   type: LoadBalancer
   httpPort: 80
   httpsPort: 443
+  # Target ports on the pod. Defaults to httpPort / httpsPort if not set.
+  # Override when the proxy listens on non-standard ports.
+  httpTargetPort: 80
+  httpsTargetPort: 443
   # Cloud-provider annotations for the LoadBalancer (e.g. AWS NLB, GCP GCLB).
   annotations: {}
 
@@ -87,20 +91,29 @@ ingressClass:
   # Set to true to mark this IngressClass as the cluster-wide default.
   default: false
 
-# Pod anti-affinity — prefer spreading replicas across nodes.
+# Pod anti-affinity — require spreading replicas across nodes.
+# Uses hard anti-affinity by default to guarantee HA. Override with
+# preferredDuringSchedulingIgnoredDuringExecution for dev/single-node clusters.
 affinity:
   podAntiAffinity:
-    preferredDuringSchedulingIgnoredDuringExecution:
-      - weight: 100
-        podAffinityTerm:
-          labelSelector:
-            matchLabels:
-              app.kubernetes.io/name: dwaar-ingress
-          topologyKey: kubernetes.io/hostname
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: dwaar-ingress
+        topologyKey: kubernetes.io/hostname
 
 nodeSelector: {}
 
 tolerations: []
+
+# Persistent storage for TLS certificates.
+# When enabled, certs survive pod restarts without re-materialisation.
+persistence:
+  enabled: false
+  storageClass: ""
+  size: 64Mi
+  accessModes:
+    - ReadWriteOnce
 
 # Extra environment variables injected into the controller container.
 extraEnv: []

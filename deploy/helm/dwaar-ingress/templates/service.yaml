@@ -16,9 +16,9 @@ spec:
   ports:
     - name: http
       port: {{ .Values.service.httpPort }}
-      targetPort: 80
+      targetPort: {{ .Values.service.httpTargetPort | default .Values.service.httpPort }}
       protocol: TCP
     - name: https
       port: {{ .Values.service.httpsPort }}
-      targetPort: 443
+      targetPort: {{ .Values.service.httpsTargetPort | default .Values.service.httpsPort }}
       protocol: TCP
