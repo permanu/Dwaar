@@ -179,7 +179,7 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
                 log_append_fields: compile_log_append(&site.directives, &var_registry),
                 log_name: find_log_name(&site.directives),
                 handler: Handler::FileServer {
-                    root: root_path,
+                    root: root_path.canonicalize().unwrap_or(root_path),
                     browse: fs_directive.browse,
                 },
                 intercepts: intercepts.clone(),
@@ -509,7 +509,7 @@ fn compile_single_block(
         let root_path = find_root(inner_directives)
             .map_or_else(|| PathBuf::from("."), |r| PathBuf::from(&r.path));
         Handler::FileServer {
-            root: root_path,
+            root: root_path.canonicalize().unwrap_or(root_path),
             browse: fs.browse,
         }
     } else if let Some(fcgi) = find_php_fastcgi(inner_directives) {
