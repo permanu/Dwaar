@@ -24,8 +24,10 @@ use pingora_core::services::background::BackgroundService;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use dwaar_core::upstream::UpstreamPool;
+
 use crate::MAX_CONFIG_SIZE;
-use crate::compile::{compile_routes, compile_tls_configs};
+use crate::compile::{collect_pools, compile_acme_domains, compile_routes, compile_tls_configs};
 use crate::parser;
 
 const DEBOUNCE_INTERVAL: Duration = Duration::from_millis(500);
@@ -48,6 +50,12 @@ pub struct ConfigWatcher {
     /// `SniResolver` picks up new or changed manual TLS entries without
     /// a restart.  `None` when the proxy runs without TLS.
     sni_domain_map: Option<DomainConfigMap>,
+    /// Shared pool list for the health checker. Swapped on reload so the
+    /// `HealthChecker` picks up new/removed pools without a restart.
+    health_pools: Option<Arc<ArcSwap<Vec<Arc<UpstreamPool>>>>>,
+    /// Shared ACME domain list. Swapped on reload so `TlsBackgroundService`
+    /// picks up new/removed `tls auto` domains without a restart.
+    acme_domains: Option<Arc<ArcSwap<Vec<String>>>>,
 }
 
 impl std::fmt::Debug for ConfigWatcher {
@@ -76,6 +84,8 @@ impl ConfigWatcher {
             config_notify: None,
             drain_timeout: Duration::from_secs(30),
             sni_domain_map: None,
+            health_pools: None,
+            acme_domains: None,
         }
     }
 
@@ -102,6 +112,22 @@ impl ConfigWatcher {
     #[must_use]
     pub fn with_sni_domain_map(mut self, map: DomainConfigMap) -> Self {
         self.sni_domain_map = Some(map);
+        self
+    }
+
+    /// Attach the shared health-check pool list so hot-reload swaps in
+    /// freshly compiled pools for the `HealthChecker`.
+    #[must_use]
+    pub fn with_health_pools(mut self, pools: Arc<ArcSwap<Vec<Arc<UpstreamPool>>>>) -> Self {
+        self.health_pools = Some(pools);
+        self
+    }
+
+    /// Attach the shared ACME domain list so hot-reload swaps in freshly
+    /// compiled domains for `TlsBackgroundService`.
+    #[must_use]
+    pub fn with_acme_domains(mut self, domains: Arc<ArcSwap<Vec<String>>>) -> Self {
+        self.acme_domains = Some(domains);
         self
     }
 
@@ -207,6 +233,20 @@ impl ConfigWatcher {
 
         refresh_sni_map(self.sni_domain_map.as_ref(), &config);
 
+        // Refresh health-check pools from the newly compiled route table.
+        if let Some(ref hp) = self.health_pools {
+            let pools = collect_pools(&new_table);
+            hp.store(Arc::new(pools));
+            debug!("health-check pools refreshed");
+        }
+
+        // Refresh ACME domain list from the new config.
+        if let Some(ref ad) = self.acme_domains {
+            let domains = compile_acme_domains(&config);
+            ad.store(Arc::new(domains));
+            debug!("ACME domain list refreshed");
+        }
+
         if let Some(ref snapshot) = self.dwaarfile_snapshot {
             // Docker mode: update snapshot, notify DockerWatcher to re-merge
             snapshot.store(Arc::new(new_table.all_routes()));
@@ -226,13 +266,11 @@ impl ConfigWatcher {
             info!(path = %self.config_path.display(), "config reloaded successfully");
         }
 
-        // Warn about components that are NOT refreshed by hot-reload.
-        // These require a full restart to pick up config changes.
-        // Tracked in ISSUE-109 (health pools), ISSUE-110 (ACME domains), ISSUE-111 (cache sizing).
+        // Cache sizing uses Box::leak with a single-init guard and cannot
+        // be safely resized while requests are in flight.
         warn!(
-            "reload refreshed routes and TLS domain map; \
-             health-check pools, ACME domain list, and cache sizing \
-             require a full restart to update"
+            "reload refreshed routes, TLS domain map, health-check pools, and ACME domains; \
+             cache sizing requires a full restart to update"
         );
 
         // Update hash — must run in both branches
