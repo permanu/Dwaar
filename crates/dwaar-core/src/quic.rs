@@ -192,25 +192,33 @@ impl BackgroundService for QuicService {
                                 return;
                             }
                         };
-                        let (conn, zero_rtt_accepted) = connecting
-                            .into_0rtt()
-                            .expect("into_0rtt always succeeds on server side");
+                        let (conn, early_data_active) = match connecting.into_0rtt() {
+                            Ok((conn, zero_rtt_accepted)) => {
+                                let flag = Arc::new(AtomicBool::new(true));
+                                let flag_clone = Arc::clone(&flag);
+                                // Resolve the ZeroRttAccepted future in the background so
+                                // request handlers see the flag flip without blocking.
+                                tokio::spawn(async move {
+                                    let _ = zero_rtt_accepted.await;
+                                    flag_clone.store(false, Ordering::Release);
+                                });
+                                (conn, flag)
+                            }
+                            Err(connecting) => {
+                                // Client doesn't support 0-RTT — fall back to full handshake.
+                                let conn = match connecting.await {
+                                    Ok(c) => c,
+                                    Err(e) => {
+                                        debug!(error = %e, "QUIC handshake failed");
+                                        return;
+                                    }
+                                };
+                                // No 0-RTT window — mark as fully handshaked from the start.
+                                (conn, Arc::new(AtomicBool::new(false)))
+                            }
+                        };
 
                         info!(remote = %conn.remote_address(), "QUIC connection established");
-
-                        // Shared flag: `true` while the 0-RTT window is open,
-                        // flipped to `false` once the full handshake completes.
-                        let early_data_active = Arc::new(AtomicBool::new(true));
-                        let early_data_flag = Arc::clone(&early_data_active);
-
-                        // Resolve the ZeroRttAccepted future in the background so
-                        // request handlers see the flag flip without blocking.
-                        tokio::spawn(async move {
-                            // ZeroRttAccepted resolves to `true` if the 0-RTT was
-                            // accepted, `false` if the handshake completed without 0-RTT.
-                            let _ = zero_rtt_accepted.await;
-                            early_data_flag.store(false, Ordering::Release);
-                        });
 
                         // Drive the HTTP/3 session on this connection.
                         if let Err(e) = handle_h3_connection(
