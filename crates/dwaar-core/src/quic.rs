@@ -356,8 +356,10 @@ where
         return Ok(());
     }
 
-    // Resolve the upstream from the route table (O(1) lock-free read).
-    let upstream_addr = match resolve_upstream_addr(&route_table, host) {
+    // Resolve the upstream from the route table using the same path-matching
+    // logic as the HTTP/1-2 proxy path (proxy.rs request_filter).
+    let request_path = uri.path();
+    let upstream_addr = match resolve_upstream_addr(&route_table, host, request_path) {
         Ok(addr) => addr,
         Err(status) => {
             send_error_response(&mut stream, status, "upstream routing failed").await;
@@ -441,30 +443,45 @@ where
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Look up the upstream address for `host` in the route table.
+/// Look up the upstream address for `host` + `path` in the route table.
 ///
-/// Returns `Ok(addr)` on success, or `Err(status_code)` to signal that an
-/// error response of the given status should be sent to the client. This
-/// keeps `handle_h3_request` under the function-length limit while all
-/// routing logic stays in one readable place.
-fn resolve_upstream_addr(route_table: &ArcSwap<RouteTable>, host: &str) -> Result<SocketAddr, u16> {
+/// Runs the same path-based handler matching as the HTTP/1-2 proxy path
+/// (`proxy.rs` `request_filter`): iterates handler blocks, finds the first
+/// whose `PathMatcher` matches the request path, and extracts the upstream.
+/// Only `ReverseProxy` and `ReverseProxyPool` handlers are supported over
+/// H3 — other handler types return 502.
+fn resolve_upstream_addr(
+    route_table: &ArcSwap<RouteTable>,
+    host: &str,
+    path: &str,
+) -> Result<SocketAddr, u16> {
     let table = route_table.load();
     let Some(route) = table.resolve(host) else {
         return Err(502);
     };
-    // Only ReverseProxy routes are supported over h3 for now.
-    // FileServer, StaticResponse, FastCgi are deferred (ISSUE-107).
-    if let Some(handler) = route.handlers.first().map(|b| &b.handler) {
-        match handler {
+
+    // Walk handler blocks with path matching — mirrors proxy.rs logic.
+    for block in &route.handlers {
+        if block.matcher.matches(path).is_none() {
+            continue;
+        }
+        match &block.handler {
             Handler::ReverseProxy { upstream } => return Ok(*upstream),
             Handler::ReverseProxyPool { pool } => {
                 if let Some(selected) = pool.select(None) {
                     return Ok(selected.addr);
                 }
+                // Pool exists but all backends are down.
+                return Err(503);
             }
-            _ => {}
+            // Non-proxy handlers (FileServer, StaticResponse, FastCgi) are
+            // not yet supported over H3 — return 502 so the client falls
+            // back to HTTP/1-2 instead of misrouting.
+            _ => return Err(502),
         }
     }
+
+    // No handler block matched the request path.
     Err(502)
 }
 
