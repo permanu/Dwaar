@@ -184,6 +184,11 @@ impl StatusMethodCounters {
 
 // -- Top-level metrics registry ----------------------------------------------
 
+/// Maximum number of distinct domains tracked in per-domain DashMaps.
+/// Beyond this limit new domains are silently dropped to prevent unbounded
+/// memory growth in multi-tenant or wildcard setups.
+const MAX_TRACKED_DOMAINS: usize = 10_000;
+
 /// All Prometheus metrics for the Dwaar proxy.
 ///
 /// Created once in `main()`, passed as `Arc<PrometheusMetrics>` to both
@@ -237,10 +242,19 @@ impl PrometheusMetrics {
         }
     }
 
+    /// Returns `true` if the domain is already tracked or we're below the limit.
+    fn domain_within_limit(&self, domain: &CompactString) -> bool {
+        self.requests.contains_key(domain) || self.requests.len() < MAX_TRACKED_DOMAINS
+    }
+
     /// Record all per-request metrics from the `logging()` callback.
     ///
     /// Called once per completed request. All operations are atomic
     /// increments on pre-allocated structures — zero heap allocation.
+    ///
+    /// If the number of tracked domains exceeds [`MAX_TRACKED_DOMAINS`],
+    /// metrics for new (unseen) domains are silently dropped to prevent
+    /// unbounded memory growth.
     pub fn record_request(
         &self,
         domain: &CompactString,
@@ -250,6 +264,10 @@ impl PrometheusMetrics {
         bytes_tx: u64,
         bytes_rx: u64,
     ) {
+        if !self.domain_within_limit(domain) {
+            return;
+        }
+
         self.requests
             .entry(domain.clone())
             .or_default()
@@ -272,11 +290,17 @@ impl PrometheusMetrics {
     }
 
     /// Increment active connections gauge for a domain.
+    ///
+    /// Skipped if the domain count exceeds [`MAX_TRACKED_DOMAINS`].
     pub fn connection_start(&self, domain: &CompactString) {
-        self.active_connections
-            .entry(domain.clone())
-            .or_default()
-            .fetch_add(1, Relaxed);
+        if self.active_connections.contains_key(domain)
+            || self.active_connections.len() < MAX_TRACKED_DOMAINS
+        {
+            self.active_connections
+                .entry(domain.clone())
+                .or_default()
+                .fetch_add(1, Relaxed);
+        }
     }
 
     /// Decrement active connections gauge for a domain.
