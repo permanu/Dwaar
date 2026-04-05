@@ -60,8 +60,10 @@ fn send_http_request(stream: &mut (impl Read + Write), request: &str) -> String 
 /// Start a Pingora service with TCP + UDS, return the thread handle.
 /// `run_forever()` blocks, so we use a thread.
 fn start_test_server(socket_path: &str, tcp_port: u16) -> std::thread::JoinHandle<()> {
-    let socket_path = socket_path.to_string();
+    let socket_path_owned = socket_path.to_string();
+    let socket_path_poll = socket_path.to_string();
     let handle = std::thread::spawn(move || {
+        let socket_path = socket_path_owned;
         use pingora_core::server::Server;
         use pingora_core::server::configuration::{Opt as PingoraOpt, ServerConf};
 
@@ -94,8 +96,15 @@ fn start_test_server(socket_path: &str, tcp_port: u16) -> std::thread::JoinHandl
         server.run_forever();
     });
 
-    // Give the server time to bind
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    // Poll until the UDS is accepting connections (or timeout after 10s).
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(10) {
+        if std::os::unix::net::UnixStream::connect(&socket_path_poll).is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
     handle
 }
 

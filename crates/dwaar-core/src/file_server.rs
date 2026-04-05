@@ -13,10 +13,34 @@
 //! - Dotfiles: hidden by default (`.env`, `.htpasswd`, etc.)
 //! - MIME type: derived from extension only, never from client input
 
-use std::path::Path;
+use std::path::{Component, Path};
 use std::time::SystemTime;
 
 use bytes::Bytes;
+
+/// Cheap lexical check: does `candidate` stay within `root` after resolving
+/// `.` and `..`? Catches obvious traversal without a syscall.
+/// Symlink-based escapes still need `canonicalize()`.
+fn lexically_within(candidate: &Path, root: &Path) -> bool {
+    // Walk components after the root prefix. If `..` ever takes us
+    // above the root level, it's a traversal attempt.
+    let suffix = match candidate.strip_prefix(root) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let mut depth: i32 = 0;
+    for component in suffix.components() {
+        match component {
+            Component::ParentDir => depth -= 1,
+            Component::Normal(_) => depth += 1,
+            _ => {}
+        }
+        if depth < 0 {
+            return false;
+        }
+    }
+    true
+}
 
 /// Result of resolving a file request.
 #[derive(Debug)]
@@ -59,20 +83,25 @@ pub fn serve_file(root: &Path, request_path: &str, browse: bool) -> FileResponse
         return FileResponse::Forbidden;
     }
 
-    // Root is expected to be pre-canonicalized at config compile time
-    // (see compile.rs). Use it directly to avoid a redundant syscall on
-    // every request. The candidate path below is still canonicalized to
-    // prevent traversal via symlinks inside the root.
+    // Root is pre-canonicalized at config compile time (see compile.rs).
     let canonical_root = root;
 
-    // Build candidate path and canonicalize to resolve symlinks + `..`
+    // Build the candidate path. First do a cheap lexical traversal check —
+    // if the normalized components escape the root, reject without a syscall.
     let candidate = canonical_root.join(clean_path);
+    if !lexically_within(&candidate, canonical_root) {
+        return FileResponse::Forbidden;
+    }
+
+    // Canonicalize to resolve symlinks that could escape the root.
+    // This is the only per-request syscall and can't be skipped — a
+    // symlink inside the root could point anywhere.
     let Ok(resolved) = candidate.canonicalize() else {
         return FileResponse::NotFound;
     };
 
-    // Critical security check — prevents path traversal
-    if !resolved.starts_with(&canonical_root) {
+    // Final security check after symlink resolution.
+    if !resolved.starts_with(canonical_root) {
         return FileResponse::Forbidden;
     }
 
