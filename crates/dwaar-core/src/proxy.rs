@@ -948,7 +948,7 @@ impl ProxyHttp for DwaarProxy {
             let mut body_buf = Vec::new();
             while let Ok(Some(chunk)) = session.downstream_session.read_request_body().await {
                 body_buf.extend_from_slice(&chunk);
-                if body_buf.len() > 10 * 1024 * 1024 {
+                if body_buf.len() as u64 > ctx.request_body_max_size {
                     break;
                 }
             }
