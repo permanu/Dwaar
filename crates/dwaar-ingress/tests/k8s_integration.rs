@@ -325,9 +325,11 @@ async fn handle_mock_connection(
         }
     }
 
-    // Read the body if present.
-    let mut body = vec![0u8; content_length];
-    if content_length > 0 {
+    // Read the body if present. Cap at 1MB to prevent test OOM from
+    // malformed Content-Length values.
+    let capped = content_length.min(1024 * 1024);
+    let mut body = vec![0u8; capped];
+    if capped > 0 {
         let _ = reader.read_exact(&mut body).await;
     }
 
