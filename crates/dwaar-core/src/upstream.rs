@@ -572,15 +572,27 @@ async fn probe_backend(
         .map_err(|_| "write timed out")?
         .or_err(pingora_error::ErrorType::WriteError, "health probe write")?;
 
-    // Read just enough to parse the status line — `HTTP/1.1 200 OK\r\n` is ~17 bytes.
+    // Read at least the status line — loop to handle partial reads.
     let mut buf = [0u8; 64];
-    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
-        .await
-        .map_err(|_| "read timed out")?
-        .or_err(pingora_error::ErrorType::ReadError, "health probe read")?;
+    let mut total = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout_at(deadline, stream.read(&mut buf[total..])).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => {
+                total += n;
+                // We have enough once we see \r\n (end of status line) or buffer is full.
+                if buf[..total].windows(2).any(|w| w == b"\r\n") || total >= buf.len() {
+                    break;
+                }
+            }
+            Ok(Err(e)) => return Err(Box::new(e)),
+            Err(_) => return Err("read timed out".into()),
+        }
+    }
 
     // Parse "HTTP/1.x NNN ..." — we only need the status code.
-    let response = std::str::from_utf8(&buf[..n])?;
+    let response = std::str::from_utf8(&buf[..total])?;
     let status = response
         .split_whitespace()
         .nth(1)
