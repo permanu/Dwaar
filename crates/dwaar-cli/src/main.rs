@@ -417,6 +417,10 @@ fn run_server(
         let under_attack_secret: Vec<u8> = std::env::var("DWAAR_UAM_SECRET")
             .ok()
             .and_then(|hex| {
+                if hex.len() % 2 != 0 {
+                    tracing::warn!("DWAAR_UAM_SECRET has odd length — ignoring");
+                    return None;
+                }
                 (0..hex.len())
                     .step_by(2)
                     .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
