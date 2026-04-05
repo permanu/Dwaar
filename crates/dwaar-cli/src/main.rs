@@ -352,11 +352,9 @@ fn run_server(
     }
     info!(routes = route_table.len(), "route table compiled");
 
-    // Collect upstream pools that have health URIs before wrapping the table.
-    // This must happen before ArcSwap wrapping because collect_pools borrows the table.
-    // NOTE: Health check pool is startup-only — not refreshed on reload.
-    // Tracked in ISSUE-109.
-    let health_pools = collect_pools(&route_table);
+    // Collect upstream pools that have health URIs. Wrapped in ArcSwap so
+    // ConfigWatcher can swap in new pools on hot-reload.
+    let health_pools = Arc::new(ArcSwap::from_pointee(collect_pools(&route_table)));
 
     // Capture initial routes before wrapping — DockerWatcher needs a
     // separate snapshot of Dwaarfile routes for merge operations.
@@ -370,10 +368,10 @@ fn run_server(
         Arc::new(ArcSwap::from_pointee(initial_routes));
     let config_notify = Arc::new(tokio::sync::Notify::new());
 
-    // NOTE: ACME domain list is startup-only — not refreshed on reload.
-    // Tracked in ISSUE-110.
-    let acme_domains = compile_acme_domains(dwaar_config);
-    let challenge_solver = if acme_domains.is_empty() {
+    // ACME domain list — wrapped in ArcSwap so ConfigWatcher can swap in
+    // new domains on hot-reload.
+    let acme_domains = Arc::new(ArcSwap::from_pointee(compile_acme_domains(dwaar_config)));
+    let challenge_solver = if acme_domains.load().is_empty() {
         None
     } else {
         Some(Arc::new(ChallengeSolver::new()))
@@ -663,7 +661,6 @@ fn run_server(
         &mut server,
         cli,
         challenge_solver.as_ref(),
-        &acme_domains,
         &cert_store,
         log_receiver,
         config_path,
@@ -676,6 +673,7 @@ fn run_server(
         &route_table_for_agg,
         &agg_metrics,
         health_pools,
+        acme_domains,
         drain_timeout,
         sni_domain_map,
     );
@@ -689,7 +687,6 @@ fn register_background_services(
     server: &mut Server,
     cli: &Cli,
     challenge_solver: Option<&Arc<ChallengeSolver>>,
-    acme_domains: &[String],
     cert_store: &Arc<CertStore>,
     log_receiver: Option<dwaar_log::LogReceiver>,
     config_path: &std::path::Path,
@@ -701,14 +698,16 @@ fn register_background_services(
     agg_receiver: Option<aggregation::AggReceiver>,
     route_table_for_agg: &Arc<ArcSwap<dwaar_core::route::RouteTable>>,
     agg_metrics: &Arc<DashMap<String, dwaar_analytics::aggregation::DomainMetrics>>,
-    health_pools: Vec<Arc<dwaar_core::upstream::UpstreamPool>>,
+    health_pools: Arc<ArcSwap<Vec<Arc<dwaar_core::upstream::UpstreamPool>>>>,
+    acme_domains: Arc<ArcSwap<Vec<String>>>,
     drain_timeout: std::time::Duration,
     sni_domain_map: DomainConfigMap,
 ) {
-    // Upstream health checker — only registered when there are pools with health URIs.
-    // Per Guardrail #20: all async background work must be a BackgroundService.
-    if !health_pools.is_empty() {
-        let checker = dwaar_core::upstream::HealthChecker::new(health_pools);
+    // Upstream health checker — runs as a BackgroundService (Guardrail #20).
+    // Always registered; it will sleep if the pool list is empty and wake up
+    // when pools are swapped in via hot-reload.
+    {
+        let checker = dwaar_core::upstream::HealthChecker::new(Arc::clone(&health_pools));
         let health_bg =
             pingora_core::services::background::background_service("health checker", checker);
         server.add_service(health_bg);
@@ -724,7 +723,7 @@ fn register_background_services(
             Arc::clone(cert_store),
         ));
         let tls_service = TlsBackgroundService::new(
-            acme_domains.to_vec(),
+            Arc::clone(&acme_domains),
             "/etc/dwaar/certs",
             issuer,
             Arc::clone(cert_store),
@@ -736,7 +735,7 @@ fn register_background_services(
         );
         server.add_service(bg);
         info!(
-            domains = acme_domains.len(),
+            domains = acme_domains.load().len(),
             "TLS background service registered"
         );
     }
@@ -762,7 +761,9 @@ fn register_background_services(
     )
     .with_drain_timeout(drain_timeout)
     .with_reload_notify(Arc::clone(config_notify))
-    .with_sni_domain_map(sni_domain_map);
+    .with_sni_domain_map(sni_domain_map)
+    .with_health_pools(health_pools)
+    .with_acme_domains(acme_domains);
     let config_watcher = if cli.docker_socket.is_some() {
         config_watcher.with_docker_mode(Arc::clone(dwaarfile_snapshot), Arc::clone(config_notify))
     } else {

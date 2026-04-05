@@ -14,6 +14,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use openssl::asn1::Asn1Time;
 use openssl::x509::X509;
@@ -29,8 +30,11 @@ use crate::cert_store::CertStore;
 
 /// Background service that provisions/renews ACME certificates and refreshes
 /// OCSP staples.
+///
+/// The domain list is behind `ArcSwap` so that `ConfigWatcher` can swap in a
+/// new set of domains on hot-reload without restarting this service.
 pub struct TlsBackgroundService {
-    domains: Vec<String>,
+    domains: Arc<ArcSwap<Vec<String>>>,
     cert_dir: String,
     issuer: Arc<CertIssuer>,
     cert_store: Arc<CertStore>,
@@ -40,7 +44,6 @@ pub struct TlsBackgroundService {
 impl std::fmt::Debug for TlsBackgroundService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TlsBackgroundService")
-            .field("domains", &self.domains)
             .field("cert_dir", &self.cert_dir)
             .finish_non_exhaustive()
     }
@@ -48,7 +51,7 @@ impl std::fmt::Debug for TlsBackgroundService {
 
 impl TlsBackgroundService {
     pub fn new(
-        domains: Vec<String>,
+        domains: Arc<ArcSwap<Vec<String>>>,
         cert_dir: &str,
         issuer: Arc<CertIssuer>,
         cert_store: Arc<CertStore>,
@@ -146,7 +149,8 @@ impl TlsBackgroundService {
     async fn refresh_ocsp_responses(&self) {
         debug!("OCSP refresh cycle started");
 
-        for domain in &self.domains {
+        let domains = self.domains.load();
+        for domain in domains.iter() {
             let Some(cached) = self.cert_store.get(domain) else {
                 continue;
             };
@@ -185,12 +189,13 @@ impl TlsBackgroundService {
 
     /// Run the startup scan: issue certs for domains that need them.
     async fn startup_scan(&self) {
+        let domains = self.domains.load();
         info!(
-            domains = self.domains.len(),
+            domains = domains.len(),
             "ACME startup scan — checking certificates"
         );
 
-        for domain in &self.domains {
+        for domain in domains.iter() {
             if !self.needs_issuance(domain).await {
                 continue;
             }
@@ -207,7 +212,9 @@ impl TlsBackgroundService {
     async fn daily_renewal(&self) {
         debug!("ACME renewal check");
 
-        for domain in &self.domains {
+        // Reload domain list from ArcSwap so hot-reloaded domains are picked up.
+        let domains = self.domains.load();
+        for domain in domains.iter() {
             if !self.needs_issuance(domain).await {
                 continue;
             }
@@ -262,7 +269,7 @@ mod tests {
             Arc::clone(&cert_store),
         ));
         TlsBackgroundService::new(
-            domains,
+            Arc::new(ArcSwap::from_pointee(domains)),
             cert_dir.to_str().expect("utf8"),
             issuer,
             cert_store,

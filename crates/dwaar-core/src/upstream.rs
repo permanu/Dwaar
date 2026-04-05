@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use pingora_core::OrErr;
 use pingora_core::services::background::BackgroundService;
@@ -455,10 +456,11 @@ fn fnv_hash_ip(ip: std::net::IpAddr) -> usize {
 ///
 /// Per Guardrail #20: all async background work must be a `BackgroundService`,
 /// never a raw `tokio::spawn`.
+///
+/// The pool list is behind `ArcSwap` so that `ConfigWatcher` can swap in a new
+/// set of pools on hot-reload without restarting this service.
 pub struct HealthChecker {
-    /// Pools are moved in via `Mutex<Option<…>>` so `start()` can take ownership
-    /// from `&self` — Pingora calls `start()` exactly once.
-    pools: std::sync::Mutex<Option<Vec<Arc<UpstreamPool>>>>,
+    pools: Arc<ArcSwap<Vec<Arc<UpstreamPool>>>>,
 }
 
 impl std::fmt::Debug for HealthChecker {
@@ -468,53 +470,52 @@ impl std::fmt::Debug for HealthChecker {
 }
 
 impl HealthChecker {
-    /// Create a new checker with the given pools.
-    pub fn new(pools: Vec<Arc<UpstreamPool>>) -> Self {
-        Self {
-            pools: std::sync::Mutex::new(Some(pools)),
-        }
+    /// Create a new checker with a shared, hot-swappable pool list.
+    pub fn new(pools: Arc<ArcSwap<Vec<Arc<UpstreamPool>>>>) -> Self {
+        Self { pools }
     }
 }
 
 #[async_trait]
 impl BackgroundService for HealthChecker {
     async fn start(&self, mut shutdown: pingora_core::server::ShutdownWatch) {
-        // Take ownership of pools from the Mutex — this runs exactly once.
-        let pools = self
-            .pools
-            .lock()
-            .expect("HealthChecker lock not poisoned")
-            .take()
-            .unwrap_or_default();
-
-        // Filter to pools that have a health URI configured.
-        let active: Vec<Arc<UpstreamPool>> = pools
-            .into_iter()
-            .filter(|p| p.health_uri.is_some())
-            .collect();
-
-        if active.is_empty() {
-            debug!("health checker: no pools with health_uri configured, exiting");
-            return;
-        }
-
-        // Derive a common poll interval — use the smallest interval across all pools.
-        let interval = active
-            .iter()
-            .map(|p| p.health_interval)
-            .min()
-            .unwrap_or(Duration::from_secs(10));
-
         loop {
-            // Probe all backends across all pools.
+            // Reload the pool list from ArcSwap on every tick so hot-reloaded
+            // pools are picked up without restarting the service.
+            let all_pools = self.pools.load();
+            let active: Vec<Arc<UpstreamPool>> = all_pools
+                .iter()
+                .filter(|p| p.health_uri.is_some())
+                .cloned()
+                .collect();
+
+            if active.is_empty() {
+                // No pools need health checking right now. Sleep with a default
+                // interval and re-check after reload might have added some.
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_secs(10)) => { continue; }
+                    _ = shutdown.changed() => {
+                        debug!("health checker: shutdown signal received");
+                        return;
+                    }
+                }
+            }
+
+            // Derive poll interval from the smallest configured across active pools.
+            let interval = active
+                .iter()
+                .map(|p| p.health_interval)
+                .min()
+                .unwrap_or(Duration::from_secs(10));
+
+            // Probe all backends across all active pools.
             for pool in &active {
                 let Some(ref uri) = pool.health_uri else {
                     continue;
                 };
                 for backend in &pool.backends {
                     let addr = backend.addr;
-                    let probe_uri = uri.clone();
-                    match probe_backend(addr, &probe_uri).await {
+                    match probe_backend(addr, uri).await {
                         Ok(status) if (200..300).contains(&status) => {
                             pool.mark_healthy(addr);
                         }
@@ -530,7 +531,7 @@ impl BackgroundService for HealthChecker {
                 }
             }
 
-            // Wait for `interval` or shutdown signal.
+            // Wait for the poll interval or shutdown signal.
             tokio::select! {
                 () = tokio::time::sleep(interval) => {}
                 _ = shutdown.changed() => {
