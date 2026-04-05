@@ -85,7 +85,7 @@ impl CacheConfig {
 /// Bundles the `'static` references Pingora's cache subsystem requires.
 ///
 /// Pingora's [`Storage`] trait methods take `&'static self`, so the backing
-/// structs must live for the entire process.  [`init_cache_backend`] allocates
+/// structs must live for the entire process.  [`new_cache_backend`] allocates
 /// them via `Box::leak`.
 /// Manual `Debug` because `MemCache` and `LruManager` don't derive it.
 #[derive(Clone, Copy)]
@@ -93,6 +93,9 @@ pub struct CacheBackend {
     pub storage: &'static MemCache,
     pub eviction: &'static LruManager<16>,
     pub lock: &'static CacheLock,
+    /// The LRU eviction budget that was used to create this backend.
+    /// Stored here so we can detect no-op reloads without re-allocating.
+    pub max_size: usize,
 }
 
 impl std::fmt::Debug for CacheBackend {
@@ -101,46 +104,61 @@ impl std::fmt::Debug for CacheBackend {
             .field("storage", &"MemCache { .. }")
             .field("eviction", &"LruManager<16> { .. }")
             .field("lock", &self.lock)
+            .field("max_size", &self.max_size)
             .finish()
     }
 }
 
-/// Allocate the global cache backend.
+/// Shared handle for hot-reloadable cache backend.
 ///
-/// `max_size` is the LRU eviction budget in bytes.  Each struct is heap-
-/// allocated and leaked so that Pingora can hold `&'static` references.
-/// This is intentional — we call it once at startup and the allocations
-/// live until the process exits.
-///
-/// # Panics
-///
-/// Panics if called more than once per process.  Cache storage is process-global
-/// and there is no safe way to replace the `'static` references Pingora already
-/// holds.  Call this exactly once during server startup.
-pub fn init_cache_backend(max_size: usize) -> CacheBackend {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static CALLED: AtomicBool = AtomicBool::new(false);
+/// The inner `Option` is `None` when no route has a `cache {}` block.
+/// On reload, [`realloc_cache_backend`] swaps in a fresh backend if the
+/// max size changed; consumers call `.load()` per request to pick up
+/// the latest backend.
+pub type SharedCacheBackend = std::sync::Arc<arc_swap::ArcSwap<Option<CacheBackend>>>;
 
-    // Swap true in atomically; if something already set it we have a double-init.
-    let already = CALLED.swap(true, Ordering::SeqCst);
-    assert!(
-        !already,
-        "init_cache_backend called more than once — cache backend is process-global"
-    );
-
-    // Pre-allocate capacity for ~1024 items per shard (16 shards).
+/// Allocate a fresh cache backend with the given LRU eviction budget.
+///
+/// Each struct is heap-allocated and leaked so that Pingora can hold
+/// `&'static` references.  This is safe to call multiple times — each
+/// call leaks a small amount of memory (~1 KB) for the old backend's
+/// control structs.  The actual cached data lives inside the structs
+/// and is abandoned, not leaked again.  Since cache resizes happen at
+/// most a handful of times per deployment the cumulative leak is
+/// negligible.
+pub fn new_cache_backend(max_size: usize) -> CacheBackend {
     let eviction = Box::leak(Box::new(LruManager::<16>::with_capacity(max_size, 1024)));
     let storage = Box::leak(Box::new(MemCache::new()));
-
-    // 10-second lock timeout — generous enough for slow origins,
-    // tight enough to unblock readers quickly on failure.
     let lock = Box::leak(Box::new(CacheLock::new(Duration::from_secs(10))));
 
     CacheBackend {
         storage,
         eviction,
         lock,
+        max_size,
     }
+}
+
+/// Swap in a new cache backend if `new_size` differs from the current one.
+///
+/// Skips reallocation when the size hasn't changed.  Old leaked
+/// `&'static` refs remain valid for any in-flight requests still
+/// referencing them.
+pub fn realloc_cache_backend(shared: &SharedCacheBackend, new_size: usize) {
+    let current = shared.load();
+    if let Some(ref backend) = **current {
+        if backend.max_size == new_size {
+            return;
+        }
+        tracing::info!(
+            old_size = backend.max_size,
+            new_size,
+            "cache backend resized on reload"
+        );
+    } else {
+        tracing::info!(new_size, "cache backend initialized on reload");
+    }
+    shared.store(std::sync::Arc::new(Some(new_cache_backend(new_size))));
 }
 
 // ---------------------------------------------------------------------------
@@ -272,12 +290,76 @@ mod tests {
         );
     }
 
-    // -- init_cache_backend -------------------------------------------------
+    // -- new_cache_backend ---------------------------------------------------
 
     #[test]
-    fn init_backend_returns_valid_refs() {
-        let backend = init_cache_backend(1024 * 1024);
-        // Smoke-test: the references are valid and Debug-printable.
+    fn new_backend_returns_valid_refs() {
+        let backend = new_cache_backend(1024 * 1024);
         let _ = format!("{backend:?}");
+        assert_eq!(backend.max_size, 1024 * 1024);
+    }
+
+    #[test]
+    fn new_backend_can_be_called_multiple_times() {
+        let a = new_cache_backend(1_000_000);
+        let b = new_cache_backend(2_000_000);
+        assert_eq!(a.max_size, 1_000_000);
+        assert_eq!(b.max_size, 2_000_000);
+        assert_ne!(
+            std::ptr::from_ref(a.storage) as usize,
+            std::ptr::from_ref(b.storage) as usize,
+        );
+    }
+
+    /// Read `max_size` from a `SharedCacheBackend`.
+    fn read_max_size(shared: &SharedCacheBackend) -> usize {
+        shared
+            .load()
+            .as_ref()
+            .as_ref()
+            .expect("backend should be Some")
+            .max_size
+    }
+
+    // -- realloc_cache_backend -----------------------------------------------
+
+    #[test]
+    fn realloc_swaps_backend() {
+        let shared: SharedCacheBackend =
+            std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(Some(new_cache_backend(
+                1_000_000,
+            ))));
+        assert_eq!(read_max_size(&shared), 1_000_000);
+
+        realloc_cache_backend(&shared, 4_000_000);
+        assert_eq!(read_max_size(&shared), 4_000_000);
+    }
+
+    #[test]
+    fn realloc_skips_unchanged() {
+        let shared: SharedCacheBackend =
+            std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(Some(new_cache_backend(
+                1_000_000,
+            ))));
+        let ptr_before = std::ptr::from_ref(
+            shared
+                .load()
+                .as_ref()
+                .as_ref()
+                .expect("backend should be Some")
+                .storage,
+        ) as usize;
+
+        realloc_cache_backend(&shared, 1_000_000);
+        let ptr_after = std::ptr::from_ref(
+            shared
+                .load()
+                .as_ref()
+                .as_ref()
+                .expect("backend should be Some")
+                .storage,
+        ) as usize;
+
+        assert_eq!(ptr_before, ptr_after, "no reallocation expected");
     }
 }

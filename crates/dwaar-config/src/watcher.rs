@@ -56,6 +56,9 @@ pub struct ConfigWatcher {
     /// Shared ACME domain list. Swapped on reload so `TlsBackgroundService`
     /// picks up new/removed `tls auto` domains without a restart.
     acme_domains: Option<Arc<ArcSwap<Vec<String>>>>,
+    /// Shared cache backend (ISSUE-111). On reload, if the max cache size
+    /// changed, a new backend is leaked and swapped in.
+    cache_backend: Option<dwaar_core::cache::SharedCacheBackend>,
 }
 
 impl std::fmt::Debug for ConfigWatcher {
@@ -86,6 +89,7 @@ impl ConfigWatcher {
             sni_domain_map: None,
             health_pools: None,
             acme_domains: None,
+            cache_backend: None,
         }
     }
 
@@ -128,6 +132,14 @@ impl ConfigWatcher {
     #[must_use]
     pub fn with_acme_domains(mut self, domains: Arc<ArcSwap<Vec<String>>>) -> Self {
         self.acme_domains = Some(domains);
+        self
+    }
+
+    /// Attach the shared cache backend so hot-reload can resize the LRU
+    /// eviction budget without a restart (ISSUE-111).
+    #[must_use]
+    pub fn with_cache_backend(mut self, backend: dwaar_core::cache::SharedCacheBackend) -> Self {
+        self.cache_backend = Some(backend);
         self
     }
 
@@ -247,6 +259,8 @@ impl ConfigWatcher {
             debug!("ACME domain list refreshed");
         }
 
+        refresh_cache_backend(self.cache_backend.as_ref(), &new_table);
+
         if let Some(ref snapshot) = self.dwaarfile_snapshot {
             // Docker mode: update snapshot, notify DockerWatcher to re-merge
             snapshot.store(Arc::new(new_table.all_routes()));
@@ -265,13 +279,6 @@ impl ConfigWatcher {
             self.route_table.store(Arc::new(new_table));
             info!(path = %self.config_path.display(), "config reloaded successfully");
         }
-
-        // Cache sizing uses Box::leak with a single-init guard and cannot
-        // be safely resized while requests are in flight.
-        warn!(
-            "reload refreshed routes, TLS domain map, health-check pools, and ACME domains; \
-             cache sizing requires a full restart to update"
-        );
 
         // Update hash — must run in both branches
         let mut last = self
@@ -456,14 +463,30 @@ fn log_route_diff(old: &RouteTable, new: &RouteTable) {
     }
 }
 
+/// Resize the cache backend if the max cache size in the new route table
+/// differs from the current one. Skips reallocation when unchanged.
+fn refresh_cache_backend(
+    cache_backend: Option<&dwaar_core::cache::SharedCacheBackend>,
+    new_table: &RouteTable,
+) {
+    let Some(cb) = cache_backend else { return };
+    let new_max = new_table
+        .all_routes()
+        .iter()
+        .flat_map(|r| r.handlers.iter())
+        .filter_map(|h| h.cache.as_ref())
+        .map(|c| c.max_size)
+        .max();
+    if let Some(size) = new_max {
+        dwaar_core::cache::realloc_cache_backend(cb, size);
+    }
+}
+
 /// Swap in a freshly compiled set of explicit TLS cert paths.
 ///
 /// Called on every successful reload so that `SniResolver` picks up new or
 /// changed `tls /cert /key` entries. Does nothing when TLS is disabled.
-fn refresh_sni_map(
-    sni_map: Option<&DomainConfigMap>,
-    config: &crate::model::DwaarConfig,
-) {
+fn refresh_sni_map(sni_map: Option<&DomainConfigMap>, config: &crate::model::DwaarConfig) {
     let Some(map) = sni_map else { return };
     let new_tls = compile_tls_configs(config);
     let domain_map: std::collections::HashMap<String, dwaar_tls::sni::DomainTlsConfig> = new_tls
@@ -484,8 +507,8 @@ fn refresh_sni_map(
 
 /// Compute SHA-256 hash of file content. Used at startup to seed the watcher.
 pub fn hash_content(content: &[u8]) -> [u8; 32] {
-    let digest = openssl::hash::hash(MessageDigest::sha256(), content)
-        .expect("SHA-256 is always available");
+    let digest =
+        openssl::hash::hash(MessageDigest::sha256(), content).expect("SHA-256 is always available");
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest);
     out
@@ -506,7 +529,10 @@ mod tests {
         let hash: [u8; 32] = hash_content(b"hello world");
         // SHA-256("hello world") starts with 0xb9 — verify we got a real hash
         assert_eq!(hash[0], 0xb9, "first byte should be 0xb9");
-        assert!(!hash.iter().all(|&b| b == 0), "hash should not be all zeros");
+        assert!(
+            !hash.iter().all(|&b| b == 0),
+            "hash should not be all zeros"
+        );
     }
 
     #[test]
@@ -660,5 +686,319 @@ mod tests {
         assert!(!draining.load(std::sync::atomic::Ordering::Relaxed));
         // The counter is still 1, but the route is force-closed
         assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    // ── ISSUE-109: health pool hot-reload tests ─────────────────
+
+    #[test]
+    fn reload_refreshes_health_pools() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("Dwaarfile");
+
+        // One site with health checks
+        let initial = "\
+a.com {
+    reverse_proxy {
+        to 127.0.0.1:8080
+        health_uri /health
+        health_interval 5
+    }
+}
+";
+        std::fs::write(&config_path, initial).expect("write");
+        let initial_hash = hash_content(initial.as_bytes());
+
+        let table = Arc::new(ArcSwap::from_pointee(compile_routes(
+            &parser::parse(initial).expect("parse"),
+        )));
+        let health_pools = Arc::new(ArcSwap::from_pointee(collect_pools(&table.load())));
+        assert_eq!(health_pools.load().len(), 1, "one pool at startup");
+
+        let watcher = ConfigWatcher::new(config_path.clone(), Arc::clone(&table), initial_hash)
+            .with_health_pools(Arc::clone(&health_pools));
+
+        // Add a second site with health checks
+        let updated = "\
+a.com {
+    reverse_proxy {
+        to 127.0.0.1:8080
+        health_uri /health
+        health_interval 5
+    }
+}
+b.com {
+    reverse_proxy {
+        to 127.0.0.1:9090
+        health_uri /ping
+        health_interval 10
+    }
+}
+";
+        std::fs::write(&config_path, updated).expect("write");
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        watcher.try_reload(&shutdown_rx);
+
+        assert_eq!(health_pools.load().len(), 2, "second pool added after reload");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reload_removes_stale_health_pools() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("Dwaarfile");
+
+        // Two sites with health checks
+        let initial = "\
+a.com {
+    reverse_proxy {
+        to 127.0.0.1:8080
+        health_uri /health
+        health_interval 5
+    }
+}
+b.com {
+    reverse_proxy {
+        to 127.0.0.1:9090
+        health_uri /ping
+        health_interval 10
+    }
+}
+";
+        std::fs::write(&config_path, initial).expect("write");
+        let initial_hash = hash_content(initial.as_bytes());
+
+        let table = Arc::new(ArcSwap::from_pointee(compile_routes(
+            &parser::parse(initial).expect("parse"),
+        )));
+        let health_pools = Arc::new(ArcSwap::from_pointee(collect_pools(&table.load())));
+        assert_eq!(health_pools.load().len(), 2, "two pools at startup");
+
+        let watcher = ConfigWatcher::new(config_path.clone(), Arc::clone(&table), initial_hash)
+            .with_health_pools(Arc::clone(&health_pools));
+
+        // Remove b.com entirely — needs tokio runtime because removing a
+        // route triggers drain_removed_routes which spawns async tasks.
+        let updated = "\
+a.com {
+    reverse_proxy {
+        to 127.0.0.1:8080
+        health_uri /health
+        health_interval 5
+    }
+}
+";
+        std::fs::write(&config_path, updated).expect("write");
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        watcher.try_reload(&shutdown_rx);
+
+        assert_eq!(health_pools.load().len(), 1, "stale pool removed after reload");
+    }
+
+    // ── ISSUE-110: ACME domain hot-reload tests ─────────────────
+
+    #[test]
+    fn reload_refreshes_acme_domains() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("Dwaarfile");
+
+        let initial = "\
+a.com {
+    tls auto
+    reverse_proxy 127.0.0.1:8080
+}
+";
+        std::fs::write(&config_path, initial).expect("write");
+        let initial_hash = hash_content(initial.as_bytes());
+
+        let config = parser::parse(initial).expect("parse");
+        let table = Arc::new(ArcSwap::from_pointee(compile_routes(&config)));
+        let acme_domains = Arc::new(ArcSwap::from_pointee(compile_acme_domains(&config)));
+        assert_eq!(acme_domains.load().len(), 1, "one ACME domain at startup");
+        assert_eq!(acme_domains.load()[0], "a.com");
+
+        let watcher = ConfigWatcher::new(config_path.clone(), Arc::clone(&table), initial_hash)
+            .with_acme_domains(Arc::clone(&acme_domains));
+
+        // Add a second ACME domain
+        let updated = "\
+a.com {
+    tls auto
+    reverse_proxy 127.0.0.1:8080
+}
+b.com {
+    tls auto
+    reverse_proxy 127.0.0.1:9090
+}
+";
+        std::fs::write(&config_path, updated).expect("write");
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        watcher.try_reload(&shutdown_rx);
+
+        let domains = acme_domains.load();
+        assert_eq!(domains.len(), 2, "second ACME domain added after reload");
+        assert!(domains.contains(&"a.com".to_string()));
+        assert!(domains.contains(&"b.com".to_string()));
+    }
+
+    #[test]
+    fn reload_removes_stale_acme_domains() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("Dwaarfile");
+
+        let initial = "\
+a.com {
+    tls auto
+    reverse_proxy 127.0.0.1:8080
+}
+b.com {
+    tls auto
+    reverse_proxy 127.0.0.1:9090
+}
+";
+        std::fs::write(&config_path, initial).expect("write");
+        let initial_hash = hash_content(initial.as_bytes());
+
+        let config = parser::parse(initial).expect("parse");
+        let table = Arc::new(ArcSwap::from_pointee(compile_routes(&config)));
+        let acme_domains = Arc::new(ArcSwap::from_pointee(compile_acme_domains(&config)));
+        assert_eq!(acme_domains.load().len(), 2, "two ACME domains at startup");
+
+        let watcher = ConfigWatcher::new(config_path.clone(), Arc::clone(&table), initial_hash)
+            .with_acme_domains(Arc::clone(&acme_domains));
+
+        // Remove b.com's tls auto (just plain reverse_proxy)
+        let updated = "\
+a.com {
+    tls auto
+    reverse_proxy 127.0.0.1:8080
+}
+b.com {
+    reverse_proxy 127.0.0.1:9090
+}
+";
+        std::fs::write(&config_path, updated).expect("write");
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        watcher.try_reload(&shutdown_rx);
+
+        let domains = acme_domains.load();
+        assert_eq!(domains.len(), 1, "stale ACME domain removed after reload");
+        assert_eq!(domains[0], "a.com");
+    }
+
+    // ── ISSUE-111: cache sizing hot-reload tests ────────────────
+
+    /// Read `max_size` from a `SharedCacheBackend`.
+    fn read_cache_max_size(cb: &dwaar_core::cache::SharedCacheBackend) -> usize {
+        cb.load()
+            .as_ref()
+            .as_ref()
+            .expect("cache backend should be Some")
+            .max_size
+    }
+
+    /// Get the storage pointer identity for change detection.
+    fn cache_storage_addr(cb: &dwaar_core::cache::SharedCacheBackend) -> usize {
+        std::ptr::from_ref(
+            cb.load()
+                .as_ref()
+                .as_ref()
+                .expect("cache backend should be Some")
+                .storage,
+        ) as usize
+    }
+
+    #[test]
+    fn reload_resizes_cache_backend() {
+        use dwaar_core::cache::{new_cache_backend, SharedCacheBackend};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("Dwaarfile");
+
+        let initial = "\
+a.com {
+    reverse_proxy 127.0.0.1:8080
+    cache {
+        max_size 1m
+    }
+}
+";
+        std::fs::write(&config_path, initial).expect("write");
+        let initial_hash = hash_content(initial.as_bytes());
+
+        let config = parser::parse(initial).expect("parse");
+        let table = Arc::new(ArcSwap::from_pointee(compile_routes(&config)));
+
+        let cache_backend: SharedCacheBackend =
+            Arc::new(ArcSwap::from_pointee(Some(new_cache_backend(1_048_576))));
+        assert_eq!(read_cache_max_size(&cache_backend), 1_048_576);
+
+        let watcher = ConfigWatcher::new(config_path.clone(), Arc::clone(&table), initial_hash)
+            .with_cache_backend(Arc::clone(&cache_backend));
+
+        // Reload with larger cache
+        let updated = "\
+a.com {
+    reverse_proxy 127.0.0.1:8080
+    cache {
+        max_size 4m
+    }
+}
+";
+        std::fs::write(&config_path, updated).expect("write");
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        watcher.try_reload(&shutdown_rx);
+
+        assert_eq!(
+            read_cache_max_size(&cache_backend),
+            4_194_304,
+            "cache backend should reflect new max_size after reload"
+        );
+    }
+
+    #[test]
+    fn reload_skips_cache_resize_when_unchanged() {
+        use dwaar_core::cache::{new_cache_backend, SharedCacheBackend};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("Dwaarfile");
+
+        let initial = "\
+a.com {
+    reverse_proxy 127.0.0.1:8080
+    cache {
+        max_size 2m
+    }
+}
+";
+        std::fs::write(&config_path, initial).expect("write");
+        let initial_hash = hash_content(initial.as_bytes());
+
+        let config = parser::parse(initial).expect("parse");
+        let table = Arc::new(ArcSwap::from_pointee(compile_routes(&config)));
+
+        let cache_backend: SharedCacheBackend =
+            Arc::new(ArcSwap::from_pointee(Some(new_cache_backend(2_097_152))));
+        let ptr_before = cache_storage_addr(&cache_backend);
+
+        let watcher = ConfigWatcher::new(config_path.clone(), Arc::clone(&table), initial_hash)
+            .with_cache_backend(Arc::clone(&cache_backend));
+
+        // Reload with different route but same cache size
+        let updated = "\
+a.com {
+    reverse_proxy 127.0.0.1:9090
+    cache {
+        max_size 2m
+    }
+}
+";
+        std::fs::write(&config_path, updated).expect("write");
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        watcher.try_reload(&shutdown_rx);
+
+        assert_eq!(
+            ptr_before,
+            cache_storage_addr(&cache_backend),
+            "same cache size should not reallocate"
+        );
     }
 }
