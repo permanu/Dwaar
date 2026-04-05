@@ -79,7 +79,7 @@ impl MinuteBuckets {
         let gap = current_minute - self.last_minute;
         // When the new write position laps or revisits any index the previous write
         // occupied, the entire ring is stale — wipe it all in one pass.
-        if gap >= NUM_BUCKETS as u64 || Self::idx(current_minute) <= Self::idx(self.last_minute) {
+        if gap >= NUM_BUCKETS as u64 {
             self.buckets = [0; NUM_BUCKETS];
         } else {
             for offset in 1..=gap {
@@ -142,9 +142,9 @@ mod tests {
         let mut b = MinuteBuckets::new();
         b.increment_at(59);
         b.increment_at(59);
-        b.increment_at(60); // maps to index 0
-        assert_eq!(b.count_at(0), 1);
-        assert_eq!(b.count_at(59), 0); // stale after full wrap
+        b.increment_at(60); // maps to index 0, gap=1 — only bucket 0 cleared
+        assert_eq!(b.count_at(60), 1); // freshly incremented at index 0
+        assert_eq!(b.count_at(59), 2); // still within 60-min window, not stale
     }
 
     #[test]
