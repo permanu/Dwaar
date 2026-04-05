@@ -944,12 +944,17 @@ impl ProxyHttp for DwaarProxy {
                 .map_or_else(String::new, |ip| ip.to_string());
             let host = ctx.plugin_ctx.host.as_deref().unwrap_or("localhost");
 
-            // Read request body for POST
+            // Read request body for POST — reject with 413 if it exceeds the limit.
             let mut body_buf = Vec::new();
             while let Ok(Some(chunk)) = session.downstream_session.read_request_body().await {
                 body_buf.extend_from_slice(&chunk);
                 if body_buf.len() as u64 > ctx.request_body_max_size {
-                    break;
+                    let mut resp = ResponseHeader::build(413, Some(0))?;
+                    resp.insert_header("Content-Length", "0")?;
+                    session
+                        .write_response_header(Box::new(resp), true)
+                        .await?;
+                    return Ok(true);
                 }
             }
 
