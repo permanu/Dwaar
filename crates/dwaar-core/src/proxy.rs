@@ -88,8 +88,10 @@ pub struct DwaarProxy {
     plugin_chain: Arc<PluginChain>,
     /// Prometheus metrics registry (ISSUE-072). `None` when `--no-metrics`.
     prometheus: Option<Arc<dwaar_analytics::prometheus::PrometheusMetrics>>,
-    /// HTTP cache backend (ISSUE-073). `None` when no route has `cache {}` or `--no-cache`.
-    cache_backend: Option<crate::cache::CacheBackend>,
+    /// HTTP cache backend (ISSUE-073, ISSUE-111 hot-reload).
+    /// `None` when `--no-cache`. Inner `ArcSwap` holds `None` when no route
+    /// has a `cache {}` block; swapped on reload when cache size changes.
+    cache_backend: Option<crate::cache::SharedCacheBackend>,
     /// Downstream keepalive timeout in seconds (ISSUE-076). Overrides
     /// Pingora's hardcoded 60s default per keep-alive connection.
     keepalive_secs: u64,
@@ -112,7 +114,7 @@ impl DwaarProxy {
         geo_lookup: Option<Arc<dwaar_geo::GeoLookup>>,
         plugin_chain: Arc<PluginChain>,
         prometheus: Option<Arc<dwaar_analytics::prometheus::PrometheusMetrics>>,
-        cache_backend: Option<crate::cache::CacheBackend>,
+        cache_backend: Option<crate::cache::SharedCacheBackend>,
         keepalive_secs: u64,
         body_timeout_secs: u64,
         h3_enabled: bool,
@@ -293,7 +295,11 @@ impl ProxyHttp for DwaarProxy {
         if !ctx.cache_enabled {
             return Ok(());
         }
-        let Some(ref backend) = self.cache_backend else {
+        let Some(ref shared) = self.cache_backend else {
+            return Ok(());
+        };
+        let guard = shared.load();
+        let Some(ref backend) = **guard else {
             return Ok(());
         };
         session.cache.enable(
@@ -486,7 +492,10 @@ impl ProxyHttp for DwaarProxy {
         if let Some(ref host) = ctx.plugin_ctx.host {
             let host_stripped = if host.starts_with('[') {
                 // IPv6 bracket notation: [::1]:8080
-                host.split(']').next().unwrap_or(host).trim_start_matches('[')
+                host.split(']')
+                    .next()
+                    .unwrap_or(host)
+                    .trim_start_matches('[')
             } else {
                 // IPv4 or hostname: example.com:8080
                 host.rsplit_once(':').map_or(host.as_str(), |(h, _)| h)
@@ -580,9 +589,7 @@ impl ProxyHttp for DwaarProxy {
                                 let mut resp = ResponseHeader::build(503, Some(0))?;
                                 resp.insert_header("Content-Length", "0")?;
                                 resp.insert_header("Retry-After", "1")?;
-                                session
-                                    .write_response_header(Box::new(resp), true)
-                                    .await?;
+                                session.write_response_header(Box::new(resp), true).await?;
                                 return Ok(true);
                             }
                         }
@@ -752,12 +759,27 @@ impl ProxyHttp for DwaarProxy {
             .plugin_chain
             .run_request(session.req_header(), &mut ctx.plugin_ctx)
         {
+            // The rate limiter sets `rate_limited` on ctx — no status code guessing.
+            if ctx.plugin_ctx.rate_limited
+                && let Some(ref prom) = self.prometheus
+                && let Some(ref domain) = ctx.metrics_domain
+            {
+                prom.rate_cache.record_rate_limit_rejected(domain);
+            }
             debug!(
                 request_id = %ctx.request_id(),
                 status = plugin_resp.status,
                 "plugin chain short-circuited request"
             );
             return Self::send_plugin_response(session, plugin_resp).await;
+        }
+
+        // Request passed rate limiting — record allowed metric (ISSUE-114).
+        if ctx.plugin_ctx.rate_limit_rps.is_some()
+            && let Some(ref prom) = self.prometheus
+            && let Some(ref domain) = ctx.metrics_domain
+        {
+            prom.rate_cache.record_rate_limit_allowed(domain);
         }
 
         // --- Basic auth check (ISSUE-046) ---
@@ -837,9 +859,7 @@ impl ProxyHttp for DwaarProxy {
                         .map_err(|e| {
                             Error::explain(HTTPStatus(status), format!("bad header: {e}"))
                         })?;
-                    session
-                        .write_response_header(Box::new(resp), false)
-                        .await?;
+                    session.write_response_header(Box::new(resp), false).await?;
                     session
                         .write_response_body(Some(Bytes::from_static(generic_body)), true)
                         .await?;
@@ -951,9 +971,7 @@ impl ProxyHttp for DwaarProxy {
                 if body_buf.len() as u64 > ctx.request_body_max_size {
                     let mut resp = ResponseHeader::build(413, Some(0))?;
                     resp.insert_header("Content-Length", "0")?;
-                    session
-                        .write_response_header(Box::new(resp), true)
-                        .await?;
+                    session.write_response_header(Box::new(resp), true).await?;
                     return Ok(true);
                 }
             }
@@ -1300,6 +1318,32 @@ impl ProxyHttp for DwaarProxy {
             .insert_header("X-Request-Id", ctx.request_id())
             .expect("UUID is valid header value");
 
+        // W3C Trace Context propagation (ISSUE-112): if the client sent a valid
+        // traceparent, propagate it unchanged; otherwise generate a fresh one so
+        // downstream tracing tools can correlate this edge span.
+        let trace_ctx = session
+            .req_header()
+            .headers
+            .get("traceparent")
+            .and_then(|v| v.to_str().ok())
+            .and_then(crate::trace::parse_traceparent)
+            .unwrap_or_else(crate::trace::generate_traceparent);
+
+        upstream_request
+            .insert_header("traceparent", trace_ctx.traceparent.as_str())
+            .expect("traceparent is valid header value");
+
+        // Pass through tracestate if present — we don't parse it, just relay.
+        if let Some(ts) = session.req_header().headers.get("tracestate")
+            && let Ok(v) = ts.to_str()
+        {
+            upstream_request
+                .insert_header("tracestate", v)
+                .expect("tracestate is valid header value");
+        }
+
+        ctx.trace_ctx = Some(trace_ctx);
+
         // Strip hop-by-hop headers (RFC 7230 §6.1)
         // IMPORTANT: Use remove_header(), not headers.remove() — Pingora
         // maintains a case-preserving header_name_map that desyncs on direct mutation.
@@ -1501,6 +1545,7 @@ impl ProxyHttp for DwaarProxy {
         // Skip for WebSocket upgrades — the 101 response body is a bidirectional
         // stream, not HTML (ISSUE-068).
         let status = upstream_response.status.as_u16();
+        ctx.upstream_status = status;
         if !ctx.is_websocket && !ctx.is_grpc && (200..300).contains(&status) {
             let is_html = upstream_response
                 .headers
@@ -1565,6 +1610,32 @@ impl ProxyHttp for DwaarProxy {
                     HTTPStatus(502),
                     "upstream response body too large",
                 ));
+            }
+        }
+
+        // --- Capture 5xx error body for logging (ISSUE-117) ---
+        // Only reads body on 5xx, caps at 1KB. Zero overhead on happy path.
+        if (500..600).contains(&ctx.upstream_status)
+            && let Some(chunk) = body.as_ref()
+        {
+            let existing = ctx.upstream_error_body.as_ref().map_or(0, String::len);
+            if existing < 1024 {
+                let remaining = 1024 - existing;
+                let slice = &chunk[..chunk.len().min(remaining)];
+                let text = if let Ok(s) = std::str::from_utf8(slice) {
+                    s.to_string()
+                } else {
+                    // Non-UTF-8 body: hex encode so the log entry stays valid JSON.
+                    let mut hex = String::with_capacity(slice.len() * 2);
+                    for &b in slice {
+                        use std::fmt::Write as _;
+                        let _ = write!(hex, "{b:02x}");
+                    }
+                    hex
+                };
+                ctx.upstream_error_body
+                    .get_or_insert_with(String::new)
+                    .push_str(&text);
             }
         }
 
@@ -1640,6 +1711,13 @@ impl ProxyHttp for DwaarProxy {
                 bytes_received,
             );
             prom.connection_end(domain);
+
+            // Cache hit/miss counters (ISSUE-114).
+            match ctx.cache_status {
+                Some("HIT" | "STALE") => prom.rate_cache.record_cache_hit(domain),
+                Some("MISS") => prom.rate_cache.record_cache_miss(domain),
+                _ => {}
+            }
         }
 
         let Some(ref sender) = self.log_sender else {
@@ -1740,6 +1818,8 @@ impl ProxyHttp for DwaarProxy {
             upstream_response_time_us: 0,
             cache_status: ctx.cache_status.map(CompactString::from),
             compression: None,
+            trace_id: ctx.trace_ctx.as_ref().map(|t| t.trace_id.clone()),
+            upstream_error_body: ctx.upstream_error_body.take(),
         };
 
         sender.send(log);

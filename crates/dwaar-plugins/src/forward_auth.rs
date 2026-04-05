@@ -89,11 +89,14 @@ impl ForwardAuthConfig {
         client_ip: Option<&str>,
     ) -> Result<AuthResult, String> {
         if !self.tls {
-            tracing::warn!(
-                upstream = %self.upstream,
-                "forward_auth uses plaintext TCP — auth responses are not integrity-protected; \
-                 set tls: true and point to a TLS-capable endpoint to fix this"
-            );
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    upstream = %self.upstream,
+                    "forward_auth uses plaintext TCP — auth responses are not integrity-protected; \
+                     set tls: true and point to a TLS-capable endpoint to fix this"
+                );
+            });
         }
 
         // Connect TCP with timeout
@@ -109,7 +112,8 @@ impl ForwardAuthConfig {
             Box<dyn AsyncRead + Unpin + Send>,
             Box<dyn AsyncWrite + Unpin + Send>,
         ) = if self.tls {
-            let tls_stream = tls_connect(tcp_stream, self.upstream, self.sni_hostname.as_deref()).await?;
+            let tls_stream =
+                tls_connect(tcp_stream, self.upstream, self.sni_hostname.as_deref()).await?;
             let (r, w) = tokio::io::split(tls_stream);
             (Box::new(r), Box::new(w))
         } else {

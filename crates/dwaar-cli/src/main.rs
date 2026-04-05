@@ -103,8 +103,14 @@ fn fork_workers(count: usize) -> anyhow::Result<WorkerRole> {
     // Install signal handlers — propagate SIGTERM/SIGINT to workers.
     // SAFETY: signal handler only sets an atomic flag.
     unsafe {
-        libc::signal(libc::SIGTERM, handle_shutdown as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGINT, handle_shutdown as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGTERM,
+            handle_shutdown as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            handle_shutdown as *const () as libc::sighandler_t,
+        );
     }
 
     // Backoff for crash loops.
@@ -112,8 +118,10 @@ fn fork_workers(count: usize) -> anyhow::Result<WorkerRole> {
     let crash_window = std::time::Duration::from_secs(5);
     let stable_run = std::time::Duration::from_secs(30);
     let mut backoff = std::time::Duration::from_secs(1);
-    let mut worker_started: std::collections::HashMap<libc::pid_t, std::time::Instant> =
-        children.iter().map(|&p| (p, std::time::Instant::now())).collect();
+    let mut worker_started: std::collections::HashMap<libc::pid_t, std::time::Instant> = children
+        .iter()
+        .map(|&p| (p, std::time::Instant::now()))
+        .collect();
 
     // Supervisor loop — restart any worker that exits.
     loop {
@@ -121,7 +129,9 @@ fn fork_workers(count: usize) -> anyhow::Result<WorkerRole> {
             info!("supervisor: shutdown signal received, terminating workers");
             for &pid in &children {
                 // SAFETY: sending SIGTERM to known child PIDs.
-                unsafe { libc::kill(pid, libc::SIGTERM); }
+                unsafe {
+                    libc::kill(pid, libc::SIGTERM);
+                }
             }
             break;
         }
@@ -191,8 +201,7 @@ fn fork_workers(count: usize) -> anyhow::Result<WorkerRole> {
 }
 
 /// Supervisor shutdown flag — set by SIGTERM/SIGINT handler.
-static SHUTTING_DOWN: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Signal handler for SIGTERM/SIGINT — sets shutdown flag.
 extern "C" fn handle_shutdown(_sig: libc::c_int) {
@@ -279,7 +288,9 @@ fn main() -> anyhow::Result<()> {
         });
         #[allow(unsafe_code)]
         // SAFETY: see comment above — single-threaded before fork.
-        unsafe { std::env::set_var("DWAAR_UAM_SECRET", &hex) };
+        unsafe {
+            std::env::set_var("DWAAR_UAM_SECRET", &hex);
+        }
     }
 
     // Single-process mode skips forking — same behavior as before.
@@ -456,10 +467,9 @@ fn run_server(
         None
     };
 
-    // Cache backend (ISSUE-073): find max cache size from all routes, init once.
-    // NOTE: Cache sizing is startup-only — not refreshed on reload.
-    // Tracked in ISSUE-111.
-    let cache_backend = if cli.cache_enabled() {
+    // Cache backend (ISSUE-073, ISSUE-111 hot-reload): wrapped in ArcSwap
+    // so ConfigWatcher can swap in a resized backend on reload.
+    let cache_backend: Option<dwaar_core::cache::SharedCacheBackend> = if cli.cache_enabled() {
         let max_cache_size = route_table
             .load()
             .all_routes()
@@ -469,10 +479,11 @@ fn run_server(
             .map(|c| c.max_size)
             .max();
 
-        max_cache_size.map(|size| {
+        let initial = max_cache_size.map(|size| {
             tracing::info!(max_size_bytes = size, "HTTP cache enabled");
-            dwaar_core::cache::init_cache_backend(size)
-        })
+            dwaar_core::cache::new_cache_backend(size)
+        });
+        Some(Arc::new(arc_swap::ArcSwap::from_pointee(initial)))
     } else {
         info!("HTTP cache disabled via CLI flag");
         None
@@ -498,6 +509,8 @@ fn run_server(
     // Clone before moving into DwaarProxy — QUIC service needs the same Arcs.
     let route_table_for_quic = Arc::clone(&route_table);
     let plugin_chain_for_quic = Arc::clone(&plugin_chain);
+    let cache_backend_for_admin = cache_backend.clone();
+    let cache_backend_for_watcher = cache_backend.clone();
 
     let proxy = DwaarProxy::new(
         route_table,
@@ -625,8 +638,8 @@ fn run_server(
         admin_service
     };
 
-    let admin_service = if let Some(ref cb) = cache_backend {
-        admin_service.with_cache_storage(cb.storage)
+    let admin_service = if let Some(cb) = cache_backend_for_admin {
+        admin_service.with_cache_backend(cb)
     } else {
         admin_service
     };
@@ -680,6 +693,7 @@ fn run_server(
         acme_domains,
         drain_timeout,
         sni_domain_map,
+        cache_backend_for_watcher,
     );
 
     info!("entering run loop, waiting for connections or signals");
@@ -706,6 +720,7 @@ fn register_background_services(
     acme_domains: Arc<ArcSwap<Vec<String>>>,
     drain_timeout: std::time::Duration,
     sni_domain_map: DomainConfigMap,
+    cache_backend: Option<dwaar_core::cache::SharedCacheBackend>,
 ) {
     // Upstream health checker — runs as a BackgroundService (Guardrail #20).
     // Always registered; it will sleep if the pool list is empty and wake up
@@ -768,6 +783,11 @@ fn register_background_services(
     .with_sni_domain_map(sni_domain_map)
     .with_health_pools(health_pools)
     .with_acme_domains(acme_domains);
+    let config_watcher = if let Some(cb) = cache_backend {
+        config_watcher.with_cache_backend(cb)
+    } else {
+        config_watcher
+    };
     let config_watcher = if cli.docker_socket.is_some() {
         config_watcher.with_docker_mode(Arc::clone(dwaarfile_snapshot), Arc::clone(config_notify))
     } else {

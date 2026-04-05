@@ -6,8 +6,8 @@
 
 //! Admin API service implementing Pingora's `ServeHttp`.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
@@ -47,8 +47,9 @@ pub struct AdminService {
     /// Prometheus metrics registry. When set, `GET /metrics` serves the
     /// Prometheus text exposition format.
     prometheus: Option<Arc<PrometheusMetrics>>,
-    /// Cache storage for PURGE endpoint (ISSUE-073). `None` = cache disabled.
-    cache_storage: Option<&'static pingora_cache::MemCache>,
+    /// Cache backend for PURGE endpoint (ISSUE-073, ISSUE-111 hot-reload).
+    /// Reads from `ArcSwap` per request so it targets the current backend.
+    cache_backend: Option<dwaar_core::cache::SharedCacheBackend>,
     /// Number of authenticated requests seen in the current rate-limit window.
     request_count: AtomicU64,
     /// Start of the current rate-limit window as Unix epoch seconds.
@@ -59,12 +60,10 @@ pub struct AdminService {
 
 impl std::fmt::Debug for AdminService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Omit auth (contains sensitive token data) and cache_storage
-        // (&'static reference doesn't implement Debug).
         f.debug_struct("AdminService")
             .field("reload_notify", &self.reload_notify.is_some())
             .field("prometheus", &self.prometheus.is_some())
-            .field("cache_storage", &self.cache_storage.is_some())
+            .field("cache_backend", &self.cache_backend.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -86,7 +85,7 @@ impl AdminService {
             auth: Auth::new(admin_token),
             reload_notify: None,
             prometheus: None,
-            cache_storage: None,
+            cache_backend: None,
             request_count: AtomicU64::new(0),
             window_start: AtomicU64::new(0),
             last_reload: AtomicU64::new(0),
@@ -107,10 +106,10 @@ impl AdminService {
         self
     }
 
-    /// Attach cache storage for the `PURGE /cache/{host}/{path}` endpoint.
+    /// Attach the shared cache backend for the `PURGE /cache/{host}/{path}` endpoint.
     #[must_use]
-    pub fn with_cache_storage(mut self, storage: &'static pingora_cache::MemCache) -> Self {
-        self.cache_storage = Some(storage);
+    pub fn with_cache_backend(mut self, backend: dwaar_core::cache::SharedCacheBackend) -> Self {
+        self.cache_backend = Some(backend);
         self
     }
 
@@ -137,7 +136,10 @@ impl AdminService {
         }
         let count = self.request_count.fetch_add(1, Ordering::Relaxed) + 1;
         if count > RATE_LIMIT_MAX {
-            return Err(Box::new(json_response(429, r#"{"error":"rate limit exceeded"}"#)));
+            return Err(Box::new(json_response(
+                429,
+                r#"{"error":"rate limit exceeded"}"#,
+            )));
         }
         Ok(())
     }
@@ -323,9 +325,16 @@ impl AdminService {
                         r#"{"error":"missing cache key — use PURGE /cache/{host}/{path}"}"#,
                     );
                 }
-                match &self.cache_storage {
+                let storage = self
+                    .cache_backend
+                    .as_ref()
+                    .and_then(|shared| {
+                        let guard = shared.load();
+                        guard.as_ref().as_ref().map(|b| b.storage)
+                    });
+                match storage {
                     Some(storage) => {
-                        if handlers::purge_cache_key(*storage, key_path).await {
+                        if handlers::purge_cache_key(storage, key_path).await {
                             info!(source, key = key_path, "cache entry purged");
                             json_response(200, r#"{"purged":true}"#)
                         } else {
@@ -358,10 +367,7 @@ fn allowed_methods_for(path: &str) -> &'static str {
         "GET, POST"
     } else if path.starts_with("/routes/") {
         "DELETE"
-    } else if path == "/analytics"
-        || path.starts_with("/analytics/")
-        || path == "/metrics"
-    {
+    } else if path == "/analytics" || path.starts_with("/analytics/") || path == "/metrics" {
         "GET"
     } else if path == "/reload" {
         "POST"
