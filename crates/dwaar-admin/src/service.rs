@@ -123,10 +123,17 @@ impl AdminService {
         let now = epoch_secs();
         let window = self.window_start.load(Ordering::Relaxed);
         if now.saturating_sub(window) >= RATE_LIMIT_WINDOW_SECS {
-            // Window expired — reset counter and start a new one.
-            self.window_start.store(now, Ordering::Relaxed);
-            self.request_count.store(1, Ordering::Relaxed);
-            return Ok(());
+            // Try to atomically claim the window reset.
+            // If another thread races us, only one succeeds — the loser
+            // falls through to the counter check which is safe.
+            if self
+                .window_start
+                .compare_exchange(window, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.request_count.store(1, Ordering::Relaxed);
+                return Ok(());
+            }
         }
         let count = self.request_count.fetch_add(1, Ordering::Relaxed) + 1;
         if count > RATE_LIMIT_MAX {
