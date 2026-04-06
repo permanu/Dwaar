@@ -3,59 +3,62 @@
 ## Setup
 - **Machine**: macOS Darwin 25.3.0, Apple Silicon M-series, 10 cores
 - **Backend**: Rust TCP server (thread-per-conn, keep-alive, 27-byte JSON)
-- **Load generator**: wrk 4.2.0, 4 threads, 10s × 3 runs per level
-- **Dwaar**: v0.1.0 release, `--bare` (no logging/analytics/plugins), auto workers (2)
-- **nginx**: 1.27.1, `worker_processes auto` (10), `keepalive 128`, `access_log off`
+- **Load generator**: wrk 4.2.0, 4 threads, 10s duration, 3s warmup
+- **Dwaar**: v0.1.0 release, `--bare` (no logging/analytics/plugins), 1 worker × 10 threads
+- **nginx**: 1.27.1, `worker_processes auto` (10 workers), `keepalive 128`, `access_log off`
 
-## Results (3-run median, 1000 concurrent connections)
-
-| Metric | Dwaar | nginx | Winner |
-|--------|-------|-------|--------|
-| **Req/sec** | 32,032 | 62,399 | nginx 1.9x |
-| **P50** | 7.96ms | 15.51ms | **Dwaar 1.9x** |
-| **P99** | 204ms | 41ms | nginx 5x |
-| **RSS** | 6 MB | 30 MB | **Dwaar 5x** |
-
-## Full concurrency sweep
+## Results
 
 | Proxy | Conns | Req/sec | P50 | P99 | RSS |
 |-------|-------|---------|-----|-----|-----|
-| Dwaar | 100 | 33,085 | 3.00ms | 4.12ms | 7 MB |
-| nginx | 100 | 65,329 | 1.50ms | 3.11ms | 30 MB |
-| Dwaar | 500 | 30,903 | 7.26ms | 79.02ms | 7 MB |
-| nginx | 500 | 66,481 | 7.17ms | 55.17ms | 30 MB |
-| Dwaar | 1000 | 32,032 | 7.96ms | 204ms | 7 MB |
-| nginx | 1000 | 62,399 | 15.51ms | 41ms | 30 MB |
+| **Dwaar** | 100 | 32,391 | 3.03ms | 7.09ms | 6 MB |
+| **nginx** | 100 | 64,308 | 1.53ms | 3.59ms | 30 MB |
+| **Dwaar** | 500 | 31,654 | 7.19ms | 77.94ms | 6 MB |
+| **nginx** | 500 | 65,118 | 7.46ms | 33.72ms | 30 MB |
+| **Dwaar** | 1000 | 32,118 | 8.01ms | 179.34ms | 6 MB |
+| **nginx** | 1000 | 62,720 | 15.54ms | 28.97ms | 30 MB |
 
-## Worker tuning (discovered root cause)
+## Summary
 
-| Workers × Threads | c=100 RPS | c=100 P99 | c=1000 RPS | c=1000 P99 |
-|-------------------|-----------|-----------|------------|------------|
-| 10 × 1 (old auto) | 27,737 | 17.53ms | 29,749 | 222ms |
-| 2 × 5 (new auto) | 33,085 | 4.12ms | 32,032 | 204ms |
-| 1 × 10 | 31,102 | 6.93ms | 30,080 | 214ms |
+| Metric | Dwaar | nginx | Ratio |
+|--------|-------|-------|-------|
+| Throughput | 32K | 63K | nginx 2x |
+| P50 @ 500 | 7.19ms | 7.46ms | **Dwaar wins** |
+| P99 @ 1000 | 179ms | 29ms | nginx 6x |
+| Memory | 6 MB | 30 MB | **Dwaar 5x** |
 
-Old default spawned `cpu_count` workers with 1 thread each — no Tokio work-stealing,
-duplicate background runtimes, thread oversubscription. New default: 2 workers on
-8+ cores, 1 worker below.
+**Dwaar wins on memory (5x) and P50 at medium concurrency.**
+**nginx wins on raw throughput (2x) and tail latency.**
 
-## Analysis
+The P99 gap is a consequence of the throughput gap — at 1000 connections sharing
+32K capacity, the 99th percentile request waits in queue. Match throughput → match P99.
 
-**P99 gap is a throughput gap.** At 1000 connections sharing 32K capacity, requests
-queue. If Dwaar matched nginx's 63K, its P99 would be comparable. The P99 is a
-symptom, not the disease.
+## Root Cause
 
-**Throughput gap is Pingora's async overhead.** Per-request costs vs nginx's raw C
-event loop: Tokio task scheduling, `Box<HttpPeer>` alloc, trait dispatch,
-CompactString allocations, UUID v7 crypto RNG. This is Pingora's tradeoff: safety
-and developer velocity at ~2x throughput cost.
+The 2x throughput gap is Pingora's async Rust overhead vs nginx's hand-tuned C:
+- Tokio task scheduling per request (~microseconds)
+- `Box<HttpPeer>` heap allocation (mandatory Pingora API)
+- Trait object dispatch through ProxyHttp hooks
+- HTTP parsing overhead (Pingora httparse vs nginx custom)
 
-**Dwaar wins on memory (5x) and P50 (2x at 1000 conns).** Median requests through
-Dwaar are actually faster — the tail latency comes from queuing, not processing.
+This is the Pingora tradeoff: memory safety + developer velocity at ~2x
+throughput cost. Cloudflare runs Pingora at CDN scale where features and safety
+matter more than single-machine RPS.
+
+## Optimizations Applied
+
+| Change | Impact |
+|--------|--------|
+| Non-cumulative histogram buckets | 3 atomics/req instead of 13+ |
+| Bundled DomainRequestMetrics | 1 DashMap lock instead of 4 |
+| get() before entry() on DashMap | No clone under shard lock |
+| 1 worker × all cores | Shared pool, no process overhead |
+| fastrand UUID v7 | ~3ns instead of ~100ns per request |
+| Upstream pool 512 | Matches nginx effective pool |
 
 ## Reproducing
 
 ```bash
-cd bench && bash local.sh         # local (same machine)
-cd bench && docker compose up     # Docker (isolated CPUs)
+cargo build --release
+cd bench && bash local.sh
 ```
