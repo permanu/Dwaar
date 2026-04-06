@@ -261,19 +261,17 @@ fn main() -> anyhow::Result<()> {
         .map(std::num::NonZero::get)
         .unwrap_or(1);
 
-    // Fewer workers with more threads each outperforms many single-threaded
-    // workers. Each Pingora worker spawns its own Tokio runtime + background
-    // services (admin API, health checker, config watcher), so N workers means
-    // N × overhead. With 2 workers on a 10-core machine, each gets 5 Tokio
-    // threads with work-stealing — better cache locality and less scheduler
-    // overhead than 10 workers × 1 thread.
+    // Pingora is not nginx. nginx workers are single-threaded event loops —
+    // more workers = more parallelism. Pingora workers each spawn a full
+    // Tokio multi-threaded runtime, so one worker with N threads already
+    // uses all cores via work-stealing. Extra workers add overhead:
+    // duplicate background runtimes (admin API, health checker, etc.)
+    // and cross-process connection pool fragmentation.
     //
-    // Benchmark (10-core Apple Silicon, Rust backend, 1000 conns):
-    //   10 workers × 1 thread:  29,749 RPS, P99 = 222ms
-    //    2 workers × 5 threads: 32,690 RPS, P99 = 175ms  (+10% RPS, -21% P99)
-    //    1 worker × 10 threads: 30,080 RPS, P99 = 214ms
+    // At 8+ cores, 2 workers lets the kernel load-balance accept() via
+    // SO_REUSEPORT without the overhead of N runtimes.
     let worker_count = match cli.workers {
-        WorkerCount::Auto => (cpu_count / 4).clamp(1, 4),
+        WorkerCount::Auto => if cpu_count >= 8 { 2 } else { 1 },
         WorkerCount::Count(n) => n,
     };
 

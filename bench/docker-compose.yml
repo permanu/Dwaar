@@ -1,0 +1,55 @@
+services:
+  # Shared backend — Rust TCP server, identical for all proxies
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    cpus: 2
+    mem_limit: 128m
+    networks:
+      - bench
+
+  # Dwaar proxy
+  dwaar:
+    build:
+      context: ..
+      dockerfile: bench/Dockerfile.dwaar
+    cpus: 4
+    mem_limit: 256m
+    ports:
+      - "6188:6188"
+    depends_on:
+      - backend
+    networks:
+      - bench
+
+  # nginx proxy (same backend, same resources)
+  nginx:
+    image: nginx:1.27-alpine
+    cpus: 4
+    mem_limit: 256m
+    ports:
+      - "8199:8199"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - backend
+    networks:
+      - bench
+
+  # wrk load generator — separate CPU allocation
+  wrk:
+    build:
+      context: .
+      dockerfile: Dockerfile.wrk
+    cpus: 2
+    mem_limit: 128m
+    depends_on:
+      - dwaar
+      - nginx
+    networks:
+      - bench
+
+networks:
+  bench:
+    driver: bridge
