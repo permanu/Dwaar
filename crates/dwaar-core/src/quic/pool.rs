@@ -70,7 +70,12 @@ pub struct BufferedConn {
 
 impl BufferedConn {
     /// Wrap a fresh TCP connection with an initial read buffer.
+    ///
+    /// Enables `TCP_NODELAY` to avoid Nagle-delayed writes on the
+    /// upstream connection — small request headers and chunked-encoding
+    /// framing must be sent immediately, not coalesced.
     pub fn new(stream: TcpStream) -> Self {
+        let _ = stream.set_nodelay(true);
         Self {
             stream,
             read_buf: BytesMut::with_capacity(INIT_READ_BUF),

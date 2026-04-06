@@ -324,7 +324,7 @@ where
         &mut conn,
         h3_stream,
         &body_framing,
-        &body_prefix,
+        body_prefix,
         plugin_chain,
         ctx,
     )
@@ -354,7 +354,7 @@ async fn stream_response_body_inline<S, B>(
     conn: &mut BufferedConn,
     h3_stream: &mut RequestStream<S, B>,
     body_framing: &BodyFraming,
-    body_prefix: &[u8],
+    body_prefix: Vec<u8>,
     plugin_chain: &PluginChain,
     ctx: &mut dwaar_plugins::plugin::PluginCtx,
 ) -> Result<bool, StreamProxyError>
@@ -391,15 +391,17 @@ where
             let mut sent = 0usize;
 
             // Yield any prefix bytes left over from header parsing.
+            // Bytes::from(Vec<u8>) takes ownership — zero copy.
             if !body_prefix.is_empty() {
                 let n = body_prefix.len().min(total);
                 sent += n;
                 let is_last = sent >= total;
-                send_chunk(
-                    h3_stream, plugin_chain, ctx,
-                    Bytes::copy_from_slice(&body_prefix[..n]),
-                    is_last,
-                ).await?;
+                let prefix_bytes = if n == body_prefix.len() {
+                    Bytes::from(body_prefix)
+                } else {
+                    Bytes::from(body_prefix[..n].to_vec())
+                };
+                send_chunk(h3_stream, plugin_chain, ctx, prefix_bytes, is_last).await?;
                 if is_last {
                     return Ok(true);
                 }
@@ -427,7 +429,7 @@ where
             if !body_prefix.is_empty() {
                 send_chunk(
                     h3_stream, plugin_chain, ctx,
-                    Bytes::copy_from_slice(body_prefix),
+                    Bytes::from(body_prefix),
                     false,
                 ).await?;
             }
