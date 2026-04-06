@@ -68,6 +68,6 @@ That's it. Both domains get HTTPS certificates automatically. Blog gets analytic
 
 ## License
 
-Dwaar is source-available under the [Business Source License 1.1](https://github.com/permanu/Dwaar/blob/main/LICENSE), converting to AGPL-3.0 after 6 years per release. Free to use for any purpose except offering a competing commercial proxy service.
+Dwaar is source-available under the [Business Source License 1.1](https://github.com/permanu/Dwaar/blob/main/LICENSE), converting to AGPL-3.0 after 10 years per release. Free to use for any purpose except offering a competing commercial proxy service.
 
 Built by [Permanu](https://permanu.com).

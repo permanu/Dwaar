@@ -74,7 +74,10 @@ pub async fn execute(req: &FastCgiRequest<'_>) -> Result<FastCgiResponse, String
         format!("{}?{}", req.request_path, req.query_string),
     );
     params.insert("SERVER_NAME", req.server_name.to_string());
-    params.insert("SERVER_PORT", if req.is_tls { "443" } else { "80" }.to_string());
+    params.insert(
+        "SERVER_PORT",
+        if req.is_tls { "443" } else { "80" }.to_string(),
+    );
     params.insert("REMOTE_ADDR", req.remote_addr.to_string());
     params.insert("CONTENT_LENGTH", req.request_body.len().to_string());
     params.insert(

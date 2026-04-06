@@ -157,15 +157,17 @@ pub enum Handler {
 impl PartialEq for Handler {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Handler::ReverseProxy { upstream: a, .. }, Handler::ReverseProxy { upstream: b, .. }) => {
-                a == b
-            }
+            (
+                Handler::ReverseProxy { upstream: a, .. },
+                Handler::ReverseProxy { upstream: b, .. },
+            ) => a == b,
             // Pool equality is by pointer identity — two pools are equal only if
             // they point to the same allocation. This is intentional: pool contents
             // are mutable (health state), so value equality would be misleading.
-            (Handler::ReverseProxyPool { pool: a, .. }, Handler::ReverseProxyPool { pool: b, .. }) => {
-                Arc::ptr_eq(a, b)
-            }
+            (
+                Handler::ReverseProxyPool { pool: a, .. },
+                Handler::ReverseProxyPool { pool: b, .. },
+            ) => Arc::ptr_eq(a, b),
             (
                 Handler::StaticResponse {
                     status: s1,
@@ -583,7 +585,10 @@ impl Route {
                 maps: vec![],
                 log_append_fields: vec![],
                 log_name: None,
-                handler: Handler::ReverseProxy { upstream, upstream_h2: false },
+                handler: Handler::ReverseProxy {
+                    upstream,
+                    upstream_h2: false,
+                },
                 intercepts: vec![],
                 copy_response_headers: None,
                 ip_filter: None,

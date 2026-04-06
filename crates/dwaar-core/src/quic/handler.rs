@@ -11,8 +11,8 @@
 //! full request lifecycle: parse → route → plugin → streaming proxy → respond.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
@@ -23,14 +23,12 @@ use tracing::{debug, warn};
 
 use crate::route::RouteTable;
 
-use super::bridge::{
-    self, BodyFraming, UpstreamError, MAX_REQUEST_BODY, UPSTREAM_TIMEOUT_SECS,
-};
-use super::pool::BufferedConn;
+use super::bridge::{self, BodyFraming, MAX_REQUEST_BODY, UPSTREAM_TIMEOUT_SECS, UpstreamError};
 use super::convert::{
     build_plugin_ctx, h3_to_pingora_headers, is_hop_by_hop, is_idempotent_method,
     pingora_resp_to_h3, resolve_upstream_addr,
 };
+use super::pool::BufferedConn;
 use super::pool::UpstreamConnPool;
 
 /// Errors while managing an h3 connection at the transport level.
@@ -178,8 +176,9 @@ where
     }
 
     let request_path = uri.path();
-    let (upstream_addr, upstream_h2) = match resolve_upstream_addr(&route_table, host, request_path) {
-        Ok(resolved) => resolved,
+    let (upstream_addr, upstream_h2) = match resolve_upstream_addr(&route_table, host, request_path)
+    {
+        Ok(addr_and_h2) => addr_and_h2,
         Err(status) => {
             send_error_response(&mut stream, status, "upstream routing failed").await;
             return Ok(());
@@ -203,7 +202,7 @@ where
             ),
         )
         .await
-        .map(|r| r.map_err(|e| StreamProxyError::H2Bridge(e)))
+        .map(|r| r.map_err(StreamProxyError::H2Bridge))
     } else {
         // HTTP/1.1 upstream — one TCP connection per stream.
         tokio::time::timeout(
@@ -263,7 +262,9 @@ where
         BufferedConn::new(
             tokio::net::TcpStream::connect(upstream_addr)
                 .await
-                .map_err(|e| StreamProxyError::Upstream(UpstreamError::Connect(upstream_addr, e)))?,
+                .map_err(|e| {
+                    StreamProxyError::Upstream(UpstreamError::Connect(upstream_addr, e))
+                })?,
         )
     };
 
@@ -281,7 +282,11 @@ where
 
     let mut total_body = 0usize;
 
-    while let Some(chunk) = h3_stream.recv_data().await.map_err(StreamProxyError::H3RecvData)? {
+    while let Some(chunk) = h3_stream
+        .recv_data()
+        .await
+        .map_err(StreamProxyError::H3RecvData)?
+    {
         use bytes::Buf;
         let remaining = chunk.remaining();
         total_body += remaining;
@@ -324,17 +329,15 @@ where
 
     for (name, value) in headers {
         if !is_hop_by_hop(name.as_str()) {
-            let _ = pingora_resp.insert_header(
-                String::from(name.as_str()),
-                String::from(value.as_str()),
-            );
+            let _ = pingora_resp
+                .insert_header(String::from(name.as_str()), String::from(value.as_str()));
         }
     }
 
     plugin_chain.run_response(&mut pingora_resp, ctx);
 
-    let h3_resp = pingora_resp_to_h3(&pingora_resp, status)
-        .map_err(StreamProxyError::BuildResponse)?;
+    let h3_resp =
+        pingora_resp_to_h3(&pingora_resp, status).map_err(StreamProxyError::BuildResponse)?;
 
     h3_stream
         .send_response(h3_resp)
@@ -431,7 +434,9 @@ where
 
             // Stream remaining body using the connection's own buffer.
             while sent < total {
-                let n = conn.read_into_buf().await
+                let n = conn
+                    .read_into_buf()
+                    .await
                     .map_err(|e| StreamProxyError::Upstream(UpstreamError::Read(e)))?;
                 if n == 0 {
                     return Err(StreamProxyError::Upstream(UpstreamError::Parse(
@@ -450,14 +455,19 @@ where
         BodyFraming::CloseDelimited => {
             if !body_prefix.is_empty() {
                 send_chunk(
-                    h3_stream, plugin_chain, ctx,
+                    h3_stream,
+                    plugin_chain,
+                    ctx,
                     Bytes::from(body_prefix),
                     false,
-                ).await?;
+                )
+                .await?;
             }
 
             loop {
-                let n = conn.read_into_buf().await
+                let n = conn
+                    .read_into_buf()
+                    .await
                     .map_err(|e| StreamProxyError::Upstream(UpstreamError::Read(e)))?;
                 if n == 0 {
                     send_chunk(h3_stream, plugin_chain, ctx, Bytes::new(), true).await?;
@@ -471,13 +481,12 @@ where
         BodyFraming::Chunked => {
             // Inline chunked decoding — async closures can't borrow h3_stream,
             // so we decode inline rather than using stream_chunked_body.
-            let mut raw = Vec::from(body_prefix);
+            let mut raw = body_prefix;
 
             loop {
                 // Drain all complete chunks from the buffer before hitting the network.
                 if let Some((payload, consumed, is_terminal)) =
-                    bridge::try_decode_one_chunk(&raw)
-                        .map_err(StreamProxyError::Upstream)?
+                    bridge::try_decode_one_chunk(&raw).map_err(StreamProxyError::Upstream)?
                 {
                     raw.drain(..consumed);
 
@@ -487,18 +496,17 @@ where
                     }
 
                     if !payload.is_empty() {
-                        send_chunk(
-                            h3_stream, plugin_chain, ctx,
-                            Bytes::from(payload),
-                            false,
-                        ).await?;
+                        send_chunk(h3_stream, plugin_chain, ctx, Bytes::from(payload), false)
+                            .await?;
                     }
                     continue;
                 }
 
                 // Need more data from upstream — read into connection's buffer,
                 // then append to the chunked accumulator.
-                let n = conn.read_into_buf().await
+                let n = conn
+                    .read_into_buf()
+                    .await
                     .map_err(|e| StreamProxyError::Upstream(UpstreamError::Read(e)))?;
                 if n == 0 {
                     return Err(StreamProxyError::Upstream(UpstreamError::Parse(
@@ -546,16 +554,15 @@ where
         .await
         .map_err(|e| super::h2_bridge::H2BridgeError::BuildResponse(e.to_string()))?;
 
-    let result = super::h2_bridge::stream_via_h2(
-        h3_stream, sender, method, uri, headers, plugin_chain, ctx,
-    )
-    .await;
+    let result =
+        super::h2_bridge::stream_via_h2(h3_stream, sender, method, uri, headers, plugin_chain, ctx)
+            .await;
 
     // On connection-level error, evict and retry once for idempotent methods.
     let is_conn_error = matches!(
         result,
-        Err(super::h2_bridge::H2BridgeError::SendRequest(_))
-            | Err(super::h2_bridge::H2BridgeError::RecvResponse(_))
+        Err(super::h2_bridge::H2BridgeError::SendRequest(_)
+            | super::h2_bridge::H2BridgeError::RecvResponse(_))
     );
 
     if is_conn_error {
@@ -573,7 +580,13 @@ where
                 .map_err(|e| super::h2_bridge::H2BridgeError::BuildResponse(e.to_string()))?;
 
             return super::h2_bridge::stream_via_h2(
-                h3_stream, sender, method, uri, headers, plugin_chain, ctx,
+                h3_stream,
+                sender,
+                method,
+                uri,
+                headers,
+                plugin_chain,
+                ctx,
             )
             .await;
         }

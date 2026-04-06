@@ -26,6 +26,7 @@ use tracing::{debug, warn};
 use super::web_vitals::Percentiles;
 use super::{AggEvent, AggReceiver, DomainMetrics};
 use crate::beacon::BeaconEvent;
+use crate::sink::{AnalyticsSink, DomainMetricsSnapshot};
 
 /// Flush aggregates every 60 seconds.
 const FLUSH_INTERVAL: Duration = Duration::from_secs(60);
@@ -49,6 +50,9 @@ pub struct AggregationService<RT: RouteValidator> {
     route_validator: RT,
     beacon_rx: Mutex<Option<mpsc::Receiver<BeaconEvent>>>,
     log_rx: Mutex<Option<AggReceiver>>,
+    /// External sink for analytics snapshots (ISSUE-116). `None` uses the
+    /// legacy stdout flush path for backwards compatibility.
+    sink: Option<Box<dyn AnalyticsSink>>,
 }
 
 impl<RT: RouteValidator> std::fmt::Debug for AggregationService<RT> {
@@ -71,7 +75,17 @@ impl<RT: RouteValidator> AggregationService<RT> {
             route_validator,
             beacon_rx: Mutex::new(Some(beacon_rx)),
             log_rx: Mutex::new(Some(log_rx)),
+            sink: None,
         }
+    }
+
+    /// Set an external sink for analytics snapshots (ISSUE-116).
+    /// When set, `flush()` sends `DomainMetricsSnapshot` to the sink
+    /// in addition to the legacy stdout path.
+    #[must_use]
+    pub fn with_sink(mut self, sink: Box<dyn AnalyticsSink>) -> Self {
+        self.sink = Some(sink);
+        self
     }
 
     /// Read-only access to the shared metrics map.
@@ -97,6 +111,17 @@ impl<RT: RouteValidator> AggregationService<RT> {
     }
 
     fn flush(&self) {
+        if let Some(ref sink) = self.sink {
+            // Sink path: send structured snapshots to external consumer.
+            for entry in self.metrics.iter() {
+                let snapshot = DomainMetricsSnapshot::from_metrics(entry.key(), entry.value());
+                if let Err(e) = sink.flush(&snapshot) {
+                    warn!(error = %e, domain = entry.key().as_str(), "analytics sink flush failed");
+                }
+            }
+        }
+
+        // Legacy stdout path — always runs so standalone Dwaar still logs.
         let stdout = std::io::stdout();
         let mut handle = stdout.lock();
         for mut entry in self.metrics.iter_mut() {

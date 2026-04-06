@@ -20,7 +20,10 @@ pub mod aggregation;
 pub mod beacon;
 pub mod decompress;
 pub mod injector;
+pub mod process_metrics;
 pub mod prometheus;
+pub mod rate_cache_metrics;
+pub mod sink;
 
 #[cfg(test)]
 mod tests {

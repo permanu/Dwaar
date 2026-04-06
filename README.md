@@ -57,7 +57,7 @@ Dwaar Plugins        → Native Rust + WASM extensibility
 
 ## License
 
-[Business Source License 1.1](LICENSE) — free to use, modify, and redistribute. Cannot be used to offer a competing commercial proxy, CDN, or analytics service. Converts to AGPL-3.0 after 6 years per release.
+[Business Source License 1.1](LICENSE) — free to use, modify, and redistribute. Cannot be used to offer a competing commercial proxy, CDN, or analytics service. Converts to AGPL-3.0 after 10 years per release.
 
 Commercial licensing available for organizations that need different terms. Contact: [hello@permanu.com](mailto:hello@permanu.com)
 

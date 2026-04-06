@@ -42,7 +42,7 @@ use tracing::{debug, info};
 use crate::route::RouteTable;
 
 // Re-export key public types for downstream consumers.
-pub use convert::{h3_to_pingora_headers, H3ParseError};
+pub use convert::{H3ParseError, h3_to_pingora_headers};
 pub use handler::{ConnectionHandlerError, RequestHandlerError};
 
 /// Maximum concurrent HTTP/3 request streams per QUIC connection.

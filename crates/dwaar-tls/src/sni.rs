@@ -222,10 +222,7 @@ mod tests {
         );
 
         // Domain config is registered — verify the shared map was updated
-        assert!(resolver
-            .domain_configs
-            .load()
-            .contains_key("example.com"));
+        assert!(resolver.domain_configs.load().contains_key("example.com"));
     }
 
     #[test]
@@ -264,10 +261,7 @@ mod tests {
         shared.store(Arc::new(new_map));
 
         // resolver.domain_configs is the same ArcSwap — load sees the new map
-        assert!(resolver
-            .domain_configs
-            .load()
-            .contains_key("reloaded.com"));
+        assert!(resolver.domain_configs.load().contains_key("reloaded.com"));
     }
 
     #[test]

@@ -94,7 +94,8 @@ impl BufferedConn {
     pub async fn read_into_buf(&mut self) -> std::io::Result<usize> {
         if self.read_buf.capacity() - self.read_buf.len() < 1024 {
             // Reserve more space, but don't exceed MAX_READ_BUF total capacity
-            let additional = INIT_READ_BUF.min(MAX_READ_BUF.saturating_sub(self.read_buf.capacity()));
+            let additional =
+                INIT_READ_BUF.min(MAX_READ_BUF.saturating_sub(self.read_buf.capacity()));
             if additional > 0 {
                 self.read_buf.reserve(additional);
             }
@@ -194,7 +195,10 @@ impl UpstreamConnPool {
     /// Expired connections are silently discarded. Returns `None` when the
     /// pool is empty or all connections have expired.
     pub fn take(&self, addr: SocketAddr) -> Option<BufferedConn> {
-        let mut pools = self.pools.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pools = self
+            .pools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let deque = pools.get_mut(&addr)?;
         let now = Instant::now();
 
@@ -223,7 +227,10 @@ impl UpstreamConnPool {
     pub fn put(&self, addr: SocketAddr, mut conn: BufferedConn) {
         conn.reset_for_reuse();
 
-        let mut pools = self.pools.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pools = self
+            .pools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let deque = pools.entry(addr).or_default();
 
         if deque.len() >= self.max_per_host {
@@ -339,8 +346,11 @@ mod tests {
 
         conn.reset_for_reuse();
         // Should NOT shrink — capacity within MAX_READ_BUF is normal
-        assert_eq!(conn.read_buf.capacity(), cap_before,
-            "normal-range buffer should not be reallocated on reset");
+        assert_eq!(
+            conn.read_buf.capacity(),
+            cap_before,
+            "normal-range buffer should not be reallocated on reset"
+        );
     }
 
     #[tokio::test]

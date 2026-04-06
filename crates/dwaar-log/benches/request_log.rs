@@ -43,6 +43,8 @@ fn sample_log() -> RequestLog {
         upstream_response_time_us: 980,
         cache_status: None,
         compression: Some("gzip".into()),
+        trace_id: None,
+        upstream_error_body: None,
     }
 }
 

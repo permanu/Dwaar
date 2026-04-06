@@ -12,42 +12,95 @@
 # Configuration
 
 - [Dwaarfile Reference](./configuration/dwaarfile.md)
+- [Global Options](./configuration/global-options.md)
+- [Named Matchers](./configuration/named-matchers.md)
+- [Placeholders & Variables](./configuration/placeholders.md)
 - [CLI Reference](./configuration/cli.md)
 - [Environment Variables](./configuration/environment.md)
 
-# Features
+# Routing & Handlers
 
-- [Automatic HTTPS](./features/automatic-https.md)
-- [First-Party Analytics](./features/analytics.md)
-- [Request Logging](./features/logging.md)
-- [Rate Limiting](./features/rate-limiting.md)
-- [Bot Detection](./features/bot-detection.md)
-- [Compression](./features/compression.md)
-- [Docker Integration](./features/docker.md)
-- [Security Headers](./features/security-headers.md)
-- [WASM Plugins](./features/wasm-plugins.md)
+- [Reverse Proxy](./routing/reverse-proxy.md)
+- [File Server](./routing/file-server.md)
+- [FastCGI / PHP](./routing/fastcgi.md)
+- [Redirects & Rewrites](./routing/redirects-rewrites.md)
+- [Handle & Route Blocks](./routing/handle.md)
+- [Respond & Error Pages](./routing/respond-errors.md)
+
+# HTTPS & TLS
+
+- [Automatic HTTPS](./tls/automatic-https.md)
+- [DNS-01 Challenge (Wildcards)](./tls/dns-challenge.md)
+- [Manual Certificates](./tls/manual-certs.md)
+- [Self-Signed (Development)](./tls/self-signed.md)
+- [Mutual TLS (mTLS)](./tls/mtls.md)
+- [OCSP Stapling](./tls/ocsp-stapling.md)
+
+# Security
+
+- [Rate Limiting](./security/rate-limiting.md)
+- [IP Filtering (Allow/Blocklist)](./security/ip-filtering.md)
+- [Bot Detection](./security/bot-detection.md)
+- [Security Headers](./security/security-headers.md)
+- [Basic Auth](./security/basic-auth.md)
+- [Forward Auth](./security/forward-auth.md)
+
+# Performance
+
+- [Compression](./performance/compression.md)
+- [HTTP Caching](./performance/caching.md)
+- [HTTP/3 (QUIC)](./performance/http3.md)
+- [Timeouts & Connection Draining](./performance/timeouts.md)
+- [Load Balancing](./performance/load-balancing.md)
+
+# Observability
+
+- [Request Logging](./observability/logging.md)
+- [First-Party Analytics](./observability/analytics.md)
+- [Prometheus Metrics](./observability/prometheus.md)
+- [Distributed Tracing](./observability/tracing.md)
+- [GeoIP](./observability/geoip.md)
+
+# Plugins
+
+- [Plugin System Overview](./plugins/overview.md)
+- [WASM Plugins](./plugins/wasm-plugins.md)
+- [Native Plugin Development](./plugins/native-plugins.md)
+
+# Admin API
+
+- [API Reference](./api/admin.md)
+- [Analytics API](./api/analytics.md)
+- [Cache Purge](./api/cache-purge.md)
+
+# Deployment
+
+- [Docker](./deployment/docker.md)
+- [Docker Label Discovery](./deployment/docker-labels.md)
+- [Kubernetes Ingress Controller](./deployment/kubernetes.md)
+- [Helm Chart](./deployment/helm.md)
+- [Systemd Service](./deployment/systemd.md)
+- [Zero-Downtime Upgrades](./deployment/zero-downtime.md)
+
+# Migration Guides
+
+- [From Caddy](./migration/from-caddy.md)
+- [From Nginx](./migration/from-nginx.md)
+- [From Traefik](./migration/from-traefik.md)
 
 # Architecture
 
 - [Overview](./architecture/overview.md)
 - [Request Lifecycle](./architecture/request-lifecycle.md)
-- [Performance](./architecture/performance.md)
-
-# API Reference
-
-- [Admin API](./api/admin.md)
-- [Analytics API](./api/analytics.md)
-
-# Guides
-
-- [Deploying with Docker](./guides/docker-deployment.md)
-- [Migrating from Caddy](./guides/migrating-from-caddy.md)
-- [Migrating from Nginx](./guides/migrating-from-nginx.md)
-- [Migrating from Traefik](./guides/migrating-from-traefik.md)
-- [Using with Deploy](./guides/deploy-integration.md)
+- [Performance Internals](./architecture/performance.md)
+- [Crate Map](./architecture/crate-map.md)
 
 # Contributing
 
 - [Development Setup](./contributing/development.md)
 - [Architecture for Contributors](./contributing/architecture.md)
-- [Plugin Development](./contributing/plugins.md)
+
+# Appendix
+
+- [Troubleshooting & FAQ](./appendix/troubleshooting.md)
+- [Changelog](./appendix/changelog.md)

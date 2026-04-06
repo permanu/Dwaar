@@ -1813,7 +1813,10 @@ impl ProxyHttp for DwaarProxy {
             upstream_response_time_us: 0,
             cache_status: ctx.cache_status.map(CompactString::from),
             compression: None,
-            trace_id: ctx.trace_ctx.as_ref().map(|t| CompactString::from(t.trace_id())),
+            trace_id: ctx
+                .trace_ctx
+                .as_ref()
+                .map(|t| CompactString::from(t.trace_id())),
             upstream_error_body: ctx.upstream_error_body.take(),
         };
 

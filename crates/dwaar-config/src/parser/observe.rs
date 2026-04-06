@@ -108,6 +108,7 @@ pub(super) fn parse_log(t: &mut Tokenizer<'_>) -> Result<LogDirective, ParseErro
 }
 
 /// Parse the value after `output` inside a log block.
+#[allow(clippy::too_many_lines)]
 fn parse_log_output(t: &mut Tokenizer<'_>) -> Result<LogOutput, ParseError> {
     let tok = t.next_token();
     let (line, col) = (tok.line, tok.col);
@@ -126,6 +127,20 @@ fn parse_log_output(t: &mut Tokenizer<'_>) -> Result<LogOutput, ParseError> {
         "stdout" => Ok(LogOutput::Stdout),
         "stderr" => Ok(LogOutput::Stderr),
         "discard" => Ok(LogOutput::Discard),
+        "unix" => {
+            let path_tok = t.next_token();
+            let (TokenKind::Word(path) | TokenKind::QuotedString(path)) = path_tok.kind else {
+                return Err(ParseError {
+                    line: path_tok.line,
+                    col: path_tok.col,
+                    kind: ParseErrorKind::InvalidValue {
+                        directive: "log".to_string(),
+                        message: "expected socket path after 'output unix'".to_string(),
+                    },
+                });
+            };
+            Ok(LogOutput::Unix { path })
+        }
         "file" => {
             let path_tok = t.next_token();
             let (TokenKind::Word(path) | TokenKind::QuotedString(path)) = path_tok.kind else {
@@ -138,7 +153,60 @@ fn parse_log_output(t: &mut Tokenizer<'_>) -> Result<LogOutput, ParseError> {
                     },
                 });
             };
-            Ok(LogOutput::File { path })
+
+            // Optional block: `{ max_size 50mb  keep 3 }`
+            let mut max_bytes = None;
+            let mut keep = None;
+            if t.peek().kind == TokenKind::OpenBrace {
+                t.next_token(); // consume '{'
+                loop {
+                    let tok = t.peek();
+                    match &tok.kind {
+                        TokenKind::CloseBrace => {
+                            t.next_token();
+                            break;
+                        }
+                        TokenKind::Word(w) => {
+                            let w = w.clone();
+                            t.next_token();
+                            match w.as_str() {
+                                "max_size" => {
+                                    max_bytes = Some(parse_size_value(t, line, col)?);
+                                }
+                                "keep" => {
+                                    let val_tok = t.next_token();
+                                    let TokenKind::Word(val) = val_tok.kind else {
+                                        return Err(ParseError {
+                                            line: val_tok.line,
+                                            col: val_tok.col,
+                                            kind: ParseErrorKind::InvalidValue {
+                                                directive: "log".to_string(),
+                                                message: "expected keep count".to_string(),
+                                            },
+                                        });
+                                    };
+                                    keep = Some(val.parse::<u32>().map_err(|_| ParseError {
+                                        line,
+                                        col,
+                                        kind: ParseErrorKind::InvalidValue {
+                                            directive: "log".to_string(),
+                                            message: format!("invalid keep count: '{val}'"),
+                                        },
+                                    })?);
+                                }
+                                _ => skip_to_next_line(t),
+                            }
+                        }
+                        _ => skip_to_next_line(t),
+                    }
+                }
+            }
+
+            Ok(LogOutput::File {
+                path,
+                max_bytes,
+                keep,
+            })
         }
         other => Err(ParseError {
             line,
@@ -146,11 +214,49 @@ fn parse_log_output(t: &mut Tokenizer<'_>) -> Result<LogOutput, ParseError> {
             kind: ParseErrorKind::InvalidValue {
                 directive: "log".to_string(),
                 message: format!(
-                    "unknown log output '{other}' — expected stdout, stderr, discard, or file"
+                    "unknown log output '{other}' — expected stdout, stderr, discard, unix, or file"
                 ),
             },
         }),
     }
+}
+
+/// Parse a human-readable size value like `50mb`, `1gb`, `1024`.
+fn parse_size_value(t: &mut Tokenizer<'_>, line: usize, col: usize) -> Result<u64, ParseError> {
+    let val_tok = t.next_token();
+    let raw = match val_tok.kind {
+        TokenKind::Word(w) => w,
+        TokenKind::QuotedString(s) => s,
+        _ => {
+            return Err(ParseError {
+                line: val_tok.line,
+                col: val_tok.col,
+                kind: ParseErrorKind::InvalidValue {
+                    directive: "log".to_string(),
+                    message: "expected size value after 'max_size'".to_string(),
+                },
+            });
+        }
+    };
+    let lower = raw.to_lowercase();
+    let (num_str, multiplier) = if let Some(n) = lower.strip_suffix("gb") {
+        (n, 1_073_741_824u64)
+    } else if let Some(n) = lower.strip_suffix("mb") {
+        (n, 1_048_576u64)
+    } else if let Some(n) = lower.strip_suffix("kb") {
+        (n, 1024u64)
+    } else {
+        (lower.as_str(), 1u64)
+    };
+    let base = num_str.parse::<u64>().map_err(|_| ParseError {
+        line,
+        col,
+        kind: ParseErrorKind::InvalidValue {
+            directive: "log".to_string(),
+            message: format!("invalid size value: '{raw}'"),
+        },
+    })?;
+    Ok(base.saturating_mul(multiplier))
 }
 
 /// Parse the value after `format` inside a log block.

@@ -50,9 +50,7 @@ impl RateLimiter {
     /// the one-second lag of the plain `rate()` method.
     pub fn check(&self, key: &str, limit: u32) -> bool {
         self.rate.observe(&key, 1);
-        let current_rate = self
-            .rate
-            .rate_with(&key, RATE_ESTIMATE_FN);
+        let current_rate = self.rate.rate_with(&key, RATE_ESTIMATE_FN);
         current_rate <= f64::from(limit)
     }
 }
@@ -124,6 +122,7 @@ impl DwaarPlugin for RateLimitPlugin {
             return PluginAction::Continue;
         }
 
+        ctx.rate_limited = true;
         PluginAction::Respond(PluginResponse {
             status: 429,
             headers: vec![

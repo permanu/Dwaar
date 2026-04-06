@@ -11,8 +11,9 @@
 //! caches compiled code — re-use is essential for performance.
 //!
 //! Engine configuration:
-//! - **Component model** disabled for now (we use core Wasm modules). Will be
-//!   enabled when host bindings are ready (ISSUE-037).
+//! - **Component model** enabled — plugins are wasmtime components built from
+//!   WIT definitions (see `bindings.rs`). Host function callbacks tracked in
+//!   ISSUE-097.
 //! - **Fuel metering** enabled — lets us enforce per-call instruction budgets.
 //! - **Epoch interruption** enabled — lets us enforce wall-clock timeouts.
 //! - **Async** disabled — plugin hooks are synchronous (called from
@@ -84,10 +85,5 @@ impl WasmEngine {
             engine,
             _ticker: ticker,
         })
-    }
-
-    /// Return a cheap reference to the underlying engine.
-    pub fn inner(&self) -> &wasmtime::Engine {
-        &self.engine
     }
 }

@@ -80,18 +80,6 @@ pub(crate) struct Backend {
     pub(crate) trusted_ca: Option<Arc<pingora_core::protocols::tls::CaType>>,
 }
 
-/// The result of a successful backend selection.
-#[derive(Debug, Clone)]
-pub struct SelectedUpstream {
-    pub addr: SocketAddr,
-    pub tls: bool,
-    pub sni: String,
-    /// Client cert+key for mTLS (ISSUE-077). `None` for plain TLS.
-    pub client_cert_key: Option<Arc<pingora_core::utils::tls::CertKey>>,
-    /// Custom CA for upstream server cert verification (ISSUE-077).
-    pub trusted_ca: Option<Arc<pingora_core::protocols::tls::CaType>>,
-}
-
 impl UpstreamPool {
     /// Build a pool from already-resolved backend descriptors.
     ///
@@ -164,7 +152,7 @@ impl UpstreamPool {
     ///
     /// When the pool has exactly one backend we skip the atomic counter increment
     /// and the Vec scan entirely. This is the common case for most Dwaarfiles.
-    pub fn select(&self, client_ip: Option<std::net::IpAddr>) -> Option<SelectedUpstream> {
+    pub fn select(&self, client_ip: Option<std::net::IpAddr>) -> Option<SocketAddr> {
         if self.backends.is_empty() {
             return None;
         }
@@ -185,7 +173,7 @@ impl UpstreamPool {
     /// This is a pure read: it does not increment `active_conns`. The caller is
     /// responsible for calling `acquire_connection()` (which does the atomic CAS
     /// increment) and `release_connection()` to bracket the request lifetime.
-    fn select_single(&self) -> Option<SelectedUpstream> {
+    fn select_single(&self) -> Option<SocketAddr> {
         let b = &self.backends[0];
         if !b.healthy.load(Ordering::Relaxed) {
             return None;
@@ -195,13 +183,7 @@ impl UpstreamPool {
         {
             return None;
         }
-        Some(SelectedUpstream {
-            addr: b.addr,
-            tls: b.tls,
-            sni: b.tls_server_name.clone(),
-            client_cert_key: b.client_cert_key.clone(),
-            trusted_ca: b.trusted_ca.clone(),
-        })
+        Some(b.addr)
     }
 
     /// Round-robin: atomically advance the global counter and mod by healthy count.
@@ -210,7 +192,7 @@ impl UpstreamPool {
     /// backend that is both healthy and under its connection cap. This handles
     /// the case where the initially-selected backend is temporarily unavailable
     /// without changing the distribution for the common all-healthy case.
-    fn select_round_robin(&self) -> Option<SelectedUpstream> {
+    fn select_round_robin(&self) -> Option<SocketAddr> {
         let n = self.backends.len();
         let start = self.counter.fetch_add(1, Ordering::Relaxed) as usize % n;
         self.find_available_from(start)
@@ -224,7 +206,7 @@ impl UpstreamPool {
     ///
     /// This is a pure read: it does not increment `active_conns`. The caller is
     /// responsible for calling `acquire_connection()` / `release_connection()`.
-    fn select_least_conn(&self) -> Option<SelectedUpstream> {
+    fn select_least_conn(&self) -> Option<SocketAddr> {
         let best = self
             .backends
             .iter()
@@ -235,48 +217,37 @@ impl UpstreamPool {
             })
             .min_by_key(|b| b.active_conns.load(Ordering::Relaxed))?;
 
-        Some(SelectedUpstream {
-            addr: best.addr,
-            tls: best.tls,
-            sni: best.tls_server_name.clone(),
-            client_cert_key: best.client_cert_key.clone(),
-            trusted_ca: best.trusted_ca.clone(),
-        })
+        Some(best.addr)
     }
 
     /// Random: choose a uniformly random healthy backend.
     ///
+    /// Uses reservoir sampling (O(1) memory) instead of collecting into a Vec.
     /// This is a pure read: it does not increment `active_conns`. The caller is
     /// responsible for calling `acquire_connection()` / `release_connection()`.
-    fn select_random(&self) -> Option<SelectedUpstream> {
-        let available: Vec<_> = self
-            .backends
-            .iter()
-            .filter(|b| {
-                b.healthy.load(Ordering::Relaxed)
-                    && b.max_conns
-                        .is_none_or(|max| b.active_conns.load(Ordering::Relaxed) < max)
-            })
-            .collect();
+    fn select_random(&self) -> Option<SocketAddr> {
+        let mut selected: Option<&Backend> = None;
+        let mut count = 0usize;
 
-        if available.is_empty() {
-            return None;
+        for b in &self.backends {
+            if b.healthy.load(Ordering::Relaxed)
+                && b.max_conns
+                    .is_none_or(|max| b.active_conns.load(Ordering::Relaxed) < max)
+            {
+                count += 1;
+                if fastrand::usize(..count) == 0 {
+                    selected = Some(b);
+                }
+            }
         }
 
-        let b = available[fastrand::usize(..available.len())];
-        Some(SelectedUpstream {
-            addr: b.addr,
-            tls: b.tls,
-            sni: b.tls_server_name.clone(),
-            client_cert_key: b.client_cert_key.clone(),
-            trusted_ca: b.trusted_ca.clone(),
-        })
+        Some(selected?.addr)
     }
 
     /// IP-hash: hash the client IP and pick a backend deterministically.
     ///
     /// Falls back to round-robin when no client IP is available.
-    fn select_ip_hash(&self, client_ip: Option<std::net::IpAddr>) -> Option<SelectedUpstream> {
+    fn select_ip_hash(&self, client_ip: Option<std::net::IpAddr>) -> Option<SocketAddr> {
         let Some(ip) = client_ip else {
             return self.select_round_robin();
         };
@@ -292,7 +263,7 @@ impl UpstreamPool {
     ///
     /// This is a pure read: it does not increment `active_conns`. The caller is
     /// responsible for calling `acquire_connection()` / `release_connection()`.
-    fn find_available_from(&self, start: usize) -> Option<SelectedUpstream> {
+    fn find_available_from(&self, start: usize) -> Option<SocketAddr> {
         let n = self.backends.len();
         for offset in 0..n {
             let b = &self.backends[(start + offset) % n];
@@ -304,13 +275,7 @@ impl UpstreamPool {
             {
                 continue;
             }
-            return Some(SelectedUpstream {
-                addr: b.addr,
-                tls: b.tls,
-                sni: b.tls_server_name.clone(),
-                client_cert_key: b.client_cert_key.clone(),
-                trusted_ca: b.trusted_ca.clone(),
-            });
+            return Some(b.addr);
         }
         None
     }
@@ -650,7 +615,7 @@ mod tests {
     fn single_backend_fast_path_returns_backend() {
         let pool = make_pool(&[8080], LbPolicy::RoundRobin);
         let sel = pool.select(None).expect("should select");
-        assert_eq!(sel.addr, make_addr(8080));
+        assert_eq!(sel, make_addr(8080));
     }
 
     #[test]
@@ -679,7 +644,7 @@ mod tests {
 
         for _ in 0..30 {
             let sel = pool.select(None).expect("should select");
-            if let Some(idx) = ports.iter().position(|&p| make_addr(p) == sel.addr) {
+            if let Some(idx) = ports.iter().position(|&p| make_addr(p) == sel) {
                 counts[idx] += 1;
             }
         }
@@ -696,7 +661,7 @@ mod tests {
         for _ in 0..20 {
             let sel = pool.select(None).expect("should select");
             assert_ne!(
-                sel.addr,
+                sel,
                 make_addr(8081),
                 "unhealthy backend must not be selected"
             );
@@ -716,7 +681,7 @@ mod tests {
 
         let sel = pool.select(None).expect("should select");
         assert_eq!(
-            sel.addr,
+            sel,
             make_addr(8082),
             "least-conn should pick 8082 (0 conns)"
         );
@@ -729,7 +694,7 @@ mod tests {
         pool.mark_unhealthy(make_addr(8080));
 
         let sel = pool.select(None).expect("should select");
-        assert_eq!(sel.addr, make_addr(8081));
+        assert_eq!(sel, make_addr(8081));
     }
 
     // ── random ────────────────────────────────────────────────────────────────
@@ -742,7 +707,7 @@ mod tests {
         for _ in 0..50 {
             let sel = pool.select(None).expect("should always select one");
             assert!(
-                ports.contains(&sel.addr.port()),
+                ports.contains(&sel.port()),
                 "random must select a configured backend"
             );
         }
@@ -755,7 +720,7 @@ mod tests {
 
         for _ in 0..30 {
             let sel = pool.select(None).expect("should select");
-            assert_eq!(sel.addr, make_addr(8081));
+            assert_eq!(sel, make_addr(8081));
         }
     }
 
@@ -766,9 +731,9 @@ mod tests {
         let pool = make_pool(&[8080, 8081, 8082], LbPolicy::IpHash);
         let ip = Some(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
 
-        let first = pool.select(ip).expect("should select").addr;
+        let first = pool.select(ip).expect("should select");
         for _ in 0..20 {
-            let sel = pool.select(ip).expect("should select").addr;
+            let sel = pool.select(ip).expect("should select");
             assert_eq!(sel, first, "ip_hash must be deterministic for same IP");
         }
     }
@@ -813,8 +778,8 @@ mod tests {
     }
 
     /// Simulates the proxy lifecycle: select → acquire → (request) → release.
-    /// Verifies that active_conns tracks correctly through the full cycle and
-    /// that max_conns is enforced after acquire.
+    /// Verifies that `active_conns` tracks correctly through the full cycle and
+    /// that `max_conns` is enforced after acquire.
     #[test]
     fn proxy_lifecycle_select_acquire_release() {
         let pool = make_pool_with_max(8080, 2);
@@ -822,23 +787,35 @@ mod tests {
 
         // Lifecycle 1: select → acquire → release
         let sel = pool.select(None).expect("should select");
-        assert_eq!(sel.addr, addr);
-        assert!(pool.acquire_connection(addr), "first acquire should succeed");
+        assert_eq!(sel, addr);
+        assert!(
+            pool.acquire_connection(addr),
+            "first acquire should succeed"
+        );
         assert_eq!(pool.backends[0].active_conns.load(Ordering::Relaxed), 1);
 
         // Lifecycle 2: second concurrent request
-        assert!(pool.acquire_connection(addr), "second acquire should succeed");
+        assert!(
+            pool.acquire_connection(addr),
+            "second acquire should succeed"
+        );
         assert_eq!(pool.backends[0].active_conns.load(Ordering::Relaxed), 2);
 
         // Lifecycle 3: at cap — third acquire must fail (503 in proxy)
-        assert!(!pool.acquire_connection(addr), "third acquire should be rejected at max=2");
+        assert!(
+            !pool.acquire_connection(addr),
+            "third acquire should be rejected at max=2"
+        );
 
         // First request completes
         pool.release_connection(addr);
         assert_eq!(pool.backends[0].active_conns.load(Ordering::Relaxed), 1);
 
         // Now a new request can acquire again
-        assert!(pool.acquire_connection(addr), "should succeed after release");
+        assert!(
+            pool.acquire_connection(addr),
+            "should succeed after release"
+        );
         assert_eq!(pool.backends[0].active_conns.load(Ordering::Relaxed), 2);
 
         // Clean up both
@@ -847,7 +824,7 @@ mod tests {
         assert_eq!(pool.backends[0].active_conns.load(Ordering::Relaxed), 0);
     }
 
-    /// Verifies that concurrent threads cannot exceed max_conns via the
+    /// Verifies that concurrent threads cannot exceed `max_conns` via the
     /// acquire CAS loop.
     #[test]
     fn concurrent_acquire_respects_max_conns() {
@@ -872,7 +849,10 @@ mod tests {
             .filter_map(|h| h.join().ok().filter(|&ok| ok))
             .count();
 
-        assert_eq!(acquired, 4, "exactly max_conns threads should have acquired");
+        assert_eq!(
+            acquired, 4,
+            "exactly max_conns threads should have acquired"
+        );
         assert_eq!(pool.backends[0].active_conns.load(Ordering::Relaxed), 4);
     }
 

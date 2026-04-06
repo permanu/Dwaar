@@ -88,10 +88,7 @@ async fn main() -> Result<()> {
 
     let readiness = ReadinessState::new();
     let metrics = IngressMetrics::new();
-    let api_client = AdminApiClient::new_with_token(
-        &args.admin_url,
-        args.admin_token.as_deref(),
-    );
+    let api_client = AdminApiClient::new_with_token(&args.admin_url, args.admin_token.as_deref());
 
     // Shutdown channel — broadcast to all subsystems.
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

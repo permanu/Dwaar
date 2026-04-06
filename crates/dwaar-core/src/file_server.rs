@@ -24,9 +24,8 @@ use bytes::Bytes;
 fn lexically_within(candidate: &Path, root: &Path) -> bool {
     // Walk components after the root prefix. If `..` ever takes us
     // above the root level, it's a traversal attempt.
-    let suffix = match candidate.strip_prefix(root) {
-        Ok(s) => s,
-        Err(_) => return false,
+    let Ok(suffix) = candidate.strip_prefix(root) else {
+        return false;
     };
     let mut depth: i32 = 0;
     for component in suffix.components() {

@@ -1399,7 +1399,7 @@ mod tests {
                     fail_duration: None,
                     max_conns: None,
                     transport_tls: false,
-            transport_h2: false,
+                    transport_h2: false,
                     tls_server_name: None,
                     tls_client_auth: None,
                     tls_trusted_ca_certs: None,

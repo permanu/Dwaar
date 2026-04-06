@@ -195,7 +195,8 @@ body {{ font-family: -apple-system, sans-serif; display: flex;
   function check() {{
     var end = nonce + 50000;
     while (nonce < end) {{
-      var data = challenge + nonce.toString();
+      var currentNonce = nonce; // capture value for closure — var is function-scoped
+      var data = challenge + currentNonce.toString();
       // Use SubtleCrypto for SHA-256
       crypto.subtle.digest("SHA-256", new TextEncoder().encode(data)).then(function(buf) {{
         var arr = new Uint8Array(buf);
@@ -208,7 +209,7 @@ body {{ font-family: -apple-system, sans-serif; display: flex;
           document.getElementById("status").textContent = "Verified! Redirecting…";
           var sep = path.indexOf("?") >= 0 ? "&" : "?";
           window.location = path + sep + "{solved_param}=1&{challenge_param}=" +
-            encodeURIComponent(challenge) + "&{nonce_param}=" + nonce;
+            encodeURIComponent(challenge) + "&{nonce_param}=" + currentNonce;
         }}
       }});
       nonce++;
