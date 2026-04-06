@@ -305,7 +305,7 @@ impl WasmPlugin {
         let mut store = Store::new(&self.engine, state);
 
         // Attach the memory limiter so wasmtime consults it on every memory.grow.
-        store.limiter(|s| s as &mut dyn wasmtime::ResourceLimiter);
+        store.limiter(|s| s.as_mut() as &mut dyn wasmtime::ResourceLimiter);
 
         // Apply fuel budget and epoch deadline — must be called per invocation
         // because both counters are consumed as the module runs.

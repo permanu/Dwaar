@@ -738,7 +738,11 @@ b.com {
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         watcher.try_reload(&shutdown_rx);
 
-        assert_eq!(health_pools.load().len(), 2, "second pool added after reload");
+        assert_eq!(
+            health_pools.load().len(),
+            2,
+            "second pool added after reload"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -790,7 +794,11 @@ a.com {
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         watcher.try_reload(&shutdown_rx);
 
-        assert_eq!(health_pools.load().len(), 1, "stale pool removed after reload");
+        assert_eq!(
+            health_pools.load().len(),
+            1,
+            "stale pool removed after reload"
+        );
     }
 
     // ── ISSUE-110: ACME domain hot-reload tests ─────────────────
@@ -908,7 +916,7 @@ b.com {
 
     #[test]
     fn reload_resizes_cache_backend() {
-        use dwaar_core::cache::{new_cache_backend, SharedCacheBackend};
+        use dwaar_core::cache::{SharedCacheBackend, new_cache_backend};
 
         let dir = tempfile::tempdir().expect("tempdir");
         let config_path = dir.path().join("Dwaarfile");
@@ -956,7 +964,7 @@ a.com {
 
     #[test]
     fn reload_skips_cache_resize_when_unchanged() {
-        use dwaar_core::cache::{new_cache_backend, SharedCacheBackend};
+        use dwaar_core::cache::{SharedCacheBackend, new_cache_backend};
 
         let dir = tempfile::tempdir().expect("tempdir");
         let config_path = dir.path().join("Dwaarfile");

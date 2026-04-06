@@ -8,11 +8,15 @@ src = "src"
 build-dir = "../target/docs"
 create-missing = false
 
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+
 [output.html]
 git-repository-url = "https://github.com/permanu/Dwaar"
 edit-url-template = "https://github.com/permanu/Dwaar/edit/main/docs/{path}"
 site-url = "https://dwaar.dev/docs/"
 no-section-label = false
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
 
 [output.html.search]
 enable = true

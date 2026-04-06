@@ -43,7 +43,7 @@ use kube::runtime::watcher::{self, Event};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
-use crate::reconciler::{ReconcilerConfig, run_reconciler, DesiredRoute};
+use crate::reconciler::{DesiredRoute, ReconcilerConfig, run_reconciler};
 
 use crate::client::AdminApiClient;
 use crate::health::ReadinessState;
@@ -95,7 +95,6 @@ impl IngressWatcher {
             cert_dir,
         }
     }
-
 }
 
 /// Mutable tracking state passed to `handle_ingress_event` to avoid
@@ -120,9 +119,16 @@ impl IngressWatcher {
     /// Builds reflector stores for each resource type, then enters the main
     /// event dispatch loop. Returns when shutdown is signalled or an
     /// unrecoverable stream error occurs.
+    #[allow(clippy::too_many_lines)]
     pub async fn run(self, mut shutdown: watch::Receiver<bool>) -> Result<(), kube::Error> {
-        let (service_store, secret_store, mut ingress_stream, mut service_stream,
-             mut secret_stream, mut ingressclass_stream) = self.build_streams();
+        let (
+            service_store,
+            secret_store,
+            mut ingress_stream,
+            mut service_stream,
+            mut secret_stream,
+            mut ingressclass_stream,
+        ) = self.build_streams();
 
         let mut rs = ReconcileState {
             ingress_domains: HashMap::new(),
@@ -137,8 +143,7 @@ impl IngressWatcher {
         // The periodic reconciler needs a snapshot of desired routes on each
         // tick. We share a channel so the watcher loop can push a fresh snapshot
         // whenever state changes without coupling the reconciler into this loop.
-        let (desired_tx, desired_rx) =
-            tokio::sync::watch::channel::<Vec<DesiredRoute>>(Vec::new());
+        let (desired_tx, desired_rx) = tokio::sync::watch::channel::<Vec<DesiredRoute>>(Vec::new());
 
         // The reconciler must stop when this method returns — whether from an
         // explicit shutdown signal or from being dropped on lease loss. We create
@@ -275,10 +280,18 @@ impl IngressWatcher {
     ) -> (
         Arc<Store<Service>>,
         Arc<Store<Secret>>,
-        std::pin::Pin<Box<dyn futures::Stream<Item = Result<Event<Ingress>, watcher::Error>> + Send>>,
-        std::pin::Pin<Box<dyn futures::Stream<Item = Result<Event<Service>, watcher::Error>> + Send>>,
-        std::pin::Pin<Box<dyn futures::Stream<Item = Result<Event<Secret>, watcher::Error>> + Send>>,
-        std::pin::Pin<Box<dyn futures::Stream<Item = Result<Event<IngressClass>, watcher::Error>> + Send>>,
+        std::pin::Pin<
+            Box<dyn futures::Stream<Item = Result<Event<Ingress>, watcher::Error>> + Send>,
+        >,
+        std::pin::Pin<
+            Box<dyn futures::Stream<Item = Result<Event<Service>, watcher::Error>> + Send>,
+        >,
+        std::pin::Pin<
+            Box<dyn futures::Stream<Item = Result<Event<Secret>, watcher::Error>> + Send>,
+        >,
+        std::pin::Pin<
+            Box<dyn futures::Stream<Item = Result<Event<IngressClass>, watcher::Error>> + Send>,
+        >,
     ) {
         let cfg = watcher::Config::default();
 
@@ -304,23 +317,16 @@ impl IngressWatcher {
             None => kube::Api::all(self.client.clone()),
         };
 
-        let ingress_stream = reflector::reflector(
-            ingress_writer,
-            watcher::watcher(api_ingress, cfg.clone()),
-        )
-        .boxed();
+        let ingress_stream =
+            reflector::reflector(ingress_writer, watcher::watcher(api_ingress, cfg.clone()))
+                .boxed();
 
-        let service_stream = reflector::reflector(
-            service_writer,
-            watcher::watcher(api_service, cfg.clone()),
-        )
-        .boxed();
+        let service_stream =
+            reflector::reflector(service_writer, watcher::watcher(api_service, cfg.clone()))
+                .boxed();
 
-        let secret_stream = reflector::reflector(
-            secret_writer,
-            watcher::watcher(api_secret, cfg.clone()),
-        )
-        .boxed();
+        let secret_stream =
+            reflector::reflector(secret_writer, watcher::watcher(api_secret, cfg.clone())).boxed();
 
         let ic_stream = reflector::reflector(
             ic_writer,
@@ -328,7 +334,14 @@ impl IngressWatcher {
         )
         .boxed();
 
-        (service_store, secret_store, ingress_stream, service_stream, secret_stream, ic_stream)
+        (
+            service_store,
+            secret_store,
+            ingress_stream,
+            service_stream,
+            secret_stream,
+            ic_stream,
+        )
     }
 
     /// Dispatch an `Event<Ingress>` to the appropriate handler.
@@ -351,28 +364,51 @@ impl IngressWatcher {
                 let key = translator::ingress_key(&ingress);
                 if self.ingress_class_matches(&ingress) {
                     self.handle_applied(
-                        &ingress, service_store, secret_store,
-                        &mut state.ingress_domains, &mut state.ingress_tls_bases,
-                    ).await;
+                        &ingress,
+                        service_store,
+                        secret_store,
+                        &mut state.ingress_domains,
+                        &mut state.ingress_tls_bases,
+                    )
+                    .await;
                     // Update reverse indexes for targeted re-reconciliation.
-                    update_reverse_indexes(&ingress, &key, &mut state.service_to_ingresses, &mut state.secret_to_ingresses);
+                    update_reverse_indexes(
+                        &ingress,
+                        &key,
+                        &mut state.service_to_ingresses,
+                        &mut state.secret_to_ingresses,
+                    );
                     state.ingress_specs.insert(key, ingress);
                 } else if state.ingress_specs.remove(&key).is_some() {
-                    remove_from_reverse_indexes(&key, &mut state.service_to_ingresses, &mut state.secret_to_ingresses);
+                    remove_from_reverse_indexes(
+                        &key,
+                        &mut state.service_to_ingresses,
+                        &mut state.secret_to_ingresses,
+                    );
                     self.handle_deleted(
-                        &ingress, service_store,
-                        &mut state.ingress_domains, &mut state.ingress_tls_bases,
-                    ).await;
+                        &ingress,
+                        service_store,
+                        &mut state.ingress_domains,
+                        &mut state.ingress_tls_bases,
+                    )
+                    .await;
                 }
             }
             Event::Delete(ingress) => {
                 let key = translator::ingress_key(&ingress);
                 state.ingress_specs.remove(&key);
-                remove_from_reverse_indexes(&key, &mut state.service_to_ingresses, &mut state.secret_to_ingresses);
+                remove_from_reverse_indexes(
+                    &key,
+                    &mut state.service_to_ingresses,
+                    &mut state.secret_to_ingresses,
+                );
                 self.handle_deleted(
-                    &ingress, service_store,
-                    &mut state.ingress_domains, &mut state.ingress_tls_bases,
-                ).await;
+                    &ingress,
+                    service_store,
+                    &mut state.ingress_domains,
+                    &mut state.ingress_tls_bases,
+                )
+                .await;
             }
             Event::InitDone => {
                 if let Some(old_domains) = state.prev_ingress_domains.take() {
@@ -380,9 +416,9 @@ impl IngressWatcher {
                         .iter()
                         .flat_map(|(key, domains)| {
                             let current = state.ingress_domains.get(key);
-                            domains.iter().filter(move |d| {
-                                !current.is_some_and(|nd| nd.contains(d))
-                            })
+                            domains
+                                .iter()
+                                .filter(move |d| !current.is_some_and(|nd| nd.contains(d)))
                         })
                         .cloned()
                         .collect();
@@ -396,9 +432,9 @@ impl IngressWatcher {
                         .iter()
                         .flat_map(|(key, bases)| {
                             let current = state.ingress_tls_bases.get(key);
-                            bases.iter().filter(move |b| {
-                                !current.is_some_and(|nb| nb.contains(b))
-                            })
+                            bases
+                                .iter()
+                                .filter(move |b| !current.is_some_and(|nb| nb.contains(b)))
                         })
                         .cloned()
                         .collect();
@@ -525,7 +561,7 @@ impl IngressWatcher {
     /// Called when a Service or Secret changes — only the Ingresses that
     /// reference the changed resource are re-evaluated, not the entire set.
     /// This reduces admin API churn from O(events × ingresses) to
-    /// O(events × affected_ingresses).
+    /// `O(events × affected_ingresses)`.
     async fn rereconcile_ingresses(
         &self,
         ingress_keys: &[String],
@@ -537,8 +573,14 @@ impl IngressWatcher {
     ) {
         for key in ingress_keys {
             if let Some(ingress) = ingress_specs.get(key) {
-                self.handle_applied(ingress, service_store, secret_store, ingress_domains, ingress_tls_bases)
-                    .await;
+                self.handle_applied(
+                    ingress,
+                    service_store,
+                    secret_store,
+                    ingress_domains,
+                    ingress_tls_bases,
+                )
+                .await;
             }
         }
     }
@@ -709,20 +751,16 @@ fn secret_key_from_event(event: &Event<Secret>) -> String {
 ///
 /// Used to build the reverse index for targeted Service-change re-reconciliation.
 fn services_from_ingress(ingress: &Ingress) -> Vec<String> {
-    let namespace = ingress
-        .metadata
-        .namespace
-        .as_deref()
-        .unwrap_or("default");
+    let namespace = ingress.metadata.namespace.as_deref().unwrap_or("default");
 
     let mut services = Vec::new();
 
     if let Some(spec) = ingress.spec.as_ref() {
         // Default backend
-        if let Some(backend) = spec.default_backend.as_ref() {
-            if let Some(svc) = backend.service.as_ref() {
-                services.push(format!("{namespace}/{}", svc.name));
-            }
+        if let Some(backend) = spec.default_backend.as_ref()
+            && let Some(svc) = backend.service.as_ref()
+        {
+            services.push(format!("{namespace}/{}", svc.name));
         }
         // Per-rule backends
         for rule in spec.rules.iter().flatten() {
@@ -745,11 +783,7 @@ fn services_from_ingress(ingress: &Ingress) -> Vec<String> {
 ///
 /// Used to build the reverse index for targeted Secret-change re-reconciliation.
 fn secrets_from_ingress(ingress: &Ingress) -> Vec<String> {
-    let namespace = ingress
-        .metadata
-        .namespace
-        .as_deref()
-        .unwrap_or("default");
+    let namespace = ingress.metadata.namespace.as_deref().unwrap_or("default");
 
     ingress
         .spec

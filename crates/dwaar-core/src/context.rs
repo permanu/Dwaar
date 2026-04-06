@@ -83,10 +83,6 @@ pub struct RequestContext {
     /// `ArcSwap` load in `https_redirect_domain()`.
     pub route_tls: bool,
 
-    /// The canonical domain from the matched route. Cached for the HTTPS redirect
-    /// Location header without needing a second route table lookup.
-    pub route_canonical_domain: Option<String>,
-
     /// Static response cached from route lookup — for `respond` directive.
     /// Avoids a second `ArcSwap` load (Guardrail #27).
     pub static_response: Option<(u16, bytes::Bytes)>,
@@ -161,11 +157,6 @@ pub struct RequestContext {
     /// Accumulated response body bytes received so far (ISSUE-070).
     pub response_body_sent: u64,
 
-    /// Domain key for Prometheus active connection tracking (ISSUE-072).
-    /// Set in `request_filter()` after host resolution, used in `logging()` to
-    /// decrement the gauge with the exact same key.
-    pub metrics_domain: Option<CompactString>,
-
     /// Active connection counter for the matched route (ISSUE-075).
     /// Decremented in `logging()` when the request completes, enabling
     /// graceful drain when a route is removed during hot-reload.
@@ -187,6 +178,17 @@ pub struct RequestContext {
     /// `Alt-Svc` h3 is only injected when this flag is true to avoid
     /// advertising a protocol the server can't actually serve for this route.
     pub quic_capable: bool,
+
+    /// Trace context parsed/generated in `upstream_request_filter()`.
+    pub trace_ctx: Option<crate::trace::TraceContext>,
+
+    /// Upstream response status cached in `response_filter()` for
+    /// `response_body_filter()` which doesn't have direct header access.
+    pub upstream_status: u16,
+
+    /// Captured upstream error body for 5xx responses (ISSUE-117).
+    /// Populated in `response_body_filter`, read in `logging()`.
+    pub upstream_error_body: Option<String>,
 }
 
 impl RequestContext {
@@ -203,7 +205,6 @@ impl RequestContext {
             plugin_ctx: PluginCtx::default(),
             route_upstream: None,
             route_tls: false,
-            route_canonical_domain: None,
             static_response: None,
             effective_path: None,
             basic_auth: None,
@@ -224,12 +225,14 @@ impl RequestContext {
             request_body_received: 0,
             response_body_max_size: 100 * 1024 * 1024, // 100 MB default
             response_body_sent: 0,
-            metrics_domain: None,
             drain_counter: None,
             cache_enabled: false,
             cache_config: None,
             cache_status: None,
             quic_capable: false,
+            trace_ctx: None,
+            upstream_status: 0,
+            upstream_error_body: None,
         }
     }
 
@@ -303,7 +306,6 @@ mod tests {
         assert!(ctx.plugin_ctx.path.is_empty());
         assert!(ctx.route_upstream.is_none());
         assert!(!ctx.route_tls);
-        assert!(ctx.route_canonical_domain.is_none());
         assert!(ctx.injector.is_none());
         assert!(ctx.decompressor.is_none());
         assert!(!ctx.plugin_ctx.is_bot);

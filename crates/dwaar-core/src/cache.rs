@@ -325,10 +325,9 @@ mod tests {
 
     #[test]
     fn realloc_swaps_backend() {
-        let shared: SharedCacheBackend =
-            std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(Some(new_cache_backend(
-                1_000_000,
-            ))));
+        let shared: SharedCacheBackend = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+            Some(new_cache_backend(1_000_000)),
+        ));
         assert_eq!(read_max_size(&shared), 1_000_000);
 
         realloc_cache_backend(&shared, 4_000_000);
@@ -337,10 +336,9 @@ mod tests {
 
     #[test]
     fn realloc_skips_unchanged() {
-        let shared: SharedCacheBackend =
-            std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(Some(new_cache_backend(
-                1_000_000,
-            ))));
+        let shared: SharedCacheBackend = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+            Some(new_cache_backend(1_000_000)),
+        ));
         let ptr_before = std::ptr::from_ref(
             shared
                 .load()

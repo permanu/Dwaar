@@ -271,7 +271,13 @@ fn main() -> anyhow::Result<()> {
     // At 8+ cores, 2 workers lets the kernel load-balance accept() via
     // SO_REUSEPORT without the overhead of N runtimes.
     let worker_count = match cli.workers {
-        WorkerCount::Auto => if cpu_count >= 8 { 2 } else { 1 },
+        WorkerCount::Auto => {
+            if cpu_count >= 8 {
+                2
+            } else {
+                1
+            }
+        }
         WorkerCount::Count(n) => n,
     };
 

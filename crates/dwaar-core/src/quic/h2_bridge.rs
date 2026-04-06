@@ -11,11 +11,11 @@
 //! Unlike the HTTP/1.1 bridge, H2 handles framing and flow control
 //! automatically — no manual chunked encoding or response parsing.
 
+use super::convert::{is_hop_by_hop, pingora_resp_to_h3};
 use bytes::Bytes;
 use dwaar_plugins::plugin::{PluginChain, PluginCtx};
 use h3::server::RequestStream;
 use pingora_http::ResponseHeader;
-use super::convert::{is_hop_by_hop, pingora_resp_to_h3};
 
 /// Errors from the H2 upstream bridge.
 #[derive(Debug, thiserror::Error)]
@@ -60,9 +60,9 @@ const MAX_REQUEST_BODY: usize = 10 * 1024 * 1024; // 10 MB
 /// Proxy a single H3 request via an H2 upstream connection.
 ///
 /// 1. Convert H3 headers → H2 request
-/// 2. Stream request body: H3 recv_data → H2 send_data
+/// 2. Stream request body: H3 `recv_data` → H2 `send_data`
 /// 3. Receive H2 response headers → run plugins → send H3 response
-/// 4. Stream response body: H2 recv_data → plugins → H3 send_data
+/// 4. Stream response body: H2 `recv_data` → plugins → H3 `send_data`
 ///
 /// Flow control is handled by the `h2` crate. We call
 /// `release_capacity()` after consuming each DATA frame to prevent
@@ -86,8 +86,8 @@ where
     let has_body = *method != http::Method::GET && *method != http::Method::HEAD;
     let end_of_stream = !has_body;
 
-    let h2_request = build_h2_request(method, uri, headers)
-        .map_err(|e| H2BridgeError::BuildResponse(e))?;
+    let h2_request =
+        build_h2_request(method, uri, headers).map_err(H2BridgeError::BuildResponse)?;
 
     // Send request headers. Returns (ResponseFuture, SendStream).
     let (response_future, mut send_stream) = sender
@@ -97,7 +97,11 @@ where
     // Stream request body from H3 to H2 (if present).
     if has_body {
         let mut total_body = 0usize;
-        while let Some(chunk) = h3_stream.recv_data().await.map_err(H2BridgeError::H3RecvData)? {
+        while let Some(chunk) = h3_stream
+            .recv_data()
+            .await
+            .map_err(H2BridgeError::H3RecvData)?
+        {
             use bytes::Buf;
             let remaining = chunk.remaining();
             total_body += remaining;
@@ -130,13 +134,10 @@ where
 
     for (name, value) in &parts.headers {
         let name_str = name.as_str();
-        if !is_hop_by_hop(name_str) {
-            if let Ok(v) = value.to_str() {
-                let _ = pingora_resp.insert_header(
-                    name_str.to_owned(),
-                    v.to_owned(),
-                );
-            }
+        if !is_hop_by_hop(name_str)
+            && let Ok(v) = value.to_str()
+        {
+            let _ = pingora_resp.insert_header(name_str.to_owned(), v.to_owned());
         }
     }
 
@@ -162,7 +163,7 @@ where
             // Release flow control capacity immediately after consuming the
             // DATA frame. This prevents deadlock where the sender is waiting
             // for window space and the receiver is waiting for data.
-            let _ = recv_stream
+            let () = recv_stream
                 .flow_control()
                 .release_capacity(len)
                 .map_err(H2BridgeError::FlowControl)?;
@@ -184,20 +185,17 @@ where
     {
         let mut body_opt: Option<Bytes> = None;
         plugin_chain.run_body(&mut body_opt, true, ctx);
-        if let Some(final_data) = body_opt {
-            if !final_data.is_empty() {
-                h3_stream
-                    .send_data(B::from(final_data))
-                    .await
-                    .map_err(|e| H2BridgeError::H3SendData(format!("{e:?}")))?;
-            }
+        if let Some(final_data) = body_opt
+            && !final_data.is_empty()
+        {
+            h3_stream
+                .send_data(B::from(final_data))
+                .await
+                .map_err(|e| H2BridgeError::H3SendData(format!("{e:?}")))?;
         }
     }
 
-    h3_stream
-        .finish()
-        .await
-        .map_err(H2BridgeError::H3Finish)?;
+    h3_stream.finish().await.map_err(H2BridgeError::H3Finish)?;
 
     Ok(())
 }
@@ -235,5 +233,7 @@ fn build_h2_request(
         builder = builder.header(name, value);
     }
 
-    builder.body(()).map_err(|e| format!("build H2 request: {e}"))
+    builder
+        .body(())
+        .map_err(|e| format!("build H2 request: {e}"))
 }

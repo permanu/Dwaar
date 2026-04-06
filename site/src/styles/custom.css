@@ -1,0 +1,31 @@
+/* Dwaar docs brand colors */
+:root {
+	--sl-color-accent-low: #1a1a2e;
+	--sl-color-accent: #e94560;
+	--sl-color-accent-high: #f8d7da;
+	--sl-hue-accent: 350;
+	--sl-font: 'Inter', system-ui, sans-serif;
+}
+
+:root[data-theme='light'] {
+	--sl-color-accent-low: #fff0f3;
+	--sl-color-accent: #c81d40;
+	--sl-color-accent-high: #4a0e1d;
+}
+
+/* Slightly tighter content for readability */
+.sl-markdown-content {
+	max-width: 75ch;
+}
+
+/* Better code block styling */
+.sl-markdown-content pre {
+	border-radius: 0.5rem;
+}
+
+/* Mermaid diagram centering */
+.sl-markdown-content svg[id^="mermaid"] {
+	display: block;
+	margin: 1.5rem auto;
+	max-width: 100%;
+}

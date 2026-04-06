@@ -22,5 +22,6 @@ pub mod proxy;
 pub mod quic;
 pub mod route;
 pub mod template;
+pub mod trace;
 pub mod upstream;
 pub mod wake;

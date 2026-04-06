@@ -355,18 +355,12 @@ pub async fn write_chunked_data(
     tcp.write_all(header.as_bytes())
         .await
         .map_err(UpstreamError::Write)?;
-    tcp.write_all(data)
-        .await
-        .map_err(UpstreamError::Write)?;
-    tcp.write_all(b"\r\n")
-        .await
-        .map_err(UpstreamError::Write)
+    tcp.write_all(data).await.map_err(UpstreamError::Write)?;
+    tcp.write_all(b"\r\n").await.map_err(UpstreamError::Write)
 }
 
 /// Write the terminal chunk (`0\r\n\r\n`) to signal end of chunked body.
-pub async fn write_chunked_end(
-    tcp: &mut tokio::net::TcpStream,
-) -> Result<(), UpstreamError> {
+pub async fn write_chunked_end(tcp: &mut tokio::net::TcpStream) -> Result<(), UpstreamError> {
     use tokio::io::AsyncWriteExt;
     tcp.write_all(b"0\r\n\r\n")
         .await
@@ -669,8 +663,7 @@ mod tests {
 
         // Decode terminal
         let rest = &raw[consumed..];
-        let (payload2, _, terminal2) =
-            try_decode_one_chunk(rest).expect("ok").expect("complete");
+        let (payload2, _, terminal2) = try_decode_one_chunk(rest).expect("ok").expect("complete");
         assert!(payload2.is_empty());
         assert!(terminal2);
     }
@@ -801,6 +794,9 @@ mod tests {
 
         let total: usize = chunks.iter().map(|(c, _)| c.len()).sum();
         assert_eq!(total, 10);
-        assert!(chunks.last().expect("has chunks").1, "last chunk should be final");
+        assert!(
+            chunks.last().expect("has chunks").1,
+            "last chunk should be final"
+        );
     }
 }

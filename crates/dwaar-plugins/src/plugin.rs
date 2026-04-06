@@ -36,6 +36,7 @@ use crate::compress::ResponseCompressor;
 /// stack with zero heap allocation. HTTP methods, hostnames, country codes,
 /// and most header values fit inline, eliminating per-request malloc churn.
 #[derive(Debug, Default)]
+#[allow(clippy::struct_excessive_bools)] // Independent protocol/feature flags, not a state machine
 pub struct PluginCtx {
     pub client_ip: Option<IpAddr>,
     pub host: Option<CompactString>,
@@ -68,6 +69,10 @@ pub struct PluginCtx {
     pub bot_category: Option<BotCategory>,
     pub country: Option<CompactString>,
     pub compressor: Option<ResponseCompressor>,
+
+    /// Set by `RateLimitPlugin` when it rejects a request. Lets the proxy
+    /// record the correct metric without guessing from the status code.
+    pub rate_limited: bool,
 }
 
 /// Data for a short-circuit response produced by a plugin.

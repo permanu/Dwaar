@@ -1,0 +1,654 @@
+---
+const title = "Dwaar — The Gateway for Your Applications";
+const description = "High-performance reverse proxy built on Pingora. Automatic HTTPS, first-party analytics, WASM plugins — one binary, zero dependencies.";
+---
+
+<html lang="en">
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1" />
+	<title>{title}</title>
+	<meta name="description" content={description} />
+	<meta property="og:title" content={title} />
+	<meta property="og:description" content={description} />
+	<meta property="og:type" content="website" />
+	<meta property="og:url" content="https://dwaar.dev" />
+	<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+	<link rel="preconnect" href="https://fonts.googleapis.com" />
+	<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+	<link href="https://fonts.googleapis.com/css2?family=Satoshi:wght@400;500;700;900&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+</head>
+
+<body>
+	<!-- Nav — minimal, no borders -->
+	<nav class="nav">
+		<div class="nav-inner">
+			<a href="/" class="logo">
+				<span class="logo-glyph" aria-hidden="true"></span>
+				<span>dwaar</span>
+			</a>
+			<div class="nav-links">
+				<a href="/getting-started/quickstart/">docs</a>
+				<a href="/getting-started/installation/">install</a>
+				<a href="https://github.com/permanu/Dwaar" target="_blank" rel="noopener" class="nav-gh">
+					<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+				</a>
+			</div>
+		</div>
+	</nav>
+
+	<!-- Hero — left-heavy, request flow visualization on right -->
+	<section class="hero">
+		<div class="hero-text">
+			<h1>One binary.<br/>Your entire<br/>ingress stack.</h1>
+			<p class="hero-sub">
+				Dwaar replaces nginx + Plausible + fail2ban + certbot
+				with a single 25 MB process. Built on Cloudflare's Pingora.
+			</p>
+			<div class="hero-actions">
+				<a href="/getting-started/quickstart/" class="btn btn-primary">
+					Get started
+					<svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M3 8h10m0 0L9 4m4 4L9 12" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+				</a>
+				<a href="https://github.com/permanu/Dwaar" target="_blank" rel="noopener" class="btn btn-ghost">Source</a>
+			</div>
+		</div>
+
+		<!-- Request flow: animated SVG showing traffic routing through Dwaar -->
+		<div class="hero-flow" aria-hidden="true">
+			<svg class="flow-svg" viewBox="0 0 480 360" fill="none">
+				<!-- Incoming request lines -->
+				<line x1="0" y1="80" x2="160" y2="180" class="flow-line fl-1" />
+				<line x1="0" y1="180" x2="160" y2="180" class="flow-line fl-2" />
+				<line x1="0" y1="280" x2="160" y2="180" class="flow-line fl-3" />
+
+				<!-- Dwaar node -->
+				<rect x="140" y="155" width="80" height="50" rx="6" class="flow-node" />
+				<text x="180" y="185" text-anchor="middle" class="flow-label">dwaar</text>
+
+				<!-- Outgoing routed lines -->
+				<line x1="220" y1="170" x2="380" y2="90" class="flow-line fl-4" />
+				<line x1="220" y1="180" x2="380" y2="180" class="flow-line fl-5" />
+				<line x1="220" y1="190" x2="380" y2="270" class="flow-line fl-6" />
+
+				<!-- Backend nodes -->
+				<rect x="380" y="72" width="90" height="36" rx="4" class="flow-backend" />
+				<text x="425" y="95" text-anchor="middle" class="flow-backend-label">:8080</text>
+
+				<rect x="380" y="162" width="90" height="36" rx="4" class="flow-backend" />
+				<text x="425" y="185" text-anchor="middle" class="flow-backend-label">:3000</text>
+
+				<rect x="380" y="252" width="90" height="36" rx="4" class="flow-backend" />
+				<text x="425" y="275" text-anchor="middle" class="flow-backend-label">:9090</text>
+
+				<!-- Request dots traveling the lines -->
+				<circle r="3" class="flow-dot fd-1"><animateMotion dur="2.4s" repeatCount="indefinite" path="M0,80 L160,180" begin="0s" /></circle>
+				<circle r="3" class="flow-dot fd-2"><animateMotion dur="2.0s" repeatCount="indefinite" path="M0,180 L160,180" begin="0.3s" /></circle>
+				<circle r="3" class="flow-dot fd-3"><animateMotion dur="2.6s" repeatCount="indefinite" path="M0,280 L160,180" begin="0.7s" /></circle>
+				<circle r="3" class="flow-dot fd-4"><animateMotion dur="1.8s" repeatCount="indefinite" path="M220,170 L380,90" begin="1.2s" /></circle>
+				<circle r="3" class="flow-dot fd-5"><animateMotion dur="1.6s" repeatCount="indefinite" path="M220,180 L380,180" begin="1.0s" /></circle>
+				<circle r="3" class="flow-dot fd-6"><animateMotion dur="2.0s" repeatCount="indefinite" path="M220,190 L380,270" begin="1.4s" /></circle>
+
+				<!-- Incoming labels -->
+				<text x="12" y="76" class="flow-src-label">HTTPS</text>
+				<text x="12" y="176" class="flow-src-label">H2</text>
+				<text x="12" y="276" class="flow-src-label">QUIC</text>
+			</svg>
+		</div>
+	</section>
+
+	<!-- Metrics — horizontal rule style, not boxed -->
+	<section class="metrics">
+		<div class="metric"><span class="metric-val">~25 MB</span><span class="metric-key">memory</span></div>
+		<div class="metric-sep" aria-hidden="true"></div>
+		<div class="metric"><span class="metric-val">5-10x</span><span class="metric-key">vs nginx</span></div>
+		<div class="metric-sep" aria-hidden="true"></div>
+		<div class="metric"><span class="metric-val">900+</span><span class="metric-key">tests</span></div>
+		<div class="metric-sep" aria-hidden="true"></div>
+		<div class="metric"><span class="metric-val">3 lines</span><span class="metric-key">to proxy</span></div>
+	</section>
+
+	<!-- Config — the terminal IS the section, full-bleed -->
+	<section class="config-section">
+		<div class="config-inner">
+			<div class="config-text">
+				<h2>Three lines. Done.</h2>
+				<p>No YAML. No JSON. No 200-line nginx.conf.<br/>
+				Write what you mean, Dwaar handles the rest &mdash;<br/>
+				TLS certificates, OCSP stapling, HTTP/3, compression.</p>
+			</div>
+			<div class="terminal">
+				<div class="terminal-bar">
+					<div class="terminal-dots">
+						<span class="dot dot-r"></span>
+						<span class="dot dot-y"></span>
+						<span class="dot dot-g"></span>
+					</div>
+					<span class="terminal-file">Dwaarfile</span>
+				</div>
+				<pre class="terminal-code"><code><span class="c-domain">example.com</span> &#123;
+    <span class="c-dir">reverse_proxy</span> <span class="c-val">localhost:8080</span>
+&#125;
+
+<span class="c-domain">api.example.com</span> &#123;
+    <span class="c-dir">reverse_proxy</span> &#123;
+        <span class="c-key">to</span>         <span class="c-val">backend1:3000 backend2:3000</span>
+        <span class="c-key">lb_policy</span>  <span class="c-val">least_conn</span>
+        <span class="c-key">health_uri</span> <span class="c-val">/healthz</span>
+    &#125;
+    <span class="c-dir">rate_limit</span> <span class="c-val">100/s</span>
+    <span class="c-dir">encode</span>     <span class="c-val">gzip zstd br</span>
+&#125;</code></pre>
+			</div>
+		</div>
+	</section>
+
+	<!-- Replace — stark visual comparison -->
+	<section class="replace">
+		<div class="replace-inner">
+			<div class="replace-before">
+				<span class="replace-tag">Before</span>
+				<ul>
+					<li>Caddy / Nginx <span class="mono">~30 MB</span></li>
+					<li>Plausible Analytics <span class="mono">~200 MB</span></li>
+					<li>fail2ban <span class="mono">~30 MB</span></li>
+					<li>Custom log scripts <span class="mono">varies</span></li>
+				</ul>
+				<p class="replace-sum">~260+ MB, 3-4 processes</p>
+			</div>
+			<div class="replace-vs" aria-hidden="true">
+				<svg width="48" height="48" viewBox="0 0 48 48" fill="none">
+					<path d="M16 24h16m0 0l-6-6m6 6l-6 6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+				</svg>
+			</div>
+			<div class="replace-after">
+				<span class="replace-tag">After</span>
+				<p class="replace-dwaar">dwaar</p>
+				<p class="replace-size">~25 MB. One process. Everything.</p>
+			</div>
+		</div>
+	</section>
+
+	<!-- Features — NO grid. Horizontal scrolling strip on desktop -->
+	<section class="features">
+		<h2>Built in, not bolted on</h2>
+		<div class="feat-strip">
+			<a href="/tls/automatic-https/" class="feat">
+				<svg class="feat-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 018 0v4"/></svg>
+				<h3>Automatic HTTPS</h3>
+				<p>Let's Encrypt + Google Trust. HTTP-01, DNS-01. OCSP stapling. Zero config.</p>
+			</a>
+			<a href="/observability/analytics/" class="feat">
+				<svg class="feat-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 3v18h18"/><path d="M7 16l4-6 4 3 5-7"/></svg>
+				<h3>First-Party Analytics</h3>
+				<p>Same-origin injection. HyperLogLog visitors, Web Vitals, TopK pages. ~30 KB/domain.</p>
+			</a>
+			<a href="/architecture/performance/" class="feat">
+				<svg class="feat-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+				<h3>Pingora Engine</h3>
+				<p>Cloudflare's framework. Lock-free routing, zero-copy buffers, jemalloc.</p>
+			</a>
+			<a href="/security/rate-limiting/" class="feat">
+				<svg class="feat-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+				<h3>Security Suite</h3>
+				<p>Rate limiting, bot detection, IP filtering, security headers, forward auth.</p>
+			</a>
+			<a href="/plugins/wasm-plugins/" class="feat">
+				<svg class="feat-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14.7 6.3a1 1 0 000 1.4l1.6 1.6a1 1 0 001.4 0l3.77-3.77a6 6 0 01-7.94 7.94l-6.91 6.91a2.12 2.12 0 01-3-3l6.91-6.91a6 6 0 017.94-7.94l-3.76 3.76z"/></svg>
+				<h3>WASM Plugins</h3>
+				<p>Extend in any language that compiles to WebAssembly. Sandboxed.</p>
+			</a>
+			<a href="/deployment/kubernetes/" class="feat">
+				<svg class="feat-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="3"/><path d="M12 2v4m0 12v4m-7.07-3.93l2.83-2.83m8.48-8.48l2.83-2.83M2 12h4m12 0h4M4.93 4.93l2.83 2.83m8.48 8.48l2.83 2.83"/></svg>
+				<h3>Kubernetes Native</h3>
+				<p>Ingress controller. Leader election. Helm chart. Drop-in replacement.</p>
+			</a>
+			<a href="/performance/http3/" class="feat">
+				<svg class="feat-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+				<h3>HTTP/3</h3>
+				<p>QUIC transport. 0-RTT resumption. Multiplexed streams.</p>
+			</a>
+			<a href="/observability/logging/" class="feat">
+				<svg class="feat-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
+				<h3>Structured Logging</h3>
+				<p>22+ field JSON. Batch-written. File rotation, Unix socket.</p>
+			</a>
+			<a href="/deployment/docker-labels/" class="feat">
+				<svg class="feat-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M6 14h12"/></svg>
+				<h3>Docker Discovery</h3>
+				<p>Auto-discover backends from container labels. Zero-config.</p>
+			</a>
+		</div>
+	</section>
+
+	<!-- Install — one-liners, no ceremony -->
+	<section class="install">
+		<h2>Install</h2>
+		<div class="install-grid">
+			<div class="install-row">
+				<span class="install-label">shell</span>
+				<code>curl -fsSL https://dwaar.dev/install.sh | sh</code>
+			</div>
+			<div class="install-row">
+				<span class="install-label">apt</span>
+				<code>sudo apt install dwaar</code>
+			</div>
+			<div class="install-row">
+				<span class="install-label">docker</span>
+				<code>docker run -p 443:443 ghcr.io/permanu/dwaar</code>
+			</div>
+			<div class="install-row">
+				<span class="install-label">brew</span>
+				<code>brew install permanu/dwaar/dwaar</code>
+			</div>
+		</div>
+	</section>
+
+	<!-- CTA — just text and a link, no box -->
+	<section class="cta">
+		<p>Ready?</p>
+		<a href="/getting-started/quickstart/" class="cta-link">Read the docs</a>
+	</section>
+
+	<!-- Footer -->
+	<footer class="footer">
+		<div class="footer-inner">
+			<p class="footer-brand">dwaar</p>
+			<nav class="footer-links">
+				<a href="/getting-started/quickstart/">Docs</a>
+				<a href="https://github.com/permanu/Dwaar">GitHub</a>
+				<a href="https://github.com/permanu/Dwaar/issues">Issues</a>
+			</nav>
+			<p class="footer-legal">
+				<a href="https://permanu.com">Permanu</a> / <a href="https://github.com/permanu/Dwaar/blob/main/LICENSE">BSL-1.1</a>
+			</p>
+		</div>
+	</footer>
+</body>
+</html>
+
+<style>
+	/* ── Reset & Base ────────────────────────────── */
+	* { margin: 0; padding: 0; box-sizing: border-box; }
+	html { scroll-behavior: smooth; }
+	body {
+		font-family: 'Satoshi', system-ui, -apple-system, sans-serif;
+		background: #0a0a0c;
+		color: #d4d4d8;
+		line-height: 1.6;
+		-webkit-font-smoothing: antialiased;
+		overflow-x: hidden;
+	}
+	a { color: inherit; text-decoration: none; }
+	code, pre { font-family: 'JetBrains Mono', monospace; }
+	h2 {
+		font-size: clamp(1.5rem, 3vw, 2rem);
+		font-weight: 700;
+		letter-spacing: -0.03em;
+		color: #fafafa;
+		margin-bottom: 2rem;
+	}
+	.mono { font-family: 'JetBrains Mono', monospace; font-size: 0.8em; color: #52525b; }
+
+	/* ── Nav ──────────────────────────────────────── */
+	.nav {
+		position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+		background: rgba(10, 10, 12, 0.9);
+		backdrop-filter: blur(12px);
+	}
+	.nav-inner {
+		max-width: 1200px; margin: 0 auto;
+		padding: 0 2rem; height: 52px;
+		display: flex; align-items: center; justify-content: space-between;
+	}
+	.logo {
+		display: flex; align-items: center; gap: 0.5rem;
+		font-weight: 700; font-size: 1rem; color: #fafafa;
+		letter-spacing: -0.02em;
+	}
+	.logo-glyph {
+		display: block; width: 18px; height: 18px;
+		border: 2px solid #e94560;
+		border-radius: 3px;
+		position: relative;
+	}
+	.logo-glyph::after {
+		content: '';
+		position: absolute; right: -1px; top: 25%; bottom: 25%;
+		width: 2px; background: #0a0a0c;
+	}
+	.nav-links { display: flex; align-items: center; gap: 1.5rem; font-size: 0.8rem; color: #71717a; }
+	.nav-links a { transition: color 0.2s; }
+	.nav-links a:hover { color: #fafafa; }
+
+	/* ── Hero ─────────────────────────────────────── */
+	.hero {
+		display: grid;
+		grid-template-columns: 1fr 1.2fr;
+		gap: 4rem;
+		align-items: center;
+		max-width: 1200px; margin: 0 auto;
+		padding: 10rem 2rem 6rem;
+		min-height: 100dvh;
+	}
+	.hero-text h1 {
+		font-size: clamp(2.5rem, 5vw, 4rem);
+		font-weight: 900;
+		line-height: 1.05;
+		letter-spacing: -0.045em;
+		color: #fafafa;
+	}
+	.hero-sub {
+		margin-top: 1.5rem;
+		font-size: 1rem;
+		color: #71717a;
+		line-height: 1.7;
+		max-width: 440px;
+	}
+	.hero-actions {
+		display: flex; gap: 0.75rem;
+		margin-top: 2rem;
+	}
+
+	/* ── Buttons ──────────────────────────────────── */
+	.btn {
+		display: inline-flex; align-items: center; gap: 0.35rem;
+		padding: 0.55rem 1.25rem;
+		border-radius: 6px;
+		font-size: 0.825rem; font-weight: 600;
+		transition: all 0.15s cubic-bezier(0.16, 1, 0.3, 1);
+		letter-spacing: -0.01em;
+	}
+	.btn:active { transform: translateY(1px); }
+	.btn-primary { background: #e94560; color: #fff; }
+	.btn-primary:hover { background: #d63851; }
+	.btn-ghost { color: #71717a; border: 1px solid #27272a; }
+	.btn-ghost:hover { color: #d4d4d8; border-color: #3f3f46; }
+
+	/* ── Request flow SVG ────────────────────────── */
+	.hero-flow { position: relative; }
+	.flow-svg { width: 100%; height: auto; }
+	.flow-line {
+		stroke: #27272a; stroke-width: 1;
+		stroke-dasharray: 6 4;
+	}
+	.flow-node {
+		fill: #e94560; fill-opacity: 0.08;
+		stroke: #e94560; stroke-width: 1.5;
+	}
+	.flow-label {
+		fill: #e94560; font-size: 13px;
+		font-family: 'JetBrains Mono', monospace;
+		font-weight: 500;
+	}
+	.flow-backend {
+		fill: #18181b;
+		stroke: #27272a; stroke-width: 1;
+	}
+	.flow-backend-label {
+		fill: #52525b; font-size: 12px;
+		font-family: 'JetBrains Mono', monospace;
+	}
+	.flow-src-label {
+		fill: #3f3f46; font-size: 10px;
+		font-family: 'JetBrains Mono', monospace;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+	}
+	.flow-dot { fill: #e94560; opacity: 0; }
+	.fd-1, .fd-2, .fd-3 { animation: dot-in 2.4s ease-in-out infinite; }
+	.fd-4, .fd-5, .fd-6 { animation: dot-out 2.0s ease-in-out infinite; }
+	.fd-1 { animation-delay: 0s; }
+	.fd-2 { animation-delay: 0.3s; }
+	.fd-3 { animation-delay: 0.7s; }
+	.fd-4 { animation-delay: 1.2s; }
+	.fd-5 { animation-delay: 1.0s; }
+	.fd-6 { animation-delay: 1.4s; }
+
+	@keyframes dot-in {
+		0% { opacity: 0; }
+		15% { opacity: 1; }
+		85% { opacity: 1; }
+		100% { opacity: 0; }
+	}
+	@keyframes dot-out {
+		0% { opacity: 0; }
+		20% { opacity: 0.8; }
+		80% { opacity: 0.8; }
+		100% { opacity: 0; }
+	}
+
+	/* Pulse on the central node */
+	@keyframes node-pulse {
+		0%, 100% { fill-opacity: 0.06; }
+		50% { fill-opacity: 0.12; }
+	}
+	.flow-node { animation: node-pulse 3s ease-in-out infinite; }
+
+	/* ── Metrics — inline, separated by thin pipes ── */
+	.metrics {
+		display: flex; align-items: center; justify-content: center;
+		gap: 0; flex-wrap: wrap;
+		padding: 2rem;
+		max-width: 800px; margin: 0 auto;
+	}
+	.metric {
+		display: flex; flex-direction: column; align-items: center;
+		padding: 0.5rem 2rem;
+	}
+	.metric-val {
+		font-family: 'JetBrains Mono', monospace;
+		font-size: 1.25rem; font-weight: 700;
+		color: #fafafa; letter-spacing: -0.02em;
+	}
+	.metric-key { font-size: 0.7rem; color: #3f3f46; margin-top: 0.15rem; }
+	.metric-sep { width: 1px; height: 28px; background: #1c1c22; flex-shrink: 0; }
+
+	/* ── Config section — split text + terminal ──── */
+	.config-section {
+		padding: 6rem 2rem;
+		max-width: 1200px; margin: 0 auto;
+	}
+	.config-inner {
+		display: grid;
+		grid-template-columns: 0.8fr 1fr;
+		gap: 4rem;
+		align-items: center;
+	}
+	.config-text h2 { text-align: left; margin-bottom: 1rem; }
+	.config-text p { color: #52525b; line-height: 1.7; font-size: 0.95rem; }
+
+	/* ── Terminal ─────────────────────────────────── */
+	.terminal {
+		border-radius: 10px; overflow: hidden;
+		background: #111114;
+		border: 1px solid #1a1a1f;
+		text-align: left;
+	}
+	.terminal-bar {
+		display: flex; align-items: center;
+		padding: 0.6rem 1rem;
+		background: #141417;
+		border-bottom: 1px solid #1a1a1f;
+	}
+	.terminal-dots { display: flex; gap: 6px; }
+	.dot { width: 10px; height: 10px; border-radius: 50%; }
+	.dot-r { background: #ff5f57; }
+	.dot-y { background: #febc2e; }
+	.dot-g { background: #28c840; }
+	.terminal-file {
+		margin-left: auto;
+		font-size: 0.65rem; color: #27272a;
+		font-family: 'JetBrains Mono', monospace;
+	}
+	.terminal-code {
+		padding: 1.25rem 1.5rem;
+		font-size: 0.78rem; line-height: 1.75;
+		overflow-x: auto;
+	}
+	.terminal-code code { background: none; }
+	.c-domain { color: #7dd3fc; font-weight: 500; }
+	.c-dir { color: #c4b5fd; }
+	.c-key { color: #71717a; }
+	.c-val { color: #86efac; }
+
+	/* ── Replace ──────────────────────────────────── */
+	.replace {
+		padding: 5rem 2rem;
+		border-top: 1px solid #141417;
+		border-bottom: 1px solid #141417;
+	}
+	.replace-inner {
+		max-width: 900px; margin: 0 auto;
+		display: grid;
+		grid-template-columns: 1fr auto 1fr;
+		gap: 3rem;
+		align-items: center;
+	}
+	.replace-tag {
+		display: block;
+		font-size: 0.6rem; font-weight: 700;
+		text-transform: uppercase; letter-spacing: 0.1em;
+		color: #3f3f46; margin-bottom: 1rem;
+	}
+	.replace-before ul {
+		list-style: none;
+	}
+	.replace-before li {
+		display: flex; justify-content: space-between;
+		padding: 0.35rem 0;
+		font-size: 0.85rem;
+		color: #52525b;
+		border-bottom: 1px solid #141417;
+	}
+	.replace-before li:last-child { border-bottom: none; }
+	.replace-sum { margin-top: 0.75rem; font-size: 0.75rem; color: #27272a; }
+	.replace-vs { color: #27272a; }
+	.replace-after { text-align: center; }
+	.replace-dwaar {
+		font-size: 2.5rem; font-weight: 900;
+		letter-spacing: -0.04em; color: #fafafa;
+	}
+	.replace-size { font-size: 0.8rem; color: #3f3f46; margin-top: 0.25rem; }
+
+	/* ── Features — horizontal scroll strip ──────── */
+	.features {
+		padding: 5rem 2rem 3rem;
+		max-width: 1200px; margin: 0 auto;
+	}
+	.feat-strip {
+		display: flex;
+		gap: 1px;
+		overflow-x: auto;
+		scroll-snap-type: x mandatory;
+		-webkit-overflow-scrolling: touch;
+		scrollbar-width: none;
+		margin: 0 -2rem;
+		padding: 0 2rem;
+	}
+	.feat-strip::-webkit-scrollbar { display: none; }
+	.feat {
+		flex: 0 0 260px;
+		scroll-snap-align: start;
+		padding: 1.5rem;
+		background: #111114;
+		border: 1px solid #1a1a1f;
+		border-radius: 8px;
+		margin-right: 0.75rem;
+		transition: border-color 0.2s, transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+	}
+	.feat:last-child { margin-right: 0; }
+	.feat:hover {
+		border-color: #27272a;
+		transform: translateY(-2px);
+	}
+	.feat-ico {
+		width: 20px; height: 20px;
+		color: #e94560;
+		margin-bottom: 0.75rem;
+		stroke-linecap: round;
+		stroke-linejoin: round;
+	}
+	.feat h3 { font-size: 0.875rem; font-weight: 700; color: #e4e4e7; margin-bottom: 0.3rem; }
+	.feat p { font-size: 0.78rem; color: #52525b; line-height: 1.5; }
+
+	/* ── Install — clean rows ────────────────────── */
+	.install {
+		padding: 4rem 2rem;
+		max-width: 640px; margin: 0 auto;
+	}
+	.install h2 { text-align: left; }
+	.install-grid { display: flex; flex-direction: column; gap: 0; }
+	.install-row {
+		display: flex; align-items: baseline; gap: 1rem;
+		padding: 0.6rem 0;
+		border-bottom: 1px solid #141417;
+	}
+	.install-row:last-child { border-bottom: none; }
+	.install-label {
+		flex: 0 0 52px;
+		font-size: 0.7rem; font-weight: 600;
+		color: #3f3f46;
+		font-family: 'JetBrains Mono', monospace;
+	}
+	.install-row code {
+		font-size: 0.8rem; color: #86efac;
+		white-space: nowrap;
+	}
+
+	/* ── CTA ──────────────────────────────────────── */
+	.cta {
+		padding: 6rem 2rem;
+		text-align: center;
+	}
+	.cta p {
+		font-size: 1.25rem; font-weight: 700;
+		color: #3f3f46; margin-bottom: 1rem;
+	}
+	.cta-link {
+		font-size: 1rem; font-weight: 700;
+		color: #e94560;
+		border-bottom: 1px solid transparent;
+		transition: border-color 0.2s;
+		padding-bottom: 2px;
+	}
+	.cta-link:hover { border-color: #e94560; }
+
+	/* ── Footer ───────────────────────────────────── */
+	.footer { padding: 2rem; border-top: 1px solid #141417; }
+	.footer-inner {
+		max-width: 1200px; margin: 0 auto;
+		display: flex; align-items: center; justify-content: space-between;
+		flex-wrap: wrap; gap: 0.75rem;
+		font-size: 0.75rem; color: #27272a;
+	}
+	.footer-brand { font-weight: 700; color: #3f3f46; letter-spacing: -0.02em; }
+	.footer-links { display: flex; gap: 1.5rem; }
+	.footer-links a:hover { color: #71717a; }
+	.footer-legal a { color: #27272a; }
+	.footer-legal a:hover { color: #71717a; }
+
+	/* ── Responsive ───────────────────────────────── */
+	@media (max-width: 768px) {
+		.hero {
+			grid-template-columns: 1fr;
+			padding: 7rem 1.5rem 3rem;
+			min-height: auto;
+			gap: 3rem;
+		}
+		.hero-flow { order: 2; }
+		.config-inner { grid-template-columns: 1fr; gap: 2rem; }
+		.replace-inner {
+			grid-template-columns: 1fr;
+			text-align: center;
+			gap: 1.5rem;
+		}
+		.replace-before li { justify-content: center; gap: 1rem; }
+		.replace-vs { transform: rotate(90deg); }
+		.metrics { flex-direction: column; }
+		.metric-sep { width: 32px; height: 1px; }
+		.install { padding: 3rem 1.5rem; }
+		.footer-inner { flex-direction: column; text-align: center; }
+		.feat { flex: 0 0 85vw; }
+	}
+</style>

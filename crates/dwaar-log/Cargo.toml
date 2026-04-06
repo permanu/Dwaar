@@ -15,13 +15,15 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sonic-rs = { workspace = true }
 chrono = { workspace = true }
-tokio = { workspace = true, features = ["sync", "io-util", "fs", "time", "rt", "macros"] }
+tokio = { workspace = true, features = ["sync", "io-util", "fs", "time", "rt", "macros", "net"] }
 tracing = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+tempfile = { workspace = true }
+compact_str = { workspace = true }
 
 [[bench]]
 name = "request_log"

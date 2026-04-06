@@ -101,7 +101,10 @@ impl H2ConnPool {
     /// returns an error on `send_request()` if the connection is dead.
     /// The caller should call `evict_and_reconnect()` on failure.
     pub fn acquire(&self, addr: SocketAddr) -> Option<SendRequest<Bytes>> {
-        let conns = self.conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let conns = self
+            .conns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let entries = conns.get(&addr)?;
         if entries.is_empty() {
             return None;
@@ -110,9 +113,12 @@ impl H2ConnPool {
         Some(entries[0].sender.clone())
     }
 
-    /// Remove all connections for a host (called after send_request fails).
+    /// Remove all connections for a host (called after `send_request` fails).
     pub fn evict(&self, addr: SocketAddr) {
-        let mut conns = self.conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut conns = self
+            .conns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         conns.remove(&addr);
     }
 
@@ -138,20 +144,20 @@ impl H2ConnPool {
             .max_concurrent_streams(MAX_CONCURRENT_STREAMS)
             .enable_push(false);
 
-        let (sender, connection) = tokio::time::timeout(
-            CONNECT_TIMEOUT,
-            builder.handshake(tcp),
-        )
-        .await
-        .map_err(|_| H2ConnError::Timeout)?
-        .map_err(H2ConnError::Handshake)?;
+        let (sender, connection) = tokio::time::timeout(CONNECT_TIMEOUT, builder.handshake(tcp))
+            .await
+            .map_err(|_| H2ConnError::Timeout)?
+            .map_err(H2ConnError::Handshake)?;
 
         debug!(upstream = %addr, "H2 upstream connection established");
 
         // Spawn the connection driver — it must be polled to completion
         // for the H2 protocol to function. On error/GOAWAY, it removes
         // itself from the pool.
-        let pool_ref = self.conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pool_ref = self
+            .conns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // We need a way for the driver to remove itself. Since we can't
         // give it &self (lifetime issues), we use a separate approach:
         // the driver just logs. Dead connections are evicted lazily in acquire().
@@ -171,7 +177,10 @@ impl H2ConnPool {
         // Insert into pool.
         let cloned = sender.clone();
         {
-            let mut conns = self.conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut conns = self
+                .conns
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let entries = conns.entry(addr).or_default();
             if entries.len() < MAX_CONNS_PER_HOST {
                 entries.push(H2Conn { sender });
@@ -240,7 +249,8 @@ mod tests {
                     .body(())
                     .expect("response");
                 let mut send = respond.send_response(response, false).expect("send resp");
-                send.send_data(Bytes::from_static(b"ok"), true).expect("send data");
+                send.send_data(Bytes::from_static(b"ok"), true)
+                    .expect("send data");
             }
         });
 
@@ -282,7 +292,8 @@ mod tests {
                             .body(())
                             .expect("response");
                         let mut send = respond.send_response(response, false).expect("send");
-                        send.send_data(Bytes::from_static(b"ok"), true).expect("data");
+                        send.send_data(Bytes::from_static(b"ok"), true)
+                            .expect("data");
                     }
                 });
             }
@@ -329,7 +340,8 @@ mod tests {
                             .body(())
                             .expect("response");
                         let mut send = respond.send_response(response, false).expect("send");
-                        send.send_data(Bytes::from_static(b"ok"), true).expect("data");
+                        send.send_data(Bytes::from_static(b"ok"), true)
+                            .expect("data");
                     }
                 });
             }
@@ -342,7 +354,10 @@ mod tests {
         assert!(pool.acquire(addr).is_some(), "should have a connection");
 
         // Verify it works.
-        let req = http::Request::builder().uri("http://localhost/a").body(()).unwrap();
+        let req = http::Request::builder()
+            .uri("http://localhost/a")
+            .body(())
+            .unwrap();
         let (resp, _) = sender1.send_request(req, true).expect("send");
         let resp: http::Response<h2::RecvStream> = resp.await.expect("response");
         assert_eq!(resp.status(), 200);
@@ -353,8 +368,13 @@ mod tests {
 
         // Reconnect — simulates retry path.
         let mut sender2 = pool.connect(addr).await.expect("reconnect");
-        let req = http::Request::builder().uri("http://localhost/b").body(()).unwrap();
-        let (resp, _) = sender2.send_request(req, true).expect("send after reconnect");
+        let req = http::Request::builder()
+            .uri("http://localhost/b")
+            .body(())
+            .unwrap();
+        let (resp, _) = sender2
+            .send_request(req, true)
+            .expect("send after reconnect");
         let resp: http::Response<h2::RecvStream> = resp.await.expect("response after reconnect");
         assert_eq!(resp.status(), 200);
     }

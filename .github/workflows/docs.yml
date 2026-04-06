@@ -22,7 +22,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - name: Install mdBook
-        run: cargo install mdbook --locked
+        run: |
+          cargo install mdbook --locked
+          cargo install mdbook-mermaid --locked
+      - name: Install Mermaid assets
+        run: mdbook-mermaid install docs/
       - name: Build docs
         run: cd docs && mdbook build
       - name: Upload artifact

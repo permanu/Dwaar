@@ -171,7 +171,10 @@ pub fn resolve_upstream_addr(
             continue;
         }
         match &block.handler {
-            Handler::ReverseProxy { upstream, upstream_h2 } => {
+            Handler::ReverseProxy {
+                upstream,
+                upstream_h2,
+            } => {
                 return Ok((*upstream, *upstream_h2));
             }
             Handler::ReverseProxyPool { pool, upstream_h2 } => {

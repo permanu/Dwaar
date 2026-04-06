@@ -26,6 +26,7 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+libc = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]
@@ -33,6 +34,7 @@ chrono = { workspace = true }
 compact_str = { workspace = true }
 criterion = { workspace = true }
 hyperloglog = { workspace = true }
+tempfile = { workspace = true }
 
 [[bench]]
 name = "aggregation"

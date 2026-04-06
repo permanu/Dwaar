@@ -95,6 +95,15 @@ pub struct RequestLog {
     /// Compression algorithm applied (e.g., "gzip", "br")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compression: Option<CompactString>,
+
+    /// W3C trace ID for distributed tracing correlation
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_id: Option<CompactString>,
+
+    /// First 1KB of upstream response body on 5xx errors.
+    /// Enables downstream error tracking without app-level instrumentation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_error_body: Option<String>,
 }
 
 #[cfg(test)]
@@ -125,6 +134,8 @@ mod tests {
             upstream_response_time_us: 980,
             cache_status: None,
             compression: Some("gzip".into()),
+            trace_id: None,
+            upstream_error_body: None,
         }
     }
 
@@ -192,5 +203,31 @@ mod tests {
     fn request_log_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<RequestLog>();
+    }
+
+    #[test]
+    fn upstream_error_body_present_on_5xx() {
+        let mut log = sample_log();
+        log.status = 500;
+        log.upstream_error_body = Some("Internal Server Error".to_string());
+
+        let json = serde_json::to_string(&log).expect("serialize");
+        assert!(json.contains("\"upstream_error_body\":\"Internal Server Error\""));
+    }
+
+    #[test]
+    fn upstream_error_body_absent_on_200() {
+        let log = sample_log();
+        let json = serde_json::to_string(&log).expect("serialize");
+        assert!(!json.contains("upstream_error_body"));
+    }
+
+    #[test]
+    fn trace_id_present_when_set() {
+        let mut log = sample_log();
+        log.trace_id = Some("4bf92f3577b34da6a3ce929d0e0e4736".into());
+
+        let json = serde_json::to_string(&log).expect("serialize");
+        assert!(json.contains("\"trace_id\":\"4bf92f3577b34da6a3ce929d0e0e4736\""));
     }
 }

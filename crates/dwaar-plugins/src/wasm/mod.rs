@@ -28,6 +28,6 @@ pub mod limits;
 
 pub use adapter::WasmPlugin;
 pub use cache::ModuleCache;
-pub use engine::{EngineError, WasmEngine};
+pub use engine::WasmEngine;
 pub use error::WasmError;
 pub use limits::WasmLimits;

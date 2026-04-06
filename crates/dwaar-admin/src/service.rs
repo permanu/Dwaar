@@ -325,13 +325,10 @@ impl AdminService {
                         r#"{"error":"missing cache key — use PURGE /cache/{host}/{path}"}"#,
                     );
                 }
-                let storage = self
-                    .cache_backend
-                    .as_ref()
-                    .and_then(|shared| {
-                        let guard = shared.load();
-                        guard.as_ref().as_ref().map(|b| b.storage)
-                    });
+                let storage = self.cache_backend.as_ref().and_then(|shared| {
+                    let guard = shared.load();
+                    guard.as_ref().as_ref().map(|b| b.storage)
+                });
                 match storage {
                     Some(storage) => {
                         if handlers::purge_cache_key(storage, key_path).await {

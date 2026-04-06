@@ -188,6 +188,8 @@ mod tests {
             upstream_response_time_us: 50,
             cache_status: None,
             compression: None,
+            trace_id: None,
+            upstream_error_body: None,
         }
     }
 

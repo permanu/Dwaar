@@ -253,13 +253,20 @@ impl ResponseCompressor {
                 brotli_encoder: Some(brotli::CompressorWriter::new(Vec::new(), 4096, 4, 22)),
                 zstd_encoder: None,
             },
-            CompressEncoding::Zstd => Self {
-                encoding,
-                gzip_encoder: None,
-                brotli_encoder: None,
-                // level 3 = fast compression (default is 3, range 1-22)
-                zstd_encoder: zstd::stream::write::Encoder::new(Vec::new(), 3).ok(),
-            },
+            CompressEncoding::Zstd => {
+                let zstd_encoder = zstd::stream::write::Encoder::new(Vec::new(), 3)
+                    .map_err(|e| {
+                        tracing::warn!(error = %e, "zstd encoder creation failed — compression disabled");
+                        e
+                    })
+                    .ok();
+                Self {
+                    encoding,
+                    gzip_encoder: None,
+                    brotli_encoder: None,
+                    zstd_encoder,
+                }
+            }
         }
     }
 

@@ -34,8 +34,8 @@
 //!     └───────────────── observe expired ◄───────────────┘
 //! ```
 
-use std::sync::atomic::Ordering;
 use std::sync::Mutex;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use k8s_openapi::api::coordination::v1::Lease;
@@ -265,9 +265,7 @@ impl LeaderElector {
             Ok(created) => {
                 // We created the Lease — we are now the leader.  Store the
                 // resourceVersion so the first renewal can use it.
-                self.store_resource_version(
-                    created.metadata.resource_version.as_deref(),
-                );
+                self.store_resource_version(created.metadata.resource_version.as_deref());
                 return Ok(true);
             }
             Err(kube::Error::Api(ae)) if ae.code == 409 => {
@@ -330,9 +328,7 @@ impl LeaderElector {
             .await
         {
             Ok(patched) => {
-                self.store_resource_version(
-                    patched.metadata.resource_version.as_deref(),
-                );
+                self.store_resource_version(patched.metadata.resource_version.as_deref());
                 Ok(true)
             }
             Err(kube::Error::Api(ae)) if ae.code == 409 => {
@@ -385,9 +381,7 @@ impl LeaderElector {
         {
             Ok(renewed) => {
                 // Update the stored version so the next renewal uses it.
-                self.store_resource_version(
-                    renewed.metadata.resource_version.as_deref(),
-                );
+                self.store_resource_version(renewed.metadata.resource_version.as_deref());
                 Ok(())
             }
             Err(kube::Error::Api(ae)) if ae.code == 409 => {
@@ -587,10 +581,7 @@ mod tests {
         // how recently it was renewed. Negative values from the K8s API must
         // not wrap around via `as u64`.
         let lease = make_lease_with_renew_time(0); // just renewed
-        assert!(
-            lease_is_expired(&lease, 0),
-            "zero duration must be expired"
-        );
+        assert!(lease_is_expired(&lease, 0), "zero duration must be expired");
         assert!(
             lease_is_expired(&lease, -1),
             "negative duration must be expired"
