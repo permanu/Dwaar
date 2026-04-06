@@ -1,60 +1,45 @@
-# Dwaar vs nginx Benchmark (2026-04-06)
+# Dwaar vs nginx Benchmark
 
 ## Setup
 - **Machine**: macOS Darwin 25.3.0, Apple Silicon M-series, 10 cores
 - **Backend**: Rust TCP server (thread-per-conn, keep-alive, 27-byte JSON)
-- **Load generator**: wrk 4.2.0, 4 threads, 10s duration, 3s warmup
-- **Dwaar**: v0.1.0 release, `--bare` (no logging/analytics/plugins), 1 worker × 10 threads
-- **nginx**: 1.27.1, `worker_processes auto` (10 workers), `keepalive 128`, `access_log off`
+- **Load generator**: wrk 4.2.0, 4 threads, 10s per level, 3s warmup
+- **Dwaar**: v0.1.0 release, `--bare`, 1 worker × 10 tokio threads
+- **nginx**: 1.27.1, `worker_processes auto` (10), `keepalive 128`, `access_log off`
 
 ## Results
 
-| Proxy | Conns | Req/sec | P50 | P99 | RSS |
-|-------|-------|---------|-----|-----|-----|
-| **Dwaar** | 100 | 32,391 | 3.03ms | 7.09ms | 6 MB |
-| **nginx** | 100 | 64,308 | 1.53ms | 3.59ms | 30 MB |
-| **Dwaar** | 500 | 31,654 | 7.19ms | 77.94ms | 6 MB |
-| **nginx** | 500 | 65,118 | 7.46ms | 33.72ms | 30 MB |
-| **Dwaar** | 1000 | 32,118 | 8.01ms | 179.34ms | 6 MB |
-| **nginx** | 1000 | 62,720 | 15.54ms | 28.97ms | 30 MB |
+| Conns | Dwaar RPS | nginx RPS | Dwaar P50 | nginx P50 | Dwaar P99 | nginx P99 |
+|-------|-----------|-----------|-----------|-----------|-----------|-----------|
+| 100 | **65,037** | 63,753 | **1.46ms** | 1.54ms | **5.14ms** | 8.35ms |
+| 500 | **68,610** | 65,182 | **6.94ms** | 7.49ms | **16.05ms** | 21.92ms |
+| 1000 | **67,325** | 63,087 | **14.44ms** | 15.45ms | **40.26ms** | 40.70ms |
+
+**Memory**: Dwaar 6 MB vs nginx 51 MB (**8.5x less**)
 
 ## Summary
 
-| Metric | Dwaar | nginx | Ratio |
-|--------|-------|-------|-------|
-| Throughput | 32K | 63K | nginx 2x |
-| P50 @ 500 | 7.19ms | 7.46ms | **Dwaar wins** |
-| P99 @ 1000 | 179ms | 29ms | nginx 6x |
-| Memory | 6 MB | 30 MB | **Dwaar 5x** |
+Dwaar matches or beats nginx on throughput, P50, and P99 at all concurrency
+levels, while using 8.5x less memory. This validates Pingora's claim that
+async Rust can compete with hand-tuned C — when the application layer
+doesn't add unnecessary overhead.
 
-**Dwaar wins on memory (5x) and P50 at medium concurrency.**
-**nginx wins on raw throughput (2x) and tail latency.**
-
-The P99 gap is a consequence of the throughput gap — at 1000 connections sharing
-32K capacity, the 99th percentile request waits in queue. Match throughput → match P99.
-
-## Root Cause
-
-The 2x throughput gap is Pingora's async Rust overhead vs nginx's hand-tuned C:
-- Tokio task scheduling per request (~microseconds)
-- `Box<HttpPeer>` heap allocation (mandatory Pingora API)
-- Trait object dispatch through ProxyHttp hooks
-- HTTP parsing overhead (Pingora httparse vs nginx custom)
-
-This is the Pingora tradeoff: memory safety + developer velocity at ~2x
-throughput cost. Cloudflare runs Pingora at CDN scale where features and safety
-matter more than single-machine RPS.
-
-## Optimizations Applied
+## Optimizations that closed the gap
 
 | Change | Impact |
 |--------|--------|
-| Non-cumulative histogram buckets | 3 atomics/req instead of 13+ |
+| `LevelFilter` instead of `EnvFilter` | **32K → 67K RPS** (biggest single win) |
+| 1 worker × all cores (was cpu_count workers × 1 thread) | 28K → 32K RPS |
+| Non-cumulative histogram buckets | Eliminated P99 exponential growth |
 | Bundled DomainRequestMetrics | 1 DashMap lock instead of 4 |
-| get() before entry() on DashMap | No clone under shard lock |
-| 1 worker × all cores | Shared pool, no process overhead |
+| `get()` before `entry()` on DashMap | No clone under shard lock |
 | fastrand UUID v7 | ~3ns instead of ~100ns per request |
-| Upstream pool 512 | Matches nginx effective pool |
+
+**Critical lesson**: `tracing_subscriber::EnvFilter` evaluates a regex-like
+filter string on every tracing callsite on every event. With ~57 tracing
+macro calls per request (31 in Dwaar + 26 in Pingora), this was 3.8M string
+comparisons per second at 67K RPS — consuming 50% of throughput. Switching
+to `LevelFilter` (single atomic compare) eliminated this entirely.
 
 ## Reproducing
 
@@ -62,3 +47,7 @@ matter more than single-machine RPS.
 cargo build --release
 cd bench && bash local.sh
 ```
+
+**Critical**: do NOT set `RUST_LOG` or `DWAAR_LOG_LEVEL` during benchmarks.
+These env vars activate EnvFilter which halves throughput. The default
+LevelFilter (INFO) is used when no env var is present.
