@@ -24,9 +24,9 @@ use tracing::{debug, warn};
 use crate::route::RouteTable;
 
 use super::bridge::{
-    self, BodyFraming, UpstreamError, BRIDGE_CHUNK_SIZE, MAX_REQUEST_BODY,
-    UPSTREAM_TIMEOUT_SECS,
+    self, BodyFraming, UpstreamError, MAX_REQUEST_BODY, UPSTREAM_TIMEOUT_SECS,
 };
+use super::pool::BufferedConn;
 use super::convert::{
     build_plugin_ctx, h3_to_pingora_headers, is_hop_by_hop, is_idempotent_method,
     pingora_resp_to_h3, resolve_upstream_addr,
@@ -232,14 +232,17 @@ where
     S: h3::quic::SendStream<B> + h3::quic::RecvStream,
     B: bytes::Buf + From<Bytes> + Send + 'static,
 {
-    // Acquire upstream connection (pool or fresh).
-    let mut tcp = if let Some(pooled) = conn_pool.take(upstream_addr) {
+    // Acquire upstream connection (pool or fresh). BufferedConn carries its
+    // own read buffer — no per-request allocation needed for body streaming.
+    let mut conn = if let Some(pooled) = conn_pool.take(upstream_addr) {
         debug!(upstream = %upstream_addr, "reusing pooled connection");
         pooled
     } else {
-        tokio::net::TcpStream::connect(upstream_addr)
-            .await
-            .map_err(|e| StreamProxyError::Upstream(UpstreamError::Connect(upstream_addr, e)))?
+        BufferedConn::new(
+            tokio::net::TcpStream::connect(upstream_addr)
+                .await
+                .map_err(|e| StreamProxyError::Upstream(UpstreamError::Connect(upstream_addr, e)))?,
+        )
     };
 
     // Always use chunked encoding to the upstream. The h3 Content-Length
@@ -250,7 +253,7 @@ where
     // the terminal 0-chunk signals end-of-body, no byte count to enforce.
     let has_body = *method != http::Method::GET && *method != http::Method::HEAD;
 
-    bridge::write_request_head(&mut tcp, method, uri, headers, None)
+    bridge::write_request_head(&mut conn.stream, method, uri, headers, None)
         .await
         .map_err(StreamProxyError::Upstream)?;
 
@@ -268,37 +271,47 @@ where
         let frozen = data.freeze();
 
         if has_body {
-            bridge::write_chunked_data(&mut tcp, &frozen)
+            bridge::write_chunked_data(&mut conn.stream, &frozen)
                 .await
                 .map_err(StreamProxyError::Upstream)?;
         }
     }
 
     if has_body {
-        bridge::write_chunked_end(&mut tcp)
+        bridge::write_chunked_end(&mut conn.stream)
             .await
             .map_err(StreamProxyError::Upstream)?;
     }
 
-    // Parse upstream response headers incrementally.
-    let resp_head = bridge::read_response_head(&mut tcp)
+    // Parse upstream response headers using the connection's own buffer.
+    let resp_head = bridge::read_response_head(&mut conn)
         .await
         .map_err(StreamProxyError::Upstream)?;
 
-    // Build response headers, run plugins, send to h3 immediately (TTFB).
-    let mut pingora_resp =
-        ResponseHeader::build(resp_head.status, Some(resp_head.headers.len()))
-            .map_err(|e| StreamProxyError::BuildResponse(e.to_string()))?;
+    // Destructure — headers are consumed by Pingora, body fields kept for streaming.
+    let bridge::UpstreamResponseHead {
+        status,
+        headers,
+        body_framing,
+        body_prefix,
+    } = resp_head;
 
-    for (name, value) in &resp_head.headers {
+    // Build response headers, run plugins, send to h3 immediately (TTFB).
+    let mut pingora_resp = ResponseHeader::build(status, Some(headers.len()))
+        .map_err(|e| StreamProxyError::BuildResponse(e.to_string()))?;
+
+    for (name, value) in headers {
         if !is_hop_by_hop(name.as_str()) {
-            let _ = pingora_resp.insert_header(name.clone(), value.as_str().to_owned());
+            let _ = pingora_resp.insert_header(
+                String::from(name.as_str()),
+                String::from(value.as_str()),
+            );
         }
     }
 
     plugin_chain.run_response(&mut pingora_resp, ctx);
 
-    let h3_resp = pingora_resp_to_h3(&pingora_resp, resp_head.status)
+    let h3_resp = pingora_resp_to_h3(&pingora_resp, status)
         .map_err(StreamProxyError::BuildResponse)?;
 
     h3_stream
@@ -306,11 +319,12 @@ where
         .await
         .map_err(StreamProxyError::H3SendResponse)?;
 
-    // Stream response body inline — read from TCP, run plugins, send to h3.
+    // Stream response body — reads from the connection's own buffer (zero alloc).
     let reusable = stream_response_body_inline(
-        &mut tcp,
+        &mut conn,
         h3_stream,
-        &resp_head,
+        &body_framing,
+        &body_prefix,
         plugin_chain,
         ctx,
     )
@@ -322,7 +336,7 @@ where
         .map_err(StreamProxyError::H3Finish)?;
 
     if reusable {
-        conn_pool.put(upstream_addr, tcp);
+        conn_pool.put(upstream_addr, conn);
     }
 
     Ok(())
@@ -330,12 +344,17 @@ where
 
 /// Stream the response body from TCP to h3, running plugin body hooks per chunk.
 ///
+/// Uses the connection's own [`BytesMut`] read buffer — zero per-request
+/// allocation. Reads via [`BufferedConn::read_into_buf`], yields chunks via
+/// [`BufferedConn::take_bytes`] (zero-copy `split_to().freeze()`).
+///
 /// Returns whether the upstream connection is reusable.
 #[allow(clippy::too_many_lines)]
 async fn stream_response_body_inline<S, B>(
-    tcp: &mut tokio::net::TcpStream,
+    conn: &mut BufferedConn,
     h3_stream: &mut RequestStream<S, B>,
-    resp_head: &bridge::UpstreamResponseHead,
+    body_framing: &BodyFraming,
+    body_prefix: &[u8],
     plugin_chain: &PluginChain,
     ctx: &mut dwaar_plugins::plugin::PluginCtx,
 ) -> Result<bool, StreamProxyError>
@@ -343,8 +362,6 @@ where
     S: h3::quic::SendStream<B>,
     B: bytes::Buf + From<Bytes>,
 {
-    use tokio::io::AsyncReadExt;
-
     /// Send one chunk through plugins and h3.
     async fn send_chunk<S2, B2>(
         h3_stream: &mut RequestStream<S2, B2>,
@@ -369,18 +386,18 @@ where
         Ok(())
     }
 
-    match resp_head.body_framing {
+    match *body_framing {
         BodyFraming::ContentLength(total) => {
             let mut sent = 0usize;
 
-            // Yield prefix bytes.
-            if !resp_head.body_prefix.is_empty() {
-                let n = resp_head.body_prefix.len().min(total);
+            // Yield any prefix bytes left over from header parsing.
+            if !body_prefix.is_empty() {
+                let n = body_prefix.len().min(total);
                 sent += n;
                 let is_last = sent >= total;
                 send_chunk(
                     h3_stream, plugin_chain, ctx,
-                    Bytes::copy_from_slice(&resp_head.body_prefix[..n]),
+                    Bytes::copy_from_slice(&body_prefix[..n]),
                     is_last,
                 ).await?;
                 if is_last {
@@ -388,59 +405,52 @@ where
                 }
             }
 
-            let mut buf = vec![0u8; BRIDGE_CHUNK_SIZE];
+            // Stream remaining body using the connection's own buffer.
             while sent < total {
-                let to_read = (total - sent).min(BRIDGE_CHUNK_SIZE);
-                let n = tcp.read(&mut buf[..to_read]).await
+                let n = conn.read_into_buf().await
                     .map_err(|e| StreamProxyError::Upstream(UpstreamError::Read(e)))?;
                 if n == 0 {
                     return Err(StreamProxyError::Upstream(UpstreamError::Parse(
                         "upstream closed before content-length fulfilled".into(),
                     )));
                 }
-                sent += n;
+                // Don't read past the declared Content-Length.
+                let usable = n.min(total - sent);
+                sent += usable;
                 let is_last = sent >= total;
-                send_chunk(
-                    h3_stream, plugin_chain, ctx,
-                    Bytes::copy_from_slice(&buf[..n]),
-                    is_last,
-                ).await?;
+                let chunk = conn.take_bytes(usable);
+                send_chunk(h3_stream, plugin_chain, ctx, chunk, is_last).await?;
             }
             Ok(true)
         }
         BodyFraming::CloseDelimited => {
-            if !resp_head.body_prefix.is_empty() {
+            if !body_prefix.is_empty() {
                 send_chunk(
                     h3_stream, plugin_chain, ctx,
-                    Bytes::copy_from_slice(&resp_head.body_prefix),
+                    Bytes::copy_from_slice(body_prefix),
                     false,
                 ).await?;
             }
 
-            let mut buf = vec![0u8; BRIDGE_CHUNK_SIZE];
             loop {
-                let n = tcp.read(&mut buf).await
+                let n = conn.read_into_buf().await
                     .map_err(|e| StreamProxyError::Upstream(UpstreamError::Read(e)))?;
                 if n == 0 {
                     send_chunk(h3_stream, plugin_chain, ctx, Bytes::new(), true).await?;
                     break;
                 }
-                send_chunk(
-                    h3_stream, plugin_chain, ctx,
-                    Bytes::copy_from_slice(&buf[..n]),
-                    false,
-                ).await?;
+                let chunk = conn.take_bytes(n);
+                send_chunk(h3_stream, plugin_chain, ctx, chunk, false).await?;
             }
             Ok(false)
         }
         BodyFraming::Chunked => {
-            // Inline chunked decoding — we can't use the closure-based
-            // stream_chunked_body because async closures can't borrow h3_stream.
-            let mut raw = Vec::from(resp_head.body_prefix.as_slice());
-            let mut buf = vec![0u8; BRIDGE_CHUNK_SIZE];
+            // Inline chunked decoding — async closures can't borrow h3_stream,
+            // so we decode inline rather than using stream_chunked_body.
+            let mut raw = Vec::from(body_prefix);
 
             loop {
-                // Try to decode a chunk from accumulated raw data.
+                // Drain all complete chunks from the buffer before hitting the network.
                 if let Some((payload, consumed, is_terminal)) =
                     bridge::try_decode_one_chunk(&raw)
                         .map_err(StreamProxyError::Upstream)?
@@ -462,18 +472,21 @@ where
                     continue;
                 }
 
-                // Need more data from upstream.
-                let n = tcp.read(&mut buf).await
+                // Need more data from upstream — read into connection's buffer,
+                // then append to the chunked accumulator.
+                let n = conn.read_into_buf().await
                     .map_err(|e| StreamProxyError::Upstream(UpstreamError::Read(e)))?;
                 if n == 0 {
                     return Err(StreamProxyError::Upstream(UpstreamError::Parse(
                         "upstream closed mid-chunked-body".into(),
                     )));
                 }
-                if raw.len() + n > 10 * 1024 * 1024 {
+                if raw.len() + n > super::pool::MAX_CHUNKED_ACCUMULATOR {
                     return Err(StreamProxyError::Upstream(UpstreamError::ResponseTooLarge));
                 }
-                raw.extend_from_slice(&buf[..n]);
+                // Move from conn's BytesMut into the chunked accumulator.
+                let fresh = conn.take_bytes(n);
+                raw.extend_from_slice(&fresh);
             }
         }
     }

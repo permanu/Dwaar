@@ -13,6 +13,13 @@ authors.workspace = true
 name = "dwaar"
 path = "src/main.rs"
 
+[features]
+## Enable jemalloc heap profiling. Build with:
+##   cargo build --release --features=heap-profile
+## Run with:
+##   _RJEM_MALLOC_CONF="prof:true,prof_active:true,prof_prefix:/tmp/dwaar_heap,lg_prof_interval:30" ./target/release/dwaar run -f Dwaarfile
+heap-profile = ["tikv-jemallocator/profiling"]
+
 [dependencies]
 tikv-jemallocator = { workspace = true }
 dwaar-config = { workspace = true }

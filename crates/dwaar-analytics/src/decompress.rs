@@ -45,8 +45,10 @@ impl Encoding {
 
 /// Max compressed buffer before giving up — prevents OOM from
 /// adversarial or unexpectedly large compressed responses.
-/// 10 MB is generous for HTML responses (injection only applies to HTML).
-const MAX_BUFFER_SIZE: usize = 10 * 1024 * 1024;
+/// 256 KB matches `HtmlInjector::MAX_SCAN_BYTES` — the injector only
+/// scans the first 256 KB of decompressed output, so buffering more
+/// compressed data is wasted memory.
+const MAX_BUFFER_SIZE: usize = 256 * 1024;
 
 /// Max decompressed output size — prevents decompression bombs where a small
 /// compressed payload expands to gigabytes. 100 MB matches Guardrail #28's
@@ -61,8 +63,10 @@ const MAX_DECOMPRESSED_SIZE: usize = 100 * 1024 * 1024;
 /// On decompression error, passes through the raw bytes and stops trying —
 /// better to serve garbled content than to silently drop the response.
 ///
-/// Buffer is bounded at [`MAX_BUFFER_SIZE`] (10 MB) to prevent
+/// Buffer is bounded at [`MAX_BUFFER_SIZE`] (256 KB) to prevent
 /// unbounded memory growth from adversarial inputs (Guardrail #19).
+/// Matches `HtmlInjector::MAX_SCAN_BYTES` — injection only scans
+/// the first 256 KB of decompressed output.
 #[derive(Debug)]
 pub struct Decompressor {
     encoding: Encoding,
@@ -199,8 +203,7 @@ fn read_bounded<R: Read>(mut reader: R) -> Result<Vec<u8>, std::io::Error> {
             break;
         }
         if output.len() + n > MAX_DECOMPRESSED_SIZE {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 "decompressed output exceeds MAX_DECOMPRESSED_SIZE",
             ));
         }
