@@ -145,7 +145,7 @@ impl DwaarProxy {
             .is_some()
     }
 
-    fn https_redirect_domain(session: &Session, ctx: &RequestContext) -> Option<String> {
+    fn https_redirect_domain(&self, session: &Session, ctx: &RequestContext) -> Option<String> {
         if Self::is_tls_connection(session) {
             return None;
         }
@@ -158,10 +158,14 @@ impl DwaarProxy {
             return None;
         }
 
-        // Use cached route_tls and route_canonical_domain from request_filter()
-        // instead of a second ArcSwap load + hash lookup.
+        // Lazily resolve the canonical domain from the route table only when
+        // a redirect is actually needed. This avoids a String clone on every
+        // non-redirect request. ArcSwap load + resolve is ~1ns lock-free.
         if ctx.route_tls {
-            ctx.route_canonical_domain.clone()
+            self.route_table
+                .load()
+                .resolve(ctx.plugin_ctx.host.as_deref().unwrap_or(""))
+                .map(|r| r.domain.clone())
         } else {
             None
         }
@@ -531,14 +535,13 @@ impl ProxyHttp for DwaarProxy {
                 ctx.plugin_ctx.under_attack = route.under_attack();
                 ctx.route_upstream = route.upstream();
                 ctx.route_tls = route.tls;
-                ctx.route_canonical_domain = Some(route.domain.clone());
 
                 // Path-based handler resolution (ISSUE-050).
                 // Iterate handler blocks, find the first matching one (handle/handle_path)
                 // or run all matching (route). Cache matched handler data in ctx.
-                let request_path = ctx.plugin_ctx.path.clone();
+                let request_path = ctx.plugin_ctx.path.as_str();
                 for block in &route.handlers {
-                    let Some(prefix_len) = block.matcher.matches(&request_path) else {
+                    let Some(prefix_len) = block.matcher.matches(request_path) else {
                         continue;
                     };
 
@@ -557,18 +560,17 @@ impl ProxyHttp for DwaarProxy {
                         crate::route::Handler::FileServer { root, browse } => {
                             ctx.file_server = Some((root.clone(), *browse));
                         }
-                        crate::route::Handler::ReverseProxy { upstream } => {
+                        crate::route::Handler::ReverseProxy { upstream, .. } => {
                             ctx.route_upstream = Some(*upstream);
                             ctx.quic_capable = true;
                         }
-                        crate::route::Handler::ReverseProxyPool { pool } => {
+                        crate::route::Handler::ReverseProxyPool { pool, .. } => {
                             ctx.quic_capable = true;
                             // Resolve the upstream now using the LB policy.
                             // Cache the selected address in `route_upstream` so
                             // `upstream_peer()` doesn't need to call `select()` again
                             // for single-backend pools.
-                            let selected = pool.select(ctx.plugin_ctx.client_ip);
-                            ctx.route_upstream = selected.as_ref().map(|s| s.addr);
+                            ctx.route_upstream = pool.select(ctx.plugin_ctx.client_ip);
                             // Always cache the pool so `upstream_peer()` can use the
                             // correct TLS settings even in the single-backend case.
                             ctx.upstream_pool = Some(pool.clone());
@@ -638,7 +640,7 @@ impl ProxyHttp for DwaarProxy {
 
                     // Cache config (ISSUE-073) — only for GET requests on matching paths
                     if let Some(ref cache_cfg) = block.cache {
-                        let path = ctx.effective_path.as_deref().unwrap_or(&request_path);
+                        let path = ctx.effective_path.as_deref().unwrap_or(request_path);
                         if cache_cfg.path_matches(path)
                             && !ctx.is_websocket
                             && !ctx.is_grpc
@@ -656,8 +658,8 @@ impl ProxyHttp for DwaarProxy {
                             let map_tmpl_ctx = TemplateContext {
                                 host: ctx.plugin_ctx.host.as_deref().unwrap_or(""),
                                 method: ctx.plugin_ctx.method.as_str(),
-                                path: &request_path,
-                                uri: &request_path,
+                                path: request_path,
+                                uri: request_path,
                                 query: "",
                                 scheme: if ctx.route_tls { "https" } else { "http" },
                                 remote_host: "",
@@ -682,7 +684,7 @@ impl ProxyHttp for DwaarProxy {
                         let mut path = ctx
                             .effective_path
                             .as_deref()
-                            .unwrap_or(&request_path)
+                            .unwrap_or(request_path)
                             .to_string();
 
                         for rule in &block.rewrites {
@@ -723,9 +725,7 @@ impl ProxyHttp for DwaarProxy {
         if let Some(ref prom) = self.prometheus
             && let Some(ref host) = ctx.plugin_ctx.host
         {
-            let domain = host.clone();
-            prom.connection_start(&domain);
-            ctx.metrics_domain = Some(domain);
+            prom.connection_start(host);
         }
 
         // --- Request body size check (ISSUE-069) ---
@@ -762,9 +762,9 @@ impl ProxyHttp for DwaarProxy {
             // The rate limiter sets `rate_limited` on ctx — no status code guessing.
             if ctx.plugin_ctx.rate_limited
                 && let Some(ref prom) = self.prometheus
-                && let Some(ref domain) = ctx.metrics_domain
+                && let Some(ref host) = ctx.plugin_ctx.host
             {
-                prom.rate_cache.record_rate_limit_rejected(domain);
+                prom.rate_cache.record_rate_limit_rejected(host);
             }
             debug!(
                 request_id = %ctx.request_id(),
@@ -777,9 +777,9 @@ impl ProxyHttp for DwaarProxy {
         // Request passed rate limiting — record allowed metric (ISSUE-114).
         if ctx.plugin_ctx.rate_limit_rps.is_some()
             && let Some(ref prom) = self.prometheus
-            && let Some(ref domain) = ctx.metrics_domain
+            && let Some(ref host) = ctx.plugin_ctx.host
         {
-            prom.rate_cache.record_rate_limit_allowed(domain);
+            prom.rate_cache.record_rate_limit_allowed(host);
         }
 
         // --- Basic auth check (ISSUE-046) ---
@@ -1095,7 +1095,7 @@ impl ProxyHttp for DwaarProxy {
         }
 
         // --- HTTP→HTTPS redirect (ISSUE-016) ---
-        if let Some(canonical_domain) = Self::https_redirect_domain(session, ctx) {
+        if let Some(canonical_domain) = self.https_redirect_domain(session, ctx) {
             return self
                 .send_https_redirect(session, ctx, &canonical_domain)
                 .await;
@@ -1330,7 +1330,7 @@ impl ProxyHttp for DwaarProxy {
             .unwrap_or_else(crate::trace::generate_traceparent);
 
         upstream_request
-            .insert_header("traceparent", trace_ctx.traceparent.as_str())
+            .insert_header("traceparent", trace_ctx.traceparent())
             .expect("traceparent is valid header value");
 
         // Pass through tracestate if present — we don't parse it, just relay.
@@ -1700,22 +1700,22 @@ impl ProxyHttp for DwaarProxy {
 
         // Prometheus metrics (ISSUE-072) — recorded before host.take() moves it
         if let Some(ref prom) = self.prometheus
-            && let Some(ref domain) = ctx.metrics_domain
+            && let Some(ref host) = ctx.plugin_ctx.host
         {
             prom.record_request(
-                domain,
+                host,
                 ctx.plugin_ctx.method.as_str(),
                 status,
                 response_time_us,
                 bytes_sent,
                 bytes_received,
             );
-            prom.connection_end(domain);
+            prom.connection_end(host);
 
             // Cache hit/miss counters (ISSUE-114).
             match ctx.cache_status {
-                Some("HIT" | "STALE") => prom.rate_cache.record_cache_hit(domain),
-                Some("MISS") => prom.rate_cache.record_cache_miss(domain),
+                Some("HIT" | "STALE") => prom.rate_cache.record_cache_hit(host),
+                Some("MISS") => prom.rate_cache.record_cache_miss(host),
                 _ => {}
             }
         }
@@ -1773,14 +1773,9 @@ impl ProxyHttp for DwaarProxy {
             agg.send(event);
         }
 
-        // Request ID: 36 bytes exceeds CompactString's 24-byte inline threshold.
-        // Use a stack buffer write to produce a CompactString without going
-        // through an intermediate &str → String → CompactString chain.
-        let request_id = {
-            let mut s = CompactString::with_capacity(36);
-            s.push_str(ctx.request_id());
-            s
-        };
+        // Request ID: 36 bytes exceeds CompactString's 24-byte inline threshold,
+        // so this heap-allocates. Unavoidable because RequestLog uses serde Serialize.
+        let request_id = CompactString::from(ctx.request_id());
 
         let log = RequestLog {
             timestamp: Utc::now(),
@@ -1818,7 +1813,7 @@ impl ProxyHttp for DwaarProxy {
             upstream_response_time_us: 0,
             cache_status: ctx.cache_status.map(CompactString::from),
             compression: None,
-            trace_id: ctx.trace_ctx.as_ref().map(|t| t.trace_id.clone()),
+            trace_id: ctx.trace_ctx.as_ref().map(|t| CompactString::from(t.trace_id())),
             upstream_error_body: ctx.upstream_error_body.take(),
         };
 

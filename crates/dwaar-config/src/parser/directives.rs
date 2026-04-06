@@ -88,6 +88,7 @@ fn parse_reverse_proxy_inline(t: &mut Tokenizer<'_>) -> Result<ReverseProxyDirec
         fail_duration: None,
         max_conns: None,
         transport_tls: false,
+        transport_h2: false,
         tls_server_name: None,
         tls_client_auth: None,
         tls_trusted_ca_certs: None,
@@ -125,6 +126,7 @@ fn parse_reverse_proxy_block(t: &mut Tokenizer<'_>) -> Result<ReverseProxyDirect
     let mut fail_duration: Option<u64> = None;
     let mut max_conns: Option<u32> = None;
     let mut transport_tls = false;
+    let mut transport_h2 = false;
     let mut tls_server_name: Option<String> = None;
     let mut tls_client_auth: Option<(String, String)> = None;
     let mut tls_trusted_ca_certs: Option<String> = None;
@@ -240,6 +242,10 @@ fn parse_reverse_proxy_block(t: &mut Tokenizer<'_>) -> Result<ReverseProxyDirect
                                     // `transport { tls }` — plain TLS flag
                                     transport_tls = true;
                                 }
+                                TokenKind::Word(ref kw) if kw == "h2" || kw == "h2c" => {
+                                    // `transport { h2 }` — HTTP/2 upstream multiplexing
+                                    transport_h2 = true;
+                                }
                                 TokenKind::Word(ref kw) if kw == "tls_server_name" => {
                                     transport_tls = true;
                                     let sni_tok = t.next_token();
@@ -275,12 +281,19 @@ fn parse_reverse_proxy_block(t: &mut Tokenizer<'_>) -> Result<ReverseProxyDirect
                             }
                         }
                     } else {
-                        // `transport tls` on a single line — no block
-                        if let TokenKind::Word(ref kw) = t.peek().kind
-                            && kw == "tls"
-                        {
-                            t.next_token();
-                            transport_tls = true;
+                        // `transport tls` or `transport h2` on a single line — no block
+                        if let TokenKind::Word(ref kw) = t.peek().kind {
+                            match kw.as_str() {
+                                "tls" => {
+                                    t.next_token();
+                                    transport_tls = true;
+                                }
+                                "h2" | "h2c" => {
+                                    t.next_token();
+                                    transport_h2 = true;
+                                }
+                                _ => {}
+                            }
                         }
                     }
                 }
@@ -325,6 +338,7 @@ fn parse_reverse_proxy_block(t: &mut Tokenizer<'_>) -> Result<ReverseProxyDirect
         fail_duration,
         max_conns,
         transport_tls,
+        transport_h2,
         tls_server_name,
         tls_client_auth,
         tls_trusted_ca_certs,
@@ -719,7 +733,11 @@ fn parse_forward_auth_body(
             TokenKind::Word(w) => match w.as_str() {
                 "uri" => {
                     t.next_token();
-                    uri = Some(expect_word_or_quoted(t, "forward_auth uri", "auth URI path")?);
+                    uri = Some(expect_word_or_quoted(
+                        t,
+                        "forward_auth uri",
+                        "auth URI path",
+                    )?);
                 }
                 "copy_headers" => {
                     t.next_token();
@@ -730,9 +748,11 @@ fn parse_forward_auth_body(
                                 if !matches!(w.as_str(), "uri" | "copy_headers" | "transport")
                                     && !matches!(next.kind, TokenKind::CloseBrace) =>
                             {
-                                copy_headers.push(
-                                    expect_word_or_quoted(t, "copy_headers", "header name")?,
-                                );
+                                copy_headers.push(expect_word_or_quoted(
+                                    t,
+                                    "copy_headers",
+                                    "header name",
+                                )?);
                             }
                             _ => break,
                         }
@@ -744,7 +764,8 @@ fn parse_forward_auth_body(
                     if proto != "tls" {
                         let (line, col) = t.position();
                         return Err(ParseError {
-                            line, col,
+                            line,
+                            col,
                             kind: ParseErrorKind::InvalidValue {
                                 directive: "forward_auth transport".to_string(),
                                 message: format!("unknown transport '{proto}' — expected 'tls'"),
@@ -755,7 +776,8 @@ fn parse_forward_auth_body(
                 }
                 other => {
                     return Err(ParseError {
-                        line: tok.line, col: tok.col,
+                        line: tok.line,
+                        col: tok.col,
                         kind: ParseErrorKind::InvalidValue {
                             directive: "forward_auth".to_string(),
                             message: format!("unknown subdirective '{other}'"),
@@ -765,7 +787,8 @@ fn parse_forward_auth_body(
             },
             _ => {
                 return Err(ParseError {
-                    line: tok.line, col: tok.col,
+                    line: tok.line,
+                    col: tok.col,
                     kind: ParseErrorKind::Expected {
                         expected: "subdirective or '}'".to_string(),
                         got: format!("{}", tok.kind),

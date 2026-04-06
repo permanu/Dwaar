@@ -174,8 +174,8 @@ where
     }
 
     let request_path = uri.path();
-    let upstream_addr = match resolve_upstream_addr(&route_table, host, request_path) {
-        Ok(addr) => addr,
+    let (upstream_addr, _upstream_h2) = match resolve_upstream_addr(&route_table, host, request_path) {
+        Ok(resolved) => resolved,
         Err(status) => {
             send_error_response(&mut stream, status, "upstream routing failed").await;
             return Ok(());

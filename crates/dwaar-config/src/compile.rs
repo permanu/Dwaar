@@ -794,8 +794,7 @@ fn resolve_all_upstreams(upstreams: &[UpstreamAddr]) -> Vec<SocketAddr> {
             UpstreamAddr::SocketAddr(addr) => Some(*addr),
             UpstreamAddr::HostPort(hp) => {
                 let hp_clone = hp.clone();
-                let addr =
-                    tokio::task::block_in_place(|| hp_clone.to_socket_addrs().ok()?.next());
+                let addr = tokio::task::block_in_place(|| hp_clone.to_socket_addrs().ok()?.next());
                 if addr.is_none() {
                     warn!(upstream = %hp, "DNS resolution failed for upstream, skipping");
                 }
@@ -826,6 +825,7 @@ fn compile_reverse_proxy_handler(rp: &ReverseProxyDirective, location: &str) -> 
         || rp.fail_duration.is_some()
         || rp.max_conns.is_some()
         || rp.transport_tls
+        || rp.transport_h2
         || rp.tls_server_name.is_some()
         || rp.tls_client_auth.is_some()
         || rp.tls_trusted_ca_certs.is_some()
@@ -834,7 +834,10 @@ fn compile_reverse_proxy_handler(rp: &ReverseProxyDirective, location: &str) -> 
     if rp.upstreams.len() <= 1 && !is_block_form {
         // Common single-upstream case — zero overhead path.
         let addr = resolve_upstream(&rp.upstreams)?;
-        return Some(Handler::ReverseProxy { upstream: addr });
+        return Some(Handler::ReverseProxy {
+            upstream: addr,
+            upstream_h2: rp.transport_h2,
+        });
     }
 
     // Multi-upstream or block-form options — build a pool.
@@ -914,6 +917,7 @@ fn compile_reverse_proxy_handler(rp: &ReverseProxyDirective, location: &str) -> 
 
     Some(Handler::ReverseProxyPool {
         pool: Arc::new(pool),
+        upstream_h2: rp.transport_h2,
     })
 }
 
@@ -924,7 +928,7 @@ pub fn collect_pools(table: &dwaar_core::route::RouteTable) -> Vec<Arc<UpstreamP
     let mut pools = Vec::new();
     for route in table.all_routes() {
         for block in &route.handlers {
-            if let Handler::ReverseProxyPool { pool } = &block.handler {
+            if let Handler::ReverseProxyPool { pool, .. } = &block.handler {
                 // Only pools with a health URI need the background checker.
                 if pool.has_health_check() {
                     pools.push(pool.clone());
@@ -1270,6 +1274,7 @@ mod tests {
             fail_duration: None,
             max_conns: None,
             transport_tls: false,
+            transport_h2: false,
             tls_server_name: None,
             tls_client_auth: None,
             tls_trusted_ca_certs: None,
@@ -1289,6 +1294,7 @@ mod tests {
             fail_duration: None,
             max_conns: None,
             transport_tls: false,
+            transport_h2: false,
             tls_server_name: None,
             tls_client_auth: None,
             tls_trusted_ca_certs: None,
@@ -1305,6 +1311,7 @@ mod tests {
             fail_duration: None,
             max_conns: None,
             transport_tls: false,
+            transport_h2: false,
             tls_server_name: None,
             tls_client_auth: None,
             tls_trusted_ca_certs: None,
@@ -1392,6 +1399,7 @@ mod tests {
                     fail_duration: None,
                     max_conns: None,
                     transport_tls: false,
+            transport_h2: false,
                     tls_server_name: None,
                     tls_client_auth: None,
                     tls_trusted_ca_certs: None,
@@ -2062,7 +2070,7 @@ mod tests {
         let route = table.resolve("example.com").expect("should resolve");
         let block = route.handlers.first().expect("has handler block");
         assert!(
-            matches!(&block.handler, Handler::ReverseProxy { upstream }
+            matches!(&block.handler, Handler::ReverseProxy { upstream, .. }
                     if *upstream == "127.0.0.1:8080".parse::<SocketAddr>().expect("valid test addr")),
             "single upstream without block options must compile to ReverseProxy"
         );
@@ -2081,7 +2089,7 @@ mod tests {
         let route = table.resolve("example.com").expect("should resolve");
         let block = route.handlers.first().expect("has handler block");
         assert!(
-            matches!(&block.handler, Handler::ReverseProxyPool { pool } if pool.len() == 2),
+            matches!(&block.handler, Handler::ReverseProxyPool { pool, .. } if pool.len() == 2),
             "multi-upstream must compile to ReverseProxyPool"
         );
     }
