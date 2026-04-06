@@ -66,6 +66,7 @@ pub async fn handle_h3_connection(
     route_table: Arc<ArcSwap<RouteTable>>,
     plugin_chain: Arc<PluginChain>,
     conn_pool: Arc<UpstreamConnPool>,
+    h2_pool: Arc<super::h2_pool::H2ConnPool>,
 ) -> Result<(), ConnectionHandlerError> {
     let h3_conn = h3_quinn::Connection::new(conn);
     let mut h3_server: h3::server::Connection<_, Bytes> = h3::server::Connection::new(h3_conn)
@@ -78,6 +79,7 @@ pub async fn handle_h3_connection(
                 let route_table = Arc::clone(&route_table);
                 let plugin_chain = Arc::clone(&plugin_chain);
                 let conn_pool = Arc::clone(&conn_pool);
+                let h2_pool = Arc::clone(&h2_pool);
                 let is_early_data = early_data_active.load(Ordering::Acquire);
 
                 tokio::spawn(async move {
@@ -86,6 +88,7 @@ pub async fn handle_h3_connection(
                         route_table,
                         plugin_chain,
                         conn_pool,
+                        h2_pool,
                         is_early_data,
                     )
                     .await
@@ -124,6 +127,7 @@ async fn handle_h3_request<C, B>(
     route_table: Arc<ArcSwap<RouteTable>>,
     plugin_chain: Arc<PluginChain>,
     conn_pool: Arc<UpstreamConnPool>,
+    h2_pool: Arc<super::h2_pool::H2ConnPool>,
     is_early_data: bool,
 ) -> Result<(), RequestHandlerError>
 where
@@ -174,7 +178,7 @@ where
     }
 
     let request_path = uri.path();
-    let (upstream_addr, _upstream_h2) = match resolve_upstream_addr(&route_table, host, request_path) {
+    let (upstream_addr, upstream_h2) = match resolve_upstream_addr(&route_table, host, request_path) {
         Ok(resolved) => resolved,
         Err(status) => {
             send_error_response(&mut stream, status, "upstream routing failed").await;
@@ -183,27 +187,45 @@ where
     };
 
     // Wrap the entire upstream exchange in a timeout.
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(UPSTREAM_TIMEOUT_SECS),
-        stream_proxy(
-            &mut stream,
-            upstream_addr,
-            &method,
-            &uri,
-            &headers,
-            &plugin_chain,
-            &mut ctx,
-            &conn_pool,
-        ),
-    )
-    .await;
+    let result = if upstream_h2 {
+        // HTTP/2 upstream — multiplex on shared H2 connections.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(UPSTREAM_TIMEOUT_SECS),
+            stream_proxy_h2(
+                &mut stream,
+                upstream_addr,
+                &method,
+                &uri,
+                &headers,
+                &plugin_chain,
+                &mut ctx,
+                &h2_pool,
+            ),
+        )
+        .await
+        .map(|r| r.map_err(|e| StreamProxyError::H2Bridge(e)))
+    } else {
+        // HTTP/1.1 upstream — one TCP connection per stream.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(UPSTREAM_TIMEOUT_SECS),
+            stream_proxy(
+                &mut stream,
+                upstream_addr,
+                &method,
+                &uri,
+                &headers,
+                &plugin_chain,
+                &mut ctx,
+                &conn_pool,
+            ),
+        )
+        .await
+    };
 
     match result {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => {
             warn!(error = %e, upstream = %upstream_addr, "streaming proxy error");
-            // If headers haven't been sent yet, we can send an error.
-            // Otherwise the stream is already mid-flight and will be reset on drop.
             Ok(())
         }
         Err(_timeout) => {
@@ -494,11 +516,60 @@ where
     }
 }
 
+/// H2 upstream proxy — multiplexes on shared H2 connections.
+///
+/// Gets a `SendRequest` handle from the H2 pool (or establishes a new
+/// connection), then delegates to [`h2_bridge::stream_via_h2`].
+/// On connection-level errors, evicts the dead connection and retries
+/// once for idempotent methods.
+#[allow(clippy::too_many_arguments)]
+async fn stream_proxy_h2<S, B>(
+    h3_stream: &mut RequestStream<S, B>,
+    upstream_addr: SocketAddr,
+    method: &http::Method,
+    uri: &http::Uri,
+    headers: &http::HeaderMap,
+    plugin_chain: &PluginChain,
+    ctx: &mut dwaar_plugins::plugin::PluginCtx,
+    h2_pool: &super::h2_pool::H2ConnPool,
+) -> Result<(), super::h2_bridge::H2BridgeError>
+where
+    S: h3::quic::SendStream<B> + h3::quic::RecvStream,
+    B: bytes::Buf + From<Bytes> + Send + 'static,
+    Bytes: From<B>,
+{
+    let sender = h2_pool
+        .get_or_connect(upstream_addr)
+        .await
+        .map_err(|e| super::h2_bridge::H2BridgeError::BuildResponse(e.to_string()))?;
+
+    let result = super::h2_bridge::stream_via_h2(
+        h3_stream, sender, method, uri, headers, plugin_chain, ctx,
+    )
+    .await;
+
+    // On H2 connection-level error, evict the dead connection so the
+    // next request gets a fresh one.
+    if let Err(ref e) = result {
+        if matches!(e,
+            super::h2_bridge::H2BridgeError::SendRequest(_)
+            | super::h2_bridge::H2BridgeError::RecvResponse(_))
+        {
+            h2_pool.evict(upstream_addr);
+        }
+    }
+
+    result
+}
+
 /// Errors from the streaming proxy path.
 #[derive(Debug, thiserror::Error)]
 enum StreamProxyError {
     #[error("upstream: {0}")]
     Upstream(UpstreamError),
+
+    #[error("h2 bridge: {0}")]
+    H2Bridge(super::h2_bridge::H2BridgeError),
 
     #[error("h3 recv_data: {0:?}")]
     H3RecvData(h3::error::StreamError),

@@ -58,8 +58,10 @@ pub struct QuicService {
     endpoint: Mutex<Option<quinn::Endpoint>>,
     route_table: Arc<ArcSwap<RouteTable>>,
     plugin_chain: Arc<PluginChain>,
-    /// Per-host upstream TCP connection pool (ISSUE-108).
+    /// Per-host upstream TCP connection pool for HTTP/1.1 (ISSUE-108).
     conn_pool: Arc<pool::UpstreamConnPool>,
+    /// Per-host upstream H2 connection pool for HTTP/2 multiplexing.
+    h2_pool: Arc<h2_pool::H2ConnPool>,
     max_streams: u32,
 }
 
@@ -110,6 +112,7 @@ impl QuicService {
             route_table,
             plugin_chain,
             conn_pool: Arc::new(pool::UpstreamConnPool::default()),
+            h2_pool: Arc::new(h2_pool::H2ConnPool::new()),
             max_streams,
         })
     }
@@ -136,6 +139,7 @@ impl BackgroundService for QuicService {
                     let route_table = Arc::clone(&self.route_table);
                     let plugin_chain = Arc::clone(&self.plugin_chain);
                     let conn_pool = Arc::clone(&self.conn_pool);
+                    let h2_pool = Arc::clone(&self.h2_pool);
 
                     tokio::spawn(async move {
                         let connecting = match incoming.accept() {
@@ -175,6 +179,7 @@ impl BackgroundService for QuicService {
                             route_table,
                             plugin_chain,
                             conn_pool,
+                            h2_pool,
                         )
                         .await
                         {
