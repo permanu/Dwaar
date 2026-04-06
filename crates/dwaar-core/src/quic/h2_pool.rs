@@ -303,4 +303,59 @@ mod tests {
             "pool has {count} conns, expected <= {MAX_CONNS_PER_HOST}"
         );
     }
+
+    #[tokio::test]
+    async fn evict_removes_dead_connection_and_reconnect_works() {
+        use h2::server;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        // Server accepts connections and responds until they close.
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut conn = match server::handshake(tcp).await {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    };
+                    while let Some(Ok((_req, mut respond))) = conn.accept().await {
+                        let response = http::Response::builder()
+                            .status(200)
+                            .body(())
+                            .expect("response");
+                        let mut send = respond.send_response(response, false).expect("send");
+                        send.send_data(Bytes::from_static(b"ok"), true).expect("data");
+                    }
+                });
+            }
+        });
+
+        let pool = H2ConnPool::new();
+
+        // Establish a connection.
+        let mut sender1 = pool.connect(addr).await.expect("connect");
+        assert!(pool.acquire(addr).is_some(), "should have a connection");
+
+        // Verify it works.
+        let req = http::Request::builder().uri("http://localhost/a").body(()).unwrap();
+        let (resp, _) = sender1.send_request(req, true).expect("send");
+        let resp: http::Response<h2::RecvStream> = resp.await.expect("response");
+        assert_eq!(resp.status(), 200);
+
+        // Evict — simulates what the handler does on connection error.
+        pool.evict(addr);
+        assert!(pool.acquire(addr).is_none(), "evict should clear pool");
+
+        // Reconnect — simulates retry path.
+        let mut sender2 = pool.connect(addr).await.expect("reconnect");
+        let req = http::Request::builder().uri("http://localhost/b").body(()).unwrap();
+        let (resp, _) = sender2.send_request(req, true).expect("send after reconnect");
+        let resp: http::Response<h2::RecvStream> = resp.await.expect("response after reconnect");
+        assert_eq!(resp.status(), 200);
+    }
 }

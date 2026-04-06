@@ -520,8 +520,11 @@ where
 ///
 /// Gets a `SendRequest` handle from the H2 pool (or establishes a new
 /// connection), then delegates to [`h2_bridge::stream_via_h2`].
-/// On connection-level errors, evicts the dead connection and retries
-/// once for idempotent methods.
+///
+/// On connection-level errors (`SendRequest` / `RecvResponse`), evicts
+/// the dead connection and retries **once** for idempotent methods
+/// (GET/HEAD/OPTIONS/PUT/DELETE). Non-idempotent methods (POST/PATCH)
+/// fail immediately — replaying them could cause duplicate side effects.
 #[allow(clippy::too_many_arguments)]
 async fn stream_proxy_h2<S, B>(
     h3_stream: &mut RequestStream<S, B>,
@@ -548,14 +551,31 @@ where
     )
     .await;
 
-    // On H2 connection-level error, evict the dead connection so the
-    // next request gets a fresh one.
-    if let Err(ref e) = result {
-        if matches!(e,
-            super::h2_bridge::H2BridgeError::SendRequest(_)
-            | super::h2_bridge::H2BridgeError::RecvResponse(_))
-        {
-            h2_pool.evict(upstream_addr);
+    // On connection-level error, evict and retry once for idempotent methods.
+    let is_conn_error = matches!(
+        result,
+        Err(super::h2_bridge::H2BridgeError::SendRequest(_))
+            | Err(super::h2_bridge::H2BridgeError::RecvResponse(_))
+    );
+
+    if is_conn_error {
+        h2_pool.evict(upstream_addr);
+
+        if is_idempotent_method(method) {
+            debug!(
+                upstream = %upstream_addr,
+                method = %method,
+                "H2 connection died, retrying idempotent request on fresh connection"
+            );
+            let sender = h2_pool
+                .connect(upstream_addr)
+                .await
+                .map_err(|e| super::h2_bridge::H2BridgeError::BuildResponse(e.to_string()))?;
+
+            return super::h2_bridge::stream_via_h2(
+                h3_stream, sender, method, uri, headers, plugin_chain, ctx,
+            )
+            .await;
         }
     }
 
