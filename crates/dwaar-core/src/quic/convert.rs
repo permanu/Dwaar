@@ -154,11 +154,13 @@ pub fn is_hop_by_hop(name: &str) -> bool {
 /// whose `PathMatcher` matches the request path, and extracts the upstream.
 /// Only `ReverseProxy` and `ReverseProxyPool` handlers are supported over
 /// H3 — other handler types return 502.
+/// Returns `(addr, upstream_h2)` — the upstream address and whether H2
+/// multiplexing is configured for this backend.
 pub fn resolve_upstream_addr(
     route_table: &ArcSwap<RouteTable>,
     host: &str,
     path: &str,
-) -> Result<SocketAddr, u16> {
+) -> Result<(SocketAddr, bool), u16> {
     let table = route_table.load();
     let Some(route) = table.resolve(host) else {
         return Err(502);
@@ -169,10 +171,12 @@ pub fn resolve_upstream_addr(
             continue;
         }
         match &block.handler {
-            Handler::ReverseProxy { upstream } => return Ok(*upstream),
-            Handler::ReverseProxyPool { pool } => {
-                if let Some(selected) = pool.select(None) {
-                    return Ok(selected.addr);
+            Handler::ReverseProxy { upstream, upstream_h2 } => {
+                return Ok((*upstream, *upstream_h2));
+            }
+            Handler::ReverseProxyPool { pool, upstream_h2 } => {
+                if let Some(addr) = pool.select(None) {
+                    return Ok((addr, *upstream_h2));
                 }
                 return Err(503);
             }

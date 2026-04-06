@@ -126,12 +126,20 @@ pub enum Handler {
     ///
     /// Used when the config has exactly one upstream and no block-form options.
     /// Keeps `upstream_peer()` allocation-free: no `Arc` load, no pool scan.
-    ReverseProxy { upstream: SocketAddr },
+    ReverseProxy {
+        upstream: SocketAddr,
+        /// Use HTTP/2 multiplexing for the upstream connection (H3 path only).
+        upstream_h2: bool,
+    },
     /// Forward the request through a load-balancing pool of backends.
     ///
     /// Created when the config has multiple upstreams or block-form options
-    /// (`lb_policy`, `health_uri`, `max_conns`, transport tls).
-    ReverseProxyPool { pool: Arc<UpstreamPool> },
+    /// (`lb_policy`, `health_uri`, `max_conns`, transport tls/h2).
+    ReverseProxyPool {
+        pool: Arc<UpstreamPool>,
+        /// Use HTTP/2 multiplexing for upstream connections (H3 path only).
+        upstream_h2: bool,
+    },
     /// Return a fixed response — no upstream contacted. Used by `respond` directive.
     StaticResponse { status: u16, body: bytes::Bytes },
     /// Serve static files from disk. Used by `file_server` directive.
@@ -149,13 +157,13 @@ pub enum Handler {
 impl PartialEq for Handler {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Handler::ReverseProxy { upstream: a }, Handler::ReverseProxy { upstream: b }) => {
+            (Handler::ReverseProxy { upstream: a, .. }, Handler::ReverseProxy { upstream: b, .. }) => {
                 a == b
             }
             // Pool equality is by pointer identity — two pools are equal only if
             // they point to the same allocation. This is intentional: pool contents
             // are mutable (health state), so value equality would be misleading.
-            (Handler::ReverseProxyPool { pool: a }, Handler::ReverseProxyPool { pool: b }) => {
+            (Handler::ReverseProxyPool { pool: a, .. }, Handler::ReverseProxyPool { pool: b, .. }) => {
                 Arc::ptr_eq(a, b)
             }
             (
@@ -575,7 +583,7 @@ impl Route {
                 maps: vec![],
                 log_append_fields: vec![],
                 log_name: None,
-                handler: Handler::ReverseProxy { upstream },
+                handler: Handler::ReverseProxy { upstream, upstream_h2: false },
                 intercepts: vec![],
                 copy_response_headers: None,
                 ip_filter: None,
@@ -601,12 +609,12 @@ impl Route {
         var_defaults: VarSlots,
     ) -> Self {
         let default_upstream = handlers.iter().find_map(|b| match &b.handler {
-            Handler::ReverseProxy { upstream } | Handler::FastCgi { upstream, .. } => {
+            Handler::ReverseProxy { upstream, .. } | Handler::FastCgi { upstream, .. } => {
                 Some(*upstream)
             }
             // For pool handlers, cache the first backend address so the common
             // path (no pool selection needed) stays zero-cost.
-            Handler::ReverseProxyPool { pool } => pool.first_addr(),
+            Handler::ReverseProxyPool { pool, .. } => pool.first_addr(),
             Handler::StaticResponse { .. } | Handler::FileServer { .. } => None,
         });
         let first = handlers.first();

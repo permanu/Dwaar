@@ -433,6 +433,10 @@ pub struct ReverseProxyDirective {
     pub max_conns: Option<u32>,
     /// Connect to upstream over TLS (e.g. backend is HTTPS).
     pub transport_tls: bool,
+    /// Use HTTP/2 multiplexing for upstream connections.
+    /// Enables multiple H3 streams to share 1-2 TCP connections per host
+    /// instead of opening one per stream. Requires upstream H2 support.
+    pub transport_h2: bool,
     /// SNI hostname to use for upstream TLS connections.
     pub tls_server_name: Option<String>,
     /// Client cert+key paths for mutual TLS with the upstream.
@@ -554,8 +558,16 @@ pub enum LogOutput {
     Stderr,
     /// Discard all log output for this site.
     Discard,
-    /// Write to a file at the given path.
+    /// Write to a file with size-based rotation.
     File {
+        path: String,
+        /// Rotate when the file exceeds this size in bytes.
+        max_bytes: Option<u64>,
+        /// Number of rotated files to keep.
+        keep: Option<u32>,
+    },
+    /// Write JSON lines to a Unix domain socket.
+    Unix {
         path: String,
     },
 }
@@ -962,6 +974,7 @@ mod tests {
                     fail_duration: None,
                     max_conns: None,
                     transport_tls: false,
+                    transport_h2: false,
                     tls_server_name: None,
                     tls_client_auth: None,
                     tls_trusted_ca_certs: None,
@@ -1112,6 +1125,8 @@ mod tests {
         let d = LogDirective {
             output: Some(LogOutput::File {
                 path: "/var/log/access.log".to_string(),
+                max_bytes: None,
+                keep: None,
             }),
             format: Some(LogFormat::Json),
             level: Some("INFO".to_string()),

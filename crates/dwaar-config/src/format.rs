@@ -151,6 +151,7 @@ fn format_reverse_proxy(out: &mut String, rp: &ReverseProxyDirective, depth: usi
         || rp.fail_duration.is_some()
         || rp.max_conns.is_some()
         || rp.transport_tls
+        || rp.transport_h2
         || rp.tls_server_name.is_some()
         || rp.tls_client_auth.is_some()
         || rp.tls_trusted_ca_certs.is_some()
@@ -229,6 +230,7 @@ fn format_reverse_proxy(out: &mut String, rp: &ReverseProxyDirective, depth: usi
 /// Emit the `transport { tls ... }` block for `reverse_proxy` when TLS options are present.
 fn format_reverse_proxy_transport(out: &mut String, rp: &ReverseProxyDirective, depth: usize) {
     let has_transport = rp.transport_tls
+        || rp.transport_h2
         || rp.tls_server_name.is_some()
         || rp.tls_client_auth.is_some()
         || rp.tls_trusted_ca_certs.is_some();
@@ -239,8 +241,14 @@ fn format_reverse_proxy_transport(out: &mut String, rp: &ReverseProxyDirective, 
     let inner2 = "    ".repeat(depth + 2);
     out.push_str(&inner);
     out.push_str("transport {\n");
-    out.push_str(&inner2);
-    out.push_str("tls\n");
+    if rp.transport_tls {
+        out.push_str(&inner2);
+        out.push_str("tls\n");
+    }
+    if rp.transport_h2 {
+        out.push_str(&inner2);
+        out.push_str("h2\n");
+    }
     if let Some(ref sni) = rp.tls_server_name {
         out.push_str(&inner2);
         out.push_str("tls_server_name ");
@@ -619,8 +627,30 @@ fn format_log(out: &mut String, ld: &LogDirective, depth: usize) {
             LogOutput::Stdout => out.push_str("stdout"),
             LogOutput::Stderr => out.push_str("stderr"),
             LogOutput::Discard => out.push_str("discard"),
-            LogOutput::File { path } => {
+            LogOutput::File {
+                path,
+                max_bytes,
+                keep,
+            } => {
                 out.push_str("file ");
+                out.push_str(path);
+                if max_bytes.is_some() || keep.is_some() {
+                    use std::fmt::Write;
+                    out.push_str(" {\n");
+                    if let Some(mb) = max_bytes {
+                        out.push_str(&inner);
+                        let _ = writeln!(out, "    max_size {mb}");
+                    }
+                    if let Some(k) = keep {
+                        out.push_str(&inner);
+                        let _ = writeln!(out, "    keep {k}");
+                    }
+                    out.push_str(&inner);
+                    out.push('}');
+                }
+            }
+            LogOutput::Unix { path } => {
+                out.push_str("unix ");
                 out.push_str(path);
             }
         }
