@@ -123,7 +123,7 @@ quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 rustls-pemfile = "2"
-webpki-roots = "0.26"
+webpki-roots = "1.0"
 
 # HTTP/3 request parsing (ISSUE-104) — h3 0.0.8 is latest stable, h3-quinn 0.0.10 is the quinn 0.11 adapter
 h3 = "0.0.8"
