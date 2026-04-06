@@ -14,6 +14,7 @@
 use std::net::SocketAddr;
 
 use bytes::Bytes;
+use compact_str::CompactString;
 use h3::server::RequestStream;
 
 use super::convert::is_hop_by_hop;
@@ -262,10 +263,14 @@ pub const BRIDGE_CHUNK_SIZE: usize = 64 * 1024; // 64 KB
 const MAX_HEADER_SIZE: usize = 8 * 1024; // 8 KB
 
 /// Parsed response headers from the upstream.
+///
+/// Header names and values use [`CompactString`] — stores ≤24 bytes
+/// inline without heap allocation. Most HTTP header names fit inline
+/// (e.g. "content-type" = 12 bytes, "cache-control" = 13 bytes).
 #[derive(Debug)]
 pub struct UpstreamResponseHead {
     pub status: u16,
-    pub headers: Vec<(String, String)>,
+    pub headers: Vec<(CompactString, CompactString)>,
     /// How the body is framed — determines how we read it.
     pub body_framing: BodyFraming,
     /// Leftover bytes after the header block that belong to the body.
@@ -368,88 +373,89 @@ pub async fn write_chunked_end(
         .map_err(UpstreamError::Write)
 }
 
-/// Parse response headers incrementally from a TCP stream using `httparse`.
+/// Parse response headers incrementally using the connection's own buffer.
 ///
-/// Reads into a bounded buffer (8 KB, Guardrail #28) until the full header
-/// block arrives. Returns the parsed headers plus any leftover body bytes
-/// that were read past the header boundary.
+/// Reads into [`BufferedConn::read_buf`] (bounded at 8 KB by the
+/// `MAX_HEADER_SIZE` check) until the full header block arrives. Returns
+/// the parsed headers plus any leftover body bytes that were read past
+/// the header boundary.
 pub async fn read_response_head(
-    tcp: &mut tokio::net::TcpStream,
+    conn: &mut super::pool::BufferedConn,
 ) -> Result<UpstreamResponseHead, UpstreamError> {
-    use tokio::io::AsyncReadExt;
-
-    let mut buf = vec![0u8; MAX_HEADER_SIZE];
-    let mut filled = 0;
-
     loop {
-        if filled >= MAX_HEADER_SIZE {
+        if conn.buffered() >= MAX_HEADER_SIZE {
             return Err(UpstreamError::Parse(
                 "response headers exceed 8 KB limit".into(),
             ));
         }
 
-        let n = tcp
-            .read(&mut buf[filled..])
-            .await
-            .map_err(UpstreamError::Read)?;
+        // Try to parse what we have so far before reading more.
+        {
+            let mut headers_buf = [httparse::EMPTY_HEADER; 64];
+            let mut resp = httparse::Response::new(&mut headers_buf);
 
+            match resp.parse(&conn.read_buf) {
+                Ok(httparse::Status::Complete(header_len)) => {
+                    let status = resp.code.unwrap_or(502);
+
+                    let mut headers = Vec::with_capacity(resp.headers.len());
+                    let mut content_length: Option<usize> = None;
+                    let mut is_chunked = false;
+
+                    for h in resp.headers.iter() {
+                        let name = CompactString::from(h.name);
+                        let value = CompactString::from(String::from_utf8_lossy(h.value).as_ref());
+
+                        if name.eq_ignore_ascii_case("content-length") {
+                            content_length = value.trim().parse().ok();
+                        }
+                        if name.eq_ignore_ascii_case("transfer-encoding")
+                            && value.eq_ignore_ascii_case("chunked")
+                        {
+                            is_chunked = true;
+                        }
+                        headers.push((name, value));
+                    }
+
+                    let body_framing = if is_chunked {
+                        BodyFraming::Chunked
+                    } else if let Some(len) = content_length {
+                        BodyFraming::ContentLength(len)
+                    } else {
+                        BodyFraming::CloseDelimited
+                    };
+
+                    // Consume the header bytes, leave body prefix in the buffer.
+                    let filled = conn.buffered();
+                    let _ = conn.take_bytes(header_len);
+                    let body_prefix = if filled > header_len {
+                        conn.take_bytes(filled - header_len).to_vec()
+                    } else {
+                        Vec::new()
+                    };
+
+                    return Ok(UpstreamResponseHead {
+                        status,
+                        headers,
+                        body_framing,
+                        body_prefix,
+                    });
+                }
+                Ok(httparse::Status::Partial) => {
+                    // Need more data — fall through to read.
+                }
+                Err(e) => {
+                    return Err(UpstreamError::Parse(format!("httparse error: {e}")));
+                }
+            }
+        }
+
+        // Read more data into the connection's buffer.
+        let n = conn.read_into_buf().await.map_err(UpstreamError::Read)?;
         if n == 0 {
             return Err(UpstreamError::Parse(
                 "upstream closed before sending complete headers".into(),
             ));
-        }
-        filled += n;
-
-        // Try to parse what we have so far.
-        let mut headers_buf = [httparse::EMPTY_HEADER; 64];
-        let mut resp = httparse::Response::new(&mut headers_buf);
-
-        match resp.parse(&buf[..filled]) {
-            Ok(httparse::Status::Complete(header_len)) => {
-                let status = resp.code.unwrap_or(502);
-
-                let mut headers = Vec::with_capacity(resp.headers.len());
-                let mut content_length: Option<usize> = None;
-                let mut is_chunked = false;
-
-                for h in resp.headers.iter() {
-                    let name = h.name.to_owned();
-                    let value = String::from_utf8_lossy(h.value).into_owned();
-
-                    if name.eq_ignore_ascii_case("content-length") {
-                        content_length = value.trim().parse().ok();
-                    }
-                    if name.eq_ignore_ascii_case("transfer-encoding")
-                        && value.eq_ignore_ascii_case("chunked")
-                    {
-                        is_chunked = true;
-                    }
-                    headers.push((name, value));
-                }
-
-                let body_framing = if is_chunked {
-                    BodyFraming::Chunked
-                } else if let Some(len) = content_length {
-                    BodyFraming::ContentLength(len)
-                } else {
-                    BodyFraming::CloseDelimited
-                };
-
-                let body_prefix = buf[header_len..filled].to_vec();
-
-                return Ok(UpstreamResponseHead {
-                    status,
-                    headers,
-                    body_framing,
-                    body_prefix,
-                });
-            }
-            Ok(httparse::Status::Partial) => {
-                // Need more data — loop and read again.
-            }
-            Err(e) => {
-                return Err(UpstreamError::Parse(format!("httparse error: {e}")));
-            }
         }
     }
 }
@@ -759,8 +765,9 @@ mod tests {
                 .expect("write");
         });
 
-        let mut tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
-        let head = read_response_head(&mut tcp).await.expect("parse");
+        let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let mut conn = crate::quic::pool::BufferedConn::new(tcp);
+        let head = read_response_head(&mut conn).await.expect("parse");
 
         assert_eq!(head.status, 200);
         assert!(head.headers.iter().any(|(k, _)| k == "Content-Length"));
