@@ -1,0 +1,10 @@
+FROM rust:1.87-alpine AS build
+RUN apk add --no-cache musl-dev
+WORKDIR /src
+COPY backend.rs .
+RUN rustc -O -o /backend backend.rs
+
+FROM alpine:3.22
+COPY --from=build /backend /backend
+EXPOSE 19876
+CMD ["/backend"]
