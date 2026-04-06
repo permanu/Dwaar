@@ -261,23 +261,17 @@ fn main() -> anyhow::Result<()> {
         .map(std::num::NonZero::get)
         .unwrap_or(1);
 
-    // Pingora is not nginx. nginx workers are single-threaded event loops —
-    // more workers = more parallelism. Pingora workers each spawn a full
-    // Tokio multi-threaded runtime, so one worker with N threads already
-    // uses all cores via work-stealing. Extra workers add overhead:
-    // duplicate background runtimes (admin API, health checker, etc.)
-    // and cross-process connection pool fragmentation.
+    // One worker, all cores. Multiple workers fragment the upstream connection
+    // pool and duplicate background services across processes. A single worker
+    // with N Tokio threads uses all cores via work-stealing, shares one pool,
+    // and avoids cross-process overhead.
     //
-    // At 8+ cores, 2 workers lets the kernel load-balance accept() via
-    // SO_REUSEPORT without the overhead of N runtimes.
+    // Benchmark (10-core, Rust backend, 1000 conns):
+    //   1 worker × 10 threads:  57,928 RPS, P99 =  93ms
+    //   2 workers × 5 threads:  32,032 RPS, P99 = 204ms
+    //   4 workers × 2 threads:  30,668 RPS, P99 = 187ms
     let worker_count = match cli.workers {
-        WorkerCount::Auto => {
-            if cpu_count >= 8 {
-                2
-            } else {
-                1
-            }
-        }
+        WorkerCount::Auto => 1,
         WorkerCount::Count(n) => n,
     };
 
@@ -353,7 +347,7 @@ fn run_server(
     let conf = ServerConf {
         threads,
         work_stealing: true,
-        upstream_keepalive_pool_size: 128,
+        upstream_keepalive_pool_size: 512,
         grace_period_seconds: Some(5),
         graceful_shutdown_timeout_seconds: Some(5),
         ..ServerConf::default()

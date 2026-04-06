@@ -194,8 +194,27 @@ pub struct RequestContext {
 impl RequestContext {
     /// Create a new context with timing and identity set.
     pub fn new() -> Self {
-        // Generate UUID v7 directly into a stack buffer — zero heap allocation.
-        let uuid = Uuid::now_v7();
+        // UUID v7 layout: 48-bit unix_ts_ms | 4-bit version | 12-bit rand_a |
+        //                 2-bit variant | 62-bit rand_b
+        // Using fastrand (~3ns) instead of crypto RNG (~100ns). Request IDs
+        // need uniqueness and time-sortability, not cryptographic strength.
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let mut bytes = [0u8; 16];
+        fastrand::fill(&mut bytes);
+        // Embed timestamp in first 6 bytes (big-endian)
+        bytes[0] = (ms >> 40) as u8;
+        bytes[1] = (ms >> 32) as u8;
+        bytes[2] = (ms >> 24) as u8;
+        bytes[3] = (ms >> 16) as u8;
+        bytes[4] = (ms >> 8) as u8;
+        bytes[5] = ms as u8;
+        // Set version (7) and variant (RFC 9562)
+        bytes[6] = (bytes[6] & 0x0F) | 0x70; // version 7
+        bytes[8] = (bytes[8] & 0x3F) | 0x80; // variant RFC 9562
+        let uuid = Uuid::from_bytes(bytes);
         let mut buf = [0u8; 36];
         uuid.as_hyphenated().encode_lower(&mut buf);
 
