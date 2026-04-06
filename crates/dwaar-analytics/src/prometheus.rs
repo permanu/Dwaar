@@ -74,25 +74,32 @@ impl Histogram {
     }
 
     /// Record an observation in microseconds.
+    ///
+    /// Stores a **non-cumulative** per-bucket count — exactly 1 bucket is
+    /// incremented per observation (3 atomic ops total). Cumulative totals
+    /// required by Prometheus are derived in [`snapshot()`] on the rare
+    /// `/metrics` scrape path, not on the hot request path.
     pub fn observe(&self, value_us: u64) {
-        // Linear scan — 11 buckets, faster than binary search at this size
-        for (i, &bound) in BUCKET_BOUNDS_US.iter().enumerate() {
-            if value_us <= bound {
-                self.bucket_counts[i].fetch_add(1, Relaxed);
-            }
-        }
-        // +Inf bucket always incremented
-        self.bucket_counts[BUCKET_BOUNDS_US.len()].fetch_add(1, Relaxed);
-
+        let idx = BUCKET_BOUNDS_US
+            .iter()
+            .position(|&bound| value_us <= bound)
+            .unwrap_or(BUCKET_BOUNDS_US.len()); // +Inf bucket
+        self.bucket_counts[idx].fetch_add(1, Relaxed);
         self.sum_us.fetch_add(value_us, Relaxed);
         self.count.fetch_add(1, Relaxed);
     }
 
-    /// Snapshot bucket counts (cumulative), sum (seconds), and count.
+    /// Snapshot as cumulative buckets (Prometheus wire format), sum, and count.
     fn snapshot(&self) -> HistogramSnapshot {
-        let buckets: Vec<u64> = self.bucket_counts.iter().map(|c| c.load(Relaxed)).collect();
+        let raw: Vec<u64> = self.bucket_counts.iter().map(|c| c.load(Relaxed)).collect();
+        let mut cumulative = Vec::with_capacity(raw.len());
+        let mut running = 0u64;
+        for &count in &raw {
+            running += count;
+            cumulative.push(running);
+        }
         HistogramSnapshot {
-            buckets,
+            buckets: cumulative,
             sum_secs: self.sum_us.load(Relaxed) as f64 / 1_000_000.0,
             count: self.count.load(Relaxed),
         }
@@ -184,10 +191,40 @@ impl StatusMethodCounters {
 
 // -- Top-level metrics registry ----------------------------------------------
 
-/// Maximum number of distinct domains tracked in per-domain DashMaps.
+/// Maximum number of distinct domains tracked in per-domain `DashMap`s.
 /// Beyond this limit new domains are silently dropped to prevent unbounded
 /// memory growth in multi-tenant or wildcard setups.
 const MAX_TRACKED_DOMAINS: usize = 10_000;
+
+/// Per-domain request metrics bundled into a single struct.
+///
+/// One `DashMap` lookup per request instead of four — reduces lock contention
+/// by ~75% under high concurrency.
+pub struct DomainRequestMetrics {
+    pub requests: StatusMethodCounters,
+    pub duration: Histogram,
+    pub bytes_sent: AtomicU64,
+    pub bytes_received: AtomicU64,
+}
+
+impl std::fmt::Debug for DomainRequestMetrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DomainRequestMetrics")
+            .field("total_requests", &self.requests.total())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for DomainRequestMetrics {
+    fn default() -> Self {
+        Self {
+            requests: StatusMethodCounters::new(),
+            duration: Histogram::new(),
+            bytes_sent: AtomicU64::new(0),
+            bytes_received: AtomicU64::new(0),
+        }
+    }
+}
 
 /// All Prometheus metrics for the Dwaar proxy.
 ///
@@ -195,11 +232,10 @@ const MAX_TRACKED_DOMAINS: usize = 10_000;
 /// `DwaarProxy` (writes in `logging()`) and `AdminService` (reads on
 /// `GET /metrics`).
 pub struct PrometheusMetrics {
-    // Per-domain counters (DashMap key = domain)
-    pub requests: DashMap<CompactString, StatusMethodCounters>,
-    pub request_duration: DashMap<CompactString, Histogram>,
-    pub bytes_sent: DashMap<CompactString, AtomicU64>,
-    pub bytes_received: DashMap<CompactString, AtomicU64>,
+    /// Per-domain request metrics — single `DashMap` for the hot path.
+    pub domains: DashMap<CompactString, DomainRequestMetrics>,
+    /// Active connections gauge — separate because it has a different
+    /// lifecycle (`connection_start`/`connection_end` vs per-request record).
     pub active_connections: DashMap<CompactString, AtomicI64>,
 
     // Per-upstream
@@ -210,12 +246,18 @@ pub struct PrometheusMetrics {
     pub tls_handshake_duration: Histogram,
     pub config_reloads_success: AtomicU64,
     pub config_reloads_failure: AtomicU64,
+
+    // ISSUE-113: standard process metrics (CPU, RSS, FDs, threads)
+    pub process: crate::process_metrics::ProcessMetrics,
+
+    // ISSUE-114: rate limiter + cache counters
+    pub rate_cache: crate::rate_cache_metrics::RateCacheMetrics,
 }
 
 impl std::fmt::Debug for PrometheusMetrics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PrometheusMetrics")
-            .field("domains_tracked", &self.requests.len())
+            .field("domains_tracked", &self.domains.len())
             .finish_non_exhaustive()
     }
 }
@@ -229,32 +271,26 @@ impl Default for PrometheusMetrics {
 impl PrometheusMetrics {
     pub fn new() -> Self {
         Self {
-            requests: DashMap::new(),
-            request_duration: DashMap::new(),
-            bytes_sent: DashMap::new(),
-            bytes_received: DashMap::new(),
+            domains: DashMap::new(),
             active_connections: DashMap::new(),
             upstream_connect_duration: DashMap::new(),
             upstream_health: DashMap::new(),
             tls_handshake_duration: Histogram::new(),
             config_reloads_success: AtomicU64::new(0),
             config_reloads_failure: AtomicU64::new(0),
+            process: crate::process_metrics::ProcessMetrics::new(),
+            rate_cache: crate::rate_cache_metrics::RateCacheMetrics::new(),
         }
     }
 
-    /// Returns `true` if the domain is already tracked or we're below the limit.
     fn domain_within_limit(&self, domain: &CompactString) -> bool {
-        self.requests.contains_key(domain) || self.requests.len() < MAX_TRACKED_DOMAINS
+        self.domains.contains_key(domain) || self.domains.len() < MAX_TRACKED_DOMAINS
     }
 
     /// Record all per-request metrics from the `logging()` callback.
     ///
-    /// Called once per completed request. All operations are atomic
-    /// increments on pre-allocated structures — zero heap allocation.
-    ///
-    /// If the number of tracked domains exceeds [`MAX_TRACKED_DOMAINS`],
-    /// metrics for new (unseen) domains are silently dropped to prevent
-    /// unbounded memory growth.
+    /// Single `DashMap` lookup per request — the bundled `DomainRequestMetrics`
+    /// holds counters, histogram, and byte totals in one allocation.
     pub fn record_request(
         &self,
         domain: &CompactString,
@@ -268,25 +304,11 @@ impl PrometheusMetrics {
             return;
         }
 
-        self.requests
-            .entry(domain.clone())
-            .or_default()
-            .increment(status, method);
-
-        self.request_duration
-            .entry(domain.clone())
-            .or_default()
-            .observe(duration_us);
-
-        self.bytes_sent
-            .entry(domain.clone())
-            .or_default()
-            .fetch_add(bytes_tx, Relaxed);
-
-        self.bytes_received
-            .entry(domain.clone())
-            .or_default()
-            .fetch_add(bytes_rx, Relaxed);
+        let entry = self.domains.entry(domain.clone()).or_default();
+        entry.requests.increment(status, method);
+        entry.duration.observe(duration_us);
+        entry.bytes_sent.fetch_add(bytes_tx, Relaxed);
+        entry.bytes_received.fetch_add(bytes_rx, Relaxed);
     }
 
     /// Increment active connections gauge for a domain.
@@ -327,6 +349,8 @@ impl PrometheusMetrics {
         self.render_upstream_health(&mut out);
         self.render_tls_handshake_duration(&mut out);
         self.render_config_reloads(&mut out);
+        self.process.render(&mut out);
+        self.rate_cache.render(&mut out);
 
         out
     }
@@ -334,9 +358,9 @@ impl PrometheusMetrics {
     fn render_requests(&self, out: &mut String) {
         out.push_str("# HELP dwaar_requests_total Total HTTP requests processed.\n");
         out.push_str("# TYPE dwaar_requests_total counter\n");
-        for entry in &self.requests {
+        for entry in &self.domains {
             let domain = entry.key();
-            let counters = entry.value();
+            let counters = &entry.value().requests;
             for (si, &status_label) in STATUS_CODES.iter().enumerate() {
                 for (mi, &method_label) in METHODS.iter().enumerate() {
                     let val = counters.counts[si * METHOD_COUNT + mi].load(Relaxed);
@@ -354,12 +378,12 @@ impl PrometheusMetrics {
     fn render_request_duration(&self, out: &mut String) {
         out.push_str("# HELP dwaar_request_duration_seconds Request duration in seconds.\n");
         out.push_str("# TYPE dwaar_request_duration_seconds histogram\n");
-        for entry in &self.request_duration {
+        for entry in &self.domains {
             render_histogram(
                 out,
                 "dwaar_request_duration_seconds",
                 entry.key(),
-                &entry.value().snapshot(),
+                &entry.value().duration.snapshot(),
             );
         }
     }
@@ -367,8 +391,8 @@ impl PrometheusMetrics {
     fn render_bytes(&self, out: &mut String) {
         out.push_str("# HELP dwaar_bytes_sent_total Total response bytes sent.\n");
         out.push_str("# TYPE dwaar_bytes_sent_total counter\n");
-        for entry in &self.bytes_sent {
-            let val = entry.value().load(Relaxed);
+        for entry in &self.domains {
+            let val = entry.value().bytes_sent.load(Relaxed);
             if val > 0 {
                 let _ = writeln!(
                     out,
@@ -380,8 +404,8 @@ impl PrometheusMetrics {
 
         out.push_str("# HELP dwaar_bytes_received_total Total request bytes received.\n");
         out.push_str("# TYPE dwaar_bytes_received_total counter\n");
-        for entry in &self.bytes_received {
-            let val = entry.value().load(Relaxed);
+        for entry in &self.domains {
+            let val = entry.value().bytes_received.load(Relaxed);
             if val > 0 {
                 let _ = writeln!(
                     out,
@@ -607,24 +631,16 @@ mod tests {
     }
 
     #[test]
-    fn record_request_populates_all_maps() {
+    fn record_request_populates_domain_metrics() {
         let m = PrometheusMetrics::new();
         let domain = CompactString::from("test.example.com");
         m.record_request(&domain, "GET", 200, 5_000, 1024, 256);
 
-        assert!(m.requests.contains_key(&domain));
-        assert!(m.request_duration.contains_key(&domain));
-        assert_eq!(
-            m.bytes_sent.get(&domain).expect("bytes_sent").load(Relaxed),
-            1024
-        );
-        assert_eq!(
-            m.bytes_received
-                .get(&domain)
-                .expect("bytes_received")
-                .load(Relaxed),
-            256
-        );
+        let entry = m.domains.get(&domain).expect("domain should be tracked");
+        assert_eq!(entry.requests.total(), 1);
+        assert_eq!(entry.duration.count.load(Relaxed), 1);
+        assert_eq!(entry.bytes_sent.load(Relaxed), 1024);
+        assert_eq!(entry.bytes_received.load(Relaxed), 256);
     }
 
     #[test]
