@@ -1395,48 +1395,40 @@ fn load_geoip_database() -> Option<Arc<dwaar_geo::GeoLookup>> {
 }
 
 fn init_logging(cli: &Cli) {
-    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::filter::LevelFilter;
 
-    // Check for explicit env override first. If DWAAR_LOG_LEVEL or RUST_LOG
-    // is set, use the full EnvFilter (supports per-crate directives).
-    // Otherwise use a simple LevelFilter — much cheaper per-event evaluation
-    // (~1 atomic compare vs EnvFilter's string matching per callsite).
-    let has_env_filter = std::env::var("DWAAR_LOG_LEVEL").is_ok()
-        || std::env::var("RUST_LOG").is_ok();
+    // Always use LevelFilter — a single atomic compare per tracing callsite.
+    // EnvFilter uses regex-like string matching per callsite per event, which
+    // halves throughput (~57 tracing calls/request × 67K RPS = 3.8M evals/sec).
+    //
+    // Parse level from env: DWAAR_LOG_LEVEL > RUST_LOG > default "info".
+    // Only simple levels supported (error/warn/info/debug/trace).
+    // Per-crate directives (e.g. "dwaar_core=debug,h2=warn") are not supported
+    // in production — use them only for local debugging by patching this code.
+    let level_str = std::env::var("DWAAR_LOG_LEVEL")
+        .or_else(|_| std::env::var("RUST_LOG"))
+        .unwrap_or_else(|_| "info".to_string());
 
-    if has_env_filter {
-        let filter = EnvFilter::try_from_env("DWAAR_LOG_LEVEL")
-            .or_else(|_| EnvFilter::try_from_default_env())
-            .unwrap_or_else(|_| EnvFilter::new("info"));
+    let level = match level_str.to_ascii_lowercase().as_str() {
+        "error" => LevelFilter::ERROR,
+        "warn" => LevelFilter::WARN,
+        "info" => LevelFilter::INFO,
+        "debug" => LevelFilter::DEBUG,
+        "trace" => LevelFilter::TRACE,
+        "off" => LevelFilter::OFF,
+        _ => LevelFilter::INFO,
+    };
 
-        if cli.daemon {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .json()
-                .with_target(false)
-                .init();
-        } else {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_target(false)
-                .init();
-        }
+    if cli.daemon {
+        tracing_subscriber::fmt()
+            .with_max_level(level)
+            .json()
+            .with_target(false)
+            .init();
     } else {
-        // Fast path: simple level filter, no per-callsite string matching.
-        use tracing_subscriber::filter::LevelFilter;
-        let level = LevelFilter::INFO;
-
-        if cli.daemon {
-            tracing_subscriber::fmt()
-                .with_max_level(level)
-                .json()
-                .with_target(false)
-                .init();
-        } else {
-            tracing_subscriber::fmt()
-                .with_max_level(level)
-                .with_target(false)
-                .init();
-        }
+        tracing_subscriber::fmt()
+            .with_max_level(level)
+            .with_target(false)
+            .init();
     }
 }
