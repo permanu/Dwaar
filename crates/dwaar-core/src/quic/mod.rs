@@ -22,6 +22,8 @@
 
 pub mod bridge;
 pub mod convert;
+pub mod h2_bridge;
+pub mod h2_pool;
 pub mod handler;
 pub mod pool;
 
