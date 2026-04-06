@@ -300,10 +300,19 @@ impl PrometheusMetrics {
         bytes_tx: u64,
         bytes_rx: u64,
     ) {
-        if !self.domain_within_limit(domain) {
+        // Fast path: domain already tracked — read-only get(), no clone, no write lock.
+        if let Some(entry) = self.domains.get(domain) {
+            entry.requests.increment(status, method);
+            entry.duration.observe(duration_us);
+            entry.bytes_sent.fetch_add(bytes_tx, Relaxed);
+            entry.bytes_received.fetch_add(bytes_rx, Relaxed);
             return;
         }
 
+        // Cold path: first request for this domain — clone + insert.
+        if !self.domain_within_limit(domain) {
+            return;
+        }
         let entry = self.domains.entry(domain.clone()).or_default();
         entry.requests.increment(status, method);
         entry.duration.observe(duration_us);
@@ -315,9 +324,11 @@ impl PrometheusMetrics {
     ///
     /// Skipped if the domain count exceeds [`MAX_TRACKED_DOMAINS`].
     pub fn connection_start(&self, domain: &CompactString) {
-        if self.active_connections.contains_key(domain)
-            || self.active_connections.len() < MAX_TRACKED_DOMAINS
-        {
+        if let Some(gauge) = self.active_connections.get(domain) {
+            gauge.fetch_add(1, Relaxed);
+            return;
+        }
+        if self.active_connections.len() < MAX_TRACKED_DOMAINS {
             self.active_connections
                 .entry(domain.clone())
                 .or_default()
@@ -327,10 +338,9 @@ impl PrometheusMetrics {
 
     /// Decrement active connections gauge for a domain.
     pub fn connection_end(&self, domain: &CompactString) {
-        self.active_connections
-            .entry(domain.clone())
-            .or_default()
-            .fetch_sub(1, Relaxed);
+        if let Some(gauge) = self.active_connections.get(domain) {
+            gauge.fetch_sub(1, Relaxed);
+        }
     }
 
     /// Render all metrics in Prometheus text exposition format.
