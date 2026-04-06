@@ -1397,19 +1397,46 @@ fn load_geoip_database() -> Option<Arc<dwaar_geo::GeoLookup>> {
 fn init_logging(cli: &Cli) {
     use tracing_subscriber::EnvFilter;
 
-    let filter =
-        EnvFilter::try_from_env("DWAAR_LOG_LEVEL").unwrap_or_else(|_| EnvFilter::new("info"));
+    // Check for explicit env override first. If DWAAR_LOG_LEVEL or RUST_LOG
+    // is set, use the full EnvFilter (supports per-crate directives).
+    // Otherwise use a simple LevelFilter — much cheaper per-event evaluation
+    // (~1 atomic compare vs EnvFilter's string matching per callsite).
+    let has_env_filter = std::env::var("DWAAR_LOG_LEVEL").is_ok()
+        || std::env::var("RUST_LOG").is_ok();
 
-    if cli.daemon {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .json()
-            .with_target(false)
-            .init();
+    if has_env_filter {
+        let filter = EnvFilter::try_from_env("DWAAR_LOG_LEVEL")
+            .or_else(|_| EnvFilter::try_from_default_env())
+            .unwrap_or_else(|_| EnvFilter::new("info"));
+
+        if cli.daemon {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .json()
+                .with_target(false)
+                .init();
+        } else {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .init();
+        }
     } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_target(false)
-            .init();
+        // Fast path: simple level filter, no per-callsite string matching.
+        use tracing_subscriber::filter::LevelFilter;
+        let level = LevelFilter::INFO;
+
+        if cli.daemon {
+            tracing_subscriber::fmt()
+                .with_max_level(level)
+                .json()
+                .with_target(false)
+                .init();
+        } else {
+            tracing_subscriber::fmt()
+                .with_max_level(level)
+                .with_target(false)
+                .init();
+        }
     }
 }
