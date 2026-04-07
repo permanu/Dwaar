@@ -1,0 +1,12 @@
+target/
+.git/
+site/node_modules/
+site/dist/
+site/.astro/
+local/
+bench/profiles/
+benchmarks/
+.claude/
+.github/
+*.log
+.DS_Store

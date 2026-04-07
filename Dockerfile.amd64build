@@ -1,0 +1,7 @@
+FROM --platform=linux/amd64 rust:1.94-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config libssl-dev cmake build-essential \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+COPY . .
+RUN cargo build --release && strip target/release/dwaar
