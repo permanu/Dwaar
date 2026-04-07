@@ -36,35 +36,12 @@ jobs:
         working-directory: site
         run: npx astro build
 
-      # Option A: Deploy to Cloudflare Pages
-      # Uncomment when CF_API_TOKEN and CF_ACCOUNT_ID are set in repo secrets
-      # - name: Deploy to Cloudflare Pages
-      #   if: github.ref == 'refs/heads/main'
-      #   uses: cloudflare/wrangler-action@v3
-      #   with:
-      #     apiToken: ${{ secrets.CF_API_TOKEN }}
-      #     accountId: ${{ secrets.CF_ACCOUNT_ID }}
-      #     command: pages deploy site/dist --project-name=dwaar-docs
-
-      # Option B: Deploy to GitHub Pages (drop-in replacement for mdbook)
-      - name: Upload artifact
-        if: github.ref == 'refs/heads/main'
-        uses: actions/upload-pages-artifact@v4
-        with:
-          path: site/dist
-
-  deploy:
-    name: Deploy to GitHub Pages
-    if: github.ref == 'refs/heads/main'
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v5
+      - name: Verify no source maps (Guardrail #38)
+        working-directory: site
+        run: |
+          count=$(find dist -name '*.map' | wc -l)
+          if [ "$count" -ne 0 ]; then
+            echo "ERROR: Found $count source map files in dist/"
+            find dist -name '*.map'
+            exit 1
+          fi

@@ -3,7 +3,7 @@
 # Usage: curl -fsSL https://dwaar.dev/install.sh | sh
 set -eu
 
-REPO="permanu/Dwaar"
+BASE_URL="https://releases.dwaar.dev"
 INSTALL_DIR="${DWAAR_INSTALL_DIR:-/usr/local/bin}"
 
 # --- Detect platform ---
@@ -28,8 +28,7 @@ ARTIFACT="dwaar-${os}-${arch}"
 if [ -n "${DWAAR_VERSION:-}" ]; then
   VERSION="$DWAAR_VERSION"
 else
-  VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-    | grep '"tag_name"' | head -1 | cut -d'"' -f4)"
+  VERSION="$(curl -fsSL "${BASE_URL}/latest")"
 fi
 
 if [ -z "$VERSION" ]; then
@@ -37,7 +36,7 @@ if [ -z "$VERSION" ]; then
   exit 1
 fi
 
-DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION}/${ARTIFACT}"
+DOWNLOAD_URL="${BASE_URL}/${VERSION}/${ARTIFACT}"
 CHECKSUM_URL="${DOWNLOAD_URL}.sha256"
 
 printf "Installing dwaar %s (%s/%s)\n" "$VERSION" "$os" "$arch"

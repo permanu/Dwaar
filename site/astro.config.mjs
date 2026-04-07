@@ -21,8 +21,28 @@ export default defineConfig({
 			editLink: { baseUrl: 'https://github.com/permanu/Dwaar/edit/main/site/' },
 			head: [
 				{ tag: 'meta', attrs: { name: 'og:image', content: '/og.png' } },
+				{ tag: 'meta', attrs: { name: 'color-scheme', content: 'dark' } },
+				{
+					tag: 'script',
+					content: `document.documentElement.dataset.theme = 'dark'; localStorage.setItem('starlight-theme', 'dark');`,
+				},
 			],
 			customCss: ['./src/styles/custom.css'],
+			// Force dark mode — match landing page
+			defaultLocale: 'en',
+			expressiveCode: {
+				themes: ['github-dark'],
+				styleOverrides: {
+					borderRadius: '8px',
+					borderColor: 'rgba(255, 255, 255, 0.06)',
+					codeBackground: '#111114',
+					frames: {
+						editorTabBarBackground: '#141417',
+						terminalBackground: '#111114',
+						terminalTitlebarBackground: '#141417',
+					},
+				},
+			},
 			sidebar: [
 				{
 					label: 'Getting Started',
