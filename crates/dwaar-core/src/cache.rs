@@ -16,12 +16,40 @@
 //! references that Pingora's `Storage` trait demands, and helper functions
 //! build cache keys and meta defaults.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use http::StatusCode;
 use pingora_cache::eviction::lru::Manager as LruManager;
 use pingora_cache::lock::CacheLock;
 use pingora_cache::{CacheKey, CacheMetaDefaults, MemCache};
+
+/// Number of cache backends that have been leaked since process start.
+/// Increments by one on every successful [`new_cache_backend`] call.
+static LEAKED_BACKEND_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Approximate cumulative bytes intentionally leaked by [`new_cache_backend`]
+/// across all reloads. Tracked as a sentinel — if this grows past the
+/// configured budget at runtime, operators should know to recycle the
+/// process via the supervisor (Guardrail #28).
+static LEAKED_BACKEND_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Approximate per-backend control-struct overhead. The actual leak is
+/// dominated by the boxed `MemCache` + `LruManager` headers; the cached
+/// data inside lives only as long as the backend itself and is not
+/// double-leaked on rebuild.
+const APPROX_BACKEND_OVERHEAD_BYTES: u64 = 1024;
+
+/// Number of backends leaked since process start. Exposed for metrics.
+pub fn leaked_cache_backend_count() -> u64 {
+    LEAKED_BACKEND_COUNT.load(Ordering::Relaxed)
+}
+
+/// Approximate cumulative leaked bytes since process start. Exposed for
+/// metrics.
+pub fn leaked_cache_backend_bytes() -> u64 {
+    LEAKED_BACKEND_BYTES.load(Ordering::Relaxed)
+}
 
 // ---------------------------------------------------------------------------
 // Per-route cache configuration
@@ -130,6 +158,11 @@ pub fn new_cache_backend(max_size: usize) -> CacheBackend {
     let eviction = Box::leak(Box::new(LruManager::<16>::with_capacity(max_size, 1024)));
     let storage = Box::leak(Box::new(MemCache::new()));
     let lock = Box::leak(Box::new(CacheLock::new(Duration::from_secs(10))));
+
+    // Record the leak so operators can monitor cumulative growth and
+    // recycle the process if rebuilds happen far more often than expected.
+    LEAKED_BACKEND_COUNT.fetch_add(1, Ordering::Relaxed);
+    LEAKED_BACKEND_BYTES.fetch_add(APPROX_BACKEND_OVERHEAD_BYTES, Ordering::Relaxed);
 
     CacheBackend {
         storage,

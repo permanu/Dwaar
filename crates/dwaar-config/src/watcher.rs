@@ -178,14 +178,28 @@ impl ConfigWatcher {
             return;
         }
 
-        let content =
-            match tokio::task::block_in_place(|| std::fs::read_to_string(&self.config_path)) {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(path = %self.config_path.display(), error = %e, "failed to read config");
-                    return;
-                }
-            };
+        // Use a bounded read instead of trusting the metadata size — the
+        // file could grow between stat and read (TOCTOU), and a runaway
+        // config writer must not be able to OOM the watcher (Guardrail #28).
+        let content = match tokio::task::block_in_place(|| {
+            use std::io::Read;
+            let file = std::fs::File::open(&self.config_path)?;
+            let mut buf = String::new();
+            file.take(MAX_CONFIG_SIZE + 1).read_to_string(&mut buf)?;
+            if buf.len() as u64 > MAX_CONFIG_SIZE {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "config file exceeded MAX_CONFIG_SIZE during read",
+                ));
+            }
+            Ok::<String, std::io::Error>(buf)
+        }) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(path = %self.config_path.display(), error = %e, "failed to read config");
+                return;
+            }
+        };
 
         // Content hash comparison
         let new_hash = match openssl::hash::hash(MessageDigest::sha256(), content.as_bytes()) {

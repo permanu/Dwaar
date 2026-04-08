@@ -20,6 +20,12 @@ use tracing::trace;
 /// Max size for any single line or chunk body (64 KB).
 const MAX_LINE_BYTES: usize = 64 * 1024;
 
+/// Max size of a non-streaming Docker API response body (10 MB).
+/// `containers/json` and `containers/{id}/json` are the only non-streaming
+/// callers; both are well under this in practice. Bound is defensive
+/// against a hostile or compromised Docker socket (Guardrail #28).
+const MAX_RESPONSE_BYTES: u64 = 10 * 1024 * 1024;
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -116,9 +122,20 @@ impl DockerClient {
             }
         }
 
-        // Read body until EOF (Connection: close guarantees this works)
+        // Read body until EOF (Connection: close guarantees this works),
+        // bounded to MAX_RESPONSE_BYTES to defend against a hostile or
+        // compromised Docker socket sending an unbounded stream.
         let mut body = Vec::new();
-        reader.read_to_end(&mut body).await?;
+        let n = (&mut reader)
+            .take(MAX_RESPONSE_BYTES + 1)
+            .read_to_end(&mut body)
+            .await?;
+        if n as u64 > MAX_RESPONSE_BYTES {
+            return Err(DockerError::LineTooLong {
+                len: n,
+                max: MAX_RESPONSE_BYTES as usize,
+            });
+        }
 
         let value = serde_json::from_slice(&body)?;
         Ok(value)

@@ -122,6 +122,16 @@ async fn http_post_ocsp(url: &str, body: &[u8]) -> Result<Vec<u8>, OcspError> {
 
     let addr = format!("{host}:{port}");
 
+    // Reject any control characters in `host` or `path` before they reach
+    // the raw HTTP request line. The cert's AIA URL is attacker-influenced
+    // (the issuer can put arbitrary bytes there); a CR/LF would let an
+    // adversarial issuer inject extra HTTP headers (Guardrail #31).
+    if contains_ctl(host) || contains_ctl(path) {
+        return Err(OcspError::HttpFetch(
+            "OCSP responder URL contains control characters".to_string(),
+        ));
+    }
+
     let mut stream = tokio::time::timeout(OCSP_HTTP_TIMEOUT, TcpStream::connect(&addr))
         .await
         .map_err(|_| OcspError::HttpFetch("connection timed out".to_string()))?
@@ -174,6 +184,13 @@ async fn http_post_ocsp(url: &str, body: &[u8]) -> Result<Vec<u8>, OcspError> {
     }
 
     Ok(response_buf[header_end + 4..].to_vec())
+}
+
+/// True if `s` contains any byte that would corrupt an HTTP request line
+/// or header (CR, LF, NUL, or any C0 control). Used to harden the OCSP
+/// fetcher against header injection from a hostile certificate's AIA URL.
+fn contains_ctl(s: &str) -> bool {
+    s.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0 || b < 0x20)
 }
 
 /// Validate an OCSP response: check status, verify signature, check cert status.

@@ -52,10 +52,15 @@ impl std::fmt::Debug for CertStore {
 
 impl CertStore {
     fn lock_cache(&self) -> std::sync::MutexGuard<'_, LruCache<String, CachedCert>> {
-        self.cache.lock().unwrap_or_else(|poisoned| {
-            warn!("cert cache mutex was poisoned — recovering");
-            poisoned.into_inner()
-        })
+        // Fail-fast on poisoning. A poisoned mutex means a previous holder
+        // panicked mid-update, leaving the cache in a partially-mutated state.
+        // Continuing on a corrupted cert cache risks serving the wrong cert
+        // (or no cert) to a TLS handshake — strictly worse than a restart,
+        // because the supervisor will recover us cleanly while the security
+        // posture stays intact.
+        self.cache
+            .lock()
+            .expect("cert cache mutex poisoned — refusing to serve from corrupted state")
     }
 
     /// Create a new cert store loading from `cert_dir` with the given cache capacity.

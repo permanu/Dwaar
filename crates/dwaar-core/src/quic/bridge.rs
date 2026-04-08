@@ -217,8 +217,14 @@ pub fn parse_http1_response(raw: &[u8]) -> Result<Http1Response, String> {
 }
 
 /// Decode a chunked transfer-encoded body per RFC 9112 §7.1.
+///
+/// Tracks the cumulative decoded byte count and rejects responses that
+/// exceed [`MAX_UPSTREAM_RESPONSE`]. Without this cap, an upstream could
+/// send many small chunks that individually pass framing checks but
+/// together exhaust memory (Guardrail #28).
 fn decode_chunked(mut input: &[u8]) -> Result<Bytes, String> {
     let mut out = Vec::new();
+    let mut total: usize = 0;
 
     loop {
         let crlf = input
@@ -237,6 +243,17 @@ fn decode_chunked(mut input: &[u8]) -> Result<Bytes, String> {
 
         if chunk_size == 0 {
             break;
+        }
+
+        // Bound the cumulative decoded size — checked_add guards against
+        // a single hostile chunk wrapping `total` past usize::MAX.
+        total = total
+            .checked_add(chunk_size)
+            .ok_or_else(|| "chunked: total size overflow".to_string())?;
+        if total > MAX_UPSTREAM_RESPONSE {
+            return Err(format!(
+                "chunked: cumulative body exceeds {MAX_UPSTREAM_RESPONSE} byte limit"
+            ));
         }
 
         if input.len() < chunk_size + 2 {

@@ -57,7 +57,20 @@ pub enum RequestHandlerError {
     Finish(h3::error::StreamError),
 }
 
+/// Maximum time we wait for in-flight H3 request handlers to drain after
+/// the connection's accept loop exits. Past this point we abort outstanding
+/// tasks so the connection driver can return and the QUIC connection can
+/// be torn down.
+const H3_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Drive one HTTP/3 connection from acceptance to close.
+///
+/// Per-request handlers are tracked in a [`JoinSet`] scoped to this
+/// connection so that:
+///   1. They cannot outlive their parent QUIC connection.
+///   2. On normal close (peer goaway / EOF) we drain outstanding requests
+///      with a bounded timeout instead of dropping them mid-response.
+///   3. On accept error we still attempt graceful drain before returning.
 pub async fn handle_h3_connection(
     conn: quinn::Connection,
     early_data_active: Arc<AtomicBool>,
@@ -71,6 +84,8 @@ pub async fn handle_h3_connection(
         .await
         .map_err(ConnectionHandlerError::Accept)?;
 
+    let mut in_flight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+
     loop {
         match h3_server.accept().await {
             Ok(Some(resolver)) => {
@@ -80,7 +95,7 @@ pub async fn handle_h3_connection(
                 let h2_pool = Arc::clone(&h2_pool);
                 let is_early_data = early_data_active.load(Ordering::Acquire);
 
-                tokio::spawn(async move {
+                in_flight.spawn(async move {
                     if let Err(e) = handle_h3_request(
                         resolver,
                         route_table,
@@ -94,6 +109,11 @@ pub async fn handle_h3_connection(
                         debug!(error = %e, "HTTP/3 request handler error");
                     }
                 });
+
+                // Reap any handlers that finished while we were waiting on
+                // accept(), so the JoinSet doesn't accumulate over the
+                // lifetime of long-lived connections.
+                while in_flight.try_join_next().is_some() {}
             }
             Ok(None) => break,
             Err(e) if e.is_h3_no_error() => break,
@@ -101,6 +121,24 @@ pub async fn handle_h3_connection(
                 debug!(error = %e, "HTTP/3 accept error");
                 break;
             }
+        }
+    }
+
+    // Graceful drain: give still-running request handlers a bounded window
+    // to finish writing their responses before tearing down the connection.
+    if !in_flight.is_empty() {
+        let drain = async {
+            while in_flight.join_next().await.is_some() {}
+        };
+        if tokio::time::timeout(H3_DRAIN_TIMEOUT, drain).await.is_err() {
+            warn!(
+                outstanding = in_flight.len(),
+                "HTTP/3 drain timeout exceeded — aborting in-flight handlers"
+            );
+            in_flight.abort_all();
+            // Reap aborted tasks so JoinSet cleanup is complete before
+            // returning to the connection driver.
+            while in_flight.join_next().await.is_some() {}
         }
     }
 

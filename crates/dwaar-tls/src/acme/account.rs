@@ -12,9 +12,15 @@
 use std::path::{Path, PathBuf};
 
 use tokio::fs;
+use tokio::io::AsyncReadExt;
 use tracing::{debug, info};
 
 use super::AcmeError;
+
+/// Max size of an ACME account credentials file. Real files are <2 KB
+/// (account ID + URLs + base64 PKCS8 key); 64 KB is a generous defensive
+/// cap (Guardrail #28).
+const MAX_ACCOUNT_FILE_BYTES: u64 = 64 * 1024;
 
 /// Build the credentials file path for a given CA identifier.
 /// e.g., `("le")` → `/etc/dwaar/acme/le_account.json`
@@ -67,11 +73,21 @@ pub async fn save_credentials(path: &Path, json: &str) -> Result<(), AcmeError> 
     Ok(())
 }
 
-/// Load credentials JSON from disk.
+/// Load credentials JSON from disk, bounded to [`MAX_ACCOUNT_FILE_BYTES`].
 pub async fn load_credentials(path: &Path) -> Result<String, AcmeError> {
-    let json = fs::read_to_string(path)
+    let file = fs::File::open(path).await.map_err(AcmeError::AccountIo)?;
+    let mut json = String::new();
+    let n = file
+        .take(MAX_ACCOUNT_FILE_BYTES + 1)
+        .read_to_string(&mut json)
         .await
         .map_err(AcmeError::AccountIo)?;
+    if n as u64 > MAX_ACCOUNT_FILE_BYTES {
+        return Err(AcmeError::AccountIo(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "ACME account file exceeds size limit",
+        )));
+    }
     debug!(path = %path.display(), "ACME account credentials loaded");
     Ok(json)
 }
