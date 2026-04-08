@@ -63,11 +63,10 @@ pub struct VitalsSnapshot {
 
 /// Current schema version of the AnalyticsSnapshot wire format.
 ///
-/// BUG-019: consumers (Permanu agent and any external scraper) reject any
-/// snapshot whose `schema_version` doesn't match the version they were
-/// compiled against. Bumping this on a breaking field rename forces
-/// upstream code to re-test against the new shape rather than silently
-/// dropping data via `serde(deny_unknown_fields=false)` defaults.
+/// Consumers reject any snapshot whose `schema_version` doesn't match
+/// the version they were compiled against. Bumping this on a breaking
+/// field rename forces upstream code to re-test against the new shape
+/// rather than silently dropping data via serde defaults.
 pub const ANALYTICS_SCHEMA_VERSION: u32 = 1;
 
 /// Serializable read-only view of per-domain analytics.
@@ -76,7 +75,7 @@ pub const ANALYTICS_SCHEMA_VERSION: u32 = 1;
 /// the live aggregates. Safe to call on every Admin API GET.
 #[derive(Debug, Serialize)]
 pub struct AnalyticsSnapshot {
-    /// BUG-019: schema version for downstream readers.
+    /// Schema version for downstream readers.
     pub schema_version: u32,
     pub domain: String,
     /// May include stale counts if no traffic has arrived recently — the 60s flush cycle clears stale buckets.
@@ -89,19 +88,18 @@ pub struct AnalyticsSnapshot {
     pub status_codes: StatusCodeBreakdown,
     pub bytes_sent: u64,
     pub web_vitals: VitalsSnapshot,
-    /// BUG-020: bot vs human pageview split. Cumulative since the last
-    /// 60s aggregation flush. Both fields together sum to the page-view
-    /// counters above (`page_views_60m` modulo timing race).
+    /// Bot vs human pageview split. Cumulative since the last 60s
+    /// aggregation flush. Both fields together approximately sum to
+    /// the page-view counters above modulo timing race.
     pub bot_views: u64,
     pub human_views: u64,
-    /// BUG-028: explicit aggregation window so consumers can detect
-    /// heartbeat gaps. `window_end` is what the previous `timestamp`
-    /// field meant; `window_start` is `window_end - 60s` (the fixed
-    /// 60-second flush cycle today).
+    /// Explicit aggregation window so consumers can detect heartbeat
+    /// gaps. `window_end` is the cutoff for this snapshot; `window_start`
+    /// is `window_end - 60s` for the fixed 60-second flush cycle today.
     pub window_start: String,
     pub window_end: String,
-    /// Deprecated: use `window_end`. Kept for backwards compat with v0
-    /// readers that haven't migrated yet.
+    /// Deprecated alias of `window_end`. Kept for one release cycle
+    /// so pre-window_end readers continue to receive a sane timestamp.
     pub timestamp: String,
 }
 
@@ -150,7 +148,7 @@ impl AnalyticsSnapshot {
 
         let now = chrono::Utc::now();
         let window_end = now.to_rfc3339();
-        // BUG-028: 60-second flush cycle is the only supported window today.
+        // 60-second flush cycle is the only supported window today.
         // When variable windows ship, replace this with the real boundary.
         let window_start = (now - chrono::Duration::seconds(60)).to_rfc3339();
 
