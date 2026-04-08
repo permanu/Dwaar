@@ -35,6 +35,7 @@ fn sample_event(i: u32) -> AggEvent {
         } else {
             None
         },
+        is_bot: i.is_multiple_of(7),
     }
 }
 

@@ -61,12 +61,23 @@ pub struct VitalsSnapshot {
     pub inp: Percentiles,
 }
 
+/// Current schema version of the AnalyticsSnapshot wire format.
+///
+/// BUG-019: consumers (Permanu agent and any external scraper) reject any
+/// snapshot whose `schema_version` doesn't match the version they were
+/// compiled against. Bumping this on a breaking field rename forces
+/// upstream code to re-test against the new shape rather than silently
+/// dropping data via `serde(deny_unknown_fields=false)` defaults.
+pub const ANALYTICS_SCHEMA_VERSION: u32 = 1;
+
 /// Serializable read-only view of per-domain analytics.
 ///
 /// Constructed from an immutable `&DomainMetrics` — never mutates
 /// the live aggregates. Safe to call on every Admin API GET.
 #[derive(Debug, Serialize)]
 pub struct AnalyticsSnapshot {
+    /// BUG-019: schema version for downstream readers.
+    pub schema_version: u32,
     pub domain: String,
     /// May include stale counts if no traffic has arrived recently — the 60s flush cycle clears stale buckets.
     pub page_views_1m: u64,
@@ -78,6 +89,19 @@ pub struct AnalyticsSnapshot {
     pub status_codes: StatusCodeBreakdown,
     pub bytes_sent: u64,
     pub web_vitals: VitalsSnapshot,
+    /// BUG-020: bot vs human pageview split. Cumulative since the last
+    /// 60s aggregation flush. Both fields together sum to the page-view
+    /// counters above (`page_views_60m` modulo timing race).
+    pub bot_views: u64,
+    pub human_views: u64,
+    /// BUG-028: explicit aggregation window so consumers can detect
+    /// heartbeat gaps. `window_end` is what the previous `timestamp`
+    /// field meant; `window_start` is `window_end - 60s` (the fixed
+    /// 60-second flush cycle today).
+    pub window_start: String,
+    pub window_end: String,
+    /// Deprecated: use `window_end`. Kept for backwards compat with v0
+    /// readers that haven't migrated yet.
     pub timestamp: String,
 }
 
@@ -124,7 +148,14 @@ impl AnalyticsSnapshot {
             inp: m.web_vitals.peek_inp_percentiles(),
         };
 
+        let now = chrono::Utc::now();
+        let window_end = now.to_rfc3339();
+        // BUG-028: 60-second flush cycle is the only supported window today.
+        // When variable windows ship, replace this with the real boundary.
+        let window_start = (now - chrono::Duration::seconds(60)).to_rfc3339();
+
         Self {
+            schema_version: ANALYTICS_SCHEMA_VERSION,
             domain: domain.to_owned(),
             page_views_1m: m.page_views.count_last_n_now(1),
             page_views_60m: m.page_views.count_last_n_now(60),
@@ -135,7 +166,11 @@ impl AnalyticsSnapshot {
             status_codes,
             bytes_sent: m.bytes_sent,
             web_vitals,
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            bot_views: m.bot_views,
+            human_views: m.human_views,
+            window_start,
+            window_end: window_end.clone(),
+            timestamp: window_end, // deprecated alias
         }
     }
 }
@@ -155,6 +190,7 @@ mod tests {
             client_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             country: Some("US".into()),
             referer: Some("https://google.com/search".into()),
+            is_bot: false,
         }
     }
 
