@@ -1769,9 +1769,8 @@ impl ProxyHttp for DwaarProxy {
                 client_ip,
                 country: country.clone(),
                 referer: referer.clone(),
-                // BUG-020: bot-detect plugin (priority 10) classifies the
-                // request on PluginCtx; the aggregator now splits bot vs
-                // human counters in DomainMetrics.
+                // bot-detect plugin classifies the request on PluginCtx;
+                // the aggregator splits bot vs human counters in DomainMetrics.
                 is_bot: ctx.plugin_ctx.is_bot,
             };
             agg.send(event);

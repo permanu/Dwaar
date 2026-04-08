@@ -187,32 +187,33 @@ impl<RT: RouteValidator> AggregationService<RT> {
 
 /// Current schema version of the per-domain flush snapshot.
 ///
-/// BUG-019: bumped on every breaking field rename so downstream readers
-/// (Permanu agent, third-party scrapers) reject mismatched messages
-/// instead of silently dropping data via serde unknown-field defaults.
+/// Bumped on every breaking field rename so downstream readers reject
+/// mismatched messages instead of silently dropping data via serde
+/// unknown-field defaults.
 const FLUSH_SCHEMA_VERSION: u32 = 1;
 
 /// JSON snapshot emitted per domain during flush.
 #[derive(Debug, Serialize)]
 struct FlushSnapshot {
     r#type: &'static str,
-    /// BUG-019: schema version. Permanu agent compares this against its
-    /// own constant and `slog.Error`s if they don't match.
+    /// Schema version. Consumers compare against their own constant
+    /// and reject mismatches loudly so a future field rename never
+    /// silently corrupts downstream data.
     schema_version: u32,
     domain: String,
-    /// Deprecated: use `window_end`. Kept for backwards compat with v0
-    /// readers that haven't migrated yet.
+    /// Deprecated: use `window_end`. Kept for one release cycle so
+    /// pre-window_end readers continue to receive a sane timestamp.
     timestamp: String,
-    /// BUG-028: explicit aggregation window so consumers can detect
-    /// heartbeat gaps. `window_end` mirrors `timestamp`; `window_start`
-    /// is `window_end - 60s` for the fixed flush cycle today.
+    /// Explicit aggregation window so consumers can detect heartbeat
+    /// gaps. `window_end` mirrors `timestamp`; `window_start` is
+    /// `window_end - 60s` for the fixed 60s flush cycle today.
     window_start: String,
     window_end: String,
     page_views_1m: u64,
     page_views_60m: u64,
     unique_visitors: u64,
-    /// BUG-020: bot vs human pageview split. Cumulative since the last
-    /// flush. `bot_views + human_views` ≈ `page_views_60m` modulo timing.
+    /// Bot vs human pageview split. Cumulative since the last flush.
+    /// `bot_views + human_views` ≈ `page_views_60m` modulo timing.
     bot_views: u64,
     human_views: u64,
     top_pages: Vec<PageCount>,

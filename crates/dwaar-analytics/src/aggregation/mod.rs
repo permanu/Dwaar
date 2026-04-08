@@ -43,10 +43,9 @@ pub struct AggEvent {
     pub client_ip: IpAddr,
     pub country: Option<CompactString>,
     pub referer: Option<CompactString>,
-    /// BUG-020: bot classification from the bot-detect plugin (priority 10)
-    /// flows through the aggregation pipeline so the snapshot can surface
-    /// bot-vs-human pageview ratios. Default `false` for callers that
-    /// haven't migrated — treated as a human request.
+    /// Bot classification from the bot-detect plugin (priority 10),
+    /// propagated so the aggregation snapshot can surface bot-vs-human
+    /// pageview ratios. Default `false` is treated as a human request.
     pub is_bot: bool,
 }
 const TOP_PAGES_K: usize = 100;
@@ -67,10 +66,10 @@ pub struct DomainMetrics {
     pub status_codes: [u64; 6],
     pub bytes_sent: u64,
     pub web_vitals: WebVitals,
-    /// BUG-020: cumulative bot vs human pageview counters. The page_views
-    /// MinuteBuckets counter is the union of both — these counters answer
-    /// "what fraction of traffic is bot?" without needing a separate
-    /// time-windowed structure.
+    /// Cumulative bot vs human pageview counters. The page_views
+    /// MinuteBuckets counter is the union of both — these counters
+    /// answer "what fraction of traffic is bot?" without needing a
+    /// separate time-windowed structure.
     pub bot_views: u64,
     pub human_views: u64,
 }
@@ -98,7 +97,7 @@ impl DomainMetrics {
         self.top_pages.insert(event.path.to_string());
         self.status_codes[status_bucket(event.status)] += 1;
         self.bytes_sent += event.bytes_sent;
-        // BUG-020: split bot vs human counters.
+        // Split bot vs human counters from the bot-detect classification.
         if event.is_bot {
             self.bot_views += 1;
         } else {
