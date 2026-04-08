@@ -43,6 +43,11 @@ pub struct AggEvent {
     pub client_ip: IpAddr,
     pub country: Option<CompactString>,
     pub referer: Option<CompactString>,
+    /// BUG-020: bot classification from the bot-detect plugin (priority 10)
+    /// flows through the aggregation pipeline so the snapshot can surface
+    /// bot-vs-human pageview ratios. Default `false` for callers that
+    /// haven't migrated — treated as a human request.
+    pub is_bot: bool,
 }
 const TOP_PAGES_K: usize = 100;
 const TOP_REFERRERS_N: usize = 50;
@@ -62,6 +67,12 @@ pub struct DomainMetrics {
     pub status_codes: [u64; 6],
     pub bytes_sent: u64,
     pub web_vitals: WebVitals,
+    /// BUG-020: cumulative bot vs human pageview counters. The page_views
+    /// MinuteBuckets counter is the union of both — these counters answer
+    /// "what fraction of traffic is bot?" without needing a separate
+    /// time-windowed structure.
+    pub bot_views: u64,
+    pub human_views: u64,
 }
 
 impl DomainMetrics {
@@ -75,6 +86,8 @@ impl DomainMetrics {
             status_codes: [0; 6],
             bytes_sent: 0,
             web_vitals: WebVitals::new(),
+            bot_views: 0,
+            human_views: 0,
         }
     }
 
@@ -85,6 +98,12 @@ impl DomainMetrics {
         self.top_pages.insert(event.path.to_string());
         self.status_codes[status_bucket(event.status)] += 1;
         self.bytes_sent += event.bytes_sent;
+        // BUG-020: split bot vs human counters.
+        if event.is_bot {
+            self.bot_views += 1;
+        } else {
+            self.human_views += 1;
+        }
 
         if let Some(domain) = event.referer.as_deref().and_then(extract_domain) {
             self.referrers.insert(domain);
@@ -226,6 +245,7 @@ mod tests {
             client_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             country: None,
             referer: None,
+            is_bot: false,
         };
         // Should not panic — drops silently when full
         for _ in 0..10_000 {
@@ -284,6 +304,7 @@ mod tests {
             client_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             country: Some("US".into()),
             referer: Some("https://google.com/search".into()),
+            is_bot: false,
         };
         dm.ingest_log(&event);
 

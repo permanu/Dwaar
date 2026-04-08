@@ -239,6 +239,7 @@ mod tests {
             client_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
             country: None,
             referer: None,
+            is_bot: false,
         });
         map.insert("test.example.com".to_string(), dm);
         map

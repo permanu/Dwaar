@@ -185,15 +185,36 @@ impl<RT: RouteValidator> AggregationService<RT> {
 
 // ── Flush Serialization ──────────────────────────────────────────
 
+/// Current schema version of the per-domain flush snapshot.
+///
+/// BUG-019: bumped on every breaking field rename so downstream readers
+/// (Permanu agent, third-party scrapers) reject mismatched messages
+/// instead of silently dropping data via serde unknown-field defaults.
+const FLUSH_SCHEMA_VERSION: u32 = 1;
+
 /// JSON snapshot emitted per domain during flush.
 #[derive(Debug, Serialize)]
 struct FlushSnapshot {
     r#type: &'static str,
+    /// BUG-019: schema version. Permanu agent compares this against its
+    /// own constant and `slog.Error`s if they don't match.
+    schema_version: u32,
     domain: String,
+    /// Deprecated: use `window_end`. Kept for backwards compat with v0
+    /// readers that haven't migrated yet.
     timestamp: String,
+    /// BUG-028: explicit aggregation window so consumers can detect
+    /// heartbeat gaps. `window_end` mirrors `timestamp`; `window_start`
+    /// is `window_end - 60s` for the fixed flush cycle today.
+    window_start: String,
+    window_end: String,
     page_views_1m: u64,
     page_views_60m: u64,
     unique_visitors: u64,
+    /// BUG-020: bot vs human pageview split. Cumulative since the last
+    /// flush. `bot_views + human_views` ≈ `page_views_60m` modulo timing.
+    bot_views: u64,
+    human_views: u64,
     top_pages: Vec<PageCount>,
     referrers: Vec<ReferrerCount>,
     countries: Vec<CountryCount>,
@@ -244,13 +265,21 @@ struct VitalsSnapshot {
 
 impl FlushSnapshot {
     fn from_metrics(domain: &str, m: &mut DomainMetrics) -> Self {
+        let now = chrono::Utc::now();
+        let window_end = now.to_rfc3339();
+        let window_start = (now - chrono::Duration::seconds(60)).to_rfc3339();
         Self {
             r#type: "analytics",
+            schema_version: FLUSH_SCHEMA_VERSION,
             domain: domain.to_string(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: window_end.clone(),
+            window_start,
+            window_end,
             page_views_1m: m.page_views.count_last_n_now(1),
             page_views_60m: m.page_views.count_last_n_now(60),
             unique_visitors: m.unique_visitors.len() as u64,
+            bot_views: m.bot_views,
+            human_views: m.human_views,
             top_pages: m
                 .top_pages
                 .top()
@@ -313,6 +342,7 @@ mod tests {
             client_ip: std::net::IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             country: Some("US".into()),
             referer: Some("https://google.com/search".into()),
+            is_bot: false,
         }
     }
 
