@@ -791,7 +791,8 @@ fn register_background_services(
     .with_reload_notify(Arc::clone(config_notify))
     .with_sni_domain_map(sni_domain_map)
     .with_health_pools(health_pools)
-    .with_acme_domains(acme_domains);
+    .with_acme_domains(acme_domains)
+    .with_cert_store(Arc::clone(&cert_store));
     let config_watcher = if let Some(cb) = cache_backend {
         config_watcher.with_cache_backend(cb)
     } else {

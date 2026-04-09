@@ -25,6 +25,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use dwaar_core::upstream::UpstreamPool;
+use dwaar_tls::cert_store::CertStore;
 
 use crate::MAX_CONFIG_SIZE;
 use crate::compile::{collect_pools, compile_acme_domains, compile_routes, compile_tls_configs};
@@ -59,6 +60,9 @@ pub struct ConfigWatcher {
     /// Shared cache backend (ISSUE-111). On reload, if the max cache size
     /// changed, a new backend is leaked and swapped in.
     cache_backend: Option<dwaar_core::cache::SharedCacheBackend>,
+    /// Shared cert store. On reload, domains removed from the SNI domain map
+    /// are invalidated in the LRU cache so stale certs are never served.
+    cert_store: Option<Arc<CertStore>>,
 }
 
 impl std::fmt::Debug for ConfigWatcher {
@@ -90,6 +94,7 @@ impl ConfigWatcher {
             health_pools: None,
             acme_domains: None,
             cache_backend: None,
+            cert_store: None,
         }
     }
 
@@ -140,6 +145,14 @@ impl ConfigWatcher {
     #[must_use]
     pub fn with_cache_backend(mut self, backend: dwaar_core::cache::SharedCacheBackend) -> Self {
         self.cache_backend = Some(backend);
+        self
+    }
+
+    /// Attach the shared cert store so hot-reload can invalidate LRU entries
+    /// for domains whose TLS config was removed (ISSUE-119).
+    #[must_use]
+    pub fn with_cert_store(mut self, store: Arc<CertStore>) -> Self {
+        self.cert_store = Some(store);
         self
     }
 
@@ -257,7 +270,11 @@ impl ConfigWatcher {
             return;
         }
 
-        refresh_sni_map(self.sni_domain_map.as_ref(), &config);
+        refresh_sni_map(
+            self.sni_domain_map.as_ref(),
+            self.cert_store.as_ref(),
+            &config,
+        );
 
         // Refresh health-check pools from the newly compiled route table.
         if let Some(ref hp) = self.health_pools {
@@ -500,8 +517,18 @@ fn refresh_cache_backend(
 ///
 /// Called on every successful reload so that `SniResolver` picks up new or
 /// changed `tls /cert /key` entries. Does nothing when TLS is disabled.
-fn refresh_sni_map(sni_map: Option<&DomainConfigMap>, config: &crate::model::DwaarConfig) {
+fn refresh_sni_map(
+    sni_map: Option<&DomainConfigMap>,
+    cert_store: Option<&Arc<CertStore>>,
+    config: &crate::model::DwaarConfig,
+) {
     let Some(map) = sni_map else { return };
+
+    // Snapshot the old domain set before we swap in the new map, so we can
+    // diff them afterward and invalidate removed entries from the cert cache.
+    let old_domains: std::collections::HashSet<String> =
+        map.load().keys().cloned().collect();
+
     let new_tls = compile_tls_configs(config);
     let domain_map: std::collections::HashMap<String, dwaar_tls::sni::DomainTlsConfig> = new_tls
         .into_iter()
@@ -515,6 +542,21 @@ fn refresh_sni_map(sni_map: Option<&DomainConfigMap>, config: &crate::model::Dwa
             )
         })
         .collect();
+
+    // Invalidate cert-store LRU entries for domains that were in the old
+    // config but are absent from the new one. Without this, the cert store
+    // returns cached certs for removed domains via the directory-layout
+    // fallback in `SniResolver::resolve_cert`, effectively ignoring the
+    // removal until natural LRU eviction (ISSUE-119).
+    if let Some(store) = cert_store {
+        for old_domain in &old_domains {
+            if !domain_map.contains_key(old_domain) {
+                store.invalidate(old_domain);
+                debug!(domain = %old_domain, "invalidated cert cache for removed TLS domain");
+            }
+        }
+    }
+
     map.store(Arc::new(domain_map));
     debug!("SNI domain-config map refreshed");
 }
