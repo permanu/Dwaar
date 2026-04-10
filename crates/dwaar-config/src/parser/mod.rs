@@ -201,6 +201,9 @@ fn parse_global_option_line(
         "servers" => {
             parse_servers_block(t, opts, &key_tok)?;
         }
+        "auto_update" => {
+            opts.auto_update = Some(parse_auto_update_block(t, &key_tok)?);
+        }
         // Unknown option — collect args, consume sub-blocks
         _ => {
             let args = collect_global_passthrough_args(t);
@@ -301,16 +304,19 @@ fn is_global_option_key(w: &str) -> bool {
             | "filesystem"
             | "drain_timeout"
             | "timeouts"
+            | "auto_update"
     )
 }
 
-/// Parse a duration string like "30s", "1m", "60" into seconds.
-/// Supports bare numbers (seconds), `Ns` (seconds), and `Nm` (minutes).
+/// Parse a duration string like "30s", "1m", "6h", "60" into seconds.
+/// Supports bare numbers (seconds), `Ns` (seconds), `Nm` (minutes), `Nh` (hours).
 fn parse_duration_secs(s: &str) -> Option<u64> {
     if let Some(rest) = s.strip_suffix('s') {
         rest.parse().ok()
     } else if let Some(rest) = s.strip_suffix('m') {
         rest.parse::<u64>().ok().map(|m| m * 60)
+    } else if let Some(rest) = s.strip_suffix('h') {
+        rest.parse::<u64>().ok().map(|h| h * 3600)
     } else {
         s.parse().ok()
     }
@@ -327,6 +333,147 @@ fn parse_timeout_duration(val: &str, directive: &str, tok: &Token) -> Result<u32
         },
     })?;
     Ok(u32::try_from(secs).unwrap_or(u32::MAX))
+}
+
+/// Parse the `auto_update { ... }` global block.
+fn parse_auto_update_block(
+    t: &mut Tokenizer<'_>,
+    key_tok: &Token,
+) -> Result<super::model::AutoUpdateConfig, ParseError> {
+    use super::model::{AutoUpdateAction, AutoUpdateConfig};
+
+    let brace = t.peek();
+    if !matches!(brace.kind, TokenKind::OpenBrace) {
+        return Err(ParseError {
+            line: key_tok.line,
+            col: key_tok.col,
+            kind: ParseErrorKind::Expected {
+                expected: "'{' to open auto_update block".to_string(),
+                got: format!("{}", brace.kind),
+            },
+        });
+    }
+    t.next_token(); // consume `{`
+
+    let mut cfg = AutoUpdateConfig::default();
+
+    loop {
+        let tok = t.peek();
+        match &tok.kind {
+            TokenKind::CloseBrace => {
+                t.next_token();
+                break;
+            }
+            TokenKind::Eof => {
+                return Err(ParseError {
+                    line: key_tok.line,
+                    col: key_tok.col,
+                    kind: ParseErrorKind::Expected {
+                        expected: "'}' to close auto_update block".to_string(),
+                        got: "end of file".to_string(),
+                    },
+                });
+            }
+            TokenKind::Word(_) => {
+                let sub_tok = t.next_token();
+                let sub_key = match &sub_tok.kind {
+                    TokenKind::Word(w) => w.clone(),
+                    _ => unreachable!(),
+                };
+                let val = peek_consume_word_or_quoted(t);
+
+                match sub_key.as_str() {
+                    "channel" => {
+                        if val != "stable" && val != "beta" {
+                            return Err(ParseError {
+                                line: sub_tok.line,
+                                col: sub_tok.col,
+                                kind: ParseErrorKind::InvalidValue {
+                                    directive: "auto_update.channel".to_string(),
+                                    message: format!(
+                                        "unknown channel '{val}', expected 'stable' or 'beta'"
+                                    ),
+                                },
+                            });
+                        }
+                        cfg.channel = val;
+                    }
+                    "check_interval" => {
+                        let secs = parse_duration_secs(&val).ok_or(ParseError {
+                            line: sub_tok.line,
+                            col: sub_tok.col,
+                            kind: ParseErrorKind::InvalidValue {
+                                directive: "auto_update.check_interval".to_string(),
+                                message: format!(
+                                    "'{val}' is not a valid duration (e.g. '6h', '30m', '3600')"
+                                ),
+                            },
+                        })?;
+                        cfg.check_interval_secs = secs;
+                    }
+                    "window" => {
+                        // Format: "HH:MM-HH:MM" (UTC)
+                        cfg.window = Some(parse_time_window(&val).ok_or(ParseError {
+                            line: sub_tok.line,
+                            col: sub_tok.col,
+                            kind: ParseErrorKind::InvalidValue {
+                                directive: "auto_update.window".to_string(),
+                                message: format!(
+                                    "'{val}' is not a valid time window (expected HH:MM-HH:MM)"
+                                ),
+                            },
+                        })?);
+                    }
+                    "on_new_version" => match val.as_str() {
+                        "reload" => cfg.on_new_version = AutoUpdateAction::Reload,
+                        "notify" => cfg.on_new_version = AutoUpdateAction::Notify,
+                        _ => {
+                            return Err(ParseError {
+                                line: sub_tok.line,
+                                col: sub_tok.col,
+                                kind: ParseErrorKind::InvalidValue {
+                                    directive: "auto_update.on_new_version".to_string(),
+                                    message: format!(
+                                        "unknown action '{val}', expected 'reload' or 'notify'"
+                                    ),
+                                },
+                            });
+                        }
+                    },
+                    other => {
+                        return Err(ParseError {
+                            line: sub_tok.line,
+                            col: sub_tok.col,
+                            kind: ParseErrorKind::UnknownDirective {
+                                name: format!("auto_update.{other}"),
+                                suggestion: None,
+                            },
+                        });
+                    }
+                }
+            }
+            _ => {
+                t.next_token();
+            }
+        }
+    }
+
+    Ok(cfg)
+}
+
+/// Parse "HH:MM-HH:MM" into (start_minutes_from_midnight, end_minutes_from_midnight).
+fn parse_time_window(s: &str) -> Option<(u16, u16)> {
+    let (start, end) = s.split_once('-')?;
+    let parse_hm = |hm: &str| -> Option<u16> {
+        let (h, m) = hm.split_once(':')?;
+        let h: u16 = h.parse().ok()?;
+        let m: u16 = m.parse().ok()?;
+        if h > 23 || m > 59 {
+            return None;
+        }
+        Some(h * 60 + m)
+    };
+    Some((parse_hm(start)?, parse_hm(end)?))
 }
 
 /// Parse the `timeouts { header 10s; body 30s; keepalive 60s; max_requests 1000 }` block.

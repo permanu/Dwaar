@@ -16,6 +16,7 @@
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod admin_client;
+mod auto_update;
 mod cli;
 mod self_update;
 
@@ -707,6 +708,7 @@ fn run_server(
         drain_timeout,
         sni_domain_map,
         cache_backend_for_watcher,
+        dwaar_config,
     );
 
     info!("entering run loop, waiting for connections or signals");
@@ -734,6 +736,7 @@ fn register_background_services(
     drain_timeout: std::time::Duration,
     sni_domain_map: DomainConfigMap,
     cache_backend: Option<dwaar_core::cache::SharedCacheBackend>,
+    config: &dwaar_config::model::DwaarConfig,
 ) {
     // Upstream health checker — runs as a BackgroundService (Guardrail #20).
     // Always registered; it will sleep if the pool list is empty and wake up
@@ -811,6 +814,18 @@ fn register_background_services(
         pingora_core::services::background::background_service("config watcher", config_watcher);
     server.add_service(config_bg);
     info!(path = %config_path.display(), "config watcher registered");
+
+    // Auto-update background service (opt-in via `auto_update {}` in Dwaarfile).
+    if let Some(au) = config
+        .global_options
+        .as_ref()
+        .and_then(|g| g.auto_update.as_ref())
+    {
+        let svc = auto_update::AutoUpdateService::new(au.clone());
+        let bg = pingora_core::services::background::background_service("auto-update", svc);
+        server.add_service(bg);
+        info!("auto-update service registered (channel: {})", au.channel);
+    }
 
     // Docker container auto-discovery
     if let Some(ref socket_path) = cli.docker_socket {

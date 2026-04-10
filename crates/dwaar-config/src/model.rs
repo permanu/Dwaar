@@ -39,6 +39,10 @@ pub struct GlobalOptions {
     /// When enabled, Dwaar binds a UDP listener and advertises `Alt-Svc: h3`
     /// on HTTP/2 responses so browsers can upgrade (ISSUE-079).
     pub h3_enabled: bool,
+    /// Automatic binary update configuration.
+    /// When set, a background service periodically checks releases.dwaar.dev
+    /// for newer versions and applies them within the configured window.
+    pub auto_update: Option<AutoUpdateConfig>,
     /// Options we recognized but don't act on — stored so we never error
     /// on valid Caddyfile syntax we haven't implemented yet.
     pub passthrough: Vec<(String, Vec<String>)>,
@@ -71,6 +75,56 @@ impl Default for TimeoutsConfig {
             max_requests: 1000,
         }
     }
+}
+
+/// Automatic binary update configuration.
+///
+/// ```text
+/// {
+///     auto_update {
+///         channel stable
+///         check_interval 6h
+///         window 03:00-05:00
+///         on_new_version reload
+///     }
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoUpdateConfig {
+    /// Release channel to follow. Only `stable` is supported.
+    pub channel: String,
+    /// How often to check releases.dwaar.dev for a new version (seconds).
+    /// Jittered internally to avoid thundering herd.
+    pub check_interval_secs: u64,
+    /// UTC maintenance window during which the binary replacement is
+    /// allowed. Format: `HH:MM-HH:MM`. Outside the window, a discovered
+    /// update is deferred until the next window opens.
+    /// `None` means updates can be applied at any time.
+    pub window: Option<(u16, u16)>,
+    /// What to do when a new version is installed.
+    ///   - `reload`  — exec `dwaar upgrade` for zero-downtime swap (default)
+    ///   - `notify`  — download + replace binary but don't restart
+    pub on_new_version: AutoUpdateAction,
+}
+
+impl Default for AutoUpdateConfig {
+    fn default() -> Self {
+        Self {
+            channel: "stable".to_string(),
+            check_interval_secs: 6 * 3600, // 6 hours
+            window: None,
+            on_new_version: AutoUpdateAction::Reload,
+        }
+    }
+}
+
+/// Action to take after a new version is installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoUpdateAction {
+    /// Zero-downtime upgrade via Pingora FD transfer.
+    Reload,
+    /// Replace binary on disk but don't restart — operator handles it.
+    Notify,
 }
 
 /// A fully parsed Dwaarfile — an optional global options block followed
