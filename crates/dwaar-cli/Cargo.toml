@@ -1,6 +1,6 @@
 [package]
 name = "dwaar-cli"
-version = "0.1.0"
+version = "0.1.1"
 description = "Dwaar CLI — binary entry point, commands, process management"
 edition.workspace = true
 publish = false
@@ -46,6 +46,7 @@ rand = { workspace = true }
 serde_json = { workspace = true }
 openssl = { workspace = true }
 libc = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

@@ -17,6 +17,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod admin_client;
 mod cli;
+mod self_update;
 
 use std::fs::Permissions;
 use std::os::unix::fs::PermissionsExt;
@@ -236,6 +237,9 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Upgrade { binary, pid_file }) => {
             return cmd_upgrade(binary.as_deref(), pid_file);
+        }
+        Some(Commands::SelfUpdate { force }) => {
+            return self_update::run(*force).map_err(Into::into);
         }
         None => {}
     }

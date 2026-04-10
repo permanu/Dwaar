@@ -167,6 +167,16 @@ pub(crate) enum Commands {
         #[arg(long, default_value = "/tmp/dwaar.pid")]
         pid_file: PathBuf,
     },
+    /// Check for a newer version and update the Dwaar binary in-place.
+    /// Downloads from releases.dwaar.dev, verifies the SHA-256 checksum,
+    /// and atomically replaces the current binary. Restart the server
+    /// afterward (`dwaar upgrade` or `systemctl restart dwaar`).
+    #[command(name = "self-update")]
+    SelfUpdate {
+        /// Force update even if already on the latest version
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 impl Cli {
