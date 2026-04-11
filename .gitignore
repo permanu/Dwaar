@@ -3,6 +3,10 @@
 debug/
 *.pdb
 
+# Release binaries — never commit built binaries
+/dist/
+*.trace/
+
 # IDE
 .idea/
 .vscode/
@@ -23,6 +27,16 @@ Thumbs.db
 # Built docs
 /target/docs/
 /docs/book/
+
+# Wrangler / Cloudflare local state
+.wrangler/
+
+# Instruments / profiling traces
+*.trace
+*.trace/
+
+# Benchmark profiles (large JSON)
+bench/profiles/
 
 # Claude/AI
 .claude/
