@@ -122,6 +122,7 @@ pub(super) fn expect_word_or_quoted(
             kind: ParseErrorKind::InvalidValue {
                 directive: directive.to_string(),
                 message: format!("expected {what}"),
+                accepted_format: None,
             },
         }),
     }
@@ -272,6 +273,7 @@ pub(super) fn consume_arg(
             kind: ParseErrorKind::InvalidValue {
                 directive: directive.to_string(),
                 message: format!("expected {what}"),
+                accepted_format: None,
             },
         }),
     }

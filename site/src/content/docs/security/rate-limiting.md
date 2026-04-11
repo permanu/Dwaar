@@ -53,12 +53,26 @@ Keys up to 24 bytes are stored inline in a `CompactString` with no heap allocati
 ## Configuration
 
 ```
-rate_limit <requests_per_second>
+rate_limit <N>/<duration>
 ```
 
-| Token | Type | Required | Description |
-|-------|------|----------|-------------|
-| `requests_per_second` | positive integer | yes | Maximum requests per second per IP for this route. The `/s` suffix is required. |
+The rate is expressed as **N events per duration**. The duration accepts seconds (`s`), minutes (`m`), or hours (`h`). Examples:
+
+| Expression | Meaning |
+|---|---|
+| `100/s` | 100 requests per second per IP |
+| `5000/10m` | 5 000 requests per 10 minutes per IP |
+| `10000/h` | 10 000 requests per hour per IP |
+
+If the expression cannot be parsed, Dwaar refuses the config at load time with an `expected:` hint pointing at the canonical format — as of 0.2.2, `ParseErrorKind::InvalidValue` carries an `accepted_format: &'static str` field so the parser error line directly tells you what to write:
+
+```
+error: invalid value for directive 'rate_limit' at line 6 col 5
+  got:      "100 per second"
+  expected: N/duration, e.g., 100/s or 5000/10m
+```
+
+The same `expected:` hint applies to `request_body` (body-size) and `timeouts` directives — `100mb`, `5s`, `1h30m`, etc. — so parser errors on any size- or duration-valued directive point at the canonical format instead of just saying "invalid".
 
 Place `rate_limit` inside any site block. It applies to all paths on that site. To apply different limits to different paths, use `handle` blocks:
 

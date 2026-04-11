@@ -19,7 +19,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Hard ceiling on recursive expansion to prevent infinite loops.
 const MAX_DEPTH: usize = 10;
@@ -39,6 +39,8 @@ pub enum ImportError {
     InvalidSnippet { line: usize, message: String },
     /// An IO error while reading an imported file.
     IoError(String),
+    /// A glob pattern was malformed or could not be compiled.
+    InvalidGlob(String),
 }
 
 impl fmt::Display for ImportError {
@@ -57,6 +59,7 @@ impl fmt::Display for ImportError {
                 write!(f, "invalid snippet at line {line}: {message}")
             }
             Self::IoError(msg) => write!(f, "import IO error: {msg}"),
+            Self::InvalidGlob(msg) => write!(f, "invalid glob pattern: {msg}"),
         }
     }
 }
@@ -131,6 +134,30 @@ fn expand_recursive(
                 }
 
                 visited.remove(&key);
+            } else if is_glob_pattern(name) {
+                // Glob import: enumerate matches relative to base_dir, sort
+                // them for deterministic order, and expand each file with
+                // the same args. Empty match set expands to nothing.
+                let matches = expand_glob_import(name, base_dir)?;
+                for (canon_path, content) in matches {
+                    // Visited key is the canonical path — one file can't be
+                    // double-imported in a single chain, including via glob.
+                    let key = format!("file:{}", canon_path.display());
+                    if !visited.insert(key.clone()) {
+                        return Err(ImportError::CircularImport(
+                            canon_path.display().to_string(),
+                        ));
+                    }
+
+                    let body = substitute_args(&content, &args);
+                    let expanded = expand_recursive(&body, base_dir, snippets, depth + 1, visited)?;
+                    output.push_str(&expanded);
+                    if !expanded.ends_with('\n') {
+                        output.push('\n');
+                    }
+
+                    visited.remove(&key);
+                }
             } else if looks_like_file_path(name) {
                 let key = format!("file:{name}");
                 if !visited.insert(key.clone()) {
@@ -327,21 +354,24 @@ fn resolve_placeholder(placeholder: &str, args: &[&str]) -> Option<String> {
     args.get(idx).map(|s| (*s).to_string())
 }
 
-/// Heuristic: does this name look like a file path?
+/// Heuristic: does this name look like a file path (or glob)?
 fn looks_like_file_path(name: &str) -> bool {
-    name.contains('/') || name.contains('.')
+    name.contains('/') || name.contains('.') || is_glob_pattern(name)
 }
 
-/// Read a file for import, enforcing path-traversal security.
-fn read_import_file(name: &str, base_dir: &Path) -> Result<String, ImportError> {
-    // Reject `..` before any filesystem access (belt-and-suspenders with canonicalize)
-    if name.contains("..") {
-        return Err(ImportError::PathTraversal(name.to_string()));
-    }
+/// Detect a glob-style wildcard in a filename argument.
+///
+/// A pattern with `*`, `?`, or `[` should be enumerated via `glob::glob`
+/// rather than treated as a literal path.
+fn is_glob_pattern(name: &str) -> bool {
+    name.contains('*') || name.contains('?') || name.contains('[')
+}
 
-    let target = base_dir.join(name);
-
-    // Canonicalize both paths to resolve symlinks and check containment
+/// Resolve the canonical path of an import target and enforce that it
+/// stays inside `base_dir`. Returns `PathTraversal` on containment failure,
+/// `FileNotFound` if the path can't be canonicalized, and `IoError` only
+/// when the base directory itself can't be resolved.
+fn resolve_contained(name: &str, target: &Path, base_dir: &Path) -> Result<PathBuf, ImportError> {
     let canon_base = base_dir
         .canonicalize()
         .map_err(|e| ImportError::IoError(format!("cannot resolve base dir: {e}")))?;
@@ -354,7 +384,83 @@ fn read_import_file(name: &str, base_dir: &Path) -> Result<String, ImportError> 
         return Err(ImportError::PathTraversal(name.to_string()));
     }
 
+    Ok(canon_target)
+}
+
+/// Read a file for import, enforcing path-traversal security.
+fn read_import_file(name: &str, base_dir: &Path) -> Result<String, ImportError> {
+    // Reject `..` before any filesystem access (belt-and-suspenders with canonicalize)
+    if name.contains("..") {
+        return Err(ImportError::PathTraversal(name.to_string()));
+    }
+
+    let target = base_dir.join(name);
+    let canon_target = resolve_contained(name, &target, base_dir)?;
+
     fs::read_to_string(&canon_target).map_err(|_| ImportError::FileNotFound(name.to_string()))
+}
+
+/// Enumerate files matching a glob pattern, enforcing containment.
+///
+/// The pattern is resolved relative to `base_dir`. Results are sorted
+/// lexicographically by byte representation for deterministic load
+/// order. Every matched path is canonicalized and verified to stay
+/// inside `base_dir` — symlinks escaping the tree cause the whole
+/// import to fail with `PathTraversal`, not silent skip.
+///
+/// An empty match set is not an error: this supports the "drop a file
+/// in an empty directory" workflow for deploy agents. A `tracing::debug!`
+/// is emitted so operators can spot typos.
+fn expand_glob_import(
+    pattern: &str,
+    base_dir: &Path,
+) -> Result<Vec<(PathBuf, String)>, ImportError> {
+    // Reject `..` in the pattern before touching the filesystem (Guardrail #17).
+    // This matches `read_import_file`'s hardening — path-traversal must be
+    // blocked before we ever hit disk.
+    if pattern.contains("..") {
+        return Err(ImportError::PathTraversal(pattern.to_string()));
+    }
+
+    let full_pattern = base_dir.join(pattern);
+    let pattern_str = full_pattern.to_string_lossy();
+
+    let paths = glob::glob(&pattern_str)
+        .map_err(|e| ImportError::InvalidGlob(format!("{pattern}: {e}")))?;
+
+    // Collect successful matches; ignore per-entry glob errors (permission
+    // errors on unrelated siblings must not poison the whole import).
+    let mut matches: Vec<PathBuf> = paths.filter_map(Result::ok).collect();
+
+    if matches.is_empty() {
+        tracing::debug!(pattern = %pattern, "glob import matched zero files");
+        return Ok(Vec::new());
+    }
+
+    // Lexicographic sort by byte representation — deterministic across runs
+    // and platforms (modulo filesystem case-sensitivity).
+    matches.sort();
+
+    let mut results = Vec::with_capacity(matches.len());
+    for path in matches {
+        // Skip non-files (dirs can match broad patterns like `apps/*`).
+        let is_file = path.metadata().map(|m| m.is_file()).unwrap_or(false);
+        if !is_file {
+            continue;
+        }
+
+        // Canonicalize + containment check for every match — a symlink
+        // inside the matched tree pointing outside base_dir must abort
+        // the whole import, not silently skip.
+        let canon = resolve_contained(pattern, &path, base_dir)?;
+
+        let content = fs::read_to_string(&canon)
+            .map_err(|e| ImportError::IoError(format!("{}: {e}", canon.display())))?;
+
+        results.push((canon, content));
+    }
+
+    Ok(results)
 }
 
 #[cfg(test)]
@@ -572,5 +678,130 @@ example.com {
         let input = "example.com {\n    import sub/../../../etc/passwd\n}\n";
         let err = expand_imports(input, dir.path()).expect_err("should fail");
         assert!(matches!(err, ImportError::PathTraversal(_)));
+    }
+
+    // ── Glob imports ─────────────────────────────────────
+
+    #[test]
+    fn glob_import_empty_dir_succeeds() {
+        let dir = TempDir::new().expect("tempdir");
+        fs::create_dir(dir.path().join("apps")).expect("mkdir apps");
+
+        let input = "example.com {\n    import apps/*.dwaar\n}\n";
+        let result = expand_imports(input, dir.path()).expect("empty glob ok");
+        // Host/closing-brace lines survive, but no file content is injected.
+        assert!(result.contains("example.com"));
+        assert!(!result.contains("import apps/*.dwaar"));
+    }
+
+    #[test]
+    fn glob_import_no_match_not_error() {
+        let dir = TempDir::new().expect("tempdir");
+        fs::create_dir(dir.path().join("apps")).expect("mkdir apps");
+
+        let input = "example.com {\n    import apps/nothing-*.dwaar\n}\n";
+        let result = expand_imports(input, dir.path()).expect("no match ok");
+        assert!(!result.contains("import apps/nothing-"));
+    }
+
+    #[test]
+    fn glob_import_single_file() {
+        let dir = TempDir::new().expect("tempdir");
+        let apps = dir.path().join("apps");
+        fs::create_dir(&apps).expect("mkdir apps");
+        fs::write(apps.join("one.dwaar"), "reverse_proxy localhost:8080\n")
+            .expect("write one.dwaar");
+
+        let input = "example.com {\n    import apps/*.dwaar\n}\n";
+        let result = expand_imports(input, dir.path()).expect("glob expand");
+        assert!(result.contains("reverse_proxy localhost:8080"));
+    }
+
+    #[test]
+    fn glob_import_multiple_sorted() {
+        let dir = TempDir::new().expect("tempdir");
+        let apps = dir.path().join("apps");
+        fs::create_dir(&apps).expect("mkdir apps");
+        // Write in reverse order to ensure sort is actually applied.
+        fs::write(apps.join("b.dwaar"), "marker_bravo\n").expect("write b");
+        fs::write(apps.join("a.dwaar"), "marker_alpha\n").expect("write a");
+
+        let input = "example.com {\n    import apps/*.dwaar\n}\n";
+        let result = expand_imports(input, dir.path()).expect("glob expand");
+        assert!(result.contains("marker_alpha"));
+        assert!(result.contains("marker_bravo"));
+
+        let alpha_idx = result.find("marker_alpha").expect("alpha present");
+        let bravo_idx = result.find("marker_bravo").expect("bravo present");
+        assert!(
+            alpha_idx < bravo_idx,
+            "a.dwaar should be expanded before b.dwaar (lexicographic sort), \
+             got alpha={alpha_idx} bravo={bravo_idx}"
+        );
+    }
+
+    #[test]
+    fn glob_import_path_traversal_rejected() {
+        let dir = TempDir::new().expect("tempdir");
+        let input = "example.com {\n    import ../*.dwaar\n}\n";
+        let err = expand_imports(input, dir.path()).expect_err("should fail");
+        assert!(matches!(err, ImportError::PathTraversal(_)));
+    }
+
+    #[test]
+    fn glob_import_invalid_pattern() {
+        let dir = TempDir::new().expect("tempdir");
+        // Unclosed character class `[` is a malformed glob pattern.
+        let input = "example.com {\n    import apps/[unclosed\n}\n";
+        let err = expand_imports(input, dir.path()).expect_err("should fail");
+        assert!(
+            matches!(err, ImportError::InvalidGlob(_)),
+            "expected InvalidGlob, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn glob_import_with_args() {
+        let dir = TempDir::new().expect("tempdir");
+        let apps = dir.path().join("apps");
+        fs::create_dir(&apps).expect("mkdir apps");
+        fs::write(apps.join("backend.dwaar"), "reverse_proxy {args[0]}\n").expect("write backend");
+
+        let input = "example.com {\n    import apps/*.dwaar localhost:9000\n}\n";
+        let result = expand_imports(input, dir.path()).expect("glob expand");
+        assert!(
+            result.contains("reverse_proxy localhost:9000"),
+            "args must propagate to each matched file; got:\n{result}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn glob_import_symlink_escaping_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().expect("tempdir");
+        let apps = dir.path().join("apps");
+        fs::create_dir(&apps).expect("mkdir apps");
+
+        // Create a real file outside base_dir and symlink into apps/
+        // to exercise the canonicalize + starts_with containment check.
+        let outside = TempDir::new().expect("outside tempdir");
+        let outside_file = outside.path().join("secret.dwaar");
+        fs::write(&outside_file, "escaped_content\n").expect("write outside file");
+
+        let link = apps.join("escape.dwaar");
+        // On some CI sandboxes symlink creation is restricted — skip gracefully
+        // without any stdout/stderr noise (project disallows print_stderr).
+        if symlink(&outside_file, &link).is_err() {
+            return;
+        }
+
+        let input = "example.com {\n    import apps/*.dwaar\n}\n";
+        let err = expand_imports(input, dir.path()).expect_err("symlink escape must fail");
+        assert!(
+            matches!(err, ImportError::PathTraversal(_)),
+            "expected PathTraversal, got {err:?}"
+        );
     }
 }

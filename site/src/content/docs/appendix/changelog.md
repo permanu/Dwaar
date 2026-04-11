@@ -42,8 +42,8 @@ The table below summarizes what each phase of Dwaar's development delivered. The
 | 25 | HTTP/3 Full Flow | h3 request parsing, proxy bridge, connection lifecycle, 0-RTT, flow control |
 | 26 | Observability Pipeline | W3C `traceparent` propagation, process metrics, rate/cache Prometheus counters, log socket and file rotation, `AnalyticsSink` trait, upstream error body capture |
 | 27 | H3 Memory & Performance | Connection-owned `BufferedConn` (zero per-request alloc), H2 upstream multiplexing (`transport h2`), zero-copy body streaming, `TCP_NODELAY`, jemalloc heap profiling feature, chunked/decompressor buffer caps |
-
 | 27 | Hot Reload + H3 Completion | Streaming H3 → upstream bridge, upstream connection pool, hot reload for health-check pools, ACME domain coverage, and cache sizing |
+| 28 | v0.2.2 patch release | Dwaarfile glob imports, `forward_auth` parse-time plaintext rejection, supervisor readiness probe, WASM cache reload invalidation, leader-election 409 re-read, access-log `rejected_by`/`blocked_by`, upstream health transition logs, `var_defaults` clone elision, `parking_lot` migration, ACME challenge method guard, `/admin/reload` full parse error body, `accepted_format` hint on parser errors, `Justfile` + `check-dev-env.sh` + Quick Start |
 
 ---
 

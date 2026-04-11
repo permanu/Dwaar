@@ -6,6 +6,7 @@
 
 //! Admin API service implementing Pingora's `ServeHttp`.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -44,6 +45,11 @@ pub struct AdminService {
     /// Notifier to trigger config reload. When signaled, the `ConfigWatcher`
     /// re-reads the Dwaarfile and updates the route table.
     reload_notify: Option<Arc<Notify>>,
+    /// Path to the Dwaarfile — if set, `POST /reload` validates the file
+    /// synchronously and returns the full parse error (400 / 422) on failure
+    /// before signaling the watcher. When `None`, the handler still signals
+    /// the watcher but cannot surface parse errors to the caller.
+    config_path: Option<PathBuf>,
     /// Prometheus metrics registry. When set, `GET /metrics` serves the
     /// Prometheus text exposition format.
     prometheus: Option<Arc<PrometheusMetrics>>,
@@ -62,6 +68,7 @@ impl std::fmt::Debug for AdminService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AdminService")
             .field("reload_notify", &self.reload_notify.is_some())
+            .field("config_path", &self.config_path)
             .field("prometheus", &self.prometheus.is_some())
             .field("cache_backend", &self.cache_backend.is_some())
             .finish_non_exhaustive()
@@ -84,6 +91,7 @@ impl AdminService {
             start_time,
             auth: Auth::new(admin_token),
             reload_notify: None,
+            config_path: None,
             prometheus: None,
             cache_backend: None,
             request_count: AtomicU64::new(0),
@@ -96,6 +104,18 @@ impl AdminService {
     #[must_use]
     pub fn with_reload_notify(mut self, notify: Arc<Notify>) -> Self {
         self.reload_notify = Some(notify);
+        self
+    }
+
+    /// Attach the Dwaarfile path so `POST /reload` can validate the file
+    /// synchronously and return the full parse error on failure.
+    ///
+    /// When set, the admin API parses the file in-process before notifying
+    /// the config watcher. On parse failure the handler returns the error
+    /// body verbatim so callers see the full `ParseError::Display` output.
+    #[must_use]
+    pub fn with_config_path(mut self, path: PathBuf) -> Self {
+        self.config_path = Some(path);
         self
     }
 
@@ -320,6 +340,38 @@ impl AdminService {
                             )
                             .expect("valid response");
                     }
+
+                    // If a config path is attached, parse the file in-process
+                    // first. This lets us return the full parser error body
+                    // to the caller instead of a generic "reload triggered"
+                    // message. Only signal the watcher if parsing succeeds.
+                    if let Some(path) = &self.config_path {
+                        match std::fs::read_to_string(path) {
+                            Ok(src) => match handlers::validate_config_source(&src) {
+                                handlers::ConfigValidation::Ok => {}
+                                handlers::ConfigValidation::Err { status, body } => {
+                                    warn!(
+                                        path = %path.display(),
+                                        status,
+                                        "reload rejected — parse error"
+                                    );
+                                    return plain_text_response(status, &body);
+                                }
+                            },
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    path = %path.display(),
+                                    "reload rejected — cannot read config file"
+                                );
+                                return plain_text_response(
+                                    400,
+                                    &format!("cannot read config file '{}': {e}", path.display()),
+                                );
+                            }
+                        }
+                    }
+
                     self.last_reload.store(now, Ordering::Relaxed);
                     notify.notify_waiters();
                     tracing::info!(
@@ -423,6 +475,18 @@ fn prometheus_response(body: &str) -> Response<Vec<u8>> {
     Response::builder()
         .status(200)
         .header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+        .body(body.as_bytes().to_vec())
+        .expect("valid response")
+}
+
+/// Build a `text/plain; charset=utf-8` HTTP response. Used by `POST /reload`
+/// to return the full `ParseError::Display` output to the caller so it can
+/// be shown verbatim in a terminal without any JSON escaping.
+fn plain_text_response(status: u16, body: &str) -> Response<Vec<u8>> {
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .header("Content-Length", body.len())
         .body(body.as_bytes().to_vec())
         .expect("valid response")
 }

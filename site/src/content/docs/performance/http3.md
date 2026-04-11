@@ -137,6 +137,46 @@ Close-delimited upstream response bodies (responses with no `Content-Length` and
 
 ---
 
+## Streaming Bridge (ISSUE-108)
+
+The HTTP/3 → upstream bridge is fully streaming in both directions and multiplexes all concurrent H3 streams to a given upstream over a small, shared pool of H2 upstream connections. No request or response body is ever held in memory in its entirety — chunks flow as they arrive.
+
+### Chunk-by-chunk forwarding, zero-copy
+
+Inbound H3 request bodies are drained one `Bytes` chunk at a time via `h3::server::RequestStream::recv_data()` and forwarded immediately to the upstream `h2::SendStream` (or, for H1 upstreams, the TCP writer). Upstream response bodies are drained the same way in reverse.
+
+Per-chunk forwarding uses `Buf::copy_to_bytes(n)`, which on the h3-quinn path monomorphizes to `Bytes::split_to` — a refcount bump, not a memcpy. The previous implementation used `BytesMut::with_capacity + BufMut::put + freeze`, which copied each chunk once. Peak per-chunk allocation on the bridge path is now zero.
+
+### Three independent body deadlines
+
+A single outer request timeout is not enough: a byte-trickling peer can hold a stream indefinitely inside a generous outer budget, and a wedged upstream can silently park progress behind an `h2` window that never opens. The bridge therefore enforces **three orthogonal deadlines** on every body transfer, any of which can abort the stream:
+
+| Deadline | Constant | Purpose |
+|---|---|---|
+| Per-chunk read | `CHUNK_READ_TIMEOUT = 30s` | Bounds the wait between *consecutive* `recv_data` calls. Slow-loris resistance: a peer trickling one byte per 29s cannot keep a stream alive, because the clock resets only when a chunk actually arrives. |
+| Wall-clock body | `BODY_WALL_CLOCK = 5 min` | Aggregate cap on the entire body transfer. Bounds tail latency even when the peer is nominally active. A body that takes longer than five minutes to stream in full is aborted. |
+| H2 capacity wait | `H2_CAPACITY_WAIT = 30s` | Bounds the wait inside `await_h2_capacity`, which polls `h2::SendStream::poll_capacity` until the upstream opens window for the next chunk. Catches wedged upstreams whose read loop has stalled. |
+
+The three deadlines are enforced by a `BodyDeadline` helper that computes `next_chunk_timeout() = min(CHUNK_READ_TIMEOUT, remaining wall-clock)` on each iteration, so the per-chunk budget shrinks monotonically as the wall-clock burns down. The wall-clock deadline wins over the per-chunk deadline in the final minute of a long body.
+
+### Why `await_h2_capacity` — not just `reserve_capacity`
+
+A subtle bug in earlier H3 bridge code called `h2::SendStream::reserve_capacity(n)` and then `send_data(...)` immediately. That **does not** wait: `reserve_capacity` only *requests* window from the peer, and `send_data` happily queues the bytes in `h2`'s per-stream send buffer even when no capacity has actually been granted. Under a slow upstream this produced silent unbounded in-memory queuing inside `h2`'s internals — invisible to the proxy, visible only as RSS growth.
+
+The fix: a new `await_h2_capacity(stream, len)` helper that polls `poll_capacity` until `len` bytes of window are actually granted, bounded by `H2_CAPACITY_WAIT`. Every chunk forwarded to an H2 upstream goes through it.
+
+### Connection multiplexing — one pool, many streams
+
+A single QUIC connection can carry up to `h3_max_streams` concurrent HTTP/3 request streams (default 100). All streams to the same upstream now share a **bounded** pool of H2 upstream connections, capped at `MAX_CONNS_PER_HOST = 2`. This cap is enforced regardless of how many H3 streams arrive simultaneously — cold-start bursts are serialized through a per-host async mutex inside `H2ConnPool::get_or_connect`, so the previous check-then-act race that could open N sockets for N concurrent streams is gone.
+
+**Concurrency invariant (integration-tested):** 100 concurrent H3 streams to one upstream → **≤ 2** upstream TCP connections. Verified by counting TCP `accept()` calls in `quic_h2_pool_concurrency::hundred_streams_share_two_upstream_connections`. Staggered-wave reuse is verified by `staggered_waves_reuse_pooled_connections`.
+
+### Operator notes
+
+The pool race fix is **transparent** — no configuration change is required or exposed. Existing deployments inherit both the correctness and the allocation wins on upgrade. To confirm the pool is actually reusing connections in production, watch the upstream-connection-open counter in your metrics pipeline (any Prometheus counter tagged `upstream_connections_opened` or the equivalent in your observability stack): under bursty load it should stay essentially flat for each upstream rather than climbing with request concurrency.
+
+---
+
 ## Current Limitations
 
 | Limitation | Impact |

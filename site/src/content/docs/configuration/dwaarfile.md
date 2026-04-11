@@ -71,6 +71,7 @@ The table below lists every directive Dwaar recognises. Follow the link in the *
 | `@name` | Declare a named matcher for reuse across directives | [Named Matchers](../configuration/named-matchers.md) |
 | `metrics` | Expose a Prometheus `/metrics` endpoint | [Prometheus](../observability/prometheus.md) |
 | `skip_log` | Suppress access log entries for matched requests | [Logging](../observability/logging.md) |
+| `import` | Include a snippet, file, or glob pattern at the point of the directive | [Imports & Snippets](#imports--snippets) |
 
 Directives marked **inline** are simple enough to be fully described inline in examples below rather than warranting a dedicated page.
 
@@ -128,6 +129,151 @@ The following are active for every domain with no configuration required:
 | Access logging | On (JSON to stdout) | `log` directive or `skip_log` |
 | X-Request-Id | On (UUID v7) | Not yet configurable |
 | Proxy headers | On (X-Real-IP, X-Forwarded-For) | Not yet configurable |
+
+## Imports & Snippets
+
+The `import` directive runs as a text preprocessor before the parser sees the Dwaarfile. It has three forms:
+
+```
+import <snippet-name>           # named snippet defined elsewhere in the file
+import <path>                   # single file relative to the Dwaarfile's directory
+import <glob-pattern>           # every file matching a glob (`*`, `?`, `[...]`)
+```
+
+All three forms support positional arguments (`{args[0]}`, `{args[1]}`, `{args[:]}`) for parameterized reuse. Recursion is bounded at 10 levels of nesting. Circular imports are detected by canonical path and rejected at parse time.
+
+### File imports
+
+Single-file imports are resolved relative to the directory containing the Dwaarfile:
+
+```
+# Dwaarfile
+import common/headers.conf
+
+example.com {
+    reverse_proxy localhost:8080
+}
+```
+
+```
+# common/headers.conf
+header -Server
+header X-Frame-Options DENY
+```
+
+The parser reads `common/headers.conf` at the point of the directive and splices the contents into the source before tokenization. Errors in the imported file surface with the real file name in their location.
+
+### Glob imports
+
+Glob imports enumerate every file matching a shell-style pattern. Matches are sorted lexicographically for deterministic load order across reloads, regardless of filesystem iteration order:
+
+```
+# Dwaarfile — one line does everything
+import apps/*.dwaar
+```
+
+```
+# apps/api.dwaar
+api.example.com {
+    reverse_proxy localhost:3001
+    rate_limit 200/s
+}
+```
+
+```
+# apps/www.dwaar
+www.example.com {
+    reverse_proxy localhost:3002
+}
+```
+
+On startup, Dwaar expands `apps/*.dwaar` to `apps/api.dwaar` then `apps/www.dwaar`, then runs the parser on the combined text. Adding `apps/admin.dwaar` and issuing `dwaar reload` picks up the new site — no edit to the top-level Dwaarfile is required.
+
+Glob patterns support the standard wildcards:
+
+| Token | Meaning |
+|---|---|
+| `*` | Match any number of characters (excluding `/`) |
+| `?` | Match exactly one character |
+| `[abc]` | Match any character in the set |
+
+### Deploy-agent workflow
+
+The glob form is the primary mechanism for zero-mutation deploy-agent workflows. An external agent (Permanu, a CI job, a shell script) writes one `.dwaar` file per application into a managed directory and then calls `dwaar reload`. The top-level Dwaarfile is owned by the operator and never touched by automation:
+
+```
+# Operator-owned top-level Dwaarfile
+{
+    email ops@example.com
+}
+
+# Shared snippets
+import common/defaults.conf
+
+# Per-app configs dropped in by the deploy agent
+import apps/*.dwaar
+```
+
+The agent's responsibilities shrink to file writes in `apps/` plus one HTTP call to the admin API. Rollback is `rm apps/<app>.dwaar && dwaar reload`. Concurrent agents can write independent files without coordination.
+
+### Empty matches
+
+A glob pattern that matches zero files is **not an error**. The `import` directive expands to nothing and the rest of the Dwaarfile proceeds normally. This lets you ship a Dwaarfile with `import apps/*.dwaar` before any agent has written a file — the proxy starts clean and picks up apps as they land:
+
+```
+# Dropped into an empty tree — still loads.
+import apps/*.dwaar
+```
+
+A `tracing::debug!` event is emitted when a pattern matches zero files so operators can spot typos without failing startup.
+
+### Security & error handling
+
+Every resolved match is canonicalized and verified to stay inside the Dwaarfile's base directory. A symlink pointing outside the tree causes the **entire import to fail** with `PathTraversal` — no silent skip. The string `..` in a pattern is rejected before any filesystem access.
+
+| Condition | Result |
+|---|---|
+| Pattern matches one or more files, all inside base dir | Files are imported in lexicographic order. |
+| Pattern matches zero files | Empty expansion. Not an error. |
+| Pattern contains `..` | `PathTraversal` error. |
+| A matched symlink resolves outside the base directory | `PathTraversal` error — the whole import aborts. |
+| Pattern is malformed (e.g. unclosed `[`) | `InvalidGlob` error with the pattern text and parser message. |
+| A single matched file cannot be read | `IoError` with the canonical path. |
+| An imported file imports a file already in the current chain | `CircularImport` error. |
+| Recursion exceeds 10 levels | `DepthLimitExceeded` error. |
+
+Non-file matches (directories that happen to satisfy a broad pattern like `apps/*`) are skipped automatically.
+
+### Snippets
+
+Named snippets defined at the top level of a Dwaarfile can be imported the same way. Snippet definitions use the `(name) { ... }` form and are extracted before the parser runs:
+
+```
+(common) {
+    encode gzip
+    header -Server
+}
+
+example.com {
+    import common
+    reverse_proxy localhost:8080
+}
+```
+
+Snippets accept positional arguments via `{args[0]}`, `{args[1]}`, or `{args[:]}` for all arguments joined by space:
+
+```
+(backend) {
+    reverse_proxy {args[0]}
+    header X-Backend {args[1]}
+}
+
+example.com {
+    import backend localhost:9000 api
+}
+```
+
+---
 
 ## Complete Example
 

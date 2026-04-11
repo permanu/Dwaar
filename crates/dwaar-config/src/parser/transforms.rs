@@ -55,6 +55,7 @@ pub(super) fn parse_tls(t: &mut Tokenizer<'_>) -> Result<TlsDirective, ParseErro
                             kind: ParseErrorKind::InvalidValue {
                                 directive: "tls".to_string(),
                                 message: "expected key file path after cert path".to_string(),
+                                accepted_format: None,
                             },
                         });
                     };
@@ -80,6 +81,7 @@ pub(super) fn parse_tls(t: &mut Tokenizer<'_>) -> Result<TlsDirective, ParseErro
                     kind: ParseErrorKind::InvalidValue {
                         directive: "tls".to_string(),
                         message: "expected key file path after cert path".to_string(),
+                        accepted_format: None,
                     },
                 });
             };
@@ -148,6 +150,7 @@ fn parse_tls_block(t: &mut Tokenizer<'_>) -> Result<TlsDirective, ParseError> {
                 directive: "tls".to_string(),
                 message: "tls block must contain a subdirective (e.g. 'dns cloudflare <token>')"
                     .to_string(),
+                accepted_format: None,
             },
         }
     })
@@ -166,6 +169,7 @@ fn read_tls_word(t: &mut Tokenizer<'_>, what: &str) -> Result<(String, Token), P
             kind: ParseErrorKind::InvalidValue {
                 directive: "tls".to_string(),
                 message: format!("expected {what}"),
+                accepted_format: None,
             },
         }),
     }
@@ -191,6 +195,7 @@ fn read_tls_token_value(t: &mut Tokenizer<'_>, _context_tok: &Token) -> Result<S
                     kind: ParseErrorKind::InvalidValue {
                         directive: "tls".to_string(),
                         message: "expected env.VAR_NAME inside braces".to_string(),
+                        accepted_format: None,
                     },
                 });
             };
@@ -201,6 +206,7 @@ fn read_tls_token_value(t: &mut Tokenizer<'_>, _context_tok: &Token) -> Result<S
                 kind: ParseErrorKind::InvalidValue {
                     directive: "tls".to_string(),
                     message: format!("expected {{env.VAR_NAME}} syntax, got {{{var_name}}}"),
+                    accepted_format: None,
                 },
             })?;
 
@@ -224,6 +230,7 @@ fn read_tls_token_value(t: &mut Tokenizer<'_>, _context_tok: &Token) -> Result<S
                 kind: ParseErrorKind::InvalidValue {
                     directive: "tls".to_string(),
                     message: format!("environment variable '{env_key}' is not set"),
+                    accepted_format: None,
                 },
             })
         }
@@ -249,6 +256,7 @@ fn read_tls_token_value(t: &mut Tokenizer<'_>, _context_tok: &Token) -> Result<S
             kind: ParseErrorKind::InvalidValue {
                 directive: "tls".to_string(),
                 message: "expected API token value or {env.VAR_NAME}".to_string(),
+                accepted_format: None,
             },
         }),
     }
@@ -267,6 +275,7 @@ pub(super) fn parse_header(t: &mut Tokenizer<'_>) -> Result<HeaderDirective, Par
                 kind: ParseErrorKind::InvalidValue {
                     directive: "header".to_string(),
                     message: "expected header name".to_string(),
+                    accepted_format: None,
                 },
             });
         }
@@ -291,6 +300,7 @@ pub(super) fn parse_header(t: &mut Tokenizer<'_>) -> Result<HeaderDirective, Par
                 kind: ParseErrorKind::InvalidValue {
                     directive: "header".to_string(),
                     message: "expected header value".to_string(),
+                    accepted_format: None,
                 },
             });
         }
@@ -314,6 +324,7 @@ pub(super) fn parse_request_header(
                 kind: ParseErrorKind::InvalidValue {
                     directive: "request_header".to_string(),
                     message: "expected header name".to_string(),
+                    accepted_format: None,
                 },
             });
         }
@@ -344,6 +355,7 @@ pub(super) fn parse_request_header(
                 kind: ParseErrorKind::InvalidValue {
                     directive: "request_header".to_string(),
                     message: "expected header value".to_string(),
+                    accepted_format: None,
                 },
             });
         }
@@ -381,6 +393,7 @@ pub(super) fn parse_encode(t: &mut Tokenizer<'_>) -> Result<EncodeDirective, Par
             kind: ParseErrorKind::InvalidValue {
                 directive: "encode".to_string(),
                 message: "expected at least one encoding (gzip, zstd, br)".to_string(),
+                accepted_format: None,
             },
         });
     }
@@ -462,6 +475,7 @@ pub(super) fn parse_basicauth(t: &mut Tokenizer<'_>) -> Result<BasicAuthDirectiv
             kind: ParseErrorKind::InvalidValue {
                 directive: "basicauth".to_string(),
                 message: "at least one username/hash pair required".to_string(),
+                accepted_format: None,
             },
         });
     }
@@ -480,6 +494,7 @@ pub(super) fn parse_rate_limit(t: &mut Tokenizer<'_>) -> Result<RateLimitDirecti
             kind: ParseErrorKind::InvalidValue {
                 directive: "rate_limit".to_string(),
                 message: "expected value like '100/s'".to_string(),
+                accepted_format: Some("N/duration, e.g., 100/s or 5000/10m"),
             },
         });
     };
@@ -496,6 +511,7 @@ pub(super) fn parse_rate_limit(t: &mut Tokenizer<'_>) -> Result<RateLimitDirecti
                 message: format!(
                     "expected '<number>/s' (e.g., '100/s'), got '{value}' — only per-second rates are supported"
                 ),
+                accepted_format: Some("N/duration, e.g., 100/s or 5000/10m"),
             },
         });
     };
@@ -506,6 +522,7 @@ pub(super) fn parse_rate_limit(t: &mut Tokenizer<'_>) -> Result<RateLimitDirecti
         kind: ParseErrorKind::InvalidValue {
             directive: "rate_limit".to_string(),
             message: format!("'{rps_str}' is not a valid number"),
+            accepted_format: Some("N/duration, e.g., 100/s or 5000/10m"),
         },
     })?;
 
@@ -516,6 +533,7 @@ pub(super) fn parse_rate_limit(t: &mut Tokenizer<'_>) -> Result<RateLimitDirecti
             kind: ParseErrorKind::InvalidValue {
                 directive: "rate_limit".to_string(),
                 message: "rate limit must be greater than zero".to_string(),
+                accepted_format: Some("N/duration, e.g., 100/s or 5000/10m"),
             },
         });
     }
@@ -537,6 +555,7 @@ pub(super) fn parse_ip_filter(
             kind: ParseErrorKind::InvalidValue {
                 directive: "ip_filter".to_string(),
                 message: "expected '{' block".to_string(),
+                accepted_format: None,
             },
         });
     }
@@ -627,6 +646,7 @@ pub(super) fn parse_method(
             kind: ParseErrorKind::InvalidValue {
                 directive: "method".to_string(),
                 message: "expected HTTP method name (e.g. GET, POST)".to_string(),
+                accepted_format: None,
             },
         }),
     }
@@ -644,6 +664,7 @@ pub(super) fn parse_request_body(
             kind: ParseErrorKind::InvalidValue {
                 directive: "request_body".to_string(),
                 message: "expected '{' block".to_string(),
+                accepted_format: None,
             },
         });
     }
@@ -681,6 +702,7 @@ pub(super) fn parse_request_body(
                                 kind: ParseErrorKind::InvalidValue {
                                     directive: "request_body".to_string(),
                                     message: "expected size value (e.g. 10MB, 512KB)".to_string(),
+                                    accepted_format: Some("SIZE with unit, e.g., 10MB or 1GB"),
                                 },
                             });
                         };
@@ -692,6 +714,7 @@ pub(super) fn parse_request_body(
                                 message: format!(
                                     "invalid size '{size_str}' — expected a number with optional unit (KB, MB, GB)"
                                 ),
+                                accepted_format: Some("SIZE with unit, e.g., 10MB or 1GB"),
                             },
                         })?;
                         max_size = Some(parsed);
@@ -731,6 +754,7 @@ pub(super) fn parse_response_body_limit(
             kind: ParseErrorKind::InvalidValue {
                 directive: "response_body_limit".to_string(),
                 message: "expected size value (e.g. 100MB, 1GB)".to_string(),
+                accepted_format: Some("SIZE with unit, e.g., 10MB or 1GB"),
             },
         });
     };
@@ -742,6 +766,7 @@ pub(super) fn parse_response_body_limit(
             message: format!(
                 "invalid size '{size_str}' — expected a number with optional unit (KB, MB, GB)"
             ),
+            accepted_format: Some("SIZE with unit, e.g., 10MB or 1GB"),
         },
     })?;
     Ok(ResponseBodyLimitDirective { max_size })
@@ -777,6 +802,7 @@ pub(super) fn parse_bind(
             kind: ParseErrorKind::InvalidValue {
                 directive: "bind".to_string(),
                 message: "expected at least one bind address".to_string(),
+                accepted_format: None,
             },
         });
     }
@@ -800,6 +826,7 @@ pub(super) fn parse_vars(
                 kind: ParseErrorKind::InvalidValue {
                     directive: "vars".to_string(),
                     message: "expected variable name".to_string(),
+                    accepted_format: None,
                 },
             });
         }
@@ -816,6 +843,7 @@ pub(super) fn parse_vars(
                 kind: ParseErrorKind::InvalidValue {
                     directive: "vars".to_string(),
                     message: "expected variable value".to_string(),
+                    accepted_format: None,
                 },
             });
         }
@@ -843,6 +871,7 @@ fn parse_cache_max_size(t: &mut Tokenizer<'_>) -> Result<u64, ParseError> {
             kind: ParseErrorKind::InvalidValue {
                 directive: "cache".to_string(),
                 message: "expected size value (e.g. 1g, 500MB)".to_string(),
+                accepted_format: None,
             },
         });
     };
@@ -854,6 +883,7 @@ fn parse_cache_max_size(t: &mut Tokenizer<'_>) -> Result<u64, ParseError> {
             message: format!(
                 "invalid size '{size_str}' — expected a number with optional unit (K, M, G, KB, MB, GB)"
             ),
+            accepted_format: None,
         },
     })
 }
@@ -869,6 +899,7 @@ fn parse_cache_seconds(t: &mut Tokenizer<'_>, field: &str) -> Result<u32, ParseE
             kind: ParseErrorKind::InvalidValue {
                 directive: "cache".to_string(),
                 message: format!("expected integer seconds for {field}"),
+                accepted_format: None,
             },
         });
     };
@@ -878,6 +909,7 @@ fn parse_cache_seconds(t: &mut Tokenizer<'_>, field: &str) -> Result<u32, ParseE
         kind: ParseErrorKind::InvalidValue {
             directive: "cache".to_string(),
             message: format!("'{val_str}' is not a valid u32 for {field}"),
+            accepted_format: None,
         },
     })
 }
@@ -913,6 +945,7 @@ pub(super) fn parse_cache(
             kind: ParseErrorKind::InvalidValue {
                 directive: "cache".to_string(),
                 message: "expected '{' block".to_string(),
+                accepted_format: None,
             },
         });
     }
@@ -959,6 +992,7 @@ pub(super) fn parse_cache(
                                 message: format!(
                                     "unknown sub-directive '{other}' — expected max_size, match_path, default_ttl, or stale_while_revalidate"
                                 ),
+                                accepted_format: None,
                             },
                         });
                     }

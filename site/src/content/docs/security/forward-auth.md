@@ -8,6 +8,18 @@ Delegate authentication to an external service before proxying a request to the 
 
 Compatible with Authelia, Authentik, Pomerium, and any service that implements the forward-auth subrequest pattern.
 
+:::caution[Plaintext targets are rejected at parse time]
+Since 0.2.2, a `forward_auth` target that is neither a loopback address nor TLS-wrapped is rejected during config load. The parser refuses the Dwaarfile with:
+
+```
+forward_auth target '<host>:<port>' is plaintext and non-loopback;
+set tls: true, use a loopback target, or explicitly opt in with
+allow_plaintext: true
+```
+
+The opt-in directive is `insecure_plaintext` inside the `forward_auth` block. Use it only when you cannot provision TLS — an on-path attacker can forge a `2xx` response and inject arbitrary `copy_headers` values (such as `Remote-User: admin`) on every request. The recommended configuration is `transport tls` with an in-cluster auth service (Authelia, Authentik, Pomerium) fronted by an internal CA. See [Plaintext enforcement](#plaintext-enforcement) below.
+:::
+
 ---
 
 ## Quick Start
@@ -62,9 +74,10 @@ After a `2xx`, any headers listed in `copy_headers` are extracted from the auth 
 
 ```
 forward_auth <upstream> {
-    uri          <path>
-    copy_headers <Header1> [Header2 ...]
-    transport    tls
+    uri                 <path>
+    copy_headers        <Header1> [Header2 ...]
+    transport           tls
+    insecure_plaintext
 }
 ```
 
@@ -74,6 +87,7 @@ forward_auth <upstream> {
 | `uri` | no | Path to send the subrequest to. Defaults to the original request's URI if omitted. |
 | `copy_headers` | no | Space-separated list of response header names to copy from the auth response into the upstream request. |
 | `transport tls` | no | Connect to the auth service over TLS. Required when the auth service is on a remote host or untrusted network. |
+| `insecure_plaintext` | no | Explicit opt-in to plaintext subrequests against a non-loopback target. Without this, Dwaar rejects the config at parse time. See [Plaintext enforcement](#plaintext-enforcement). |
 
 ### Upstream address formats
 
@@ -89,13 +103,30 @@ forward_auth 127.0.0.1:9000 { ... }
 
 When `transport tls` is set, Dwaar upgrades the connection using `tokio-rustls` with the `webpki-roots` trust store. If the upstream address was a DNS hostname (e.g. `authelia:9091`), the hostname is used as the TLS SNI value so certificate validation works correctly. If the upstream is a literal IP address, SNI is set to the IP.
 
-Without `transport tls`, and when the auth service address is not a loopback address, Dwaar emits a one-time warning on the first request processed:
+### Plaintext enforcement
+
+As of 0.2.2, a non-loopback `forward_auth` target without `transport tls` is rejected at config parse time rather than logged as a runtime warning. The runtime hot-path check has been removed entirely.
+
+| Target | TLS set? | Result |
+|---|---|---|
+| `127.0.0.1:*`, `localhost`, `ip6-localhost`, `ip6-loopback` | no | Accepted. Loopback is considered trusted by the host network namespace. |
+| Any other host/IP | yes (`transport tls`) | Accepted. |
+| Any other host/IP | no | **Parse error.** Must either add `transport tls` or set `insecure_plaintext`. |
+| Any other host/IP | no, with `insecure_plaintext` | Accepted. A parse-time `WARN` is logged once at config load. No per-request warning. |
+
+The opt-out is named `insecure_plaintext` to make the cost explicit in grep/review:
 
 ```
-WARN forward_auth target '<host>:<port>' is plaintext; credentials will transit unencrypted — set tls: true
+forward_auth authelia:9091 {
+    uri          /api/authz/forward-auth
+    copy_headers Remote-User Remote-Groups
+    insecure_plaintext
+}
 ```
 
-The warning fires at most once per process (via a `std::sync::Once` gate). There is no behaviour change — auth subrequests still proceed. An on-path attacker can forge a `2xx` response and inject arbitrary `copy_headers` values. Use `transport tls` whenever the auth service is not on loopback.
+**Why this matters.** The auth subrequest is the authority that tells Dwaar whether to forward `Remote-User`, `Remote-Groups`, and any other headers in `copy_headers` to the upstream. On a plaintext link an on-path attacker can inject a synthetic `2xx` response with `Remote-User: admin` and take over the upstream session. TLS with the `webpki-roots` trust store (or a pinned internal CA) closes that window. Loopback is exempt because the packets never leave the kernel's network namespace.
+
+**Recommended for production.** Run the auth service as a sidecar or in-cluster service fronted by an internal CA and enable `transport tls`. If the auth service is on `127.0.0.1` or a UNIX-side-by-side container, no opt-in is required.
 
 ---
 

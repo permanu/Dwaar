@@ -26,9 +26,10 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use pingora_core::OrErr;
 use pingora_core::services::background::BackgroundService;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::wake::ScaleToZeroConfig;
 
@@ -78,6 +79,14 @@ pub(crate) struct Backend {
     pub(crate) client_cert_key: Option<Arc<pingora_core::utils::tls::CertKey>>,
     /// Custom CA certs for verifying this backend's server cert (ISSUE-077).
     pub(crate) trusted_ca: Option<Arc<pingora_core::protocols::tls::CaType>>,
+    /// Last observed health-probe failure reason (ISSUE-127). Populated by the
+    /// health checker on a failed probe and cleared on a successful one, so the
+    /// WARN log emitted on healthy→unhealthy transition carries an operator-
+    /// actionable reason string.
+    ///
+    /// Guarded by `parking_lot::Mutex` (Guardrail #58) — set/cleared only on the
+    /// health-check path, never on the request hot path.
+    pub(crate) last_error: Mutex<Option<String>>,
 }
 
 impl UpstreamPool {
@@ -102,6 +111,7 @@ impl UpstreamPool {
                 tls_server_name: b.tls_server_name,
                 client_cert_key: b.client_cert_key,
                 trusted_ca: b.trusted_ca,
+                last_error: Mutex::new(None),
             })
             .collect();
 
@@ -281,27 +291,66 @@ impl UpstreamPool {
     }
 
     /// Mark a backend as healthy (called by `HealthChecker` after a successful probe).
+    ///
+    /// On an unhealthy→healthy transition this logs at `INFO` and clears any
+    /// previously stored `last_error` (ISSUE-127). No-op on repeat transitions.
     pub fn mark_healthy(&self, addr: SocketAddr) {
         for b in &self.backends {
             if b.addr == addr {
-                let was_unhealthy = !b.healthy.swap(true, Ordering::Relaxed);
-                if was_unhealthy {
-                    debug!(%addr, "backend marked healthy");
+                // `Release` here pairs with `Acquire` loads in the selection path so
+                // a thread that observes `healthy = true` also observes the
+                // `last_error` clear below.
+                let previous = b.healthy.swap(true, Ordering::Release);
+                if previous {
+                    debug!(%addr, "backend already healthy");
+                } else {
+                    // false → true: transition
+                    *b.last_error.lock() = None;
+                    info!(
+                        upstream = %addr,
+                        "upstream transitioned to healthy",
+                    );
                 }
                 return;
             }
         }
     }
 
-    /// Mark a backend as unhealthy (called by `HealthChecker` after a failed probe,
-    /// or by `upstream_peer()` when a connection is refused).
+    /// Mark a backend as unhealthy (called by `HealthChecker` after a failed
+    /// probe, or by `upstream_peer()` when a connection is refused).
+    ///
+    /// On a healthy→unhealthy transition this logs at `WARN` with the stored
+    /// `last_error` as the reason (ISSUE-127). No-op on repeat transitions.
     pub fn mark_unhealthy(&self, addr: SocketAddr) {
         for b in &self.backends {
             if b.addr == addr {
-                let was_healthy = b.healthy.swap(false, Ordering::Relaxed);
-                if was_healthy {
-                    warn!(%addr, "backend marked unhealthy");
+                let previous = b.healthy.swap(false, Ordering::Release);
+                if previous {
+                    // true → false: transition
+                    let err_str = b.last_error.lock().clone();
+                    warn!(
+                        upstream = %addr,
+                        reason = %err_str.as_deref().unwrap_or("<no details>"),
+                        "upstream transitioned to unhealthy",
+                    );
+                } else {
+                    debug!(%addr, "backend already unhealthy");
                 }
+                return;
+            }
+        }
+    }
+
+    /// Record a failure reason for a backend, so that a subsequent
+    /// `mark_unhealthy` on the same backend has an operator-actionable reason to
+    /// emit in its WARN log (ISSUE-127). Called by the health probe before it
+    /// calls `mark_unhealthy`.
+    ///
+    /// Safe to call repeatedly — the most recent error wins.
+    pub fn record_probe_error(&self, addr: SocketAddr, reason: String) {
+        for b in &self.backends {
+            if b.addr == addr {
+                *b.last_error.lock() = Some(reason);
                 return;
             }
         }
@@ -485,11 +534,15 @@ impl BackgroundService for HealthChecker {
                             pool.mark_healthy(addr);
                         }
                         Ok(status) => {
-                            warn!(%addr, status, "health probe returned non-2xx, marking unhealthy");
+                            // Record the reason *before* mark_unhealthy so the
+                            // transition WARN log carries it (ISSUE-127).
+                            pool.record_probe_error(addr, format!("non-2xx status {status}"));
+                            debug!(%addr, status, "health probe returned non-2xx, marking unhealthy");
                             pool.mark_unhealthy(addr);
                         }
                         Err(e) => {
-                            warn!(%addr, error = %e, "health probe failed, marking unhealthy");
+                            pool.record_probe_error(addr, e.to_string());
+                            debug!(%addr, error = %e, "health probe failed, marking unhealthy");
                             pool.mark_unhealthy(addr);
                         }
                     }
@@ -857,6 +910,66 @@ mod tests {
     }
 
     // ── health mark ───────────────────────────────────────────────────────────
+
+    // ── ISSUE-127: transition logs + last_error ───────────────────────────────
+
+    #[test]
+    fn record_probe_error_surfaces_in_backend_last_error() {
+        let pool = make_pool(&[8080], LbPolicy::RoundRobin);
+        let addr = make_addr(8080);
+
+        // No error stored initially.
+        assert!(pool.backends[0].last_error.lock().is_none());
+
+        pool.record_probe_error(addr, "connect refused".to_string());
+        assert_eq!(
+            pool.backends[0].last_error.lock().as_deref(),
+            Some("connect refused")
+        );
+
+        // Recording a newer error overwrites the previous one.
+        pool.record_probe_error(addr, "timed out".to_string());
+        assert_eq!(
+            pool.backends[0].last_error.lock().as_deref(),
+            Some("timed out")
+        );
+    }
+
+    #[test]
+    fn mark_healthy_clears_last_error_on_transition() {
+        let pool = make_pool(&[8080], LbPolicy::RoundRobin);
+        let addr = make_addr(8080);
+
+        // Seed an error, flip to unhealthy, then recover.
+        pool.record_probe_error(addr, "connect refused".to_string());
+        pool.mark_unhealthy(addr);
+        assert!(!pool.backends[0].healthy.load(Ordering::Acquire));
+        assert!(pool.backends[0].last_error.lock().is_some());
+
+        pool.mark_healthy(addr);
+        assert!(pool.backends[0].healthy.load(Ordering::Acquire));
+        assert!(
+            pool.backends[0].last_error.lock().is_none(),
+            "last_error should be cleared on unhealthy→healthy transition"
+        );
+    }
+
+    #[test]
+    fn repeat_mark_unhealthy_is_idempotent() {
+        let pool = make_pool(&[8080], LbPolicy::RoundRobin);
+        let addr = make_addr(8080);
+
+        pool.record_probe_error(addr, "first".to_string());
+        pool.mark_unhealthy(addr);
+        // Second call must not panic or overwrite state in surprising ways.
+        pool.record_probe_error(addr, "second".to_string());
+        pool.mark_unhealthy(addr);
+        assert!(!pool.backends[0].healthy.load(Ordering::Acquire));
+        assert_eq!(
+            pool.backends[0].last_error.lock().as_deref(),
+            Some("second")
+        );
+    }
 
     #[test]
     fn mark_healthy_unhealthy_toggle() {

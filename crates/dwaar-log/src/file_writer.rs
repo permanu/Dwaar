@@ -371,6 +371,8 @@ mod tests {
             compression: None,
             trace_id: None,
             upstream_error_body: None,
+            rejected_by: None,
+            blocked_by: None,
         }
     }
 

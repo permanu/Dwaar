@@ -159,6 +159,7 @@ fn parse_global_option_line(
                 kind: ParseErrorKind::InvalidValue {
                     directive: "http_port".to_string(),
                     message: format!("'{val}' is not a valid port number"),
+                    accepted_format: None,
                 },
             })?;
             opts.http_port = Some(port);
@@ -171,6 +172,7 @@ fn parse_global_option_line(
                 kind: ParseErrorKind::InvalidValue {
                     directive: "https_port".to_string(),
                     message: format!("'{val}' is not a valid port number"),
+                    accepted_format: None,
                 },
             })?;
             opts.https_port = Some(port);
@@ -192,6 +194,7 @@ fn parse_global_option_line(
                 kind: ParseErrorKind::InvalidValue {
                     directive: "drain_timeout".to_string(),
                     message: format!("'{val}' is not a valid duration (e.g. '30s', '1m', '60')"),
+                    accepted_format: Some("duration, e.g., 30s or 2m"),
                 },
             })?;
             opts.drain_timeout_secs = Some(secs);
@@ -331,6 +334,7 @@ fn parse_timeout_duration(val: &str, directive: &str, tok: &Token) -> Result<u32
         kind: ParseErrorKind::InvalidValue {
             directive: directive.to_string(),
             message: format!("'{val}' is not a valid duration (e.g. '10s', '1m')"),
+            accepted_format: Some("duration, e.g., 30s or 2m"),
         },
     })?;
     Ok(u32::try_from(secs).unwrap_or(u32::MAX))
@@ -395,6 +399,7 @@ fn parse_auto_update_block(
                                     message: format!(
                                         "unknown channel '{val}', expected 'stable' or 'beta'"
                                     ),
+                                    accepted_format: None,
                                 },
                             });
                         }
@@ -409,6 +414,7 @@ fn parse_auto_update_block(
                                 message: format!(
                                     "'{val}' is not a valid duration (e.g. '6h', '30m', '3600')"
                                 ),
+                                accepted_format: Some("duration, e.g., 30s or 2m"),
                             },
                         })?;
                         cfg.check_interval_secs = secs;
@@ -423,6 +429,7 @@ fn parse_auto_update_block(
                                 message: format!(
                                     "'{val}' is not a valid time window (expected HH:MM-HH:MM)"
                                 ),
+                                accepted_format: None,
                             },
                         })?);
                     }
@@ -438,6 +445,7 @@ fn parse_auto_update_block(
                                     message: format!(
                                         "unknown action '{val}', expected 'reload' or 'notify'"
                                     ),
+                                    accepted_format: None,
                                 },
                             });
                         }
@@ -492,6 +500,7 @@ fn parse_timeouts_block(
             kind: ParseErrorKind::InvalidValue {
                 directive: "timeouts".to_string(),
                 message: "expected '{' after 'timeouts'".to_string(),
+                accepted_format: None,
             },
         });
     }
@@ -541,6 +550,7 @@ fn parse_timeouts_block(
                             kind: ParseErrorKind::InvalidValue {
                                 directive: "timeouts.max_requests".to_string(),
                                 message: format!("'{val}' is not a valid integer"),
+                                accepted_format: None,
                             },
                         })?;
                     }
@@ -553,6 +563,7 @@ fn parse_timeouts_block(
                                 message: format!(
                                     "unknown timeout key '{other}' — expected header, body, keepalive, or max_requests"
                                 ),
+                                accepted_format: None,
                             },
                         });
                     }

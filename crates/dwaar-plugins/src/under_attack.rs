@@ -35,6 +35,7 @@ use bytes::Bytes;
 use hmac::{Hmac, Mac};
 use pingora_http::RequestHeader;
 use sha2::Sha256;
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::plugin::{DwaarPlugin, PluginAction, PluginCtx, PluginResponse};
@@ -284,14 +285,13 @@ impl DwaarPlugin for UnderAttackPlugin {
             )
         {
             // Verify the challenge matches what we'd generate for this IP.
-            // Both sides are always 64-character hex-encoded HMAC-SHA256 outputs
-            // (fixed length, same length), so the early-return branch in
-            // constant_time_eq never fires on legitimate inputs, making the XOR
-            // loop effectively branch-free. Using Mac::verify_slice here would be
-            // semantically wrong — it needs a keyed MAC, not a comparison of two
-            // pre-computed values.
+            // Both sides are 64-character hex-encoded HMAC-SHA256 outputs, so
+            // the comparison is constant-time in length by construction;
+            // subtle::ConstantTimeEq keeps the byte-by-byte diff branch-free.
+            // Using Mac::verify_slice here would be semantically wrong — it
+            // needs a keyed MAC, not a comparison of two pre-computed values.
             let expected_challenge = self.generate_challenge(ip);
-            if constant_time_eq(&challenge, &expected_challenge)
+            if bool::from(challenge.as_bytes().ct_eq(expected_challenge.as_bytes()))
                 && Self::verify_pow(&challenge, &nonce)
             {
                 // Sign and set clearance cookie, redirect to clean URL
@@ -354,24 +354,6 @@ fn leading_zero_bits(data: &[u8]) -> u32 {
         }
     }
     zeros
-}
-
-/// Constant-time string comparison to prevent timing side-channels.
-///
-/// The length XOR folds the length difference into `diff` without an early
-/// branch, and the `zip` iterates over `min(a.len(), b.len())` bytes XOR-ing
-/// each pair. Strictly speaking, `zip`'s iteration count still varies with the
-/// shorter length — but every call site passes two 64-character hex-encoded
-/// HMAC-SHA256 outputs, so `a.len() == b.len()` by construction. That same-
-/// length contract makes the loop run in constant time for the only comparison
-/// that matters, while the length fold ensures a mismatch still returns `false`.
-#[allow(clippy::cast_possible_truncation)] // intentional: XOR'd lengths folded into u8
-fn constant_time_eq(a: &str, b: &str) -> bool {
-    let mut diff = (a.len() ^ b.len()) as u8;
-    for (x, y) in a.bytes().zip(b.bytes()) {
-        diff |= x ^ y;
-    }
-    diff == 0
 }
 
 /// Extract a named cookie value from a Cookie header string.
@@ -655,14 +637,6 @@ mod tests {
         assert_eq!(leading_zero_bits(&[0xFF]), 0);
         assert_eq!(leading_zero_bits(&[0x01]), 7);
         assert_eq!(leading_zero_bits(&[]), 0);
-    }
-
-    #[test]
-    fn constant_time_eq_works() {
-        assert!(constant_time_eq("abc", "abc"));
-        assert!(!constant_time_eq("abc", "abd"));
-        assert!(!constant_time_eq("abc", "ab"));
-        assert!(!constant_time_eq("", "a"));
     }
 
     #[test]

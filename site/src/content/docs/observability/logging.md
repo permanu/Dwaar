@@ -80,8 +80,27 @@ Every request produces the following fields. Fields marked **optional** are omit
 | `compression` | string | optional | Compression algorithm applied to the response | `"gzip"` or `"br"` |
 | `trace_id` | string | optional | W3C trace ID for distributed tracing correlation | `"4bf92f3577b34da6a3ce929d0e0e4736"` |
 | `upstream_error_body` | string | optional | First 1 KB of the upstream response body on 5xx errors; absent on successful responses | `"connection refused"` |
+| `rejected_by` | string | optional | Plugin name that denied the request with a non-fatal rejection (e.g. rate limited, auth challenge). Set to a static interned string, never user input. | `"rate_limit"` |
+| `blocked_by` | string | optional | Plugin name that hard-blocked the request (e.g. IP deny list, bot detection). Mutually exclusive with `rejected_by` in normal flows. | `"bot_detection"` |
 
 All timing fields use **microseconds** for sub-millisecond precision. Both `response_time_us` and `upstream_response_time_us` are always present; their difference accounts for Dwaar's processing overhead.
+
+### Denial reason fields
+
+The `rejected_by` and `blocked_by` fields make plugin-driven denials first-class in log analysis — dashboards and alerts no longer have to infer "why was this a 429?" from the status code alone. Both fields are `&'static str` values set by the plugin at deny time, so the log line is an O(1) tag write with no allocation and no risk of user-controlled content landing in the log.
+
+| Field | Semantic | Populated by |
+|---|---|---|
+| `rejected_by` | Soft denial — the request was rate-limited or sent back a challenge, and a legitimate client can retry. | `rate_limit` (0.2.2) |
+| `blocked_by` | Hard denial — the request was denied outright based on identity, reputation, or policy. | Infrastructure wired for `bot_detection` in 0.2.2; no setter yet. |
+
+Both fields are omitted from the JSON object when `None`, so logs for allowed traffic stay compact. A rate-limited request logs as:
+
+```json
+{"timestamp":"2026-04-11T12:00:00Z","method":"GET","path":"/api","status":429,"rejected_by":"rate_limit", ...}
+```
+
+The value space is a fixed set of plugin names. Tailing for `rejected_by=rate_limit` in your log aggregator gives an instant count of per-IP rejections without a secondary metric source.
 
 ---
 

@@ -96,30 +96,19 @@ impl ForwardAuthConfig {
         original_uri: &str,
         client_ip: Option<&str>,
     ) -> Result<AuthResult, String> {
+        // Belt-and-braces runtime guard in case a ForwardAuthConfig is
+        // constructed programmatically bypassing the parse-time check in
+        // dwaar-config. The parser rejects this at config load time.
         if !self.tls && !self.upstream.ip().is_loopback() && !self.allow_plaintext {
             return Err(format!(
                 "forward_auth target '{}' is plaintext and non-loopback; \
-                 set tls: true or allow_plaintext: true",
+                 set tls: true or insecure_plaintext: true",
                 if let Some(host) = self.sni_hostname.as_deref() {
                     format!("{host}:{}", self.upstream.port())
                 } else {
                     self.upstream.to_string()
                 }
             ));
-        }
-
-        if !self.tls && !self.upstream.ip().is_loopback() {
-            static WARN_ONCE: std::sync::Once = std::sync::Once::new();
-            WARN_ONCE.call_once(|| {
-                let target = if let Some(host) = self.sni_hostname.as_deref() {
-                    format!("{host}:{}", self.upstream.port())
-                } else {
-                    self.upstream.to_string()
-                };
-                tracing::warn!(
-                    "forward_auth target '{target}' is plaintext; credentials will transit unencrypted — set tls: true"
-                );
-            });
         }
 
         // Connect TCP with timeout

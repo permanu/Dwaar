@@ -26,6 +26,7 @@ pub mod h2_bridge;
 pub mod h2_pool;
 pub mod handler;
 pub mod pool;
+pub mod stream_guard;
 
 use std::net::SocketAddr;
 use std::path::Path;

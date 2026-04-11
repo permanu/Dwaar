@@ -34,6 +34,40 @@ pub fn health(start_time: &Instant) -> String {
     format!(r#"{{"status":"ok","uptime_secs":{uptime}}}"#)
 }
 
+/// Outcome of validating a Dwaarfile source string for the `POST /reload`
+/// pre-flight check.
+///
+/// The admin API parses the config file in-process before notifying the
+/// config watcher. When parsing fails we surface the full
+/// `ParseError::Display` output to the caller so they see the same error
+/// message the CLI would produce — including line numbers, suggestions,
+/// and the optional `accepted_format` hint.
+#[derive(Debug)]
+pub enum ConfigValidation {
+    /// The source parsed successfully — the watcher can be notified.
+    Ok,
+    /// The source failed to parse. Contains the status code and the full
+    /// `Display` output of the error as the response body.
+    Err { status: u16, body: String },
+}
+
+/// Validate a Dwaarfile source string and return the response-ready
+/// `ConfigValidation` outcome.
+///
+/// Returns `Ok` when the source parses cleanly. Returns `Err { status: 400 }`
+/// for all parse errors — currently the parser does not distinguish syntax
+/// errors from semantic ones, so everything is surfaced as HTTP 400.
+#[must_use]
+pub fn validate_config_source(src: &str) -> ConfigValidation {
+    match dwaar_config::parser::parse(src) {
+        Ok(_) => ConfigValidation::Ok,
+        Err(e) => ConfigValidation::Err {
+            status: 400,
+            body: format!("{e}"),
+        },
+    }
+}
+
 /// List all routes as JSON array.
 pub fn list_routes(route_table: &ArcSwap<RouteTable>) -> Result<String, String> {
     let table = route_table.load();

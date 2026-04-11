@@ -78,7 +78,9 @@ fn missing_config_file_fails() {
         .args(["--config", "/tmp/nonexistent_dwaarfile.conf", "--test"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("failed to stat config file"));
+        .stderr(predicate::str::contains("Config file not found"))
+        .stderr(predicate::str::contains("Resolved path:"))
+        .stderr(predicate::str::contains("Working dir:"));
 }
 
 #[test]

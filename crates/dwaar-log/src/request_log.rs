@@ -227,6 +227,16 @@ pub struct RequestLog {
     /// Enables downstream error tracking without app-level instrumentation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_error_body: Option<String>,
+
+    /// Plugin that rejected the request, if any (e.g., `"rate_limit"`).
+    /// `&'static str` — zero per-request allocation (#128).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejected_by: Option<&'static str>,
+
+    /// Plugin that blocked the request, if any (e.g., `"bot_detection"`).
+    /// `&'static str` — zero per-request allocation (#128).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_by: Option<&'static str>,
 }
 
 #[cfg(test)]
@@ -259,6 +269,8 @@ mod tests {
             compression: Some("gzip".into()),
             trace_id: None,
             upstream_error_body: None,
+            rejected_by: None,
+            blocked_by: None,
         }
     }
 
@@ -423,5 +435,33 @@ mod tests {
         log.query = None;
         let json = serde_json::to_string(&log).expect("serialize");
         assert!(!json.contains("\"query\""));
+    }
+
+    #[test]
+    fn rejected_by_and_blocked_by_omitted_when_none() {
+        let log = sample_log();
+        let json = serde_json::to_string(&log).expect("serialize");
+        assert!(!json.contains("\"rejected_by\""));
+        assert!(!json.contains("\"blocked_by\""));
+    }
+
+    #[test]
+    fn rejected_by_serialized_when_set() {
+        let mut log = sample_log();
+        log.status = 429;
+        log.rejected_by = Some("rate_limit");
+        let json = serde_json::to_string(&log).expect("serialize");
+        assert!(json.contains("\"rejected_by\":\"rate_limit\""));
+        assert!(!json.contains("\"blocked_by\""));
+    }
+
+    #[test]
+    fn blocked_by_serialized_when_set() {
+        let mut log = sample_log();
+        log.status = 403;
+        log.blocked_by = Some("bot_detection");
+        let json = serde_json::to_string(&log).expect("serialize");
+        assert!(json.contains("\"blocked_by\":\"bot_detection\""));
+        assert!(!json.contains("\"rejected_by\""));
     }
 }

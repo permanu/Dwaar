@@ -6,6 +6,45 @@ title: "Development Setup"
 
 This page covers everything you need to build, test, and iterate on Dwaar locally.
 
+## Quick Start
+
+The repository ships two helpers that compress the path from clone to a passing build:
+
+```bash
+# 1. Clone and enter
+git clone https://github.com/permanu/Dwaar.git
+cd Dwaar
+
+# 2. Verify toolchain + dry-run workspace check
+./scripts/check-dev-env.sh
+
+# 3. Narrow parser test — compiles fastest
+just test-crate dwaar-config
+
+# 4. Full workspace test
+just test
+
+# 5. Lint before opening a PR
+just lint
+```
+
+`./scripts/check-dev-env.sh` confirms `rustc`, `cargo`, and `openssl` are on the `PATH` and runs a `cargo check --workspace --all-targets` dry run so broken toolchains fail here rather than halfway through a 10-minute test. The script emits no output on success — failure prints the missing tool and exits non-zero.
+
+The `Justfile` at the repo root defines the common recipes used by CI and developers:
+
+| Recipe | Command | Use for |
+|---|---|---|
+| `just test` | `cargo test --workspace --all-features` | Full workspace test suite. |
+| `just test-crate <crate>` | `cargo test -p <crate>` | Narrow feedback loop on a single crate. |
+| `just lint` | `cargo clippy --workspace --all-targets -- -D warnings` | Zero-warnings lint. |
+| `just build-release` | `cargo build --release -p dwaar-ingress` | Release binary at `target/release/dwaar`. |
+| `just ci` | Format + lint + test + build. | What CI runs; run locally before opening a PR. |
+| `just quick` | Fastest-feedback test subset. | Sanity check between keystrokes. |
+
+Install `just` with `cargo install just` if you do not already have it. The raw `cargo` commands below still work and produce the same result — `just` is a convenience, not a requirement.
+
+For the complete onboarding walkthrough (prerequisites, commit convention, release workflow), see [CONTRIBUTING.md](https://github.com/permanu/Dwaar/blob/main/CONTRIBUTING.md) in the repository root.
+
 ## Prerequisites
 
 | Requirement | Notes |

@@ -9,9 +9,10 @@
 //! Watches the config file for changes, debounces events, and swaps
 //! the route table when a valid new config is detected.
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -19,6 +20,7 @@ use dwaar_core::route::{Route, RouteTable};
 use dwaar_tls::sni::DomainConfigMap;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use openssl::hash::MessageDigest;
+use parking_lot::Mutex;
 use pingora_core::server::ShutdownWatch;
 use pingora_core::services::background::BackgroundService;
 use tokio::sync::mpsc;
@@ -33,11 +35,25 @@ use crate::parser;
 
 const DEBOUNCE_INTERVAL: Duration = Duration::from_millis(500);
 
+/// Callback invoked by [`ConfigWatcher`] on every reload for each WASM module
+/// path that was either removed from the new config or whose file mtime
+/// changed since the previous reload (ISSUE-120).
+///
+/// Wire this to [`dwaar_plugins::wasm::cache::ModuleCache::invalidate`] at
+/// startup so that the next `load()` recompiles stale WASM components without
+/// restarting the process. The default is a no-op; the watcher does not own a
+/// `ModuleCache` directly because `dwaar-config` cannot depend on the `wasm`
+/// feature of `dwaar-plugins` without dragging wasmtime into every build.
+pub type WasmInvalidator = Arc<dyn Fn(&Path) + Send + Sync>;
+
 /// Background service that watches the Dwaarfile and hot-reloads on changes.
 pub struct ConfigWatcher {
     config_path: PathBuf,
     route_table: Arc<ArcSwap<RouteTable>>,
-    last_hash: std::sync::Mutex<[u8; 32]>,
+    /// SHA-256 of the last successfully processed config content. Guarded by
+    /// `parking_lot::Mutex` (Guardrail #58) since `std::sync::Mutex` has a
+    /// slower fast path and a poisoning API we don't need.
+    last_hash: Mutex<[u8; 32]>,
     /// When Docker mode is active, store compiled routes here instead of
     /// writing to `route_table` directly. `DockerWatcher` handles the merge.
     dwaarfile_snapshot: Option<Arc<ArcSwap<Vec<Route>>>>,
@@ -63,6 +79,15 @@ pub struct ConfigWatcher {
     /// Shared cert store. On reload, domains removed from the SNI domain map
     /// are invalidated in the LRU cache so stale certs are never served.
     cert_store: Option<Arc<CertStore>>,
+    /// WASM module invalidation callback (ISSUE-120). Called for every path
+    /// that was removed from the config or whose on-disk mtime changed since
+    /// the previous reload. `None` leaves the cache untouched.
+    wasm_invalidator: Option<WasmInvalidator>,
+    /// Last-known file mtimes for WASM module paths referenced by the live
+    /// config. Used to detect content changes without re-hashing the file.
+    /// Entries are keyed by absolute path. `None` values mean "we have never
+    /// successfully stat'd this path" (e.g., symlink to a dangling target).
+    wasm_mtimes: Mutex<HashMap<PathBuf, Option<SystemTime>>>,
 }
 
 impl std::fmt::Debug for ConfigWatcher {
@@ -86,7 +111,7 @@ impl ConfigWatcher {
         Self {
             config_path,
             route_table,
-            last_hash: std::sync::Mutex::new(initial_hash),
+            last_hash: Mutex::new(initial_hash),
             dwaarfile_snapshot: None,
             config_notify: None,
             drain_timeout: Duration::from_secs(30),
@@ -95,6 +120,8 @@ impl ConfigWatcher {
             acme_domains: None,
             cache_backend: None,
             cert_store: None,
+            wasm_invalidator: None,
+            wasm_mtimes: Mutex::new(HashMap::new()),
         }
     }
 
@@ -153,6 +180,21 @@ impl ConfigWatcher {
     #[must_use]
     pub fn with_cert_store(mut self, store: Arc<CertStore>) -> Self {
         self.cert_store = Some(store);
+        self
+    }
+
+    /// Attach a WASM module invalidation callback (ISSUE-120). On every
+    /// reload, this is called once per WASM path that was removed from the
+    /// config, plus once per path whose on-disk mtime changed. The typical
+    /// wiring is `|p| cache.invalidate(p)` where `cache` is a shared
+    /// `Arc<dwaar_plugins::wasm::cache::ModuleCache>`.
+    ///
+    /// Without this hook, the `ModuleCache` would happily keep serving the
+    /// pre-reload compiled `Component` even after the operator overwrote the
+    /// `.wasm` file on disk — breaking hot-reload for WASM plugins.
+    #[must_use]
+    pub fn with_wasm_invalidator(mut self, invalidator: WasmInvalidator) -> Self {
+        self.wasm_invalidator = Some(invalidator);
         self
     }
 
@@ -229,10 +271,7 @@ impl ConfigWatcher {
         };
 
         {
-            let last = self
-                .last_hash
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let last = self.last_hash.lock();
             if *last == new_hash {
                 debug!("config hash unchanged, skipping reload");
                 return;
@@ -293,6 +332,10 @@ impl ConfigWatcher {
 
         refresh_cache_backend(self.cache_backend.as_ref(), &new_table);
 
+        // ISSUE-120: diff WASM module references against the previous reload
+        // and invalidate anything that was removed or whose file changed.
+        refresh_wasm_cache(self.wasm_invalidator.as_ref(), &self.wasm_mtimes, &config);
+
         if let Some(ref snapshot) = self.dwaarfile_snapshot {
             // Docker mode: update snapshot, notify DockerWatcher to re-merge
             snapshot.store(Arc::new(new_table.all_routes()));
@@ -313,10 +356,7 @@ impl ConfigWatcher {
         }
 
         // Update hash — must run in both branches
-        let mut last = self
-            .last_hash
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut last = self.last_hash.lock();
         *last = new_hash;
     }
 }
@@ -493,6 +533,121 @@ fn log_route_diff(old: &RouteTable, new: &RouteTable) {
             );
         }
     }
+}
+
+// ── ISSUE-120: WASM cache invalidation on reload ─────────────────────────────
+
+/// Recursively visit every nested `handle` / `handle_path` / `route` /
+/// `intercept` / `handle_errors` block and collect the paths of all
+/// `wasm_plugin` directives encountered.
+fn walk_wasm_paths(
+    directives: &[crate::model::Directive],
+    out: &mut std::collections::HashSet<PathBuf>,
+) {
+    use crate::model::Directive;
+    for d in directives {
+        match d {
+            Directive::WasmPlugin(wp) => {
+                out.insert(PathBuf::from(&wp.module_path));
+            }
+            Directive::Handle(h) => walk_wasm_paths(&h.directives, out),
+            Directive::HandlePath(h) => walk_wasm_paths(&h.directives, out),
+            Directive::Route(r) => walk_wasm_paths(&r.directives, out),
+            Directive::Intercept(i) => walk_wasm_paths(&i.directives, out),
+            Directive::HandleErrors(h) => walk_wasm_paths(&h.directives, out),
+            _ => {}
+        }
+    }
+}
+
+/// Walk every directive in a parsed config and collect the paths of all
+/// `wasm_plugin` directives into the returned set.
+///
+/// The walk recurses through `handle`, `handle_path`, `route`, `intercept`,
+/// and `handle_errors` blocks since those can nest further directives. The
+/// returned paths are exactly what `WasmPluginDirective::module_path` held in
+/// the source config (absolute or relative) — the caller canonicalises as
+/// needed.
+pub fn collect_wasm_paths(
+    config: &crate::model::DwaarConfig,
+) -> std::collections::HashSet<PathBuf> {
+    let mut out = std::collections::HashSet::new();
+    for site in &config.sites {
+        walk_wasm_paths(&site.directives, &mut out);
+    }
+    out
+}
+
+/// Snapshot the mtime of a WASM path, or return `None` if the stat fails.
+///
+/// A dangling symlink or a path that doesn't exist yet is represented as
+/// `None`; the next reload that sees a different value (either a real mtime
+/// or still `None`) will still fire an invalidation because `Option::eq`
+/// handles the comparison correctly.
+fn stat_wasm_mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
+}
+
+/// Run the WASM cache invalidation pass for a reload.
+///
+/// Computes the set of new WASM paths, diffs against the previous set stored
+/// in `wasm_mtimes`, and invokes the invalidator once per path that was
+/// removed, added-with-a-different-mtime, or whose on-disk mtime changed.
+/// Then commits the new mtime snapshot.
+///
+/// This is a free function rather than a method so it is trivially unit-
+/// testable with a hand-rolled invalidator that records its calls.
+fn refresh_wasm_cache(
+    invalidator: Option<&WasmInvalidator>,
+    mtimes: &Mutex<HashMap<PathBuf, Option<SystemTime>>>,
+    new_config: &crate::model::DwaarConfig,
+) {
+    let Some(inv) = invalidator else {
+        return;
+    };
+
+    let new_paths = collect_wasm_paths(new_config);
+
+    // Build the new mtime snapshot first (off-lock), then swap under the lock.
+    let new_snapshot: HashMap<PathBuf, Option<SystemTime>> = new_paths
+        .iter()
+        .map(|p| {
+            let mtime = stat_wasm_mtime(p);
+            (p.clone(), mtime)
+        })
+        .collect();
+
+    let mut guard = mtimes.lock();
+
+    // 1. Removed paths: present in old snapshot, absent from new_paths.
+    for old_path in guard.keys() {
+        if !new_snapshot.contains_key(old_path) {
+            debug!(path = %old_path.display(), "invalidating WASM module removed from config");
+            inv(old_path);
+        }
+    }
+
+    // 2. Still-present paths with a changed (or first-seen) mtime.
+    for (path, new_mtime) in &new_snapshot {
+        match guard.get(path) {
+            Some(old_mtime) if old_mtime == new_mtime => {
+                // Unchanged — keep the existing compiled module.
+            }
+            Some(_) => {
+                debug!(path = %path.display(), "invalidating WASM module (mtime changed)");
+                inv(path);
+            }
+            None => {
+                // Newly-added path. Invalidate defensively so any stray cache
+                // entry from a previous generation is dropped. No-op when the
+                // cache doesn't have an entry yet.
+                debug!(path = %path.display(), "WASM module added to config — invalidating");
+                inv(path);
+            }
+        }
+    }
+
+    *guard = new_snapshot;
 }
 
 /// Resize the cache backend if the max cache size in the new route table
@@ -1063,6 +1218,268 @@ a.com {
             ptr_before,
             cache_storage_addr(&cache_backend),
             "same cache size should not reallocate"
+        );
+    }
+
+    // ── ISSUE-120: WASM cache invalidation tests ──────────────────────────
+
+    /// Recording invalidator: captures every path it was called with so tests
+    /// can assert exact call counts + arguments.
+    #[derive(Default)]
+    struct RecordingInvalidator {
+        calls: parking_lot::Mutex<Vec<PathBuf>>,
+    }
+
+    impl RecordingInvalidator {
+        fn calls(&self) -> Vec<PathBuf> {
+            self.calls.lock().clone()
+        }
+    }
+
+    fn recording_invalidator() -> (Arc<RecordingInvalidator>, WasmInvalidator) {
+        let rec = Arc::new(RecordingInvalidator::default());
+        let rec_cb = Arc::clone(&rec);
+        let cb: WasmInvalidator = Arc::new(move |p: &Path| {
+            rec_cb.calls.lock().push(p.to_path_buf());
+        });
+        (rec, cb)
+    }
+
+    #[test]
+    fn collect_wasm_paths_finds_site_level_directive() {
+        let src = "\
+a.com {
+    wasm_plugin /plugins/shape.wasm {
+        priority 50
+    }
+    reverse_proxy 127.0.0.1:8080
+}
+";
+        let config = parser::parse(src).expect("parse");
+        let paths = collect_wasm_paths(&config);
+        assert_eq!(paths.len(), 1);
+        assert!(paths.contains(Path::new("/plugins/shape.wasm")));
+    }
+
+    #[test]
+    fn collect_wasm_paths_walks_handle_blocks() {
+        let src = "\
+a.com {
+    handle /api/* {
+        wasm_plugin /plugins/api.wasm {
+            priority 10
+        }
+        reverse_proxy 127.0.0.1:8080
+    }
+    handle {
+        wasm_plugin /plugins/fallback.wasm {
+            priority 90
+        }
+        reverse_proxy 127.0.0.1:9090
+    }
+}
+";
+        let config = parser::parse(src).expect("parse");
+        let paths = collect_wasm_paths(&config);
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(Path::new("/plugins/api.wasm")));
+        assert!(paths.contains(Path::new("/plugins/fallback.wasm")));
+    }
+
+    #[test]
+    fn collect_wasm_paths_deduplicates_identical_paths() {
+        let src = "\
+a.com {
+    handle /api/* {
+        wasm_plugin /plugins/shared.wasm {
+            priority 10
+        }
+        reverse_proxy 127.0.0.1:8080
+    }
+}
+b.com {
+    wasm_plugin /plugins/shared.wasm {
+        priority 10
+    }
+    reverse_proxy 127.0.0.1:9090
+}
+";
+        let config = parser::parse(src).expect("parse");
+        let paths = collect_wasm_paths(&config);
+        assert_eq!(paths.len(), 1, "same path referenced twice → one entry");
+    }
+
+    #[test]
+    fn refresh_wasm_cache_invalidates_added_paths_on_first_reload() {
+        // Write a real file so stat_wasm_mtime works.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wasm_path = dir.path().join("plugin.wasm");
+        std::fs::write(&wasm_path, b"\0asm\x01\0\0\0").expect("write wasm stub");
+
+        let src = format!(
+            "\
+a.com {{
+    wasm_plugin {} {{
+        priority 10
+    }}
+    reverse_proxy 127.0.0.1:8080
+}}
+",
+            wasm_path.display()
+        );
+        let config = parser::parse(&src).expect("parse");
+
+        let (rec, invalidator) = recording_invalidator();
+        let mtimes = Mutex::new(HashMap::new());
+
+        refresh_wasm_cache(Some(&invalidator), &mtimes, &config);
+
+        let calls = rec.calls();
+        assert_eq!(calls.len(), 1, "first-seen path should invalidate once");
+        assert_eq!(calls[0], wasm_path);
+    }
+
+    #[test]
+    fn refresh_wasm_cache_skips_unchanged_paths_on_second_reload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wasm_path = dir.path().join("plugin.wasm");
+        std::fs::write(&wasm_path, b"\0asm\x01\0\0\0").expect("write wasm stub");
+
+        let src = format!(
+            "\
+a.com {{
+    wasm_plugin {} {{
+        priority 10
+    }}
+    reverse_proxy 127.0.0.1:8080
+}}
+",
+            wasm_path.display()
+        );
+        let config = parser::parse(&src).expect("parse");
+
+        let (rec, invalidator) = recording_invalidator();
+        let mtimes = Mutex::new(HashMap::new());
+
+        // First pass populates the snapshot.
+        refresh_wasm_cache(Some(&invalidator), &mtimes, &config);
+        assert_eq!(rec.calls().len(), 1);
+
+        // Second pass with the same file + same mtime must not invalidate.
+        refresh_wasm_cache(Some(&invalidator), &mtimes, &config);
+        assert_eq!(
+            rec.calls().len(),
+            1,
+            "unchanged path + unchanged mtime must not invalidate again"
+        );
+    }
+
+    #[test]
+    fn refresh_wasm_cache_invalidates_on_mtime_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wasm_path = dir.path().join("plugin.wasm");
+        std::fs::write(&wasm_path, b"\0asm\x01\0\0\0").expect("write wasm stub");
+
+        let src = format!(
+            "\
+a.com {{
+    wasm_plugin {} {{
+        priority 10
+    }}
+    reverse_proxy 127.0.0.1:8080
+}}
+",
+            wasm_path.display()
+        );
+        let config = parser::parse(&src).expect("parse");
+
+        let (rec, invalidator) = recording_invalidator();
+        let mtimes = Mutex::new(HashMap::new());
+
+        refresh_wasm_cache(Some(&invalidator), &mtimes, &config);
+        assert_eq!(rec.calls().len(), 1);
+
+        // Force the mtime forward by rewriting the file with a newer
+        // SystemTime. We explicitly set the mtime via std::fs to avoid
+        // depending on filesystem mtime granularity (some filesystems round
+        // to 1s, which would make a tight back-to-back write indistinguishable).
+        let later = SystemTime::now() + Duration::from_secs(10);
+        let file = std::fs::File::options()
+            .write(true)
+            .open(&wasm_path)
+            .expect("open wasm stub");
+        file.set_modified(later).expect("set mtime");
+        drop(file);
+
+        refresh_wasm_cache(Some(&invalidator), &mtimes, &config);
+        let calls = rec.calls();
+        assert_eq!(
+            calls.len(),
+            2,
+            "mtime change must trigger a second invalidation"
+        );
+        assert_eq!(calls[1], wasm_path);
+    }
+
+    #[test]
+    fn refresh_wasm_cache_invalidates_removed_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wasm_path = dir.path().join("plugin.wasm");
+        std::fs::write(&wasm_path, b"\0asm\x01\0\0\0").expect("write wasm stub");
+
+        let with_plugin = format!(
+            "\
+a.com {{
+    wasm_plugin {} {{
+        priority 10
+    }}
+    reverse_proxy 127.0.0.1:8080
+}}
+",
+            wasm_path.display()
+        );
+        let without_plugin = "\
+a.com {
+    reverse_proxy 127.0.0.1:8080
+}
+";
+
+        let (rec, invalidator) = recording_invalidator();
+        let mtimes = Mutex::new(HashMap::new());
+
+        let c1 = parser::parse(&with_plugin).expect("parse");
+        refresh_wasm_cache(Some(&invalidator), &mtimes, &c1);
+        assert_eq!(rec.calls().len(), 1, "first-seen path invalidates");
+
+        let c2 = parser::parse(without_plugin).expect("parse");
+        refresh_wasm_cache(Some(&invalidator), &mtimes, &c2);
+        let calls = rec.calls();
+        assert_eq!(calls.len(), 2, "removed path must invalidate");
+        assert_eq!(calls[1], wasm_path);
+
+        // Subsequent reload with no wasm_plugin entries should be a no-op.
+        refresh_wasm_cache(Some(&invalidator), &mtimes, &c2);
+        assert_eq!(rec.calls().len(), 2, "empty → empty should not invalidate");
+    }
+
+    #[test]
+    fn refresh_wasm_cache_noop_without_invalidator() {
+        let src = "\
+a.com {
+    wasm_plugin /plugins/shape.wasm {
+        priority 10
+    }
+    reverse_proxy 127.0.0.1:8080
+}
+";
+        let config = parser::parse(src).expect("parse");
+        let mtimes = Mutex::new(HashMap::new());
+
+        // No invalidator: must not panic and must not touch the mtime map.
+        refresh_wasm_cache(None, &mtimes, &config);
+        assert!(
+            mtimes.lock().is_empty(),
+            "no-op path must not populate state"
         );
     }
 }

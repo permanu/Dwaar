@@ -45,6 +45,8 @@ fn sample_log() -> RequestLog {
         compression: Some("gzip".into()),
         trace_id: None,
         upstream_error_body: None,
+        rejected_by: None,
+        blocked_by: None,
     }
 }
 

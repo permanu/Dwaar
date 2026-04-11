@@ -798,6 +798,56 @@ fn forward_auth_unknown_subdirective_rejected() {
     assert!(result.is_err());
 }
 
+#[test]
+fn forward_auth_plaintext_non_loopback_rejected_at_parse_time() {
+    // Non-loopback plaintext target without explicit opt-in → hard parse error.
+    // This matches the issue #118 behaviour where dwaar --test Dwaarfile must
+    // surface the misconfiguration loudly instead of waiting for a request.
+    let result = parse(
+        "a.com {\n    reverse_proxy :8080\n    forward_auth authelia.prod:9091 {\n        uri /api/verify\n    }\n}\n",
+    );
+    let err = result.expect_err("plaintext non-loopback forward_auth must fail to parse");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("plaintext and non-loopback"),
+        "unexpected error message: {msg}"
+    );
+    assert!(
+        msg.contains("insecure_plaintext"),
+        "error should hint at insecure_plaintext (the Dwaarfile directive name): {msg}"
+    );
+}
+
+#[test]
+fn forward_auth_plaintext_non_loopback_allowed_with_opt_in() {
+    // Same config as above but with insecure_plaintext → succeeds.
+    // (Parser emits a tracing::warn! here; we don't capture logs in this test.)
+    let config = parse(
+        "a.com {\n    reverse_proxy :8080\n    forward_auth authelia.prod:9091 {\n        uri /api/verify\n        insecure_plaintext\n    }\n}\n",
+    )
+    .expect("opt-in plaintext should parse");
+    let Directive::ForwardAuth(fa) = &config.sites[0].directives[1] else {
+        panic!("expected ForwardAuth");
+    };
+    assert!(fa.insecure_plaintext);
+    assert!(!fa.tls);
+}
+
+#[test]
+fn forward_auth_plaintext_loopback_accepted() {
+    // Loopback IP (127.0.0.1) → plaintext is fine, no opt-in required,
+    // no warning emitted.
+    let config = parse(
+        "a.com {\n    reverse_proxy :8080\n    forward_auth 127.0.0.1:9091 {\n        uri /api/verify\n    }\n}\n",
+    )
+    .expect("loopback plaintext should parse");
+    let Directive::ForwardAuth(fa) = &config.sites[0].directives[1] else {
+        panic!("expected ForwardAuth");
+    };
+    assert!(!fa.tls);
+    assert!(!fa.insecure_plaintext);
+}
+
 // ── file_server and root directives (ISSUE-048) ──────
 
 #[test]

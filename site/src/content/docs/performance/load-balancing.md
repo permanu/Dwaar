@@ -75,6 +75,23 @@ A backend is marked unhealthy when:
 
 It is returned to the pool as soon as a subsequent health probe succeeds.
 
+### Transition logs
+
+Health state changes are logged as `tracing` events at the point of transition — not on every probe. Steady-state checks produce no log output at all, so a healthy pool is silent.
+
+| Edge | Level | Example |
+|---|---|---|
+| Healthy → unhealthy | `WARN` | `upstream transitioned to unhealthy backend=app1:8080 reason="connection refused (os error 111)"` |
+| Unhealthy → healthy | `INFO` | `upstream transitioned to healthy backend=app1:8080` |
+
+The probe error string is captured in `Backend::last_error` (a `parking_lot::Mutex<Option<String>>`) and included in the `WARN` event as the `reason=` field. On the `INFO` transition the error is cleared. This gives operators a precise "when did each backend flip" timeline without needing the full health-check debug log turned on.
+
+In a structured-logging pipeline (e.g. Vector, Loki), alert rules can trigger directly on the event name:
+
+```promql
+count_over_time({event="upstream transitioned to unhealthy"}[5m]) > 0
+```
+
 Configure health checking on the `reverse_proxy` block:
 
 ```txt
@@ -90,6 +107,14 @@ api.example.com {
 ```
 
 See [Reverse Proxy — Health Checks](../routing/reverse-proxy.md#health-checks) for full field details.
+
+---
+
+## Upstream H2 Pool (H3 → H2 multiplexing)
+
+Dwaar's HTTP/3 bridge shares a **per-host pool** of upstream H2 connections across every concurrent H3 stream targeting that upstream. The pool is capped at `MAX_CONNS_PER_HOST = 2`, and cold-start bursts are serialized through a per-host `tokio::sync::Mutex` inside `H2ConnPool::get_or_connect`. This removes a check-then-act race where N simultaneous H3 streams arriving on a cold pool could each race past the cap and open N separate upstream TCP sockets. With the mutex gating the connect decision, 100 concurrent H3 streams to one upstream share `≤ 2` TCP connections — an invariant enforced in the `quic_h2_pool_concurrency` integration suite.
+
+This is the mechanism that makes H3 → H2 upstream multiplexing deliver real TCP savings under load. It is transparent to operators: no config knob, no directive, no restart.
 
 ---
 

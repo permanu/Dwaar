@@ -35,7 +35,7 @@ That's it. HTTPS is automatic. Analytics are injected. Requests are logged.
 - **Pingora engine** — 5-10x nginx performance, ~5 MB base memory
 - **Automatic HTTPS** — Let's Encrypt + ZeroSSL, zero config
 - **First-party analytics** — Ad-blocker-proof, same-origin injection
-- **Dwaarfile** — Human-readable config, 3 lines for a working proxy
+- **Dwaarfile** — Human-readable config, 3 lines for a working proxy, with glob imports (`import apps/*.dwaar`) for deploy-agent workflows
 - **Admin API** — JSON API for runtime config changes, no restarts
 - **Docker integration** — Auto-discover containers via labels
 - **Plugin system** — Native Rust plugins + WASM runtime
@@ -43,6 +43,7 @@ That's it. HTTPS is automatic. Analytics are injected. Requests are logged.
 - **Bot detection** — User-agent + behavior analysis
 - **Rate limiting** — Per-IP, per-domain, configurable
 - **Zero-downtime upgrades** — Pingora's FD transfer, zero dropped connections
+- **HTTP/3 streaming bridge** — streaming H3 → H2 upstream with zero-copy chunk forwarding and a bounded per-host connection pool (100 concurrent H3 streams share ≤ 2 upstream TCP sockets)
 
 ## Architecture
 

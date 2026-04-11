@@ -76,6 +76,7 @@ fn parse_reverse_proxy_inline(t: &mut Tokenizer<'_>) -> Result<ReverseProxyDirec
             kind: ParseErrorKind::InvalidValue {
                 directive: "reverse_proxy".to_string(),
                 message: "expected at least one upstream address".to_string(),
+                accepted_format: None,
             },
         });
     }
@@ -172,6 +173,7 @@ fn parse_reverse_proxy_block(t: &mut Tokenizer<'_>) -> Result<ReverseProxyDirect
                                             "unknown lb_policy '{other}'; \
                                              expected round_robin, least_conn, random, ip_hash"
                                         ),
+                                        accepted_format: None,
                                     },
                                 });
                             }
@@ -196,6 +198,7 @@ fn parse_reverse_proxy_block(t: &mut Tokenizer<'_>) -> Result<ReverseProxyDirect
                                 message: format!(
                                     "health_interval must be a positive integer, got '{v}'"
                                 ),
+                                accepted_format: None,
                             },
                         })?);
                     }
@@ -212,6 +215,7 @@ fn parse_reverse_proxy_block(t: &mut Tokenizer<'_>) -> Result<ReverseProxyDirect
                                 message: format!(
                                     "fail_duration must be a positive integer, got '{v}'"
                                 ),
+                                accepted_format: None,
                             },
                         })?);
                     }
@@ -226,6 +230,7 @@ fn parse_reverse_proxy_block(t: &mut Tokenizer<'_>) -> Result<ReverseProxyDirect
                             kind: ParseErrorKind::InvalidValue {
                                 directive: "reverse_proxy".to_string(),
                                 message: format!("max_conns must be a positive integer, got '{v}'"),
+                                accepted_format: None,
                             },
                         })?);
                     }
@@ -326,6 +331,7 @@ fn parse_reverse_proxy_block(t: &mut Tokenizer<'_>) -> Result<ReverseProxyDirect
                 directive: "reverse_proxy".to_string(),
                 message: "block form requires at least one upstream via 'to' subdirective"
                     .to_string(),
+                accepted_format: None,
             },
         });
     }
@@ -356,6 +362,7 @@ pub(super) fn parse_redir(t: &mut Tokenizer<'_>) -> Result<RedirDirective, Parse
             kind: ParseErrorKind::InvalidValue {
                 directive: "redir".to_string(),
                 message: "expected source path".to_string(),
+                accepted_format: None,
             },
         });
     };
@@ -368,6 +375,7 @@ pub(super) fn parse_redir(t: &mut Tokenizer<'_>) -> Result<RedirDirective, Parse
             kind: ParseErrorKind::InvalidValue {
                 directive: "redir".to_string(),
                 message: "expected destination path".to_string(),
+                accepted_format: None,
             },
         });
     };
@@ -387,6 +395,7 @@ pub(super) fn parse_redir(t: &mut Tokenizer<'_>) -> Result<RedirDirective, Parse
                             message: format!(
                                 "invalid redirect code {parsed} — must be 301, 302, 303, 307, or 308"
                             ),
+                            accepted_format: None,
                         },
                     });
                 }
@@ -414,6 +423,7 @@ pub(super) fn parse_rewrite(t: &mut Tokenizer<'_>) -> Result<RewriteDirective, P
                 kind: ParseErrorKind::InvalidValue {
                     directive: "rewrite".to_string(),
                     message: "expected target path".to_string(),
+                    accepted_format: None,
                 },
             });
         }
@@ -431,6 +441,7 @@ pub(super) fn parse_uri(t: &mut Tokenizer<'_>) -> Result<UriDirective, ParseErro
             kind: ParseErrorKind::InvalidValue {
                 directive: "uri".to_string(),
                 message: "expected operation: strip_prefix, strip_suffix, or replace".to_string(),
+                accepted_format: None,
             },
         });
     };
@@ -463,6 +474,7 @@ pub(super) fn parse_uri(t: &mut Tokenizer<'_>) -> Result<UriDirective, ParseErro
                 message: format!(
                     "unknown operation '{op}' — expected strip_prefix, strip_suffix, or replace"
                 ),
+                accepted_format: None,
             },
         }),
     }
@@ -504,6 +516,7 @@ pub(super) fn parse_respond(t: &mut Tokenizer<'_>) -> Result<RespondDirective, P
                 kind: ParseErrorKind::InvalidValue {
                     directive: "respond".to_string(),
                     message: "expected body string or status code".to_string(),
+                    accepted_format: None,
                 },
             });
         }
@@ -526,6 +539,7 @@ pub(super) fn parse_respond(t: &mut Tokenizer<'_>) -> Result<RespondDirective, P
                     kind: ParseErrorKind::InvalidValue {
                         directive: "respond".to_string(),
                         message: format!("invalid HTTP status code {status} — must be 100-599"),
+                        accepted_format: None,
                     },
                 });
             }
@@ -594,6 +608,7 @@ pub(super) fn parse_handle_errors(
             kind: ParseErrorKind::InvalidValue {
                 directive: "handle_errors".to_string(),
                 message: "expected '{' block".to_string(),
+                accepted_format: None,
             },
         });
     }
@@ -680,6 +695,7 @@ pub(super) fn parse_forward_auth(
     t: &mut Tokenizer<'_>,
 ) -> Result<ForwardAuthDirective, ParseError> {
     // First token: upstream address
+    let (upstream_line, upstream_col) = t.position();
     let upstream_str = expect_word_or_quoted(t, "forward_auth", "upstream address")?;
     let upstream = parse_upstream_addr(&upstream_str);
 
@@ -698,6 +714,35 @@ pub(super) fn parse_forward_auth(
 
     let (uri, copy_headers, tls, insecure_plaintext) = parse_forward_auth_body(t)?;
 
+    // Security guard: plaintext subrequests to non-loopback auth services leak
+    // credentials to any on-path attacker. Caught here so `dwaar --test
+    // Dwaarfile` surfaces the issue loudly at config-load time rather than
+    // burying a warning in request logs that operators can easily miss.
+    let is_loopback_target = upstream_is_loopback(&upstream);
+    if !tls && !is_loopback_target {
+        if !insecure_plaintext {
+            return Err(ParseError {
+                line: upstream_line,
+                col: upstream_col,
+                kind: ParseErrorKind::InvalidValue {
+                    directive: "forward_auth".to_string(),
+                    message: format!(
+                        "forward_auth target '{upstream_str}' is plaintext and non-loopback; \
+                         set tls: true, use a loopback target, or explicitly opt in with insecure_plaintext: true"
+                    ),
+                    accepted_format: None,
+                },
+            });
+        }
+        // Opted-in plaintext: warn ONCE at parse time so it lands in the
+        // operator's eyeline when they load the config, not on the first
+        // request after a deploy.
+        tracing::warn!(
+            "forward_auth target '{upstream_str}' is plaintext (insecure_plaintext=true); \
+             credentials transit unencrypted — consider tls: true"
+        );
+    }
+
     Ok(ForwardAuthDirective {
         upstream,
         uri,
@@ -705,6 +750,22 @@ pub(super) fn parse_forward_auth(
         tls,
         insecure_plaintext,
     })
+}
+
+/// Best-effort loopback detection for an `UpstreamAddr`.
+///
+/// `SocketAddr` gives us the real IP check. For `HostPort` we only know the
+/// hostname at parse time (DNS resolution happens at compile/runtime), so we
+/// recognize the well-known loopback names. Anything else is assumed to be
+/// a non-loopback target, which is the safe default for the security guard.
+fn upstream_is_loopback(addr: &crate::model::UpstreamAddr) -> bool {
+    match addr {
+        crate::model::UpstreamAddr::SocketAddr(sa) => sa.ip().is_loopback(),
+        crate::model::UpstreamAddr::HostPort(hp) => {
+            let host = hp.split(':').next().unwrap_or(hp);
+            matches!(host, "localhost" | "ip6-localhost" | "ip6-loopback")
+        }
+    }
 }
 
 /// Parse the body of a `forward_auth { ... }` block.
@@ -773,6 +834,7 @@ fn parse_forward_auth_body(
                             kind: ParseErrorKind::InvalidValue {
                                 directive: "forward_auth transport".to_string(),
                                 message: format!("unknown transport '{proto}' — expected 'tls'"),
+                                accepted_format: None,
                             },
                         });
                     }
@@ -804,6 +866,7 @@ fn parse_forward_auth_body(
                         kind: ParseErrorKind::InvalidValue {
                             directive: "forward_auth".to_string(),
                             message: format!("unknown subdirective '{other}'"),
+                            accepted_format: None,
                         },
                     });
                 }
@@ -860,6 +923,7 @@ pub(super) fn parse_try_files(t: &mut Tokenizer<'_>) -> Result<TryFilesDirective
             kind: ParseErrorKind::InvalidValue {
                 directive: "try_files".to_string(),
                 message: "expected at least one file pattern".to_string(),
+                accepted_format: None,
             },
         });
     }
@@ -906,6 +970,7 @@ fn parse_scale_to_zero_block(t: &mut Tokenizer<'_>) -> Result<ScaleToZeroDirecti
                             message: format!(
                                 "wake_timeout must be a positive integer (seconds), got '{val}'"
                             ),
+                            accepted_format: None,
                         },
                     })?;
                 }
@@ -929,6 +994,7 @@ fn parse_scale_to_zero_block(t: &mut Tokenizer<'_>) -> Result<ScaleToZeroDirecti
             kind: ParseErrorKind::InvalidValue {
                 directive: "scale_to_zero".to_string(),
                 message: "wake_command is required".to_string(),
+                accepted_format: None,
             },
         }
     })?;
@@ -968,6 +1034,7 @@ pub(super) fn parse_wasm_plugin(t: &mut Tokenizer<'_>) -> Result<WasmPluginDirec
             kind: ParseErrorKind::InvalidValue {
                 directive: "wasm_plugin".to_string(),
                 message: "expected path to .wasm module".to_string(),
+                accepted_format: None,
             },
         });
     };
@@ -1089,6 +1156,7 @@ fn parse_wasm_priority(t: &mut Tokenizer<'_>) -> Result<u16, ParseError> {
             kind: ParseErrorKind::InvalidValue {
                 directive: "wasm_plugin".to_string(),
                 message: "priority must be an integer (1–65535)".to_string(),
+                accepted_format: None,
             },
         });
     };
@@ -1098,6 +1166,7 @@ fn parse_wasm_priority(t: &mut Tokenizer<'_>) -> Result<u16, ParseError> {
         kind: ParseErrorKind::InvalidValue {
             directive: "wasm_plugin".to_string(),
             message: format!("priority must be an integer 1–65535, got '{raw}'"),
+            accepted_format: None,
         },
     })?;
     if p == 0 {
@@ -1107,6 +1176,7 @@ fn parse_wasm_priority(t: &mut Tokenizer<'_>) -> Result<u16, ParseError> {
             kind: ParseErrorKind::InvalidValue {
                 directive: "wasm_plugin".to_string(),
                 message: "priority must be ≥ 1 (0 is reserved)".to_string(),
+                accepted_format: None,
             },
         });
     }
@@ -1128,6 +1198,7 @@ fn parse_wasm_u64(
             kind: ParseErrorKind::InvalidValue {
                 directive: "wasm_plugin".to_string(),
                 message: format!("{subdirective} must be {what}"),
+                accepted_format: None,
             },
         });
     };
@@ -1137,6 +1208,7 @@ fn parse_wasm_u64(
         kind: ParseErrorKind::InvalidValue {
             directive: "wasm_plugin".to_string(),
             message: format!("{subdirective} must be {what}, got '{raw}'"),
+            accepted_format: None,
         },
     })
 }
@@ -1152,6 +1224,7 @@ fn parse_wasm_config_kv(t: &mut Tokenizer<'_>) -> Result<(String, String), Parse
             kind: ParseErrorKind::InvalidValue {
                 directive: "wasm_plugin".to_string(),
                 message: "config expects 'key=value'".to_string(),
+                accepted_format: None,
             },
         });
     };
@@ -1163,6 +1236,7 @@ fn parse_wasm_config_kv(t: &mut Tokenizer<'_>) -> Result<(String, String), Parse
             kind: ParseErrorKind::InvalidValue {
                 directive: "wasm_plugin".to_string(),
                 message: format!("config value '{kv}' must be in 'key=value' form"),
+                accepted_format: None,
             },
         });
     };

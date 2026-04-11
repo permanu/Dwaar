@@ -14,9 +14,9 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use parking_lot::Mutex;
 use serde::Serialize;
 use tracing::warn;
 
@@ -98,15 +98,33 @@ impl AnalyticsSink for StdoutSink {
 
 // ── SocketSink ──────────────────────────────────────────────────────
 
+/// Mutable state for [`SocketSink`] — collapsed into a single
+/// `parking_lot::Mutex` to satisfy Guardrail #58 and avoid the tri-mutex
+/// lock-ordering footgun the previous layout had.
+struct SocketSinkState {
+    stream: Option<UnixStream>,
+    buffer: VecDeque<Vec<u8>>,
+    last_attempt: Option<Instant>,
+}
+
+impl SocketSinkState {
+    fn new() -> Self {
+        Self {
+            stream: None,
+            buffer: VecDeque::new(),
+            last_attempt: None,
+        }
+    }
+}
+
 /// Writes JSON snapshots to a Unix domain socket.
 ///
-/// Uses `std::sync::Mutex` (not tokio) because `flush()` is called
-/// synchronously from the aggregation service's loop.
+/// Uses `parking_lot::Mutex` (not tokio) because `flush()` is called
+/// synchronously from the aggregation service's loop — the trait method
+/// is non-async and there are no `.await` points under the lock.
 pub struct SocketSink {
     path: PathBuf,
-    stream: Mutex<Option<UnixStream>>,
-    buffer: Mutex<VecDeque<Vec<u8>>>,
-    last_attempt: Mutex<Option<Instant>>,
+    state: Mutex<SocketSinkState>,
 }
 
 impl std::fmt::Debug for SocketSink {
@@ -121,24 +139,19 @@ impl SocketSink {
     pub fn new(path: PathBuf) -> Self {
         Self {
             path,
-            stream: Mutex::new(None),
-            buffer: Mutex::new(VecDeque::new()),
-            last_attempt: Mutex::new(None),
+            state: Mutex::new(SocketSinkState::new()),
         }
     }
 
-    fn try_connect(&self) -> Option<UnixStream> {
-        let mut last = self
-            .last_attempt
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(t) = *last
+    /// Attempt a fresh connect, honoring the reconnect back-off stored in
+    /// `state.last_attempt`. Caller holds the state lock.
+    fn try_connect_locked(&self, state: &mut SocketSinkState) -> Option<UnixStream> {
+        if let Some(t) = state.last_attempt
             && t.elapsed() < RECONNECT_DELAY
         {
             return None;
         }
-        *last = Some(Instant::now());
-        drop(last);
+        state.last_attempt = Some(Instant::now());
 
         match UnixStream::connect(&self.path) {
             Ok(stream) => Some(stream),
@@ -181,30 +194,28 @@ impl AnalyticsSink for SocketSink {
     fn flush(&self, snapshot: &DomainMetricsSnapshot) -> Result<(), std::io::Error> {
         let line = Self::serialize(snapshot)?;
 
-        let mut stream_guard = self
-            .stream
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut buffer_guard = self
-            .buffer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Single lock acquisition — covers stream, buffer, and last_attempt.
+        // `flush()` is sync (no `.await`), so holding across blocking I/O
+        // is fine — this is the same behavior as the prior std::Mutex code.
+        let mut state = self.state.lock();
 
-        if stream_guard.is_none()
-            && let Some(new_stream) = self.try_connect()
+        if state.stream.is_none()
+            && let Some(new_stream) = self.try_connect_locked(&mut state)
         {
-            *stream_guard = Some(new_stream);
+            state.stream = Some(new_stream);
         }
 
-        if let Some(ref mut stream) = *stream_guard {
-            Self::drain_buffer(stream, &mut buffer_guard);
+        if let Some(mut stream) = state.stream.take() {
+            Self::drain_buffer(&mut stream, &mut state.buffer);
 
-            if !Self::write_line(stream, &line) {
-                *stream_guard = None;
-                Self::enqueue(&mut buffer_guard, line);
+            if Self::write_line(&mut stream, &line) {
+                state.stream = Some(stream);
+            } else {
+                // Stream broken — drop it and queue for retry.
+                Self::enqueue(&mut state.buffer, line);
             }
         } else {
-            Self::enqueue(&mut buffer_guard, line);
+            Self::enqueue(&mut state.buffer, line);
         }
 
         Ok(())
@@ -274,8 +285,8 @@ mod tests {
         sink.flush(&snap).expect("flush");
         sink.flush(&snap).expect("flush");
 
-        let buffer = sink.buffer.lock().expect("lock");
-        assert_eq!(buffer.len(), 2);
+        let state = sink.state.lock();
+        assert_eq!(state.buffer.len(), 2);
     }
 
     #[test]
@@ -289,8 +300,8 @@ mod tests {
             sink.flush(&snap).expect("flush");
         }
 
-        let buffer = sink.buffer.lock().expect("lock");
-        assert_eq!(buffer.len(), MAX_BUFFER_SNAPSHOTS);
+        let state = sink.state.lock();
+        assert_eq!(state.buffer.len(), MAX_BUFFER_SNAPSHOTS);
     }
 
     #[test]

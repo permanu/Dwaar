@@ -189,6 +189,16 @@ pub struct RequestContext {
     /// Captured upstream error body for 5xx responses (ISSUE-117).
     /// Populated in `response_body_filter`, read in `logging()`.
     pub upstream_error_body: Option<String>,
+
+    /// Name of the plugin that rejected this request (e.g., rate limiting),
+    /// surfaced in the access log as `rejected_by`. `&'static str` so no
+    /// per-request allocation on the hot path (#128).
+    pub rejected_by: Option<&'static str>,
+
+    /// Name of the plugin that blocked this request (e.g., bot detection,
+    /// IP filter, under-attack challenge), surfaced in the access log as
+    /// `blocked_by`. `&'static str` so no per-request allocation (#128).
+    pub blocked_by: Option<&'static str>,
 }
 
 impl RequestContext {
@@ -252,6 +262,8 @@ impl RequestContext {
             trace_ctx: None,
             upstream_status: 0,
             upstream_error_body: None,
+            rejected_by: None,
+            blocked_by: None,
         }
     }
 

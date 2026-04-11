@@ -18,6 +18,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 mod admin_client;
 mod auto_update;
 mod cli;
+mod readiness;
 mod self_update;
 
 use std::fs::Permissions;
@@ -74,7 +75,11 @@ enum WorkerRole {
 /// multi-threaded process is undefined behaviour; forking here (before Pingora's
 /// `run_forever()`) guarantees we are still single-threaded.
 #[allow(unsafe_code)]
-fn fork_workers(count: usize) -> anyhow::Result<WorkerRole> {
+#[allow(clippy::too_many_lines)]
+fn fork_workers(
+    count: usize,
+    readiness_target: &readiness::ReadinessTarget,
+) -> anyhow::Result<WorkerRole> {
     let mut children: Vec<libc::pid_t> = Vec::with_capacity(count);
 
     for id in 0..count {
@@ -97,6 +102,39 @@ fn fork_workers(count: usize) -> anyhow::Result<WorkerRole> {
     }
 
     info!(workers = count, "supervisor: all worker processes started");
+
+    // Verify that worker 0 (the only worker that binds the admin listener)
+    // actually becomes reachable before we hand the supervisor loop control.
+    // Non-worker-0 children share the public SO_REUSEPORT listeners; they
+    // have no deterministic bind we can probe, so we accept fork() success
+    // as their readiness signal. This is the initial-boot probe; restart
+    // readiness is handled inside the supervisor loop below.
+    if let Some(&worker0_pid) = children.first() {
+        if let Err(e) = readiness::wait_for_child_ready(
+            worker0_pid,
+            readiness_target,
+            readiness::MAX_READINESS_TIMEOUT,
+        ) {
+            tracing::error!(
+                pid = worker0_pid,
+                error = %e,
+                "supervisor: worker 0 failed readiness probe on initial boot — aborting"
+            );
+            // Kill every worker we already started so the launcher doesn't
+            // leave half-bound processes around.
+            for &pid in &children {
+                // SAFETY: sending SIGKILL to known child PIDs.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+            anyhow::bail!("worker 0 readiness probe failed: {e}");
+        }
+        info!(
+            pid = worker0_pid,
+            "supervisor: worker 0 passed readiness probe"
+        );
+    }
 
     // Track worker ID by PID so restarts preserve the logical ID.
     let mut pid_to_id: std::collections::HashMap<libc::pid_t, usize> =
@@ -192,9 +230,58 @@ fn fork_workers(count: usize) -> anyhow::Result<WorkerRole> {
                 return Ok(WorkerRole::Worker(dead_id));
             }
             child_pid => {
-                children.push(child_pid);
-                pid_to_id.insert(child_pid, dead_id);
-                worker_started.insert(child_pid, std::time::Instant::now());
+                // Only worker 0 owns the admin listener — its readiness can
+                // be verified by connecting to that endpoint. Non-zero worker
+                // restarts are accepted as ready on fork() success because
+                // they share SO_REUSEPORT listeners with their siblings and
+                // have no deterministic bind to probe.
+                if dead_id == 0 {
+                    match readiness::wait_for_child_ready(
+                        child_pid,
+                        readiness_target,
+                        readiness::MAX_READINESS_TIMEOUT,
+                    ) {
+                        Ok(()) => {
+                            info!(
+                                pid = child_pid,
+                                worker_id = dead_id,
+                                "supervisor: restarted worker passed readiness probe"
+                            );
+                            children.push(child_pid);
+                            pid_to_id.insert(child_pid, dead_id);
+                            worker_started.insert(child_pid, std::time::Instant::now());
+                        }
+                        Err(e) => {
+                            // Readiness failed — SIGKILL and fall back to the
+                            // normal crash-loop backoff so we don't spin.
+                            tracing::warn!(
+                                pid = child_pid,
+                                worker_id = dead_id,
+                                error = %e,
+                                "supervisor: restarted worker failed readiness probe — killing"
+                            );
+                            // SAFETY: SIGKILL to a known child PID.
+                            unsafe {
+                                libc::kill(child_pid, libc::SIGKILL);
+                            }
+                            // Reap the zombie so waitpid() above doesn't
+                            // double-report it in a later iteration.
+                            let mut wstatus: libc::c_int = 0;
+                            // SAFETY: blocking wait on the exact PID we just
+                            // signalled.
+                            unsafe {
+                                libc::waitpid(child_pid, &raw mut wstatus, 0);
+                            }
+                            let _ = wstatus;
+                            std::thread::sleep(backoff);
+                            backoff = (backoff * 2).min(max_backoff);
+                        }
+                    }
+                } else {
+                    children.push(child_pid);
+                    pid_to_id.insert(child_pid, dead_id);
+                    worker_started.insert(child_pid, std::time::Instant::now());
+                }
             }
         }
     }
@@ -308,7 +395,8 @@ fn main() -> anyhow::Result<()> {
         return run_server(&cli, &dwaar_config, config_path, drain_timeout, 0, 1);
     }
 
-    match fork_workers(worker_count)? {
+    let readiness_target = readiness::target_from_admin_socket(cli.admin_socket.as_deref());
+    match fork_workers(worker_count, &readiness_target)? {
         WorkerRole::Supervisor => Ok(()),
         WorkerRole::Worker(id) => run_server(
             &cli,
@@ -897,9 +985,58 @@ fn register_background_services(
     }
 }
 
+/// Resolve a user-supplied config path to an absolute display form, even
+/// when the file itself does not exist. `canonicalize` requires every
+/// component to exist on disk, so we canonicalize the parent directory (if
+/// we can) and re-attach the filename. Falls back to joining with CWD if
+/// neither the parent nor the file resolves.
+fn resolve_display_path(path: &std::path::Path) -> std::path::PathBuf {
+    if let Ok(canon) = path.canonicalize() {
+        return canon;
+    }
+    // Try to canonicalize the parent directory, then re-attach the filename.
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+        // An empty parent ("foo") → treat as CWD.
+        let parent = if parent.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            parent
+        };
+        if let Ok(canon_parent) = parent.canonicalize() {
+            return canon_parent.join(name);
+        }
+    }
+    // Last resort: join with CWD so the message still shows an absolute path.
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
+    }
+}
+
 fn load_config(path: &std::path::Path) -> anyhow::Result<dwaar_config::model::DwaarConfig> {
-    let metadata = std::fs::metadata(path)
-        .with_context(|| format!("failed to stat config file: {}", path.display()))?;
+    let metadata = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Surface the fully resolved absolute path alongside the CWD so
+            // the user can see exactly where dwaar looked. `canonicalize`
+            // would fail for a non-existent file, so resolve the parent
+            // directory (which may exist) and re-attach the file name.
+            let resolved = resolve_display_path(path);
+            let cwd = std::env::current_dir()
+                .map_or_else(|_| "<unknown>".to_string(), |p| p.display().to_string());
+            return Err(anyhow::anyhow!(
+                "Config file not found.\n  \
+                 Resolved path: {}\n  \
+                 Working dir:   {cwd}",
+                resolved.display()
+            ));
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e))
+                .with_context(|| format!("failed to stat config file: {}", path.display()));
+        }
+    };
     if metadata.len() > MAX_CONFIG_SIZE {
         bail!(
             "config file too large ({} bytes, max {} bytes)",

@@ -289,14 +289,71 @@ impl LeaderElector {
             return Ok(false);
         }
 
-        // The lease has expired. Try to take it over via a strategic merge patch.
-        // We use the resource version from the GET to ensure we win any concurrent race.
-        let resource_version = existing
+        // The lease has expired. Try to take it over via a strategic merge
+        // patch, using the resource version from the GET we just performed.
+        match self.try_patch_lease(&existing, &now).await {
+            Ok(patched) => {
+                self.store_resource_version(patched.metadata.resource_version.as_deref());
+                Ok(true)
+            }
+            Err(kube::Error::Api(ae)) if ae.code == 409 => {
+                // 409 Conflict — another controller wrote the lease
+                // between our GET and PATCH. Per Guardrail #34 we MUST
+                // re-read the lease before deciding anything: using a
+                // stale resourceVersion will just 409 again or, worse,
+                // overwrite someone else's successful acquire.
+                let fresh = match self.lease_api.get(&self.config.lease_name).await {
+                    Ok(lease) => lease,
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "failed to re-read lease after 409 conflict"
+                        );
+                        // Conservative: assume we're not leader this cycle.
+                        return Ok(false);
+                    }
+                };
+                if !self.is_lease_expired(&fresh) {
+                    // Someone else holds a valid lease now. Stand down.
+                    return Ok(false);
+                }
+                // The lease is still expired — another candidate must have
+                // also seen expiry and raced us. Make one more attempt with
+                // the *fresh* resourceVersion. If that also conflicts, we
+                // simply back off and let the next retry_period tick pick
+                // us up again.
+                match self.try_patch_lease(&fresh, &now).await {
+                    Ok(patched) => {
+                        self.store_resource_version(patched.metadata.resource_version.as_deref());
+                        Ok(true)
+                    }
+                    Err(kube::Error::Api(ae2)) if ae2.code == 409 => Ok(false),
+                    Err(e) => Err(WatcherError::Kube(e)),
+                }
+            }
+            Err(e) => Err(WatcherError::Kube(e)),
+        }
+    }
+
+    /// Build and send a strategic-merge patch that takes over an expired
+    /// lease, using `lease.metadata.resource_version` as the optimistic
+    /// concurrency token. Callers are responsible for re-reading the lease
+    /// on 409 Conflict — this helper intentionally does NOT swallow 409 so
+    /// the caller can decide whether to retry with a fresh resourceVersion
+    /// (per Guardrail #34).
+    async fn try_patch_lease(&self, lease: &Lease, now: &str) -> Result<Lease, kube::Error> {
+        let resource_version = lease
             .metadata
             .resource_version
             .as_deref()
             .unwrap_or("")
             .to_string();
+
+        let prev_transitions = lease
+            .spec
+            .as_ref()
+            .and_then(|s| s.lease_transitions)
+            .unwrap_or(0);
 
         let patch_body = serde_json::json!({
             "apiVersion": "coordination.k8s.io/v1",
@@ -304,39 +361,24 @@ impl LeaderElector {
             "metadata": {
                 "name": self.config.lease_name,
                 "namespace": self.config.namespace,
-                "resourceVersion": resource_version
+                "resourceVersion": resource_version,
             },
             "spec": {
                 "holderIdentity": self.config.holder_identity,
                 "leaseDurationSeconds": self.config.lease_duration_secs,
                 "acquireTime": now,
                 "renewTime": now,
-                "leaseTransitions": existing
-                    .spec.as_ref()
-                    .and_then(|s| s.lease_transitions)
-                    .unwrap_or(0) + 1,
+                "leaseTransitions": prev_transitions + 1,
             }
         });
 
-        match self
-            .lease_api
+        self.lease_api
             .patch(
                 &self.config.lease_name,
                 &PatchParams::default(),
                 &Patch::Merge(patch_body),
             )
             .await
-        {
-            Ok(patched) => {
-                self.store_resource_version(patched.metadata.resource_version.as_deref());
-                Ok(true)
-            }
-            Err(kube::Error::Api(ae)) if ae.code == 409 => {
-                // Another pod won the race — back off and retry later.
-                Ok(false)
-            }
-            Err(e) => Err(WatcherError::Kube(e)),
-        }
     }
 
     /// Renew the lease by updating `renewTime`.
@@ -657,6 +699,46 @@ mod tests {
         assert!(spec.renew_time.is_some());
         assert!(spec.acquire_time.is_some());
         assert_eq!(spec.lease_transitions, Some(0));
+    }
+
+    // ── 409 re-read semantics (Guardrail #34) ────────────────────────────
+    //
+    // The `try_acquire` 409 handler is hard to unit-test without mocking
+    // `kube::Api`, which is a concrete type tied to the real HTTP client.
+    // Rather than pull in a trait-based mocking layer for a single test,
+    // we exercise the pure decision the handler relies on:
+    //
+    //   1. After a 409 we MUST re-read the lease (code path asserts this).
+    //   2. If the re-read lease is NOT expired, we stand down (Ok(false)).
+    //   3. If the re-read lease IS still expired, a second patch attempt
+    //      is acceptable with the FRESH resourceVersion.
+    //
+    // Steps 2 and 3 are decided by `lease_is_expired`, which is unit-tested
+    // below. A full end-to-end test covering the HTTP round-trips is left
+    // to the integration suite (deferred — kube::Api is not trait-mockable
+    // without a large dependency footprint).
+
+    #[test]
+    fn reread_detects_fresh_lease_and_yields() {
+        // The core decision the 409 handler makes: after re-reading,
+        // if the lease is no longer expired we must yield leadership.
+        let fresh_lease = make_lease_with_renew_time(1);
+        assert!(
+            !lease_is_expired(&fresh_lease, 15),
+            "re-read lease that was just renewed must not be expired"
+        );
+        // The handler uses this exact boolean to return Ok(false).
+    }
+
+    #[test]
+    fn reread_still_expired_allows_retry() {
+        // If the re-read lease is ALSO expired, the handler is allowed
+        // to attempt the patch again with the fresh resourceVersion.
+        let stale_lease = make_lease_with_renew_time(100);
+        assert!(
+            lease_is_expired(&stale_lease, 15),
+            "re-read lease still past duration must remain expired"
+        );
     }
 
     #[test]

@@ -40,6 +40,7 @@ tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 webpki-roots = { workspace = true }
 zeroize = { workspace = true }
+subtle = "2"
 
 [dev-dependencies]
 criterion = { workspace = true }

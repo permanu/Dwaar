@@ -12,7 +12,8 @@
 //! automatically — no manual chunked encoding or response parsing.
 
 use super::convert::{is_hop_by_hop, pingora_resp_to_h3};
-use bytes::Bytes;
+use super::stream_guard::{BodyDeadline, H2CapacityError, await_h2_capacity, with_chunk_deadline};
+use bytes::{Buf, Bytes};
 use dwaar_plugins::plugin::{PluginChain, PluginCtx};
 use h3::server::RequestStream;
 use pingora_http::ResponseHeader;
@@ -52,6 +53,24 @@ pub enum H2BridgeError {
 
     #[error("H2 flow control capacity error: {0}")]
     FlowControl(h2::Error),
+
+    /// A single H3 `recv_data()` call didn't return within the per-chunk
+    /// timeout window defined by [`super::stream_guard::CHUNK_READ_TIMEOUT`]
+    /// or the remaining wall-clock from [`BodyDeadline`].
+    #[error("H3 request body chunk read timed out")]
+    RequestChunkTimeout,
+
+    /// The H2 peer's flow-control window stayed closed past
+    /// [`super::stream_guard::H2_CAPACITY_WAIT`] — the upstream is
+    /// effectively stalled, not just slow.
+    #[error("H2 upstream flow-control window did not open in time")]
+    UpstreamCapacityTimeout,
+
+    /// The cumulative wall-clock for one body transfer has been exceeded
+    /// (see [`super::stream_guard::BODY_WALL_CLOCK`]). This catches
+    /// slow-loris peers that trickle bytes below the per-chunk threshold.
+    #[error("body transfer exceeded wall-clock budget")]
+    BodyDeadlineExceeded,
 }
 
 /// Maximum request body size (same as H1 bridge, Guardrail #28).
@@ -67,7 +86,7 @@ const MAX_REQUEST_BODY: usize = 10 * 1024 * 1024; // 10 MB
 /// Flow control is handled by the `h2` crate. We call
 /// `release_capacity()` after consuming each DATA frame to prevent
 /// deadlock.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn stream_via_h2<S, B>(
     h3_stream: &mut RequestStream<S, B>,
     mut sender: h2::client::SendRequest<Bytes>,
@@ -95,30 +114,79 @@ where
         .map_err(H2BridgeError::SendRequest)?;
 
     // Stream request body from H3 to H2 (if present).
+    //
+    // Invariants enforced by this loop:
+    //
+    // * Per-chunk recv_data timeout — a stalled H3 client can't pin
+    //   the stream forever (Guardrail #29).
+    // * Wall-clock deadline across the whole body — slow-loris clients
+    //   that trickle one byte at a time within the per-chunk window
+    //   still hit a 5-minute ceiling (BodyDeadline).
+    // * Reserve + await-capacity before every send_data — the h2
+    //   crate explicitly documents that send_data without reserved
+    //   capacity buffers unboundedly in memory. Awaiting poll_capacity
+    //   propagates back-pressure up to the H3 client: if the upstream
+    //   is slow, h3 recv_data() is not polled, and quinn's receive
+    //   window drains, throttling the client transport-level rather
+    //   than piling bytes onto our heap.
+    // * Total body bytes bounded by MAX_REQUEST_BODY (Guardrail #28).
     if has_body {
+        let deadline = BodyDeadline::new();
         let mut total_body = 0usize;
-        while let Some(chunk) = h3_stream
-            .recv_data()
-            .await
-            .map_err(H2BridgeError::H3RecvData)?
-        {
-            use bytes::Buf;
-            let remaining = chunk.remaining();
-            total_body += remaining;
+
+        loop {
+            if deadline.is_exhausted() {
+                return Err(H2BridgeError::BodyDeadlineExceeded);
+            }
+
+            let recv = with_chunk_deadline(deadline, h3_stream.recv_data())
+                .await
+                .map_err(|_elapsed| H2BridgeError::RequestChunkTimeout)?
+                .map_err(H2BridgeError::H3RecvData)?;
+
+            let Some(mut chunk) = recv else {
+                break;
+            };
+
+            // Zero-copy conversion: `recv_data` returns `impl Buf`, which
+            // h3-quinn monomorphises to `Bytes`. `Bytes` overrides
+            // `Buf::copy_to_bytes` to be `split_to` — an O(1) ref-count
+            // bump, no memcpy. Using the default trait path (BytesMut +
+            // BufMut::put + freeze) would instead clone the bytes on
+            // every chunk, defeating the streaming invariant.
+            let len = chunk.remaining();
+            let frozen: Bytes = chunk.copy_to_bytes(len);
+
+            total_body = total_body
+                .checked_add(len)
+                .ok_or(H2BridgeError::RequestTooLarge)?;
             if total_body > MAX_REQUEST_BODY {
                 return Err(H2BridgeError::RequestTooLarge);
             }
-            let mut data = bytes::BytesMut::with_capacity(remaining);
-            bytes::BufMut::put(&mut data, chunk);
-            let frozen = data.freeze();
 
-            // Reserve capacity before sending (H2 flow control).
-            send_stream.reserve_capacity(frozen.len());
-            send_stream
-                .send_data(frozen, false)
-                .map_err(H2BridgeError::SendBody)?;
+            if len > 0 {
+                // Reserve the window slice for this chunk, then block until
+                // the upstream actually grants it. If the upstream window
+                // is closed and stays closed past H2_CAPACITY_WAIT, bail.
+                send_stream.reserve_capacity(len);
+                match await_h2_capacity(&mut send_stream, len).await {
+                    Ok(()) => {}
+                    Err(H2CapacityError::Timeout) => {
+                        return Err(H2BridgeError::UpstreamCapacityTimeout);
+                    }
+                    Err(H2CapacityError::H2(e)) => {
+                        return Err(H2BridgeError::FlowControl(e));
+                    }
+                }
+
+                send_stream
+                    .send_data(frozen, false)
+                    .map_err(H2BridgeError::SendBody)?;
+            }
         }
-        // Signal end of request body.
+
+        // Signal end of request body. The zero-length final frame does
+        // not need flow-control capacity.
         send_stream
             .send_data(Bytes::new(), true)
             .map_err(H2BridgeError::SendBody)?;
@@ -154,8 +222,24 @@ where
         .map_err(H2BridgeError::H3SendResponse)?;
 
     // Stream response body: H2 → plugins → H3.
-    // The h2 crate yields Bytes directly (zero-copy from its internal buffer).
-    while let Some(chunk) = recv_stream.data().await {
+    //
+    // The h2 crate yields Bytes directly (zero-copy from its internal
+    // buffer). Each recv is bounded by a per-chunk timeout so a wedged
+    // upstream can't keep the H3 stream open forever, and the whole
+    // body transfer is bounded by a 5-minute wall-clock.
+    let resp_deadline = BodyDeadline::new();
+    loop {
+        if resp_deadline.is_exhausted() {
+            return Err(H2BridgeError::BodyDeadlineExceeded);
+        }
+
+        let next = with_chunk_deadline(resp_deadline, recv_stream.data())
+            .await
+            .map_err(|_elapsed| H2BridgeError::RequestChunkTimeout)?;
+
+        let Some(chunk) = next else {
+            break;
+        };
         let chunk = chunk.map_err(H2BridgeError::RecvBody)?;
         let len = chunk.len();
 

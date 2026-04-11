@@ -33,6 +33,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -40,6 +41,7 @@ use parking_lot::Mutex;
 use bytes::Bytes;
 use h2::client::SendRequest;
 use tokio::net::TcpStream;
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, warn};
 
 /// Maximum H2 connections per upstream host. Two connections limit
@@ -66,10 +68,27 @@ struct H2Conn {
 
 /// Per-host H2 connection pool for the H3 upstream bridge.
 ///
-/// Thread-safe — the inner `Mutex` is held only for the brief
-/// clone/insert of `SendRequest`, never during I/O.
+/// Thread-safe with two concentric guards:
+///
+/// * `conns` — a fast, synchronous `parking_lot::Mutex` held only for
+///   the microseconds needed to clone/insert a `SendRequest`. Never
+///   held across I/O.
+/// * `connect_locks` — a map of per-host async mutexes, held by the
+///   caller that's actively performing the TCP connect + H2 handshake
+///   for a given upstream. Without this, 100 concurrent H3 streams
+///   racing on a cold pool all see `acquire() == None`, all fall
+///   through to `connect()`, and all open their own TCP connection —
+///   producing N sockets instead of `MAX_CONNS_PER_HOST`. Once the
+///   first caller wins the async mutex and finishes connecting,
+///   everyone else wakes up, re-checks `acquire()`, and finds the
+///   fresh connection waiting for them.
 pub struct H2ConnPool {
     conns: Mutex<HashMap<SocketAddr, Vec<H2Conn>>>,
+    /// Per-host async mutex guarding the connect-or-reuse decision.
+    /// Keys are lazily inserted on first use and never removed — the
+    /// cardinality is bounded by the number of distinct upstream hosts,
+    /// which is tiny in practice.
+    connect_locks: Mutex<HashMap<SocketAddr, Arc<AsyncMutex<()>>>>,
 }
 
 impl std::fmt::Debug for H2ConnPool {
@@ -88,7 +107,21 @@ impl H2ConnPool {
     pub fn new() -> Self {
         Self {
             conns: Mutex::new(HashMap::new()),
+            connect_locks: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Fetch (or lazily create) the per-host connect serializer.
+    ///
+    /// The outer `parking_lot::Mutex` is held only for the
+    /// `HashMap` insert — never during the async wait on the inner
+    /// `AsyncMutex`.
+    fn connect_lock_for(&self, addr: SocketAddr) -> Arc<AsyncMutex<()>> {
+        let mut locks = self.connect_locks.lock();
+        locks
+            .entry(addr)
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
     }
 
     /// Get a `SendRequest` handle for the given upstream address.
@@ -181,13 +214,34 @@ impl H2ConnPool {
     }
 
     /// Acquire an existing connection or establish a new one.
+    ///
+    /// Concurrent callers for the same host are serialized through a
+    /// per-host async mutex so only one of them ever performs the TCP
+    /// connect. The rest wake up, re-check the synchronous pool, and
+    /// reuse the freshly-established connection — which is exactly
+    /// what an H2 connection pool should do (one TCP socket serving
+    /// many multiplexed streams).
     pub async fn get_or_connect(
         &self,
         addr: SocketAddr,
     ) -> Result<SendRequest<Bytes>, H2ConnError> {
+        // Fast path — pool already has a connection.
         if let Some(sender) = self.acquire(addr) {
             return Ok(sender);
         }
+
+        // Slow path: serialize the connect decision per host.
+        let lock = self.connect_lock_for(addr);
+        let _guard = lock.lock().await;
+
+        // A peer may have filled the pool while we were waiting for the
+        // mutex. Check again before paying for a fresh handshake.
+        if let Some(sender) = self.acquire(addr) {
+            return Ok(sender);
+        }
+
+        // We are the designated connector for this host. Establish the
+        // connection, publish it to the pool, and return.
         self.connect(addr).await
     }
 }

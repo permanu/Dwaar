@@ -74,6 +74,7 @@ pub(super) fn parse_log(t: &mut Tokenizer<'_>) -> Result<LogDirective, ParseErro
                                     directive: "log".to_string(),
                                     message: "expected log level string (e.g. INFO, DEBUG)"
                                         .to_string(),
+                                    accepted_format: None,
                                 },
                             });
                         };
@@ -119,6 +120,7 @@ fn parse_log_output(t: &mut Tokenizer<'_>) -> Result<LogOutput, ParseError> {
             kind: ParseErrorKind::InvalidValue {
                 directive: "log".to_string(),
                 message: "expected output destination (stdout, stderr, discard, file)".to_string(),
+                accepted_format: None,
             },
         });
     };
@@ -136,6 +138,7 @@ fn parse_log_output(t: &mut Tokenizer<'_>) -> Result<LogOutput, ParseError> {
                     kind: ParseErrorKind::InvalidValue {
                         directive: "log".to_string(),
                         message: "expected socket path after 'output unix'".to_string(),
+                        accepted_format: None,
                     },
                 });
             };
@@ -150,6 +153,7 @@ fn parse_log_output(t: &mut Tokenizer<'_>) -> Result<LogOutput, ParseError> {
                     kind: ParseErrorKind::InvalidValue {
                         directive: "log".to_string(),
                         message: "expected file path after 'output file'".to_string(),
+                        accepted_format: None,
                     },
                 });
             };
@@ -182,6 +186,7 @@ fn parse_log_output(t: &mut Tokenizer<'_>) -> Result<LogOutput, ParseError> {
                                             kind: ParseErrorKind::InvalidValue {
                                                 directive: "log".to_string(),
                                                 message: "expected keep count".to_string(),
+                                                accepted_format: None,
                                             },
                                         });
                                     };
@@ -191,6 +196,7 @@ fn parse_log_output(t: &mut Tokenizer<'_>) -> Result<LogOutput, ParseError> {
                                         kind: ParseErrorKind::InvalidValue {
                                             directive: "log".to_string(),
                                             message: format!("invalid keep count: '{val}'"),
+                                            accepted_format: None,
                                         },
                                     })?);
                                 }
@@ -216,6 +222,7 @@ fn parse_log_output(t: &mut Tokenizer<'_>) -> Result<LogOutput, ParseError> {
                 message: format!(
                     "unknown log output '{other}' — expected stdout, stderr, discard, unix, or file"
                 ),
+                accepted_format: None,
             },
         }),
     }
@@ -234,6 +241,7 @@ fn parse_size_value(t: &mut Tokenizer<'_>, line: usize, col: usize) -> Result<u6
                 kind: ParseErrorKind::InvalidValue {
                     directive: "log".to_string(),
                     message: "expected size value after 'max_size'".to_string(),
+                    accepted_format: None,
                 },
             });
         }
@@ -254,6 +262,7 @@ fn parse_size_value(t: &mut Tokenizer<'_>, line: usize, col: usize) -> Result<u6
         kind: ParseErrorKind::InvalidValue {
             directive: "log".to_string(),
             message: format!("invalid size value: '{raw}'"),
+            accepted_format: None,
         },
     })?;
     Ok(base.saturating_mul(multiplier))
@@ -273,6 +282,7 @@ fn parse_log_format(t: &mut Tokenizer<'_>) -> Result<LogFormat, ParseError> {
                 kind: ParseErrorKind::InvalidValue {
                     directive: "log".to_string(),
                     message: format!("unknown log format '{other}' — expected console or json"),
+                    accepted_format: None,
                 },
             }),
         },
@@ -282,6 +292,7 @@ fn parse_log_format(t: &mut Tokenizer<'_>) -> Result<LogFormat, ParseError> {
             kind: ParseErrorKind::InvalidValue {
                 directive: "log".to_string(),
                 message: "expected log format (console or json)".to_string(),
+                accepted_format: None,
             },
         }),
     }
@@ -347,6 +358,7 @@ pub(super) fn parse_log_name(t: &mut Tokenizer<'_>) -> Result<LogNameDirective, 
                 kind: ParseErrorKind::InvalidValue {
                     directive: "log_name".to_string(),
                     message: "expected logger name".to_string(),
+                    accepted_format: None,
                 },
             });
         }
@@ -455,6 +467,7 @@ pub(super) fn parse_invoke(t: &mut Tokenizer<'_>) -> Result<InvokeDirective, Par
                 kind: ParseErrorKind::InvalidValue {
                     directive: "invoke".to_string(),
                     message: "expected route name".to_string(),
+                    accepted_format: None,
                 },
             });
         }
@@ -541,6 +554,7 @@ pub(super) fn parse_intercept(
                     kind: ParseErrorKind::InvalidValue {
                         directive: "intercept".to_string(),
                         message: "expected { block".to_string(),
+                        accepted_format: None,
                     },
                 });
             }

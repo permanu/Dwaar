@@ -38,11 +38,49 @@ pub enum ParseErrorKind {
         tracking_issue: Option<String>,
     },
     /// Invalid value for a directive argument.
-    InvalidValue { directive: String, message: String },
+    InvalidValue {
+        directive: String,
+        message: String,
+        /// Optional example of the accepted format (e.g., "100/s or 5000/10m").
+        accepted_format: Option<&'static str>,
+    },
     /// Unexpected end of input.
     UnexpectedEof { expected: String },
     /// Generic error for anything else.
     Other(String),
+}
+
+impl ParseErrorKind {
+    /// Construct an [`InvalidValue`] without an accepted-format hint.
+    ///
+    /// Use this for error sites where there is no single canonical format
+    /// to show the user. For sites with a clear expected form, call
+    /// [`Self::invalid_value_with_format`].
+    #[must_use]
+    pub fn invalid_value(directive: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::InvalidValue {
+            directive: directive.into(),
+            message: message.into(),
+            accepted_format: None,
+        }
+    }
+
+    /// Construct an [`InvalidValue`] with a canonical accepted-format example.
+    ///
+    /// The `accepted_format` string is appended to the error display on a
+    /// new line, prefixed with `expected:`.
+    #[must_use]
+    pub fn invalid_value_with_format(
+        directive: impl Into<String>,
+        message: impl Into<String>,
+        accepted_format: &'static str,
+    ) -> Self {
+        Self::InvalidValue {
+            directive: directive.into(),
+            message: message.into(),
+            accepted_format: Some(accepted_format),
+        }
+    }
 }
 
 impl fmt::Display for ParseError {
@@ -69,8 +107,16 @@ impl fmt::Display for ParseError {
                 }
                 Ok(())
             }
-            ParseErrorKind::InvalidValue { directive, message } => {
-                write!(f, "invalid value for '{directive}': {message}")
+            ParseErrorKind::InvalidValue {
+                directive,
+                message,
+                accepted_format,
+            } => {
+                write!(f, "invalid value for '{directive}': {message}")?;
+                if let Some(fmt) = accepted_format {
+                    write!(f, "\n    expected: {fmt}")?;
+                }
+                Ok(())
             }
             ParseErrorKind::UnexpectedEof { expected } => {
                 write!(f, "unexpected end of file, expected {expected}")
@@ -147,6 +193,44 @@ pub fn suggest_directive(input: &str) -> Option<&'static str> {
         "copy_response",
         "copy_response_headers",
         "wasm_plugin",
+        // Nested: reverse_proxy / transport
+        "transport",
+        "health_uri",
+        "health_interval",
+        "health_timeout",
+        "lb_policy",
+        "lb_try_duration",
+        "lb_try_interval",
+        "fail_duration",
+        "max_fails",
+        "unhealthy_request_count",
+        "unhealthy_status",
+        "flush_interval",
+        "buffer_requests",
+        "buffer_responses",
+        "header_up",
+        "header_down",
+        "copy_headers",
+        // Nested: tls
+        "alpn",
+        "curves",
+        "protocols",
+        "resumption",
+        "ca_root",
+        "client_auth",
+        "trusted_ca_cert",
+        // Nested: log
+        "output",
+        "format",
+        "level",
+        "roll_size",
+        "roll_keep",
+        "roll_keep_for",
+        // Nested: rate_limit
+        "key",
+        "zone",
+        "rate",
+        "burst",
     ];
 
     KNOWN

@@ -11,6 +11,7 @@ authors.workspace = true
 
 [dependencies]
 dwaar-core = { workspace = true }
+dwaar-config = { workspace = true }
 dwaar-analytics = { workspace = true }
 pingora-core = { workspace = true }
 pingora-cache = { workspace = true }

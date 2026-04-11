@@ -117,6 +117,47 @@ Pingora also applies its own `grace_period_seconds` (5 s) and `graceful_shutdown
 
 Tune `drain_timeout_secs` to match your longest expected request duration. For APIs with short timeouts, 30 s is sufficient. For file uploads or long-poll endpoints, increase to 60–120 s.
 
+## Supervisor Readiness Probe
+
+When Dwaar runs in multi-worker mode, a supervisor process forks child workers and restarts them on crash or reload. As of 0.2.2 the supervisor no longer retires an old worker until the new child has proven it can serve traffic.
+
+```mermaid
+sequenceDiagram
+    participant Sup as Supervisor
+    participant Old as Old worker
+    participant New as New worker
+    participant Admin as Admin socket
+
+    Sup->>New: fork + exec
+    Note over Sup: Start 10 s deadline
+    loop every 50 ms
+        Sup->>Admin: connect() to new worker
+        Sup->>Sup: waitpid(new, WNOHANG)
+        alt connect succeeds
+            Note over Sup: Readiness confirmed
+            Sup->>Old: SIGQUIT (drain)
+        else child already exited
+            Note over Sup: ChildExited — abort restart
+        else deadline reached
+            Note over Sup: Timeout — kill new worker
+        end
+    end
+```
+
+**What is probed.** The supervisor connects to the worker's admin endpoint — the Unix domain socket path if `--admin-socket` was passed, otherwise TCP `127.0.0.1:6190` (the always-on admin listener on worker 0). A successful `connect()` is proof that the child bound its listeners.
+
+**Cadence.** Poll every 50 ms, capped at a 10 s deadline. The supervisor uses blocking stdlib sockets (`std::net::TcpStream`, `std::os::unix::net::UnixStream`) rather than Tokio — the supervisor loop runs before Pingora's runtime is spun up, so there is no async executor available and none is needed.
+
+**Failure modes.**
+
+| Condition | Supervisor action |
+|---|---|
+| `connect()` succeeds before the deadline | Restart is declared successful. Old worker receives `SIGQUIT`. |
+| `waitpid(WNOHANG)` reports the child exited before readiness | `ChildExited` — the old worker is left running and serving, the restart is aborted. Check logs for the child's panic. |
+| 10 s deadline elapses with no successful connect | `Timeout` — the new worker is killed, the old one keeps serving. |
+
+This closes a race that existed before: a worker whose constructor panicked after `fork()` but before bind could leave the supervisor thinking the child was alive. The `waitpid(WNOHANG)` arm catches that case cleanly.
+
 ## Step-by-Step
 
 Follow these steps to perform a production upgrade:

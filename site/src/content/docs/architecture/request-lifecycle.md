@@ -197,6 +197,55 @@ The `RequestLog` is sent via `LogSender::send()` to the batch writer background 
 
 **`AggEvent`** — simultaneously sends a lightweight event to the `AggregationService` containing host, path, status, bytes, client IP, country, and referer for in-memory analytics aggregation.
 
+## HTTP/3 Path
+
+The QUIC listener does **not** flow through Pingora's `ProxyHttp` hooks — `QuicService` is a Pingora `BackgroundService` that terminates QUIC itself via `quinn` + `h3` and bridges each H3 request to an H2 upstream connection (or an H1 upstream via `BufferedConn`). The H3 bridge shares the same `RouteTable` and `PluginChain` as the TCP path, so routing, plugins, and config reloads all behave identically.
+
+```mermaid
+sequenceDiagram
+    participant C as Client (QUIC)
+    participant Q as QuicService (quinn + h3)
+    participant BD as BodyDeadline
+    participant P as H2ConnPool
+    participant U as Upstream (H2)
+
+    C->>Q: QUIC stream — H3 request headers
+    Q->>Q: Route lookup (ArcSwap — same table as TCP)
+    Q->>P: get_or_connect(host:port)
+    Note over P: Per-host tokio::sync::Mutex serializes cold-start<br/>connect races. Bounded by MAX_CONNS_PER_HOST = 2.
+    P-->>Q: shared h2::SendRequest
+
+    Q->>U: send_request(headers)
+    U-->>Q: h2::SendStream + ResponseFuture
+
+    loop request body chunks
+        C->>BD: recv_data (chunk deadline wraps each call)
+        BD-->>Q: Bytes (zero-copy via split_to)
+        Q->>Q: await_h2_capacity(stream, chunk.len())
+        Q->>U: send_data(chunk)
+    end
+
+    U-->>Q: response headers
+    Q-->>C: H3 headers
+
+    loop response body chunks
+        U->>BD: recv_data (same deadline wrapping in reverse)
+        BD-->>Q: Bytes (zero-copy)
+        Q-->>C: H3 DATA frame
+    end
+
+    Q->>P: release connection to pool (reuse for next stream)
+```
+
+**Key properties of the H3 path:**
+
+- **Streaming both directions.** No request or response body is ever fully buffered. Each `recv_data` → `send_data` cycle is a refcount bump via `Buf::copy_to_bytes` → `Bytes::split_to`; peak per-chunk allocation is zero.
+- **Three independent body deadlines.** `CHUNK_READ_TIMEOUT = 30s` bounds each `recv_data` wait (slow-loris resistance). `BODY_WALL_CLOCK = 5 min` bounds the aggregate transfer (tail-latency cap). `H2_CAPACITY_WAIT = 30s` bounds `await_h2_capacity` (wedged-upstream detection).
+- **Race-free upstream pool.** `H2ConnPool::get_or_connect` is serialized per host so that `MAX_CONNS_PER_HOST = 2` is honored even under cold-start bursts. 100 concurrent H3 streams to one upstream share ≤ 2 TCP connections.
+- **Bounded h2 backpressure.** `await_h2_capacity` polls `poll_capacity` until the requested window is actually granted, so `send_data` never queues ahead of the peer's flow-control cursor.
+
+**File refs:** `crates/dwaar-core/src/quic/h2_bridge.rs`, `handler.rs`, `h2_pool.rs`, `stream_guard.rs` (`BodyDeadline`, `with_chunk_deadline`, `await_h2_capacity`).
+
 ## Error Handling
 
 | Phase | Error | Result |

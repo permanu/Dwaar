@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use arc_swap::ArcSwap;
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use dwaar_plugins::plugin::{PluginChain, PluginResponse};
 use h3::server::RequestStream;
 use pingora_http::ResponseHeader;
@@ -24,6 +24,7 @@ use tracing::{debug, warn};
 use crate::route::RouteTable;
 
 use super::bridge::{self, BodyFraming, MAX_REQUEST_BODY, UPSTREAM_TIMEOUT_SECS, UpstreamError};
+use super::stream_guard::{BodyDeadline, with_chunk_deadline};
 
 /// Maximum cumulative bytes accepted from a close-delimited upstream body.
 /// Close-delimited responses have no declared length — cap them to prevent
@@ -321,24 +322,46 @@ where
         .await
         .map_err(StreamProxyError::Upstream)?;
 
+    // Stream the request body h3 → upstream TCP, chunk-by-chunk.
+    //
+    // Every recv_data() is wrapped in a per-chunk timeout derived from
+    // BodyDeadline — a slow-loris h3 client hits the per-chunk cap
+    // first, and a client that trickles bytes below the cap eventually
+    // hits BODY_WALL_CLOCK. The total body is also bounded by
+    // MAX_REQUEST_BODY (Guardrail #28). Each chunk is forwarded to the
+    // upstream as soon as it arrives — no per-request accumulator,
+    // peak memory is bounded by (h3 recv window) + (1 in-flight chunk).
+    let request_deadline = BodyDeadline::new();
     let mut total_body = 0usize;
 
-    while let Some(chunk) = h3_stream
-        .recv_data()
-        .await
-        .map_err(StreamProxyError::H3RecvData)?
-    {
-        use bytes::Buf;
-        let remaining = chunk.remaining();
-        total_body += remaining;
+    loop {
+        if request_deadline.is_exhausted() {
+            return Err(StreamProxyError::RequestChunkTimeout);
+        }
+
+        let recv = with_chunk_deadline(request_deadline, h3_stream.recv_data())
+            .await
+            .map_err(|_elapsed| StreamProxyError::RequestChunkTimeout)?
+            .map_err(StreamProxyError::H3RecvData)?;
+
+        let Some(mut chunk) = recv else {
+            break;
+        };
+
+        // Zero-copy: `Buf::copy_to_bytes` on `Bytes` is just `split_to`
+        // (O(1) ref-count increment). The h3-quinn monomorphisation of
+        // `impl Buf` is `Bytes`, so static dispatch picks the override.
+        let len = chunk.remaining();
+        let frozen: Bytes = chunk.copy_to_bytes(len);
+
+        total_body = total_body
+            .checked_add(len)
+            .ok_or(StreamProxyError::RequestTooLarge)?;
         if total_body > MAX_REQUEST_BODY {
             return Err(StreamProxyError::RequestTooLarge);
         }
-        let mut data = bytes::BytesMut::with_capacity(remaining);
-        bytes::BufMut::put(&mut data, chunk);
-        let frozen = data.freeze();
 
-        if has_body {
+        if has_body && len > 0 {
             bridge::write_chunked_data(&mut conn.stream, &frozen)
                 .await
                 .map_err(StreamProxyError::Upstream)?;
@@ -452,6 +475,12 @@ where
         Ok(())
     }
 
+    // One deadline for the whole response body. Each upstream read is
+    // wrapped in `read_with_deadline` so a stalled upstream TCP socket
+    // trips CHUNK_READ_TIMEOUT, and a drip-feed upstream eventually
+    // trips BODY_WALL_CLOCK.
+    let response_deadline = BodyDeadline::new();
+
     match *body_framing {
         BodyFraming::ContentLength(total) => {
             let mut sent = 0usize;
@@ -475,10 +504,7 @@ where
 
             // Stream remaining body using the connection's own buffer.
             while sent < total {
-                let n = conn
-                    .read_into_buf()
-                    .await
-                    .map_err(|e| StreamProxyError::Upstream(UpstreamError::Read(e)))?;
+                let n = read_with_deadline(conn, response_deadline).await?;
                 if n == 0 {
                     return Err(StreamProxyError::Upstream(UpstreamError::Parse(
                         "upstream closed before content-length fulfilled".into(),
@@ -512,10 +538,7 @@ where
             }
 
             loop {
-                let n = conn
-                    .read_into_buf()
-                    .await
-                    .map_err(|e| StreamProxyError::Upstream(UpstreamError::Read(e)))?;
+                let n = read_with_deadline(conn, response_deadline).await?;
                 if n == 0 {
                     send_chunk(h3_stream, plugin_chain, ctx, Bytes::new(), true).await?;
                     break;
@@ -555,10 +578,7 @@ where
 
                 // Need more data from upstream — read into connection's buffer,
                 // then append to the chunked accumulator.
-                let n = conn
-                    .read_into_buf()
-                    .await
-                    .map_err(|e| StreamProxyError::Upstream(UpstreamError::Read(e)))?;
+                let n = read_with_deadline(conn, response_deadline).await?;
                 if n == 0 {
                     return Err(StreamProxyError::Upstream(UpstreamError::Parse(
                         "upstream closed mid-chunked-body".into(),
@@ -646,6 +666,27 @@ where
     result
 }
 
+/// Read into the connection's own buffer with a per-chunk + wall-clock
+/// deadline. Used by every TCP upstream read on the streaming path.
+///
+/// Lives here (rather than on [`BufferedConn`]) so it can map the tokio
+/// [`Elapsed`] into the same [`StreamProxyError`] vocabulary that the
+/// rest of the handler speaks.
+///
+/// [`Elapsed`]: tokio::time::error::Elapsed
+async fn read_with_deadline(
+    conn: &mut BufferedConn,
+    deadline: BodyDeadline,
+) -> Result<usize, StreamProxyError> {
+    if deadline.is_exhausted() {
+        return Err(StreamProxyError::Upstream(UpstreamError::Timeout));
+    }
+    with_chunk_deadline(deadline, conn.read_into_buf())
+        .await
+        .map_err(|_elapsed| StreamProxyError::Upstream(UpstreamError::Timeout))?
+        .map_err(|e| StreamProxyError::Upstream(UpstreamError::Read(e)))
+}
+
 /// Errors from the streaming proxy path.
 #[derive(Debug, thiserror::Error)]
 enum StreamProxyError {
@@ -660,6 +701,13 @@ enum StreamProxyError {
 
     #[error("request body exceeded limit")]
     RequestTooLarge,
+
+    /// Per-chunk `recv_data()` from the H3 client did not return within
+    /// the timeout window, *or* the wall-clock body deadline expired.
+    /// Both failure modes funnel through here because the caller does
+    /// the same thing in either case (drop the stream).
+    #[error("h3 request body chunk read timed out")]
+    RequestChunkTimeout,
 
     #[error("failed to build response: {0}")]
     BuildResponse(String),

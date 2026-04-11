@@ -14,13 +14,42 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-/// Default admin API address.
-pub(crate) const DEFAULT_ADMIN_ADDR: &str = "127.0.0.1:6190";
-
 /// Response from the admin API.
 pub(crate) struct AdminResponse {
     pub status: u16,
     pub body: String,
+}
+
+/// Build an actionable error message for a failed connect to the admin API.
+///
+/// `ConnectionRefused` and `NotFound` both mean "nobody is listening on this
+/// address" — the daemon is almost certainly not running. Surface a hint
+/// that tells the user exactly how to start it, instead of the bare OS
+/// error that clap/anyhow would otherwise print.
+///
+/// All other errors (timeouts, permission, routing) get the raw message so
+/// the user can diagnose the environment problem.
+fn friendly_connect_error(addr: &str, err: &std::io::Error) -> anyhow::Error {
+    let is_not_listening = matches!(
+        err.kind(),
+        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+    );
+
+    // Prefer the explicit DWAAR_CONFIG if the user set one, otherwise fall
+    // back to the conventional Dwaarfile name. We intentionally do not try
+    // to canonicalize here — we want the suggestion to match what the user
+    // will type, not a filesystem-resolved absolute path.
+    let config_hint = std::env::var("DWAAR_CONFIG").unwrap_or_else(|_| "./Dwaarfile".to_string());
+
+    if is_not_listening {
+        anyhow::anyhow!(
+            "dwaar admin socket at {addr} is not accepting connections.\n\
+             Is dwaar running? Start it with:\n  \
+               dwaar --config {config_hint}"
+        )
+    } else {
+        anyhow::anyhow!("cannot connect to admin API at {addr}: {err}")
+    }
 }
 
 /// Send a GET request to the admin API and return the response.
@@ -39,12 +68,7 @@ fn request(
     path: &str,
     body: Option<&str>,
 ) -> anyhow::Result<AdminResponse> {
-    let mut stream = TcpStream::connect(addr).map_err(|e| {
-        anyhow::anyhow!(
-            "cannot connect to admin API at {addr}: {e}\n\
-             Is Dwaar running? The admin API listens on {DEFAULT_ADMIN_ADDR} by default."
-        )
-    })?;
+    let mut stream = TcpStream::connect(addr).map_err(|e| friendly_connect_error(addr, &e))?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
 

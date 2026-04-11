@@ -159,6 +159,8 @@ ERROR plugin=my-plugin hook=on-request traps=10 WASM plugin disabled after too m
 
 **Config reload.** Sending `SIGHUP` (or running `dwaar reload`) reloads the Dwaarfile and recompiles all `wasm_plugin` entries from scratch. A previously disabled plugin is re-enabled if you supply a new `.wasm` binary at the same path.
 
+**Module cache invalidation (0.2.2).** The compiled-module cache is now diffed on every hot-reload. Before the new config goes live, Dwaar walks the old and new `wasm_plugin` sets and calls `ModuleCache::invalidate()` on every module path whose file `mtime` changed or whose entry was removed. Overwriting `plugin.wasm` on disk and running `dwaar reload` is now sufficient to pick up the new binary — a full process restart is no longer required. Paths that did not change retain their cached compiled artifact for zero re-compile overhead.
+
 ## Writing your own plugin
 
 Start from the hello-world example at `examples/wasm-plugins/hello-world/`. The steps are:

@@ -60,6 +60,12 @@ The challenge token is served directly by Dwaar's request filter — no separate
 
 Certificates use ECDSA P-256 keys and include a Subject Alternative Name (SAN) for the domain.
 
+### Challenge path and the HTTPS redirect
+
+The HTTP→HTTPS auto-redirect normally rewrites every plaintext request to its HTTPS counterpart. The only exception is `/.well-known/acme-challenge/`: those requests must be answered over plaintext so the ACME CA can fetch the token during validation.
+
+As of 0.2.2 the bypass is gated on the HTTP method. Only `GET` requests to `/.well-known/acme-challenge/...` are served in the clear; `POST`, `PUT`, `DELETE`, and every other method fall through to the normal HTTPS redirect. This matches [RFC 8555 §8.3](https://datatracker.ietf.org/doc/html/rfc8555#section-8.3), which specifies the challenge verification as a `GET`, and closes a narrow redirect-bypass vector on clients that tunnel arbitrary methods through the well-known path.
+
 ## ACME Providers
 
 | Provider | Directory URL | Notes |

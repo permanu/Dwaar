@@ -103,6 +103,7 @@ fn parse_layer4_server(
             kind: ParseErrorKind::InvalidValue {
                 directive: "layer4".to_string(),
                 message: "expected at least one listen address".to_string(),
+                accepted_format: None,
             },
         });
     }

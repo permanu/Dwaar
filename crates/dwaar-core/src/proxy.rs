@@ -150,10 +150,14 @@ impl DwaarProxy {
             return None;
         }
 
-        if ctx
-            .plugin_ctx
-            .path
-            .starts_with("/.well-known/acme-challenge/")
+        // ACME HTTP-01 challenges are GET-only per RFC 8555 §8.3. Gating the
+        // bypass by method prevents a cross-protocol request smuggling surface
+        // where a non-GET to this prefix would skip the HTTPS redirect.
+        if ctx.plugin_ctx.method == "GET"
+            && ctx
+                .plugin_ctx
+                .path
+                .starts_with("/.well-known/acme-challenge/")
         {
             return None;
         }
@@ -700,29 +704,34 @@ impl ProxyHttp for DwaarProxy {
                         }
                     }
 
-                    // Evaluate map directives to populate VarSlots (ISSUE-056)
-                    if !block.maps.is_empty() || !route.var_defaults.is_empty() {
+                    // Evaluate map directives to populate VarSlots (ISSUE-056).
+                    //
+                    // Only clone `route.var_defaults` when `maps` is non-empty —
+                    // i.e., when we actually need a mutable per-request copy.
+                    // With `maps` empty, the consumer below falls back to
+                    // `&route.var_defaults` directly, eliminating a per-request
+                    // `Vec<Option<CompactString>>` deep clone on routes that
+                    // declare `vars` defaults without any `map` rules (#126).
+                    if !block.maps.is_empty() {
                         let mut slots = route.var_defaults.clone();
-                        if !block.maps.is_empty() {
-                            let map_tmpl_ctx = TemplateContext {
-                                host: ctx.plugin_ctx.host.as_deref().unwrap_or(""),
-                                method: ctx.plugin_ctx.method.as_str(),
-                                path: request_path,
-                                uri: request_path,
-                                query: "",
-                                scheme: if ctx.route_tls { "https" } else { "http" },
-                                remote_host: "",
-                                remote_port: 0,
-                                request_id: ctx.request_id(),
-                                upstream_host: "",
-                                upstream_port: 0,
-                                tls_server_name: "",
-                                vars: None,
-                            };
-                            for map in &block.maps {
-                                if let Some(val) = map.evaluate(&map_tmpl_ctx) {
-                                    slots.set(map.dest_slot, CompactString::from(val));
-                                }
+                        let map_tmpl_ctx = TemplateContext {
+                            host: ctx.plugin_ctx.host.as_deref().unwrap_or(""),
+                            method: ctx.plugin_ctx.method.as_str(),
+                            path: request_path,
+                            uri: request_path,
+                            query: "",
+                            scheme: if ctx.route_tls { "https" } else { "http" },
+                            remote_host: "",
+                            remote_port: 0,
+                            request_id: ctx.request_id(),
+                            upstream_host: "",
+                            upstream_port: 0,
+                            tls_server_name: "",
+                            vars: None,
+                        };
+                        for map in &block.maps {
+                            if let Some(val) = map.evaluate(&map_tmpl_ctx) {
+                                slots.set(map.dest_slot, CompactString::from(val));
                             }
                         }
                         ctx.var_slots = Some(slots);
@@ -750,7 +759,13 @@ impl ProxyHttp for DwaarProxy {
                                 upstream_host: "",
                                 upstream_port: 0,
                                 tls_server_name: "",
-                                vars: ctx.var_slots.as_ref(),
+                                // When `map` directives fired, read vars from the mutated
+                                // per-request copy on `ctx.var_slots`. Otherwise fall back
+                                // to `&route.var_defaults` directly — avoids a per-request
+                                // `VarSlots::clone()` on routes that declare `vars` without
+                                // any `map` rules (#126). `route.var_defaults` is always
+                                // present (possibly empty) so the reference is always valid.
+                                vars: ctx.var_slots.as_ref().or(Some(&route.var_defaults)),
                             };
                             if let Some(rewritten) = rule.apply(&path, Some(&tmpl_ctx)) {
                                 path = rewritten;
@@ -806,11 +821,15 @@ impl ProxyHttp for DwaarProxy {
             .run_request(session.req_header(), &mut ctx.plugin_ctx)
         {
             // The rate limiter sets `rate_limited` on ctx — no status code guessing.
-            if ctx.plugin_ctx.rate_limited
-                && let Some(ref prom) = self.prometheus
-                && let Some(ref host) = ctx.plugin_ctx.host
-            {
-                prom.rate_cache.record_rate_limit_rejected(host);
+            if ctx.plugin_ctx.rate_limited {
+                // Surface attribution to the access log (#128). `&'static str`,
+                // zero allocation.
+                ctx.rejected_by = Some("rate_limit");
+                if let Some(ref prom) = self.prometheus
+                    && let Some(ref host) = ctx.plugin_ctx.host
+                {
+                    prom.rate_cache.record_rate_limit_rejected(host);
+                }
             }
             debug!(
                 request_id = %ctx.request_id(),
@@ -1893,6 +1912,8 @@ impl ProxyHttp for DwaarProxy {
                 .as_ref()
                 .map(|t| CompactString::from(t.trace_id())),
             upstream_error_body: ctx.upstream_error_body.take(),
+            rejected_by: ctx.rejected_by,
+            blocked_by: ctx.blocked_by,
         };
 
         sender.send(log);

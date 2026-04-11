@@ -4,6 +4,7 @@ Thank you for your interest in contributing to Dwaar. This document covers every
 
 ## Table of Contents
 
+- [Quick Start](#quick-start)
 - [License](#license)
 - [Getting Started](#getting-started)
 - [Development Workflow](#development-workflow)
@@ -13,6 +14,49 @@ Thank you for your interest in contributing to Dwaar. This document covers every
 - [Issue Guidelines](#issue-guidelines)
 - [AI Policy](#ai-policy)
 - [Code Standards](#code-standards)
+
+## Quick Start
+
+From zero to a passing build in five commands:
+
+```bash
+# 1. Clone and enter the directory
+git clone https://github.com/permanu/Dwaar.git
+cd Dwaar
+
+# 2. Verify your toolchain and run a dry-run workspace check
+./scripts/check-dev-env.sh
+
+# 3. Narrow test — compiles fastest, exercises the parser
+just test-crate dwaar-config
+
+# 4. Full workspace test
+just test
+
+# 5. Lint before opening a PR
+just lint
+```
+
+The `just` recipes live in the top-level `Justfile`. Install with
+`cargo install just` if you don't already have it — otherwise fall back
+to the raw `cargo` commands shown in [Getting Started](#getting-started).
+
+### Optional feature dependencies
+
+Most of Dwaar builds out-of-the-box from a stock Rust toolchain. A few
+features have optional external dependencies that are only required if
+you intend to test those specific code paths:
+
+- **MaxMind GeoIP**: requires a `GeoLite2-Country.mmdb` file placed at
+  the path referenced by your Dwaarfile. Only needed if you are testing
+  the GeoIP feature.
+- **Wasmtime WASM plugins**: `wasmtime` is pulled in automatically by
+  Cargo — no external tool is needed unless you want to compile your
+  own `.wasm` modules. In that case install `cargo-component` or use the
+  precompiled examples shipped in `examples/`.
+- **Docker label discovery**: requires a running Docker daemon on the
+  local host. Only needed for the `deploy-agent` integration tests and
+  the Docker label scanner.
 
 ## License
 

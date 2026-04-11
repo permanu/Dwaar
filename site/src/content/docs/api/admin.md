@@ -368,6 +368,22 @@ dwaar reload --admin 127.0.0.1:6190
 { "message": "config reload triggered" }
 ```
 
+**Response** `400 Bad Request` — parse error in the new Dwaarfile
+
+As of 0.2.2, a failed parse returns `400` with the full `ConfigError::Display` output as the response body. `Content-Type` is `text/plain; charset=utf-8` so the error reads cleanly when piped to a terminal. The running config is never touched on parse failure — the cooldown is still consumed so a broken file cannot be hot-reloaded in a tight loop.
+
+```bash
+curl -sS -X POST \
+     -H "Authorization: Bearer $TOKEN" \
+     http://127.0.0.1:6190/reload
+```
+
+```
+parse error at line 12 col 5: unexpected token 'reverse_proxys'
+  expected one of: reverse_proxy, respond, handle, handle_path, route, ...
+  did you mean 'reverse_proxy'?
+```
+
 **Response** `429 Too Many Requests` — cooldown not elapsed
 
 ```json
@@ -381,6 +397,7 @@ The `Retry-After` response header contains the same integer value as `retry_afte
 | Code | Meaning |
 |---|---|
 | `200` | Reload signal sent to config watcher |
+| `400` | Parse error in the new Dwaarfile. Body is the full error text (plain). Running config is unchanged. |
 | `401` | Missing or invalid bearer token (TCP only) |
 | `429` | Cooldown period active; see `Retry-After` header |
 | `501` | Config watcher not active |
