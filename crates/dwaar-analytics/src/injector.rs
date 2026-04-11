@@ -30,6 +30,11 @@ const CARRYOVER_SIZE: usize = 11;
 /// The script tag injected before `</head>`.
 const SCRIPT_TAG: &[u8] = b"<script src=\"/_dwaar/a.js\" defer></script>";
 
+/// The HTML attribute name of the beacon-auth meta tag. The client-side
+/// `analytics.js` reads this tag at startup and echoes its value in the
+/// beacon POST so the server can verify it via HMAC (see `auth` module).
+const BEACON_META_NAME: &str = "dwaar-beacon-auth";
+
 /// Marker to detect double injection.
 const ALREADY_INJECTED_MARKER: &[u8] = b"/_dwaar/a.js";
 
@@ -55,6 +60,14 @@ pub struct HtmlInjector {
     /// Last `CARRYOVER_SIZE` bytes from the previous chunk, held back so we can
     /// detect `</head>` tags split across chunk boundaries without duplicating data.
     carryover: BytesMut,
+    /// Bytes to insert before `</head>`. When authenticated beacons are
+    /// enabled (see [`HtmlInjector::new_with_auth`]) this holds the
+    /// `<meta name="dwaar-beacon-auth" ...>` tag followed by the script
+    /// tag. In the default case it holds just the script tag.
+    ///
+    /// Held as an owned `Vec<u8>` so each request can carry its own
+    /// freshly signed nonce — the injection blob differs per-request.
+    injection_blob: Vec<u8>,
     /// When `true`, analytics injection is gated on user consent signals (GDPR/CCPA).
     ///
     /// This is a privacy-compliance aid, not a security boundary. When enabled,
@@ -72,11 +85,40 @@ impl Default for HtmlInjector {
 
 impl HtmlInjector {
     /// Create a new injector in the Scanning state with consent gating disabled.
+    ///
+    /// Injection blob is the plain script tag — no beacon-auth meta tag.
+    /// Prefer [`new_with_auth`] in production so beacons are HMAC-signed
+    /// (see C-04 / `crate::auth`).
     pub fn new() -> Self {
         Self {
             state: State::Scanning,
             bytes_scanned: 0,
             carryover: BytesMut::new(),
+            injection_blob: SCRIPT_TAG.to_vec(),
+            respect_consent: false,
+        }
+    }
+
+    /// Create a new injector that embeds a signed beacon-auth meta tag
+    /// ahead of the script tag.
+    ///
+    /// The meta tag carries `<nonce_b64>:<sig_hex>` in its `content`
+    /// attribute. The client-side `analytics.js` reads this tag at
+    /// startup and echoes both values in the beacon POST body. The
+    /// server then verifies the signature in `proxy::handle_beacon`
+    /// via [`crate::auth::verify`].
+    ///
+    /// The `host` argument is the request's serving host; it is bound
+    /// into the HMAC input so nonces issued for one host cannot be
+    /// replayed against another.
+    pub fn new_with_auth(host: &str) -> Self {
+        let auth = crate::auth::issue(host);
+        let blob = build_injection_blob(&auth.meta_content());
+        Self {
+            state: State::Scanning,
+            bytes_scanned: 0,
+            carryover: BytesMut::new(),
+            injection_blob: blob,
             respect_consent: false,
         }
     }
@@ -91,6 +133,20 @@ impl HtmlInjector {
             state: State::Scanning,
             bytes_scanned: 0,
             carryover: BytesMut::new(),
+            injection_blob: SCRIPT_TAG.to_vec(),
+            respect_consent,
+        }
+    }
+
+    /// Create an injector with both consent gating AND signed beacon auth.
+    pub fn new_with_auth_and_consent(host: &str, respect_consent: bool) -> Self {
+        let auth = crate::auth::issue(host);
+        let blob = build_injection_blob(&auth.meta_content());
+        Self {
+            state: State::Scanning,
+            bytes_scanned: 0,
+            carryover: BytesMut::new(),
+            injection_blob: blob,
             respect_consent,
         }
     }
@@ -136,9 +192,9 @@ impl HtmlInjector {
         // Search for </head> before checking budget — if it's in this
         // combined buffer, inject regardless of cumulative bytes scanned
         if let Some(pos) = find_case_insensitive(&search_buf, b"</head>") {
-            let mut buf = BytesMut::with_capacity(search_buf.len() + SCRIPT_TAG.len());
+            let mut buf = BytesMut::with_capacity(search_buf.len() + self.injection_blob.len());
             buf.extend_from_slice(&search_buf[..pos]);
-            buf.extend_from_slice(SCRIPT_TAG);
+            buf.extend_from_slice(&self.injection_blob);
             buf.extend_from_slice(&search_buf[pos..]);
             *body = Some(buf.freeze());
             self.state = State::Done;
@@ -240,6 +296,33 @@ impl HtmlInjector {
         }
         false
     }
+}
+
+/// Build the bytes inserted before `</head>` when authenticated beacons
+/// are enabled. Layout: `<meta name="..." content="...">` + script tag.
+///
+/// `meta_content` comes from [`crate::auth::BeaconAuth::meta_content`] and
+/// is of the form `<base64url_nonce>:<hex_sig>` — both halves use a
+/// strict URL-safe / hex alphabet and contain NO HTML-meta characters,
+/// so no escaping is needed. As defence-in-depth we still filter anything
+/// that isn't in the expected alphabet; in the unlikely event of a bug
+/// upstream we'd rather ship a broken meta tag than an HTML injection.
+fn build_injection_blob(meta_content: &str) -> Vec<u8> {
+    let sanitized: String = meta_content
+        .chars()
+        .filter(|c| {
+            c.is_ascii_alphanumeric() || matches!(*c, '-' | '_' | ':' | '=' | '.' | '+' | '/')
+        })
+        .collect();
+
+    let mut out = Vec::with_capacity(64 + sanitized.len() + SCRIPT_TAG.len());
+    out.extend_from_slice(b"<meta name=\"");
+    out.extend_from_slice(BEACON_META_NAME.as_bytes());
+    out.extend_from_slice(b"\" content=\"");
+    out.extend_from_slice(sanitized.as_bytes());
+    out.extend_from_slice(b"\">");
+    out.extend_from_slice(SCRIPT_TAG);
+    out
 }
 
 /// Case-insensitive byte search. Returns the byte offset of the first
@@ -605,5 +688,71 @@ mod tests {
         assert!(!a.respect_consent);
         let b = HtmlInjector::new_with_consent(true);
         assert!(b.respect_consent);
+    }
+
+    // --- beacon-auth injection tests (C-04) ---
+
+    #[test]
+    fn new_with_auth_emits_meta_tag_and_script() {
+        let mut injector = HtmlInjector::new_with_auth("example.com");
+        let mut body = Some(Bytes::from_static(
+            b"<html><head><title>T</title></head><body></body></html>",
+        ));
+        injector.process(&mut body, true);
+        let out = std::str::from_utf8(body.as_ref().expect("body")).expect("utf8");
+        assert!(out.contains("<meta name=\"dwaar-beacon-auth\" content=\""));
+        assert!(out.contains("/_dwaar/a.js"));
+        // Meta tag must appear BEFORE the script tag so the client can
+        // read it during script startup.
+        let meta_pos = out.find("dwaar-beacon-auth").expect("meta present");
+        let script_pos = out.find("/_dwaar/a.js").expect("script present");
+        assert!(meta_pos < script_pos);
+    }
+
+    #[test]
+    fn build_injection_blob_strips_html_special_chars() {
+        // Defence-in-depth: any stray angle bracket or quote must be
+        // removed so a malformed upstream value can't inject HTML.
+        let blob = build_injection_blob("abc<script>alert('x')</script>:def\"");
+        let s = std::str::from_utf8(&blob).expect("utf8");
+        // Forbidden chars must not appear in the content attribute value.
+        // (They are legitimately present in the script tag at the end.)
+        let content_start = s.find("content=\"").expect("content attr") + 9;
+        let content_end = s[content_start..]
+            .find('"')
+            .map(|i| content_start + i)
+            .expect("closing quote");
+        let content_val = &s[content_start..content_end];
+        assert!(!content_val.contains('<'));
+        assert!(!content_val.contains('>'));
+        assert!(!content_val.contains('\''));
+        assert!(!content_val.contains(' '));
+    }
+
+    #[test]
+    fn auth_meta_content_verifies_round_trip() {
+        // The nonce + sig embedded in the meta tag must verify against the
+        // same host via crate::auth::verify.
+        let mut injector = HtmlInjector::new_with_auth("example.com");
+        let mut body = Some(Bytes::from_static(
+            b"<html><head></head><body></body></html>",
+        ));
+        injector.process(&mut body, true);
+        let out = std::str::from_utf8(body.as_ref().expect("body")).expect("utf8");
+
+        // Extract the content attribute value.
+        let content_start = out.find("content=\"").expect("content attr") + 9;
+        let content_end = out[content_start..]
+            .find('"')
+            .map(|i| content_start + i)
+            .expect("closing quote");
+        let content_val = &out[content_start..content_end];
+
+        let (nonce, sig) = content_val
+            .split_once(':')
+            .expect("meta content is nonce:sig");
+        assert!(crate::auth::verify(nonce, sig, "example.com"));
+        // Cross-host must fail.
+        assert!(!crate::auth::verify(nonce, sig, "attacker.com"));
     }
 }

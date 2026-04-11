@@ -19,7 +19,7 @@
 //! | Security | `max_conns` enforced atomically before accepting new work |
 //! | Competitive Parity | Round-robin, least-conn, random, ip-hash match nginx/Caddy |
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
@@ -306,8 +306,9 @@ impl UpstreamPool {
                 } else {
                     // false → true: transition
                     *b.last_error.lock() = None;
+                    let masked = mask_addr(&addr);
                     info!(
-                        upstream = %addr,
+                        upstream = %masked,
                         "upstream transitioned to healthy",
                     );
                 }
@@ -321,6 +322,12 @@ impl UpstreamPool {
     ///
     /// On a healthy→unhealthy transition this logs at `WARN` with the stored
     /// `last_error` as the reason (ISSUE-127). No-op on repeat transitions.
+    ///
+    /// The upstream address is masked before logging (M-08) so shared log
+    /// sinks can't be used to map internal network topology. Operators who
+    /// need the unmasked address can correlate via the ops-only metrics
+    /// endpoint, which emits full socket addresses over an authenticated
+    /// channel.
     pub fn mark_unhealthy(&self, addr: SocketAddr) {
         for b in &self.backends {
             if b.addr == addr {
@@ -328,8 +335,9 @@ impl UpstreamPool {
                 if previous {
                     // true → false: transition
                     let err_str = b.last_error.lock().clone();
+                    let masked = mask_addr(&addr);
                     warn!(
-                        upstream = %addr,
+                        upstream = %masked,
                         reason = %err_str.as_deref().unwrap_or("<no details>"),
                         "upstream transitioned to unhealthy",
                     );
@@ -433,6 +441,39 @@ pub struct BackendConfig {
     pub client_cert_key: Option<Arc<pingora_core::utils::tls::CertKey>>,
     /// Pre-loaded CA certs for upstream server verification (ISSUE-077).
     pub trusted_ca: Option<Arc<pingora_core::protocols::tls::CaType>>,
+}
+
+// ── Log masking (M-08) ────────────────────────────────────────────────────────
+
+/// Render a [`SocketAddr`] with the host portion partially masked for safe
+/// inclusion in operator logs (M-08).
+///
+/// The goal is to preserve enough context for an operator running the proxy
+/// to correlate a transition warning with a specific subnet, without leaking
+/// the full internal topology into shared log sinks. For IPv4 we keep only
+/// the first octet; for IPv6 we keep the first three hextets (/48 prefix).
+/// The port is always retained — it identifies the service, not the host.
+///
+/// Examples:
+/// - `10.0.0.5:8080` → `10.x.x.x:8080`
+/// - `[2001:db8:abcd::1]:443` → `2001:db8:abcd::/48:443`
+fn mask_addr(addr: &SocketAddr) -> String {
+    match addr.ip() {
+        IpAddr::V4(v4) => {
+            let [a, _, _, _] = v4.octets();
+            format!("{a}.x.x.x:{}", addr.port())
+        }
+        IpAddr::V6(v6) => {
+            let segs = v6.segments();
+            format!(
+                "{:x}:{:x}:{:x}::/48:{}",
+                segs[0],
+                segs[1],
+                segs[2],
+                addr.port()
+            )
+        }
+    }
 }
 
 // ── FNV-1a IP hash ────────────────────────────────────────────────────────────
@@ -997,5 +1038,58 @@ mod tests {
         assert!(pool.select(None).is_none());
         assert!(pool.first_addr().is_none());
         assert!(pool.is_empty());
+    }
+
+    // ── mask_addr (M-08) ────────────────────────────────────────────────────
+
+    #[test]
+    fn mask_addr_ipv4_keeps_first_octet_and_port() {
+        let addr: SocketAddr = "10.0.0.5:8080"
+            .parse()
+            .expect("literal socket addr must parse");
+        assert_eq!(mask_addr(&addr), "10.x.x.x:8080");
+
+        let addr: SocketAddr = "192.168.1.42:443"
+            .parse()
+            .expect("literal socket addr must parse");
+        assert_eq!(mask_addr(&addr), "192.x.x.x:443");
+
+        // Edge: 0.0.0.0 still renders cleanly.
+        let addr: SocketAddr = "0.0.0.0:1".parse().expect("literal socket addr must parse");
+        assert_eq!(mask_addr(&addr), "0.x.x.x:1");
+    }
+
+    #[test]
+    fn mask_addr_ipv6_keeps_48_prefix_and_port() {
+        let addr: SocketAddr = "[2001:db8:abcd::1]:443"
+            .parse()
+            .expect("literal socket addr must parse");
+        assert_eq!(mask_addr(&addr), "2001:db8:abcd::/48:443");
+
+        // Loopback collapses to all-zero prefix, still no trailing host bits.
+        let addr: SocketAddr = "[::1]:8080"
+            .parse()
+            .expect("literal socket addr must parse");
+        assert_eq!(mask_addr(&addr), "0:0:0::/48:8080");
+
+        // Full-form global address.
+        let addr: SocketAddr = "[2606:4700:4700::1111]:53"
+            .parse()
+            .expect("literal socket addr must parse");
+        assert_eq!(mask_addr(&addr), "2606:4700:4700::/48:53");
+    }
+
+    #[test]
+    fn mask_addr_never_contains_tail_octets() {
+        // Regression guard: masked output must not contain any of the
+        // trailing-octet values from the original address.
+        let addr: SocketAddr = "10.11.12.13:9000"
+            .parse()
+            .expect("literal socket addr must parse");
+        let masked = mask_addr(&addr);
+        assert!(!masked.contains("11"));
+        assert!(!masked.contains("12"));
+        assert!(!masked.contains("13"));
+        assert!(masked.contains("9000"));
     }
 }

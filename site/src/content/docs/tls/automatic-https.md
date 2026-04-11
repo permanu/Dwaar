@@ -207,6 +207,41 @@ Parsed certificates are held in a bounded LRU cache. After a renewal, the old ca
 
 If a cached certificate carries an OCSP staple (refreshed every 12 hours), it is attached to the `ServerHello` during the handshake.
 
+## Revocation handling (0.2.3)
+
+When a scheduled OCSP refresh returns `CertRevoked`, the ACME service now:
+
+1. Invalidates the revoked certificate from the in-memory LRU cache so no handshake can pick it up again.
+2. Deletes the on-disk `{domain}.pem` and `{domain}.key` files in the cert directory.
+3. Kicks off a fresh ACME order (Let's Encrypt first, Google Trust Services fallback) to re-issue the certificate.
+
+Before 0.2.3, the cache retained the revoked entry until natural LRU eviction, so a revoked cert could continue to be served while re-issuance was in flight. The new eviction + delete + re-issue sequence closes that window. Re-issuance is gated by the same in-progress guard used for renewal, so a revocation detected on two domains in one refresh cycle still produces only one concurrent ACME run per domain.
+
+## Wildcard SNI enforcement (0.2.3)
+
+`is_valid_sni_hostname` now strictly follows [RFC 6125 §6.4.3](https://datatracker.ietf.org/doc/html/rfc6125#section-6.4.3): `*` is only accepted as the **entire** first label of a DNS name. Dwaar rejects every other form at parse time and at SNI lookup time:
+
+| Input | Status |
+|---|---|
+| `*.example.com` | Accepted |
+| `*` (bare) | Rejected |
+| `exam*ple.com` | Rejected (partial-label wildcard) |
+| `*ample.com` | Rejected (prefix wildcard) |
+| `foo.*.com` | Rejected (wildcard not in leftmost label) |
+| `**.example.com` | Rejected (multiple `*` in label) |
+
+The same validator is applied by `CertStore::get` / `get_async` / `get_or_load` before interpolating the hostname into a filesystem path, so a malformed SNI cannot be used to steer cert-store reads toward unexpected files.
+
+## Private key zeroization (0.2.3)
+
+Sensitive key material is now wiped from memory as soon as it goes out of scope:
+
+- **ACME private key PEM** — `generate_key_and_csr` returns the freshly-minted private key wrapped in `Zeroizing<String>`. When the issuance pipeline finishes (success or failure), the PEM buffer is overwritten byte-by-byte before the allocation is freed.
+- **Cached cert OCSP buffer** — `CachedCert` now has a manual `Drop` implementation that zeroes the OCSP response DER buffer on eviction. This closes the window where a heap-allocated copy of the most recent OCSP response could linger in freed memory.
+- **Private key inside OpenSSL** — the parsed `PKey` is freed via `EVP_PKEY_free`, which already calls `OPENSSL_cleanse` on the underlying key bytes.
+
+This has no operator-visible effect — it is a defense-in-depth mitigation against heap-disclosure bugs and core-dump inspection.
+
 ## Troubleshooting
 
 ### Challenge fails: `connection refused` or timeout

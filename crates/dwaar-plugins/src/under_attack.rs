@@ -26,6 +26,18 @@
 //! 1. GET without valid cookie → 200 + challenge HTML (JS computes `PoW`)
 //! 2. GET with `_dwaar_solved=1` query param + valid `PoW` → 302 + Set-Cookie
 //! 3. GET with valid `_dwaar_clearance` cookie → Continue (pass to upstream)
+//!
+//! ## Challenge window design (M-19)
+//!
+//! Challenges are bound to a five-minute time window: `window = unix_secs / 300`.
+//! The issuer always stamps the current window. Verification accepts a challenge
+//! matching **either** the current window **or** the immediately previous window
+//! — this is the same one-window grace pattern used by the beacon HMAC so clients
+//! that start solving near a boundary don't fail intermittently. Future windows
+//! are never accepted, which blocks pre-computation of tomorrow's challenge.
+//!
+//! The `subtle::ConstantTimeEq` comparison on the two candidates prevents timing
+//! side channels on the challenge token (see v0.2.2 #124).
 
 use std::fmt;
 use std::net::IpAddr;
@@ -46,6 +58,11 @@ type HmacSha256 = Hmac<Sha256>;
 /// 20 bits ≈ 1M iterations ≈ 200ms on a modern browser.
 const POW_DIFFICULTY: u32 = 20;
 
+/// Challenge validity window in seconds. Challenges issued at time `t` are
+/// accepted until `floor(t / WINDOW_SECS) + 1` becomes the current window,
+/// at which point the previous-window grace period covers one more cycle.
+const WINDOW_SECS: u64 = 300;
+
 /// Default cookie TTL: 1 hour.
 const DEFAULT_TTL_SECS: u64 = 3600;
 
@@ -63,9 +80,10 @@ const CHALLENGE_PARAM: &str = "_dwaar_challenge";
 
 /// Under Attack Mode plugin.
 ///
-/// Priority 15 — runs after bot detection (10) but before rate limiting (20).
-/// This ordering means detected bots get flagged before the challenge check,
-/// and rate limiting still applies to challenge page requests.
+/// Priority 20 — runs after bot detection (10) and rate limiting (15). Running
+/// AFTER the rate limiter is load-bearing (L-14): challenge-page requests and
+/// PoW-solution submissions are themselves subject to the per-route rate limit,
+/// so an attacker cannot replay unlimited solutions.
 pub struct UnderAttackPlugin {
     secret: Zeroizing<Vec<u8>>,
     ttl_secs: u64,
@@ -88,22 +106,49 @@ impl UnderAttackPlugin {
         }
     }
 
-    /// Generate a deterministic challenge from the client's IP and a time window.
-    /// The time window rounds to 5-minute buckets so the challenge stays valid
-    /// for a reasonable period without server-side state.
+    /// Generate a deterministic challenge from the client's IP and the current
+    /// 5-minute time window. Issued challenges always target the current window;
+    /// verification additionally accepts the previous window to absorb boundary
+    /// crossings (see module-level docs).
     fn generate_challenge(&self, ip: IpAddr) -> String {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_secs();
-        // 5-minute window
-        let window = now / 300;
+        self.challenge_for_window(ip, current_window(WINDOW_SECS))
+    }
 
+    /// Compute the HMAC-SHA256 challenge for an explicit window. Factored out so
+    /// verification can reproduce prior windows for the grace-period check (M-19).
+    fn challenge_for_window(&self, ip: IpAddr, window: u64) -> String {
         let mut mac =
             HmacSha256::new_from_slice(&self.secret).expect("HMAC accepts any key length");
         mac.update(&window.to_be_bytes());
         mac.update(ip_bytes(ip).as_slice());
         hex::encode(mac.finalize().into_bytes())
+    }
+
+    /// Verify a client-supplied challenge token against the expected value for
+    /// this IP. Accepts the current window OR the previous window (grace period),
+    /// but never a future window. Returns `true` on match.
+    ///
+    /// Uses constant-time equality (`subtle::ConstantTimeEq`) to avoid leaking
+    /// whether a partial match made it further into the byte comparison.
+    fn verify_challenge(&self, challenge: &str, ip: IpAddr) -> bool {
+        self.verify_challenge_at(challenge, ip, current_window(WINDOW_SECS))
+    }
+
+    /// Inner form of [`verify_challenge`] taking an explicit "now" window. This
+    /// is the seam tests poke at so we don't need to mock `SystemTime`.
+    fn verify_challenge_at(&self, challenge: &str, ip: IpAddr, now_window: u64) -> bool {
+        let candidates = [
+            self.challenge_for_window(ip, now_window),
+            // Saturating sub so an underflow at the epoch can never wrap to a
+            // distant future window.
+            self.challenge_for_window(ip, now_window.saturating_sub(1)),
+        ];
+        let supplied = challenge.as_bytes();
+        let mut matched = 0u8;
+        for candidate in &candidates {
+            matched |= u8::from(bool::from(supplied.ct_eq(candidate.as_bytes())));
+        }
+        matched != 0
     }
 
     /// Verify a challenge + nonce pair: the SHA-256 hash of challenge||nonce
@@ -254,7 +299,7 @@ impl DwaarPlugin for UnderAttackPlugin {
     }
 
     fn priority(&self) -> u16 {
-        15
+        20
     }
 
     fn on_request(&self, req: &RequestHeader, ctx: &mut PluginCtx) -> PluginAction {
@@ -284,16 +329,13 @@ impl DwaarPlugin for UnderAttackPlugin {
                 get_param(query, NONCE_PARAM),
             )
         {
-            // Verify the challenge matches what we'd generate for this IP.
-            // Both sides are 64-character hex-encoded HMAC-SHA256 outputs, so
-            // the comparison is constant-time in length by construction;
-            // subtle::ConstantTimeEq keeps the byte-by-byte diff branch-free.
+            // Accept the challenge if it matches either the current window or
+            // the previous window (grace period, M-19). Both candidates are
+            // 64-char hex-encoded HMAC-SHA256 outputs compared via
+            // subtle::ConstantTimeEq, so the byte-by-byte diff is branch-free.
             // Using Mac::verify_slice here would be semantically wrong — it
-            // needs a keyed MAC, not a comparison of two pre-computed values.
-            let expected_challenge = self.generate_challenge(ip);
-            if bool::from(challenge.as_bytes().ct_eq(expected_challenge.as_bytes()))
-                && Self::verify_pow(&challenge, &nonce)
-            {
+            // needs a keyed MAC, not a comparison of two pre-computed MAC outputs.
+            if self.verify_challenge(&challenge, ip) && Self::verify_pow(&challenge, &nonce) {
                 // Sign and set clearance cookie, redirect to clean URL
                 let cookie_value = self.sign_cookie(ip);
                 let clean_path = strip_dwaar_params(&ctx.path);
@@ -333,6 +375,18 @@ impl DwaarPlugin for UnderAttackPlugin {
 }
 
 // -- Helper functions --
+
+/// Returns the current challenge window, computed from wall-clock time.
+///
+/// Split out so tests can compute the same value without duplicating the
+/// `SystemTime::now()` + saturating epoch-fallback dance.
+fn current_window(window_secs: u64) -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs()
+        / window_secs
+}
 
 /// Convert an IP address to bytes for HMAC input.
 fn ip_bytes(ip: IpAddr) -> Vec<u8> {
@@ -430,25 +484,33 @@ fn hex_digit(c: u8) -> Option<u8> {
     }
 }
 
-/// Strip _dwaar_* query parameters from a path, returning a clean URL.
+/// Strip _dwaar_* query parameters from a path, returning a clean URL (L-20).
+///
+/// Writes directly into a pre-sized `String` instead of collecting into a
+/// temporary `Vec<&str>` + `join()`. Avoids the intermediate Vec allocation
+/// and the join-time second pass over surviving parameters.
 fn strip_dwaar_params(path: &str) -> String {
     let Some((base, query)) = path.split_once('?') else {
         return path.to_string();
     };
 
-    let clean_params: Vec<&str> = query
-        .split('&')
-        .filter(|p| {
-            let key = p.split('=').next().unwrap_or("");
-            !key.starts_with("_dwaar_")
-        })
-        .collect();
+    // Upper bound: everything survives, plus one '?' character. Stripping just
+    // means the buffer ends up shorter — still no realloc.
+    let mut out = String::with_capacity(path.len());
+    out.push_str(base);
 
-    if clean_params.is_empty() {
-        base.to_string()
-    } else {
-        format!("{base}?{}", clean_params.join("&"))
+    let mut first = true;
+    for part in query.split('&') {
+        let key = part.split('=').next().unwrap_or("");
+        if key.starts_with("_dwaar_") {
+            continue;
+        }
+        out.push(if first { '?' } else { '&' });
+        out.push_str(part);
+        first = false;
     }
+
+    out
 }
 
 /// Minimal HTML escaping for user-supplied path in the challenge page.
@@ -566,6 +628,48 @@ mod tests {
         let c1 = plugin.generate_challenge(ip);
         let c2 = plugin.generate_challenge(ip);
         assert_eq!(c1, c2);
+    }
+
+    #[test]
+    fn challenge_window_grace_boundary() {
+        // M-19: issue a challenge at window 0, then verify across logical "now"
+        // windows corresponding to t=0, t=100, t=310, t=650.
+        // Window math: t=0 → 0, t=100 → 0, t=310 → 1, t=650 → 2.
+        //
+        // Window 0 (current == issued): must accept.
+        // Window 1 (issued is previous): must accept (grace period).
+        // Window 2 (issued is two windows stale): must reject.
+        let plugin = make_plugin();
+        let ip = test_ip();
+        let issued_window = 0u64;
+        let challenge = plugin.challenge_for_window(ip, issued_window);
+
+        assert!(
+            plugin.verify_challenge_at(&challenge, ip, 0),
+            "t=0 (window 0, issued window): must accept"
+        );
+        assert!(
+            plugin.verify_challenge_at(&challenge, ip, 0),
+            "t=100 (still window 0): must accept"
+        );
+        assert!(
+            plugin.verify_challenge_at(&challenge, ip, 1),
+            "t=310 (window 1, previous-window grace): must accept"
+        );
+        assert!(
+            !plugin.verify_challenge_at(&challenge, ip, 2),
+            "t=650 (window 2, two windows stale): must reject"
+        );
+    }
+
+    #[test]
+    fn challenge_future_window_rejected() {
+        // M-19: a challenge generated for a future window must never be accepted.
+        let plugin = make_plugin();
+        let ip = test_ip();
+        let now_window = 100u64;
+        let future = plugin.challenge_for_window(ip, now_window + 1);
+        assert!(!plugin.verify_challenge_at(&future, ip, now_window));
     }
 
     #[test]

@@ -52,6 +52,39 @@ If your deployment includes subdomains that intentionally serve only HTTP (e.g. 
 
 ---
 
+## Upstream info-leak stripping (0.2.3)
+
+The plugin now strips a fixed set of upstream response headers that commonly fingerprint the backend stack, **before** it applies its own baseline headers. The stripped set is:
+
+| Header | Typical source |
+|---|---|
+| `X-Powered-By` | PHP, Express, ASP.NET |
+| `X-AspNet-Version` | ASP.NET |
+| `X-AspNetMvc-Version` | ASP.NET MVC |
+| `X-Runtime` | Rails, Rack |
+| `X-Generator` | Drupal, static generators |
+| `Server` | Every HTTP server on the planet |
+
+Stripping runs on every response, including static files and error bodies, and happens before the plugin writes its own `Server: Dwaar` banner. The result is that an attacker scraping responses cannot tell whether the upstream is Rails, ASP.NET, or a static file server — all they see is Dwaar's banner.
+
+### Configuration
+
+The behaviour is controlled by the `strip_leaky_headers: bool` field on the plugin config (default **`true`**). If you need the upstream banner to pass through unchanged — for example on an internal debug endpoint where you want to know which backend answered — disable it:
+
+```
+debug.example.com {
+    reverse_proxy localhost:9000
+
+    security_headers {
+        strip_leaky_headers false
+    }
+}
+```
+
+When disabled, the plugin still applies its own baseline headers, but leaves any upstream `Server`, `X-Powered-By`, etc. untouched. The default is `true` on every site block, so the strip is on by default.
+
+Default CSP remains opt-in by design — the plugin does not emit `Content-Security-Policy` or `Content-Security-Policy-Report-Only` unless you configure one explicitly (see next section). This preserves backwards compatibility with existing sites that would otherwise break on a forced restrictive default.
+
 ## Content Security Policy
 
 The `SecurityHeadersPlugin` has two optional CSP fields: `content_security_policy` and `content_security_policy_report_only`. Both default to `None` — no `Content-Security-Policy` or `Content-Security-Policy-Report-Only` header is sent unless explicitly configured. Configure them via the `header` directive inside a site block (the plugin picks up overrides at response-header time):

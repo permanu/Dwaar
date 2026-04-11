@@ -16,6 +16,11 @@ use pingora_http::RequestHeader;
 
 use crate::plugin::{DwaarPlugin, PluginAction, PluginCtx};
 
+/// Stack buffer size for in-place User-Agent lowercasing (M-17). Covers the
+/// overwhelming majority of real-world UA strings (RFC 9110 suggests ≤ 256);
+/// longer UAs fall back to a heap `Vec`.
+const STACK_BUF: usize = 512;
+
 /// Broad category of the detected bot. Kept coarse intentionally — callers
 /// decide what to do (block, rate-limit, tag, log) based on category.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,16 +153,31 @@ impl BotDetector {
             return None;
         }
 
-        // Lowercase once as bytes — all stored patterns are already lowercase.
-        // Uses Vec<u8> + make_ascii_lowercase to avoid the UTF-8 re-validation
-        // cost of str::to_ascii_lowercase (User-Agent headers are always ASCII).
-        let mut ua_bytes = user_agent.as_bytes().to_vec();
-        ua_bytes.make_ascii_lowercase();
+        // Real-world User-Agent strings almost always fit in a few hundred
+        // bytes (the RFC 9110 recommendation is ≤ 256). Lowercase into a fixed
+        // stack buffer to avoid a per-request heap allocation, and only fall
+        // back to a Vec for the rare oversize UA. All stored patterns are
+        // already lowercase, so case-folding the input is sufficient.
+        let bytes = user_agent.as_bytes();
+        if bytes.len() <= STACK_BUF {
+            let mut stack = [0u8; STACK_BUF];
+            let slice = &mut stack[..bytes.len()];
+            slice.copy_from_slice(bytes);
+            slice.make_ascii_lowercase();
+            self.find_match(slice)
+        } else {
+            // Oversize path — rare enough that the fallback alloc is fine.
+            let mut heap = bytes.to_vec();
+            heap.make_ascii_lowercase();
+            self.find_match(&heap)
+        }
+    }
 
-        // Find all overlapping matches and take the lowest pattern index
-        // (highest priority). Anchored patterns must start at position 0.
+    /// Run the automaton and resolve the highest-priority match. Split out so
+    /// both the stack and heap paths share a single scanning implementation.
+    fn find_match(&self, lowered: &[u8]) -> Option<BotCategory> {
         self.automaton
-            .find_overlapping_iter(&ua_bytes)
+            .find_overlapping_iter(lowered)
             .filter(|m| {
                 let idx = m.value();
                 !self.anchored[idx] || m.start() == 0
@@ -322,6 +342,17 @@ mod tests {
         let detector = BotDetector::new();
         assert_eq!(detector.classify("something curl/7.0"), None);
         assert_eq!(detector.classify("obscurlity"), None);
+    }
+
+    #[test]
+    fn oversize_ua_still_classified_correctly() {
+        // UA longer than the 512-byte stack buffer must hit the heap path and
+        // still produce the same classification as the short-path counterpart.
+        let detector = BotDetector::new();
+        let padding = "x".repeat(1024);
+        let ua = format!("Mozilla/5.0 Googlebot/2.1 {padding}");
+        assert!(ua.len() > 512);
+        assert_eq!(detector.classify(&ua), Some(BotCategory::SearchEngine));
     }
 
     #[test]

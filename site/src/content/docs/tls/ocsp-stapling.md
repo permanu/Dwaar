@@ -90,11 +90,40 @@ Domains are processed sequentially with a 1-second delay between each to avoid t
 | Failure mode | Behavior |
 |---|---|
 | OCSP responder unreachable or slow (10s timeout) | Warning logged; previous cached response continues to be stapled |
-| OCSP response indicates certificate revoked | Error logged; stapling disabled for that domain — the certificate is not served |
+| OCSP response indicates certificate revoked | Error logged; the cached entry and on-disk PEM/key files are deleted and the ACME service re-issues a fresh certificate (see [Revocation handling](automatic-https.md#revocation-handling-023)) |
+| OCSP responder URL resolves to a private, loopback, link-local, ULA, broadcast, multicast, unspecified, or metadata-service address | Request refused before the HTTP call — stapling is left unchanged for this refresh cycle (see [Responder address blocklist](#responder-address-blocklist-023)) |
+| Cached OCSP response is older than 7 days | Stale response is **not** stapled; the handshake still succeeds, the client falls back to fetching OCSP itself |
 | Certificate has no OCSP responder URL (e.g. `tls internal`) | Silently skipped — no OCSP for self-signed certs |
 | Certificate chain has no issuer (single-cert PEM, no CA chain) | Silently skipped — issuer is required to build the OCSP request |
 
 OCSP responses are valid for roughly 24 hours as issued by Let's Encrypt and Google Trust Services. A 12-hour refresh cycle ensures the stapled response is always current when it reaches clients.
+
+### Staleness guard (0.2.3)
+
+`CachedCert` now tracks the timestamp of the last successful OCSP refresh in `ocsp_last_refresh`. When the TLS callback builds a `ServerHello`, it compares that timestamp against the current time and suppresses the stapled response if it is older than **7 days**.
+
+The handshake still completes normally — the client simply sees a response without a stapled OCSP extension and falls back to its own revocation check (soft-fail in most modern browsers, AIA fetch in older clients). This is deliberately more conservative than the formal OCSP response validity window: if Dwaar cannot reach the responder for a full week, the cached response is treated as untrustworthy and dropped from the handshake rather than quietly served past its useful life.
+
+Operators see a matching `warn!` entry in the log when a stale response is suppressed. Resolving the underlying fetch failure (network, firewall, CA outage) restores stapling on the next successful refresh.
+
+### Responder address blocklist (0.2.3)
+
+Before dispatching an OCSP request, `http_post_ocsp` resolves the AIA-extracted responder host and rejects any address that falls into one of the following categories:
+
+| Category | IPv4 | IPv6 |
+|---|---|---|
+| Loopback | `127.0.0.0/8` | `::1/128` |
+| Private | `10/8`, `172.16/12`, `192.168/16` | — |
+| Unique local (ULA) | — | `fc00::/7` |
+| Link-local | `169.254/16` | `fe80::/10` |
+| Broadcast / multicast / unspecified | `255.255.255.255`, `224/4`, `0.0.0.0` | `ff00::/8`, `::` |
+| Cloud metadata service | `169.254.169.254` | — |
+
+Non-HTTP(S) URI schemes are also refused per [RFC 6960 §A.1](https://datatracker.ietf.org/doc/html/rfc6960#appendix-A.1).
+
+The blocklist is enforced **after** DNS resolution, so an AIA record that claims a public hostname but resolves to a private IP (DNS rebinding / internal split-horizon) is still blocked. This prevents a malicious or compromised CA from steering OCSP traffic at internal services — closing a server-side request forgery (SSRF) vector that existed in every OCSP-stapling proxy that trusted responder URIs verbatim.
+
+The request budget, timeouts, and retry policy are unchanged; only the target address validation is new.
 
 ### OCSP response storage
 

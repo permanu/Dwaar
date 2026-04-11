@@ -158,6 +158,14 @@ sequenceDiagram
 
 This closes a race that existed before: a worker whose constructor panicked after `fork()` but before bind could leave the supervisor thinking the child was alive. The `waitpid(WNOHANG)` arm catches that case cleanly.
 
+### Shutdown flag ordering (0.2.3)
+
+The supervisor's `SHUTTING_DOWN` flag — set by the `SIGTERM` / `SIGINT` signal handler and read by the supervisor loop to decide whether to restart a dying child — is now loaded and stored with `Ordering::SeqCst` on both sides of the exchange.
+
+Relaxed or acquire/release orderings were not strictly wrong for a single atomic, but `SeqCst` is the ordering required by the C11 memory model to guarantee that a signal handler on one thread and a normal load on the supervisor loop thread observe the flag in a consistent global order — especially relevant under POSIX signal-safety rules where the signal can interrupt the loop mid-iteration. Without `SeqCst`, a signal arriving between the flag load and the `fork()` call could leave a fresh child running after the supervisor had already decided to shut down.
+
+No operator-facing change. Shutdown semantics are unchanged; the fix is a memory-ordering correctness patch that closes a rare race observed under synthetic stress testing.
+
 ## Step-by-Step
 
 Follow these steps to perform a production upgrade:

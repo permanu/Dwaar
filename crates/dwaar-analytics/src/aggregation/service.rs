@@ -113,6 +113,8 @@ impl<RT: RouteValidator> AggregationService<RT> {
     fn flush(&self) {
         if let Some(ref sink) = self.sink {
             // Sink path: send structured snapshots to external consumer.
+            // Reads are non-mutating so the sink sees the same counts the
+            // stdout path will serialize and reset below.
             for entry in self.metrics.iter() {
                 let snapshot = DomainMetricsSnapshot::from_metrics(entry.key(), entry.value());
                 if let Err(e) = sink.flush(&snapshot) {
@@ -122,16 +124,37 @@ impl<RT: RouteValidator> AggregationService<RT> {
         }
 
         // Legacy stdout path — always runs so standalone Dwaar still logs.
+        // Each entry is consumed mutably: after serialization we zero the
+        // per-window counters (status_codes, bytes_sent, bot_views,
+        // human_views) so the next flush reports the delta for the next
+        // 60s window rather than a perpetually growing lifetime total.
+        //
+        // This matches the documented intent in `FlushSnapshot` ("Cumulative
+        // since the last flush. `bot_views + human_views` ≈ `page_views_60m`
+        // modulo timing.") and in `AnalyticsSnapshot` ("Cumulative since the
+        // last 60s aggregation flush."). Prior to H-13 the code silently
+        // accumulated lifetime totals, contradicting both doc comments.
+        //
+        // `page_views`, `unique_visitors`, `top_pages`, `referrers`,
+        // `countries`, and `web_vitals` manage their own windows internally
+        // (minute buckets, HyperLogLog, TopK, bounded counter, tdigest) and
+        // do NOT need explicit reset here.
         let stdout = std::io::stdout();
         let mut handle = stdout.lock();
         for mut entry in self.metrics.iter_mut() {
             let domain = entry.key().clone();
-            let snapshot = FlushSnapshot::from_metrics(&domain, entry.value_mut());
+            let metrics = entry.value_mut();
+            let snapshot = FlushSnapshot::from_metrics(&domain, metrics);
             if let Err(e) = serde_json::to_writer(&mut handle, &snapshot)
                 .and_then(|()| handle.write_all(b"\n").map_err(serde_json::Error::io))
             {
-                warn!(error = %e, domain = entry.key().as_str(), "failed to flush analytics");
+                warn!(error = %e, domain = domain.as_str(), "failed to flush analytics");
             }
+            // Reset cumulative per-window counters AFTER serialization.
+            metrics.status_codes = [0; 6];
+            metrics.bytes_sent = 0;
+            metrics.bot_views = 0;
+            metrics.human_views = 0;
         }
         if let Err(e) = handle.flush() {
             warn!(error = %e, "failed to flush stdout");
@@ -440,16 +463,29 @@ mod tests {
                 .expect("send should succeed");
         }
 
-        // Give the service time to process
+        // Give the service time to process the ingested events.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Signal shutdown
+        // H-13 (v0.2.3): per-window counters are reset by `flush`, and the
+        // shutdown path triggers a final flush. Capture the in-memory state
+        // *before* signalling shutdown so we're asserting on the ingest-side
+        // behaviour, not the flush-side reset behaviour (which is covered
+        // separately by `flush_resets_cumulative_counters`).
+        {
+            let entry = metrics.get("app.io").expect("domain should exist");
+            assert_eq!(entry.status_codes[1], 10); // 10 x 2xx
+        }
+
+        // Now verify the shutdown path itself: signal, wait, and confirm
+        // the service exited cleanly without panic. After the final flush,
+        // per-window counters are expected to be zero per H-13.
         shutdown_tx.send(true).expect("shutdown send");
-        // Give the service time to flush and exit
         tokio::time::sleep(Duration::from_millis(50)).await;
-
         let entry = metrics.get("app.io").expect("domain should exist");
-        assert_eq!(entry.status_codes[1], 10); // 10 x 2xx
+        assert_eq!(
+            entry.status_codes[1], 0,
+            "final flush must zero per-window counters"
+        );
     }
 
     #[tokio::test]
@@ -471,11 +507,72 @@ mod tests {
         }
 
         tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // H-13 (v0.2.3): assert the ingested total *before* shutdown-flush
+        // zeros the per-window counters. The shutdown path is still
+        // exercised below; we just decouple the two assertions.
+        {
+            let entry = metrics.get("stress.io").expect("domain should exist");
+            assert_eq!(entry.status_codes[1], 1000, "4 * 250 = 1000 requests");
+        }
+
         shutdown_tx.send(true).expect("shutdown send");
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
-        let entry = metrics.get("stress.io").expect("domain should exist");
-        assert_eq!(entry.status_codes[1], 1000, "4 * 250 = 1000 requests");
+    #[test]
+    fn flush_resets_cumulative_counters() {
+        // H-13: per-window counters (status_codes, bytes_sent, bot_views,
+        // human_views) must zero out after a flush so downstream consumers
+        // see per-window deltas instead of lifetime totals.
+        let domains: HashSet<String> = ["cumul.test".into()].into();
+        let (_beacon_tx, beacon_rx) = mpsc::channel(1);
+        let (_log_tx, log_rx) = mpsc::channel(1);
+        let metrics = Arc::new(DashMap::new());
+        let svc = AggregationService::new(
+            Arc::clone(&metrics),
+            TestValidator(domains),
+            beacon_rx,
+            AggReceiver { rx: log_rx },
+        );
+
+        svc.ingest_log(&test_event("cumul.test", "/a", 200));
+        svc.ingest_log(&test_event("cumul.test", "/b", 200));
+        svc.ingest_log(&test_event("cumul.test", "/c", 404));
+
+        {
+            let entry = metrics.get("cumul.test").expect("domain");
+            assert_eq!(entry.status_codes[1], 2, "2xx before flush");
+            assert_eq!(entry.status_codes[3], 1, "4xx before flush");
+            assert_eq!(entry.bytes_sent, 3 * 1024);
+            assert_eq!(entry.human_views, 3);
+            assert_eq!(entry.bot_views, 0);
+        }
+
+        svc.flush();
+
+        {
+            let entry = metrics.get("cumul.test").expect("domain");
+            assert_eq!(entry.status_codes, [0; 6], "status_codes reset");
+            assert_eq!(entry.bytes_sent, 0, "bytes_sent reset");
+            assert_eq!(entry.bot_views, 0, "bot_views reset");
+            assert_eq!(entry.human_views, 0, "human_views reset");
+        }
+
+        svc.flush();
+        {
+            let entry = metrics.get("cumul.test").expect("domain");
+            assert_eq!(entry.status_codes, [0; 6]);
+            assert_eq!(entry.bytes_sent, 0);
+        }
+
+        svc.ingest_log(&test_event("cumul.test", "/d", 500));
+        {
+            let entry = metrics.get("cumul.test").expect("domain");
+            assert_eq!(entry.status_codes[4], 1, "only window 2 5xx");
+            assert_eq!(entry.bytes_sent, 1024, "only window 2 bytes");
+            assert_eq!(entry.human_views, 1);
+        }
     }
 
     #[tokio::test]

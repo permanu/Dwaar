@@ -10,11 +10,14 @@
 //! `CompactString` in `DashMap` for concurrent access without allocation
 //! after the first request per domain.
 
+use std::borrow::Cow;
 use std::fmt::Write;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
 
 use compact_str::CompactString;
 use dashmap::DashMap;
+
+use crate::MAX_TRACKED_DOMAINS;
 
 // -- Histogram bucket bounds (microseconds) ----------------------------------
 // Matches the issue spec: 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s,
@@ -28,6 +31,81 @@ const BUCKET_BOUNDS_US: &[u64] = &[
 const BUCKET_BOUNDS_SECS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
+
+/// Escape a label value for the Prometheus text exposition format.
+///
+/// Per the exposition spec, label values enclosed in double quotes must
+/// escape `\\`, `"`, and `\n`. Domain labels are user-controlled (from the
+/// `Host` header) and can otherwise break the exposition format or inject
+/// synthetic metric lines — see the v0.2.3 audit finding H-11.
+///
+/// Returns `Cow::Borrowed` in the common case where the input contains no
+/// metacharacters, keeping the hot render path allocation-free.
+pub(crate) fn escape_label_value(s: &str) -> Cow<'_, str> {
+    if !s.bytes().any(|b| b == b'\\' || b == b'"' || b == b'\n') {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    Cow::Owned(out)
+}
+
+#[cfg(test)]
+mod escape_tests {
+    use super::escape_label_value;
+    use std::borrow::Cow;
+
+    #[test]
+    fn clean_value_returns_borrowed() {
+        assert!(matches!(
+            escape_label_value("example.com"),
+            Cow::Borrowed("example.com")
+        ));
+    }
+
+    #[test]
+    fn quote_is_escaped() {
+        assert_eq!(escape_label_value("a\"b").as_ref(), "a\\\"b");
+    }
+
+    #[test]
+    fn backslash_is_escaped() {
+        assert_eq!(escape_label_value("a\\b").as_ref(), "a\\\\b");
+    }
+
+    #[test]
+    fn newline_is_escaped() {
+        assert_eq!(escape_label_value("a\nb").as_ref(), "a\\nb");
+    }
+
+    #[test]
+    fn injection_attempt_is_neutralized() {
+        let attack = "evil.com\"} 999\ndwaar_pwned 1";
+        let escaped = escape_label_value(attack);
+        // Invariant 1: no raw newline — Prometheus cannot see a new metric line.
+        assert!(!escaped.contains('\n'));
+        // Invariant 2: every `"` in the output is preceded by a backslash.
+        let bytes = escaped.as_bytes();
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == b'"' {
+                assert!(
+                    i > 0 && bytes[i - 1] == b'\\',
+                    "quote at {i} is not preceded by backslash: {escaped}"
+                );
+            }
+        }
+        // Invariant 3: the escape sequence `\"` shows up at least once,
+        // proving the escaper actually ran on the attack string.
+        assert!(escaped.as_ref().contains("\\\""));
+    }
+}
 
 /// A Prometheus histogram with pre-allocated buckets.
 ///
@@ -190,11 +268,6 @@ impl StatusMethodCounters {
 }
 
 // -- Top-level metrics registry ----------------------------------------------
-
-/// Maximum number of distinct domains tracked in per-domain `DashMap`s.
-/// Beyond this limit new domains are silently dropped to prevent unbounded
-/// memory growth in multi-tenant or wildcard setups.
-const MAX_TRACKED_DOMAINS: usize = 10_000;
 
 /// Per-domain request metrics bundled into a single struct.
 ///
@@ -369,7 +442,8 @@ impl PrometheusMetrics {
         out.push_str("# HELP dwaar_requests_total Total HTTP requests processed.\n");
         out.push_str("# TYPE dwaar_requests_total counter\n");
         for entry in &self.domains {
-            let domain = entry.key();
+            // Escape once per domain — method/status labels are server-controlled.
+            let domain = escape_label_value(entry.key());
             let counters = &entry.value().requests;
             for (si, &status_label) in STATUS_CODES.iter().enumerate() {
                 for (mi, &method_label) in METHODS.iter().enumerate() {
@@ -404,11 +478,8 @@ impl PrometheusMetrics {
         for entry in &self.domains {
             let val = entry.value().bytes_sent.load(Relaxed);
             if val > 0 {
-                let _ = writeln!(
-                    out,
-                    "dwaar_bytes_sent_total{{domain=\"{}\"}} {val}",
-                    entry.key()
-                );
+                let domain = escape_label_value(entry.key());
+                let _ = writeln!(out, "dwaar_bytes_sent_total{{domain=\"{domain}\"}} {val}");
             }
         }
 
@@ -417,10 +488,10 @@ impl PrometheusMetrics {
         for entry in &self.domains {
             let val = entry.value().bytes_received.load(Relaxed);
             if val > 0 {
+                let domain = escape_label_value(entry.key());
                 let _ = writeln!(
                     out,
-                    "dwaar_bytes_received_total{{domain=\"{}\"}} {val}",
-                    entry.key()
+                    "dwaar_bytes_received_total{{domain=\"{domain}\"}} {val}"
                 );
             }
         }
@@ -431,11 +502,8 @@ impl PrometheusMetrics {
         out.push_str("# TYPE dwaar_active_connections gauge\n");
         for entry in &self.active_connections {
             let val = entry.value().load(Relaxed);
-            let _ = writeln!(
-                out,
-                "dwaar_active_connections{{domain=\"{}\"}} {val}",
-                entry.key()
-            );
+            let domain = escape_label_value(entry.key());
+            let _ = writeln!(out, "dwaar_active_connections{{domain=\"{domain}\"}} {val}");
         }
     }
 
@@ -461,10 +529,10 @@ impl PrometheusMetrics {
         out.push_str("# TYPE dwaar_upstream_health gauge\n");
         for entry in &self.upstream_health {
             let val = entry.value().load(Relaxed);
+            let upstream = escape_label_value(entry.key());
             let _ = writeln!(
                 out,
-                "dwaar_upstream_health{{upstream=\"{}\"}} {val}",
-                entry.key()
+                "dwaar_upstream_health{{upstream=\"{upstream}\"}} {val}"
             );
         }
     }

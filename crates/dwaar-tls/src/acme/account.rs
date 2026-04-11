@@ -47,29 +47,55 @@ pub async fn ensure_acme_dir(dir: &Path) -> Result<(), AcmeError> {
     Ok(())
 }
 
-/// Save serialized credentials JSON to disk with `0600` permissions.
+/// Save serialized credentials JSON to disk with `0600` permissions,
+/// atomically, using an unpredictable temp file name in the target directory.
+///
+/// Uses [`tempfile::NamedTempFile::new_in`] (random suffix) instead of a
+/// predictable `.tmp` pattern so that a local attacker cannot pre-create a
+/// symlink at the temp path pointing to a privileged file and trick dwaar
+/// into overwriting it. Mirrors the same pattern used for cert PEM writes.
+///
+/// The `tempfile` crate's API is blocking, so this runs on `spawn_blocking`
+/// to keep the async runtime free during `fsync`.
 pub async fn save_credentials(path: &Path, json: &str) -> Result<(), AcmeError> {
-    // Atomic write: write to .tmp, then rename
-    let tmp_path = path.with_extension("json.tmp");
+    let path = path.to_path_buf();
+    let json = json.to_string();
 
-    fs::write(&tmp_path, json.as_bytes())
-        .await
-        .map_err(AcmeError::AccountIo)?;
+    tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
+        use std::io::Write;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        fs::set_permissions(&tmp_path, perms)
-            .await
-            .map_err(AcmeError::AccountIo)?;
-    }
+        let parent = path.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "account credentials path has no parent directory",
+            )
+        })?;
 
-    fs::rename(&tmp_path, path)
-        .await
-        .map_err(AcmeError::AccountIo)?;
+        let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+        tmp.write_all(json.as_bytes())?;
 
-    info!(path = %path.display(), "ACME account credentials saved");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(tmp.path(), perms)?;
+        }
+
+        // fsync before rename so a crash cannot leave a zero-length creds file.
+        tmp.as_file_mut().sync_all()?;
+
+        tmp.persist(&path).map_err(|e| e.error)?;
+        info!(path = %path.display(), "ACME account credentials saved");
+        Ok(())
+    })
+    .await
+    .map_err(|e| {
+        AcmeError::AccountIo(std::io::Error::other(format!(
+            "save_credentials join error: {e}"
+        )))
+    })?
+    .map_err(AcmeError::AccountIo)?;
+
     Ok(())
 }
 

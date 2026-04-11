@@ -11,6 +11,7 @@
 
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
@@ -18,10 +19,38 @@ use lru::LruCache;
 use openssl::pkey::{PKey, Private};
 use openssl::x509::X509;
 use tracing::{debug, warn};
+use zeroize::Zeroize;
+
+use crate::sni::is_valid_sni_hostname;
+
+/// Maximum age a cached OCSP response is allowed to have before we stop
+/// stapling it. Matches typical OCSP lifetimes (~7 days for most CAs).
+///
+/// A stale response is still cryptographically valid but no longer fresh:
+/// rather than advertising an obsolete status to clients, we withhold the
+/// staple and let the client fetch its own (or skip OCSP entirely). The
+/// handshake still succeeds — stapling is a latency optimization, not a
+/// security requirement.
+pub const MAX_OCSP_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
+
+/// Errors returned by [`CertStore`] lookups.
+#[derive(Debug, thiserror::Error)]
+pub enum CertStoreError {
+    /// Domain name failed SNI / DNS validation — path traversal or malformed input.
+    #[error("invalid hostname: {0}")]
+    InvalidHostname(String),
+}
 
 /// A cached cert+key pair, ready to inject into an SSL context.
 ///
 /// `Debug` is not derived because `X509` and `PKey` don't implement it.
+///
+/// The OCSP response buffer is zeroized on drop as defense-in-depth. OpenSSL's
+/// own cleanup frees the `EVP_PKEY` internals when `PKey` drops (scrubbing the
+/// private key via `OPENSSL_cleanse` on modern builds). We cannot reach into
+/// the raw key bytes from Rust without re-serializing them — which would
+/// defeat the purpose — so we rely on OpenSSL for the key itself and
+/// explicitly wipe any auxiliary buffers we hold here.
 #[derive(Clone)]
 #[allow(missing_debug_implementations)]
 pub struct CachedCert {
@@ -29,6 +58,34 @@ pub struct CachedCert {
     pub key: PKey<Private>,
     pub issuer: Option<X509>,
     pub ocsp_response: Option<Vec<u8>>,
+    /// When the OCSP response was last refreshed. `None` means never refreshed
+    /// (e.g. freshly loaded from disk with no prior staple). Used by the TLS
+    /// stapling path to suppress responses older than [`MAX_OCSP_AGE`].
+    pub ocsp_last_refresh: Option<Instant>,
+}
+
+impl CachedCert {
+    /// True if the cached OCSP response is present and was refreshed within
+    /// [`MAX_OCSP_AGE`]. A response loaded from disk (with no `ocsp_last_refresh`)
+    /// is considered stale — we only staple what we have proactively refreshed.
+    pub fn is_ocsp_fresh(&self) -> bool {
+        match (self.ocsp_response.as_ref(), self.ocsp_last_refresh) {
+            (Some(_), Some(ts)) => Instant::now().duration_since(ts) < MAX_OCSP_AGE,
+            _ => false,
+        }
+    }
+}
+
+impl Drop for CachedCert {
+    fn drop(&mut self) {
+        // Zero any cached key-derived buffers we retain. OpenSSL's `PKey<Private>`
+        // drop already scrubs the `EVP_PKEY` internals; the OCSP response is not
+        // key material but it can be tied to a certificate serial, and it's
+        // cheap to wipe so we do it as defense-in-depth against heap scraping.
+        if let Some(ref mut resp) = self.ocsp_response {
+            resp.zeroize();
+        }
+    }
 }
 
 /// Certificate store that loads from filesystem and caches in LRU.
@@ -66,42 +123,85 @@ impl CertStore {
         }
     }
 
-    /// Look up a cert for `domain`. Returns from cache if available,
-    /// otherwise loads from disk and caches it.
-    pub fn get(&self, domain: &str) -> Option<CachedCert> {
+    /// Cache-only lookup. Returns the cached entry if present, `None` otherwise.
+    /// Does not touch the filesystem. Safe to call from any thread, sync or async.
+    fn lookup_cached(&self, domain: &str) -> Option<CachedCert> {
         let mut cache = self.lock_cache();
+        cache.get(domain).cloned()
+    }
 
-        // Cache hit — LRU promotes this entry to most-recently-used
-        if let Some(cached) = cache.get(domain) {
-            debug!(domain, "cert cache hit");
-            return Some(cached.clone());
+    /// Look up a cert for `domain`. Returns from cache if available,
+    /// otherwise loads from disk **synchronously** and caches it.
+    ///
+    /// The synchronous variant is retained for non-hot-path callers (ACME
+    /// background tasks, tests). The TLS handshake hot path must use
+    /// [`CertStore::get_async`] so the blocking disk read runs on the blocking
+    /// pool rather than stalling a tokio runtime thread (H-06).
+    ///
+    /// Returns `None` if the hostname is invalid (M-10) or the files are
+    /// missing. Invalid hostnames are logged at `warn!` so operators see
+    /// misuse at the call site.
+    pub fn get(&self, domain: &str) -> Option<CachedCert> {
+        if !is_valid_sni_hostname(domain) {
+            warn!(domain, "CertStore::get refused invalid hostname");
+            return None;
         }
-        // Drop the lock before doing disk I/O
-        drop(cache);
 
-        // Cache miss — try loading from filesystem
+        if let Some(cached) = self.lookup_cached(domain) {
+            debug!(domain, "cert cache hit");
+            return Some(cached);
+        }
+
+        // Cache miss — try loading from filesystem (sync I/O).
         let cert = self.load_from_disk(domain)?;
 
-        // Re-acquire lock and insert
+        let mut cache = self.lock_cache();
+        cache.put(domain.to_string(), cert.clone());
+        Some(cert)
+    }
+
+    /// Async variant of [`Self::get`] for the TLS hot path.
+    ///
+    /// On a cache hit this is lock-free and identical to `get`. On a miss the
+    /// blocking PEM read is dispatched via `tokio::task::spawn_blocking` so
+    /// the tokio runtime worker is not stalled during a TLS handshake (H-06).
+    pub async fn get_async(&self, domain: &str) -> Option<CachedCert> {
+        if !is_valid_sni_hostname(domain) {
+            warn!(domain, "CertStore::get_async refused invalid hostname");
+            return None;
+        }
+
+        if let Some(cached) = self.lookup_cached(domain) {
+            debug!(domain, "cert cache hit");
+            return Some(cached);
+        }
+
+        let cert_path = self.cert_dir.join(format!("{domain}.pem"));
+        let key_path = self.cert_dir.join(format!("{domain}.key"));
+        let cert = load_pem_pair_blocking(cert_path, key_path).await?;
+
         let mut cache = self.lock_cache();
         cache.put(domain.to_string(), cert.clone());
         Some(cert)
     }
 
     /// Load a cert from explicit file paths (for `tls /cert.pem /key.pem` directives).
-    /// Caches under the given domain name.
+    /// Caches under the given domain name. Synchronous — do not call from the
+    /// TLS handshake hot path; use [`Self::get_or_load_async`] instead.
     pub fn get_or_load(
         &self,
         domain: &str,
         cert_path: &Path,
         key_path: &Path,
     ) -> Option<CachedCert> {
-        let mut cache = self.lock_cache();
-
-        if let Some(cached) = cache.get(domain) {
-            return Some(cached.clone());
+        if !is_valid_sni_hostname(domain) {
+            warn!(domain, "CertStore::get_or_load refused invalid hostname");
+            return None;
         }
-        drop(cache);
+
+        if let Some(cached) = self.lookup_cached(domain) {
+            return Some(cached);
+        }
 
         let cert = load_pem_pair(cert_path, key_path)?;
 
@@ -110,9 +210,43 @@ impl CertStore {
         Some(cert)
     }
 
+    /// Async variant of [`Self::get_or_load`] that dispatches the blocking PEM
+    /// reads onto the tokio blocking pool (H-06).
+    pub async fn get_or_load_async(
+        &self,
+        domain: &str,
+        cert_path: PathBuf,
+        key_path: PathBuf,
+    ) -> Option<CachedCert> {
+        if !is_valid_sni_hostname(domain) {
+            warn!(
+                domain,
+                "CertStore::get_or_load_async refused invalid hostname"
+            );
+            return None;
+        }
+
+        if let Some(cached) = self.lookup_cached(domain) {
+            return Some(cached);
+        }
+
+        let cert = load_pem_pair_blocking(cert_path, key_path).await?;
+
+        let mut cache = self.lock_cache();
+        cache.put(domain.to_string(), cert.clone());
+        Some(cert)
+    }
+
     /// Try loading cert/key from the default filesystem layout:
-    /// `{cert_dir}/{domain}.pem` and `{cert_dir}/{domain}.key`
+    /// `{cert_dir}/{domain}.pem` and `{cert_dir}/{domain}.key`.
+    ///
+    /// Callers must validate `domain` before invoking — this helper assumes
+    /// the input has already been screened by [`is_valid_sni_hostname`].
     fn load_from_disk(&self, domain: &str) -> Option<CachedCert> {
+        debug_assert!(
+            is_valid_sni_hostname(domain),
+            "load_from_disk called with invalid domain: {domain}"
+        );
         let cert_path = self.cert_dir.join(format!("{domain}.pem"));
         let key_path = self.cert_dir.join(format!("{domain}.key"));
         load_pem_pair(&cert_path, &key_path)
@@ -139,14 +273,31 @@ impl CertStore {
     /// Uses `peek_mut()` to avoid promoting the entry in the LRU —
     /// OCSP refresh is a background operation and shouldn't affect
     /// eviction order (which should reflect actual handshake traffic).
-    /// No-op if the domain isn't cached.
+    /// No-op if the domain isn't cached. Also stamps `ocsp_last_refresh`
+    /// with the current [`Instant`] so the stapling path can reject
+    /// responses older than [`MAX_OCSP_AGE`] (M-11).
     pub fn update_ocsp(&self, domain: &str, response: Vec<u8>) {
         let mut cache = self.lock_cache();
         if let Some(entry) = cache.peek_mut(domain) {
             entry.ocsp_response = Some(response);
+            entry.ocsp_last_refresh = Some(Instant::now());
             debug!(domain, "OCSP response updated in cache");
         }
     }
+}
+
+/// `spawn_blocking` wrapper around [`load_pem_pair`] for use from async contexts.
+///
+/// The TLS handshake callback runs on a tokio worker thread. Reading a PEM
+/// file inline there would stall the runtime under high handshake rates. This
+/// helper moves the read onto the blocking pool where stalls are expected.
+async fn load_pem_pair_blocking(cert_path: PathBuf, key_path: PathBuf) -> Option<CachedCert> {
+    tokio::task::spawn_blocking(move || load_pem_pair(&cert_path, &key_path))
+        .await
+        .unwrap_or_else(|e| {
+            warn!(error = %e, "spawn_blocking for PEM load panicked or was cancelled");
+            None
+        })
 }
 
 /// Read PEM files from disk and parse into `X509` + `PKey`.
@@ -230,6 +381,7 @@ fn load_pem_pair(cert_path: &Path, key_path: &Path) -> Option<CachedCert> {
         key,
         issuer,
         ocsp_response: None,
+        ocsp_last_refresh: None,
     })
 }
 
@@ -413,6 +565,112 @@ mod tests {
         assert_eq!(store.cached_count(), 3);
         assert!(store.get("lru1.example.com").is_some(), "lru1 still cached");
         assert!(store.get("lru2.example.com").is_some(), "lru2 still cached");
+    }
+
+    #[test]
+    fn get_rejects_invalid_hostnames() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = CertStore::new(dir.path(), 100);
+        assert!(store.get("../etc/passwd").is_none());
+        assert!(store.get("/etc/passwd").is_none());
+        assert!(store.get("").is_none());
+        assert!(store.get("..").is_none());
+        assert!(store.get("host..with..dots").is_none());
+        assert_eq!(store.cached_count(), 0, "no invalid entry should be cached");
+    }
+
+    #[test]
+    fn get_does_not_touch_filesystem_on_cache_hit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cert_pem, key_pem) = generate_self_signed("cached.example.com");
+        let cert_file = dir.path().join("cached.example.com.pem");
+        let key_file = dir.path().join("cached.example.com.key");
+        std::fs::write(&cert_file, &cert_pem).expect("write cert");
+        std::fs::write(&key_file, &key_pem).expect("write key");
+        let store = CertStore::new(dir.path(), 100);
+        store.get("cached.example.com").expect("initial load");
+        std::fs::remove_file(&cert_file).expect("rm cert");
+        std::fs::remove_file(&key_file).expect("rm key");
+        let hit = store
+            .get("cached.example.com")
+            .expect("cache hit should still succeed");
+        assert!(hit.cert.to_pem().is_ok());
+    }
+
+    #[tokio::test]
+    async fn get_async_cache_hit_avoids_blocking_pool() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cert_pem, key_pem) = generate_self_signed("async.example.com");
+        let cert_file = dir.path().join("async.example.com.pem");
+        let key_file = dir.path().join("async.example.com.key");
+        std::fs::write(&cert_file, &cert_pem).expect("write cert");
+        std::fs::write(&key_file, &key_pem).expect("write key");
+        let store = CertStore::new(dir.path(), 100);
+        store.get("async.example.com").expect("prime cache");
+        std::fs::remove_file(&cert_file).expect("rm cert");
+        std::fs::remove_file(&key_file).expect("rm key");
+        let hit = store
+            .get_async("async.example.com")
+            .await
+            .expect("cached lookup should succeed");
+        assert!(hit.cert.to_pem().is_ok());
+    }
+
+    #[tokio::test]
+    async fn get_async_cache_miss_loads_from_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cert_pem, key_pem) = generate_self_signed("async-miss.example.com");
+        std::fs::write(dir.path().join("async-miss.example.com.pem"), &cert_pem).expect("cert");
+        std::fs::write(dir.path().join("async-miss.example.com.key"), &key_pem).expect("key");
+        let store = CertStore::new(dir.path(), 100);
+        let cert = store
+            .get_async("async-miss.example.com")
+            .await
+            .expect("should load via blocking pool");
+        assert!(cert.cert.to_pem().is_ok());
+        assert_eq!(store.cached_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_async_rejects_invalid_hostnames() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = CertStore::new(dir.path(), 100);
+        assert!(store.get_async("../etc/passwd").await.is_none());
+        assert!(store.get_async("").await.is_none());
+    }
+
+    #[test]
+    fn update_ocsp_stamps_last_refresh() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cert_pem, key_pem) = generate_self_signed("fresh.example.com");
+        std::fs::write(dir.path().join("fresh.example.com.pem"), &cert_pem).expect("cert");
+        std::fs::write(dir.path().join("fresh.example.com.key"), &key_pem).expect("key");
+        let store = CertStore::new(dir.path(), 100);
+        let cached = store.get("fresh.example.com").expect("load");
+        assert!(cached.ocsp_last_refresh.is_none(), "unrefreshed");
+        assert!(!cached.is_ocsp_fresh(), "no response → not fresh");
+        store.update_ocsp("fresh.example.com", vec![1, 2, 3]);
+        let cached = store.get("fresh.example.com").expect("cached");
+        assert!(cached.ocsp_last_refresh.is_some(), "timestamp set");
+        assert!(cached.is_ocsp_fresh(), "freshly refreshed → fresh");
+    }
+
+    #[test]
+    fn is_ocsp_fresh_false_for_old_timestamp() {
+        let (cert_pem, key_pem) = generate_self_signed("stale.example.com");
+        let cert = X509::from_pem(&cert_pem).expect("parse cert");
+        let key = PKey::private_key_from_pem(&key_pem).expect("parse key");
+        let Some(old_ts) = Instant::now().checked_sub(MAX_OCSP_AGE + Duration::from_secs(1)) else {
+            return;
+        };
+        let cached = CachedCert {
+            cert,
+            key,
+            issuer: None,
+            ocsp_response: Some(vec![0xA]),
+            ocsp_last_refresh: Some(old_ts),
+        };
+        assert!(!cached.is_ocsp_fresh(), "older than MAX_OCSP_AGE");
     }
 
     #[test]

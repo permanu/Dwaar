@@ -44,6 +44,7 @@ That's it. HTTPS is automatic. Analytics are injected. Requests are logged.
 - **Rate limiting** — Per-IP, per-domain, configurable
 - **Zero-downtime upgrades** — Pingora's FD transfer, zero dropped connections
 - **HTTP/3 streaming bridge** — streaming H3 → H2 upstream with zero-copy chunk forwarding and a bounded per-host connection pool (100 concurrent H3 streams share ≤ 2 upstream TCP sockets)
+- **v0.2.3 audit remediation** — ~50 fixes: beacon HMAC auth, TLS hardening (OCSP SSRF blocklist, strict wildcard SNI, revoked-cert eviction), Prometheus label escaping, GeoIP hot reload
 
 ## Architecture
 

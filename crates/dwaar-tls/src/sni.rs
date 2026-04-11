@@ -24,13 +24,25 @@ use tracing::{debug, warn};
 
 use crate::cert_store::CertStore;
 
-/// Validate that an SNI hostname is a legal DNS name.
-/// Rejects path traversal attempts, null bytes, and other non-hostname characters.
-fn is_valid_sni_hostname(s: &str) -> bool {
+/// Validate that an SNI hostname is a legal DNS name or single-label wildcard.
+///
+/// Rejects path traversal attempts, null bytes, non-ASCII characters, and
+/// malformed wildcards. Per RFC 6125 §6.4.3 the `*` wildcard is only valid
+/// as the *entire* left-most label — `*.example.com` is fine, but
+/// `exam*ple.com`, `*ample.com`, `foo.*.com`, and `**.example.com` are not
+/// (M-13).
+///
+/// Exposed at crate level because `CertStore` also validates hostnames before
+/// interpolating them into filesystem paths (M-10).
+pub fn is_valid_sni_hostname(s: &str) -> bool {
     if s.is_empty() || s.len() > 253 {
         return false;
     }
-    s.split('.').all(|label| {
+
+    let labels: Vec<&str> = s.split('.').collect();
+
+    // Every label must be a well-formed LDH label (or the wildcard `*`).
+    let label_ok = |label: &str| -> bool {
         !label.is_empty()
             && label.len() <= 63
             && label
@@ -38,7 +50,27 @@ fn is_valid_sni_hostname(s: &str) -> bool {
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'*')
             && !label.starts_with('-')
             && !label.ends_with('-')
-    })
+    };
+
+    if !labels.iter().all(|l| label_ok(l)) {
+        return false;
+    }
+
+    // Wildcard position check (RFC 6125 §6.4.3):
+    //   * The wildcard `*` may appear *only* as the entire left-most label.
+    //   * No other label may contain `*`.
+    //   * The left-most label, if it contains `*`, must be exactly `*`.
+    if labels.iter().skip(1).any(|l| l.contains('*')) {
+        return false;
+    }
+    if let Some(first) = labels.first()
+        && first.contains('*')
+        && *first != "*"
+    {
+        return false;
+    }
+
+    true
 }
 
 /// Per-domain TLS config from the Dwaarfile `tls` directive.
@@ -117,7 +149,10 @@ impl SniResolver {
 
     /// Resolve cert for a domain — tries explicit config first,
     /// then wildcard, then default directory layout.
-    fn resolve_cert(&self, sni: &str) -> Option<crate::cert_store::CachedCert> {
+    ///
+    /// Async so that cache misses dispatch their PEM reads onto the tokio
+    /// blocking pool rather than stalling the handshake thread (H-06).
+    async fn resolve_cert(&self, sni: &str) -> Option<crate::cert_store::CachedCert> {
         if !is_valid_sni_hostname(sni) {
             warn!(sni = %sni, "invalid SNI hostname — rejecting");
             return None;
@@ -125,19 +160,23 @@ impl SniResolver {
 
         let sni_lower = sni.to_lowercase();
 
-        // Load the current domain map — this is a single atomic pointer load,
-        // no lock required.
+        // Snapshot the current domain map — single atomic pointer load, no lock.
         let configs = self.domain_configs.load();
 
         // Try explicit cert path for this exact domain
         if let Some(config) = configs.get(&sni_lower) {
             return self
                 .cert_store
-                .get_or_load(&sni_lower, &config.cert_path, &config.key_path);
+                .get_or_load_async(
+                    &sni_lower,
+                    config.cert_path.clone(),
+                    config.key_path.clone(),
+                )
+                .await;
         }
 
         // Try default directory layout for exact domain
-        if let Some(cert) = self.cert_store.get(&sni_lower) {
+        if let Some(cert) = self.cert_store.get_async(&sni_lower).await {
             return Some(cert);
         }
 
@@ -148,10 +187,11 @@ impl SniResolver {
             if let Some(config) = configs.get(&wildcard) {
                 return self
                     .cert_store
-                    .get_or_load(&wildcard, &config.cert_path, &config.key_path);
+                    .get_or_load_async(&wildcard, config.cert_path.clone(), config.key_path.clone())
+                    .await;
             }
 
-            return self.cert_store.get(&wildcard);
+            return self.cert_store.get_async(&wildcard).await;
         }
 
         None
@@ -175,7 +215,7 @@ impl TlsAccept for SniResolver {
             }
         };
 
-        let Some(cached) = self.resolve_cert(&sni) else {
+        let Some(cached) = self.resolve_cert(&sni).await else {
             warn!(sni = %sni, "no cert found for SNI hostname");
             return;
         };
@@ -191,12 +231,22 @@ impl TlsAccept for SniResolver {
             return;
         }
 
-        // Staple OCSP response if available
+        // Staple OCSP response only if it was refreshed within MAX_OCSP_AGE
+        // (M-11). A stale response — e.g. refresh has been failing for days —
+        // is withheld so clients fall back to their own OCSP checks rather
+        // than seeing an obsolete status. The handshake itself still succeeds.
         if let Some(ref ocsp_der) = cached.ocsp_response {
-            if let Err(e) = ssl.set_ocsp_status(ocsp_der) {
-                warn!(sni = %sni, error = %e, "failed to staple OCSP response");
+            if cached.is_ocsp_fresh() {
+                if let Err(e) = ssl.set_ocsp_status(ocsp_der) {
+                    warn!(sni = %sni, error = %e, "failed to staple OCSP response");
+                } else {
+                    debug!(sni = %sni, "OCSP response stapled to handshake");
+                }
             } else {
-                debug!(sni = %sni, "OCSP response stapled to handshake");
+                debug!(
+                    sni = %sni,
+                    "cached OCSP response is stale (> MAX_OCSP_AGE) — skipping staple"
+                );
             }
         }
 
@@ -264,8 +314,8 @@ mod tests {
         assert!(resolver.domain_configs.load().contains_key("reloaded.com"));
     }
 
-    #[test]
-    fn wildcard_fallback_in_resolver() {
+    #[tokio::test]
+    async fn wildcard_fallback_in_resolver() {
         let dir = tempfile::tempdir().expect("tempdir");
 
         // Create a wildcard cert
@@ -277,15 +327,15 @@ mod tests {
         let resolver = SniResolver::new(store);
 
         // api.example.com should fall back to *.example.com
-        let cert = resolver.resolve_cert("api.example.com");
+        let cert = resolver.resolve_cert("api.example.com").await;
         assert!(cert.is_some(), "wildcard cert should match subdomain");
     }
 
-    #[test]
-    fn no_cert_returns_none() {
+    #[tokio::test]
+    async fn no_cert_returns_none() {
         let store = Arc::new(CertStore::new("/tmp/nonexistent_cert_dir", 100));
         let resolver = SniResolver::new(store);
-        assert!(resolver.resolve_cert("unknown.com").is_none());
+        assert!(resolver.resolve_cert("unknown.com").await.is_none());
     }
 
     #[test]
@@ -297,5 +347,33 @@ mod tests {
         assert!(is_valid_sni_hostname("example.com"));
         assert!(is_valid_sni_hostname("*.example.com"));
         assert!(is_valid_sni_hostname("sub.domain.example.com"));
+    }
+
+    #[test]
+    fn wildcard_only_as_entire_first_label() {
+        // Valid
+        assert!(is_valid_sni_hostname("*.example.com"));
+        assert!(is_valid_sni_hostname("example.com"));
+        assert!(is_valid_sni_hostname("*.sub.example.com"));
+
+        // Invalid: wildcard embedded in a label
+        assert!(!is_valid_sni_hostname("exam*ple.com"));
+        assert!(!is_valid_sni_hostname("*ample.com"));
+        assert!(!is_valid_sni_hostname("examp*.com"));
+        // Invalid: wildcard not in the first label
+        assert!(!is_valid_sni_hostname("foo.*.com"));
+        assert!(!is_valid_sni_hostname("foo.*bar.com"));
+        assert!(!is_valid_sni_hostname("example.*"));
+        // Invalid: multiple wildcards / too many stars
+        assert!(!is_valid_sni_hostname("**.example.com"));
+        assert!(!is_valid_sni_hostname("*.*.example.com"));
+    }
+
+    #[tokio::test]
+    async fn resolve_cert_rejects_invalid_sni() {
+        let store = Arc::new(CertStore::new("/tmp/nonexistent_cert_dir", 100));
+        let resolver = SniResolver::new(store);
+        assert!(resolver.resolve_cert("../etc/passwd").await.is_none());
+        assert!(resolver.resolve_cert("exam*ple.com").await.is_none());
     }
 }

@@ -12,15 +12,30 @@
 //! `/proc/self` on Linux and fall back to `libc` / `sysctl` on macOS.
 
 use std::fmt::Write;
+use std::sync::OnceLock;
 use std::time::SystemTime;
+
+/// Cached process start time in Unix seconds.
+///
+/// Populated on first access via the platform-specific
+/// [`process_start_time_secs`] implementation. The value never changes
+/// after the process starts, so `OnceLock` is strictly a one-shot cache
+/// with no contention and no reload cost. Using a static (rather than a
+/// field on `ProcessMetrics`) means a late-initialized metrics registry
+/// still reports the actual kernel-recorded process start time, not the
+/// time at which `ProcessMetrics::new()` happened to run.
+static PROCESS_START_TIME_SECS: OnceLock<f64> = OnceLock::new();
 
 /// Collects standard Prometheus process metrics.
 ///
-/// `start_time` is captured once at construction — the process start time
-/// doesn't change, so there's no reason to re-read it per scrape.
+/// `start_time_seconds` is read from a platform-specific kernel source on
+/// first access — not captured at construction — so a late-initialized
+/// metrics registry still reports the true process start time instead of
+/// the struct construction time. See [`process_start_time_secs`] for the
+/// lookup order.
 #[derive(Debug)]
 pub struct ProcessMetrics {
-    start_time_secs: f64,
+    _priv: (),
 }
 
 impl Default for ProcessMetrics {
@@ -31,9 +46,12 @@ impl Default for ProcessMetrics {
 
 impl ProcessMetrics {
     pub fn new() -> Self {
-        Self {
-            start_time_secs: current_unix_secs(),
-        }
+        // Eagerly populate the start-time cache so scrapers see a stable
+        // value from the first render onward, but do NOT fall back to
+        // `SystemTime::now()` inside `new()` — the platform lookup
+        // determines the real value.
+        let _ = *PROCESS_START_TIME_SECS.get_or_init(process_start_time_secs);
+        Self { _priv: () }
     }
 
     pub fn cpu_seconds_total(&self) -> f64 {
@@ -49,7 +67,7 @@ impl ProcessMetrics {
     }
 
     pub fn start_time_seconds(&self) -> f64 {
-        self.start_time_secs
+        *PROCESS_START_TIME_SECS.get_or_init(process_start_time_secs)
     }
 
     pub fn max_fds(&self) -> u64 {
@@ -107,6 +125,114 @@ fn current_unix_secs() -> f64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+/// Platform-specific lookup of the real process start time in Unix seconds.
+///
+/// * Linux: reads `/proc/self/stat` field 22 (`starttime`, in clock ticks
+///   since boot) and combines it with `/proc/stat` `btime` (boot time in
+///   Unix seconds) and `sysconf(_SC_CLK_TCK)`.
+/// * macOS: calls `proc_pidinfo(PROC_PIDTBSDINFO)` on the current pid and
+///   reads `pbi_start_tvsec` + `pbi_start_tvusec` from the returned
+///   `proc_bsdinfo`.
+/// * Other platforms (including Windows): falls back to `SystemTime::now()`.
+///   This is the legacy behavior and is only "accurate" if the metrics
+///   registry is constructed very early in `main()`.
+///
+/// Every path returns a finite non-negative `f64` — callers never have to
+/// handle errors because the metric is a best-effort gauge.
+fn process_start_time_secs() -> f64 {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(secs) = linux_process_start_time_secs() {
+            return secs;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(secs) = macos_process_start_time_secs() {
+            return secs;
+        }
+    }
+    current_unix_secs()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_start_time_secs() -> Option<f64> {
+    // /proc/self/stat: split on the LAST `)` to avoid desync from a
+    // `comm` field that contains spaces or parens.
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    let rparen = stat.rfind(')')?;
+    let after = stat.get(rparen + 1..)?.trim_start();
+    // `starttime` is original field 22 → index 22-3 = 19 in `after`.
+    let starttime_ticks: u64 = after.split_ascii_whitespace().nth(19)?.parse().ok()?;
+
+    // SAFETY: sysconf with a valid _SC_* constant has no preconditions.
+    #[allow(unsafe_code)]
+    let clk_tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if clk_tck <= 0 {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
+    let clk_tck = clk_tck as f64;
+    #[allow(clippy::cast_precision_loss)]
+    let seconds_since_boot = starttime_ticks as f64 / clk_tck;
+
+    let stat2 = std::fs::read_to_string("/proc/stat").ok()?;
+    let btime: u64 = stat2
+        .lines()
+        .find_map(|l| l.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()?;
+
+    #[allow(clippy::cast_precision_loss)]
+    let result = btime as f64 + seconds_since_boot;
+    Some(result)
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn macos_process_start_time_secs() -> Option<f64> {
+    // `proc_pidinfo(PROC_PIDTBSDINFO)` on the current pid returns a
+    // `proc_bsdinfo` whose `pbi_start_tvsec`/`pbi_start_tvusec` give
+    // the process start time in Unix seconds + microseconds. This is
+    // the supported Darwin API for reading a process's start time
+    // without touching the fragile `kinfo_proc` sysctl path.
+    use std::mem;
+
+    // SAFETY: `proc_bsdinfo` is a POD struct with no required invariants;
+    // zeroed memory is a valid initial value that `proc_pidinfo` will
+    // overwrite on success.
+    let mut info: libc::proc_bsdinfo = unsafe { mem::zeroed() };
+    // proc_bsdinfo is a small POD struct (~200 bytes); size fits in c_int
+    // on every target Dwaar supports. `try_into` avoids the signed-cast lint.
+    let size: libc::c_int = mem::size_of::<libc::proc_bsdinfo>()
+        .try_into()
+        .expect("proc_bsdinfo size fits in c_int");
+
+    // SAFETY: `getpid()` is always safe. `proc_pidinfo` populates `info`
+    // when the return value equals `size` — checked before reading.
+    let pid = unsafe { libc::getpid() };
+    let rc = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            std::ptr::from_mut::<libc::proc_bsdinfo>(&mut info).cast::<libc::c_void>(),
+            size,
+        )
+    };
+    if rc != size {
+        return None;
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    let sec = info.pbi_start_tvsec as f64;
+    #[allow(clippy::cast_precision_loss)]
+    let usec = info.pbi_start_tvusec as f64 / 1_000_000.0;
+    let result = sec + usec;
+    if result > 0.0 { Some(result) } else { None }
 }
 
 // libc FFI: getrusage has no safe Rust wrapper; zeroed struct + single call.

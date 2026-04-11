@@ -22,6 +22,7 @@ use openssl::pkey::PKey;
 use openssl::x509::X509ReqBuilder;
 use tokio::fs;
 use tracing::{debug, info};
+use zeroize::Zeroizing;
 
 use super::account::{credentials_path, ensure_acme_dir, load_credentials, save_credentials};
 use super::solver::ChallengeSolver;
@@ -301,7 +302,12 @@ impl CertIssuer {
         let key_auth = order.key_authorization(challenge);
 
         debug!(domain, token = %token, "setting HTTP-01 challenge token");
-        self.solver.set(&token, key_auth.as_str());
+        self.solver
+            .set(&token, key_auth.as_str())
+            .map_err(|e| AcmeError::ChallengeValidation {
+                domain: domain.to_string(),
+                reason: e.to_string(),
+            })?;
 
         order
             .set_challenge_ready(&challenge.url)
@@ -436,10 +442,24 @@ impl CertIssuer {
         let cert_path = self.cert_dir.join(format!("{domain}.pem"));
         let key_path = self.cert_dir.join(format!("{domain}.key"));
 
-        // Ensure cert directory exists
+        // Ensure cert directory exists with 0700 permissions so only the
+        // dwaar user can list or read the directory contents. Mirrors the
+        // account.rs `ensure_acme_dir` pattern (private key material must
+        // never be world-readable). Permissions are re-applied on every
+        // call so an operator's out-of-band chmod can't leave the
+        // directory world-readable long-term.
         fs::create_dir_all(&self.cert_dir)
             .await
             .map_err(AcmeError::CertWrite)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o700);
+            fs::set_permissions(&self.cert_dir, perms)
+                .await
+                .map_err(AcmeError::CertWrite)?;
+        }
 
         atomic_write_pem(&cert_path, cert_pem, 0o644).await?;
         atomic_write_pem(&key_path, key_pem, 0o600).await?;
@@ -449,39 +469,73 @@ impl CertIssuer {
     }
 }
 
-/// Write a PEM string to disk atomically via a temp file and rename.
+/// Write a PEM string to disk atomically via an unpredictable temp file
+/// created in the target directory, then rename into place.
+///
+/// Uses [`tempfile::NamedTempFile::new_in`] so the temp filename is
+/// unpredictable (random suffix in the target directory), which defeats
+/// symlink-bait attacks on shared systems where an attacker could otherwise
+/// pre-create a symlink at `<target>.tmp` pointing to a privileged file.
 ///
 /// `mode` sets the Unix file permissions (ignored on non-Unix).
+///
+/// The `tempfile` crate's API is blocking, so the whole operation runs on a
+/// `spawn_blocking` pool worker — this keeps the async runtime unblocked
+/// during `fsync`, which can be slow on loaded disks.
 async fn atomic_write_pem(
     target: &std::path::Path,
     content: &str,
-    #[allow(unused_variables)] mode: u32,
+    #[cfg_attr(not(unix), allow(unused_variables))] mode: u32,
 ) -> Result<(), AcmeError> {
-    let tmp = target.with_extension("tmp");
-    fs::write(&tmp, content.as_bytes())
-        .await
-        .map_err(AcmeError::CertWrite)?;
+    let target = target.to_path_buf();
+    let content = content.to_string();
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(mode);
-        fs::set_permissions(&tmp, perms)
-            .await
-            .map_err(AcmeError::CertWrite)?;
-    }
+    tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
+        use std::io::Write;
 
-    fs::rename(&tmp, target)
-        .await
-        .map_err(AcmeError::CertWrite)?;
+        let parent = target.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "cert target path has no parent directory",
+            )
+        })?;
+
+        let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+        tmp.write_all(content.as_bytes())?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(mode);
+            std::fs::set_permissions(tmp.path(), perms)?;
+        }
+
+        // Ensure the file bytes and metadata hit the disk before the rename
+        // so a crash between rename and sync cannot leave a zero-length file.
+        tmp.as_file_mut().sync_all()?;
+
+        tmp.persist(&target).map_err(|e| e.error)?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| {
+        AcmeError::CertWrite(std::io::Error::other(format!(
+            "atomic_write_pem join error: {e}"
+        )))
+    })?
+    .map_err(AcmeError::CertWrite)?;
 
     Ok(())
 }
 
 /// Generate an ECDSA P-256 private key and a DER-encoded CSR for the given domain.
 ///
-/// Returns `(private_key_pem, csr_der)`.
-fn generate_key_and_csr(domain: &str) -> Result<(String, Vec<u8>), openssl::error::ErrorStack> {
+/// Returns `(private_key_pem, csr_der)`. The private key PEM is wrapped in
+/// [`Zeroizing`] so its buffer is scrubbed on drop — the key must never
+/// linger in process memory after the cert file has been written.
+fn generate_key_and_csr(
+    domain: &str,
+) -> Result<(Zeroizing<String>, Vec<u8>), openssl::error::ErrorStack> {
     let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
     let ec_key = EcKey::generate(&group)?;
     let pkey = PKey::from_ec_key(ec_key)?;
@@ -506,8 +560,16 @@ fn generate_key_and_csr(domain: &str) -> Result<(String, Vec<u8>), openssl::erro
     builder.sign(&pkey, openssl::hash::MessageDigest::sha256())?;
 
     let csr_der = builder.build().to_der()?;
-    let key_pem = String::from_utf8(pkey.private_key_to_pem_pkcs8()?)
-        .expect("PEM output should be valid UTF-8");
+
+    // OpenSSL's PEM writer always emits ASCII, so `from_utf8` is infallible
+    // in practice. We own the returned `Vec<u8>` and hand it straight into
+    // the `String`, so no second copy of the raw key bytes exists on the
+    // heap. Wrapping the final `String` in `Zeroizing` ensures the PEM text
+    // (which embeds the PKCS8 base64) is scrubbed on drop.
+    let key_pem = Zeroizing::new(
+        String::from_utf8(pkey.private_key_to_pem_pkcs8()?)
+            .expect("PEM output should be valid UTF-8"),
+    );
 
     Ok((key_pem, csr_der))
 }

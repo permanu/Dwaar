@@ -9,6 +9,7 @@
 //! Builds OCSP requests using OpenSSL, transports them via raw HTTP/1.1,
 //! and validates the response signature and cert status.
 
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use openssl::hash::MessageDigest;
@@ -16,7 +17,7 @@ use openssl::ocsp::{OcspCertStatus, OcspFlag, OcspRequest, OcspResponse, OcspRes
 use openssl::x509::X509;
 use openssl::x509::store::X509StoreBuilder;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{self, TcpStream};
 use tracing::{debug, warn};
 
 /// Timeout for HTTP requests to OCSP responders.
@@ -100,11 +101,23 @@ fn build_ocsp_request(cert: &X509, issuer: &X509) -> Result<Vec<u8>, OcspError> 
 ///
 /// OCSP responders typically serve plain HTTP — the response is
 /// cryptographically signed, so transport security is unnecessary.
+///
+/// **SSRF hardening (M-12):** OCSP URLs come from the certificate's AIA
+/// extension which is ultimately controlled by whoever signed the cert. A
+/// compromised or hostile issuer could point OCSP at `127.0.0.1`, cloud
+/// metadata endpoints, or private RFC1918 ranges to probe or attack
+/// internal services. We explicitly resolve the host, reject any IP in a
+/// sensitive range, and then dial that specific address — bypassing
+/// `connect`'s built-in resolver loop so no unchecked candidate can be
+/// reached.
 async fn http_post_ocsp(url: &str, body: &[u8]) -> Result<Vec<u8>, OcspError> {
-    // OCSP URLs are always simple http://host[:port]/path
-    let stripped = url
-        .strip_prefix("http://")
-        .ok_or_else(|| OcspError::HttpFetch(format!("non-HTTP OCSP URL: {url}")))?;
+    // Only plain HTTP is valid per RFC 6960; https:// or any other scheme
+    // is a sign of a malformed or hostile AIA entry.
+    let stripped = url.strip_prefix("http://").ok_or_else(|| {
+        OcspError::HttpFetch(format!(
+            "non-HTTP OCSP URL (RFC 6960 mandates http://): {url}"
+        ))
+    })?;
 
     let (host_port, path) = stripped
         .find('/')
@@ -120,8 +133,6 @@ async fn http_post_ocsp(url: &str, body: &[u8]) -> Result<Vec<u8>, OcspError> {
         (host_port, 80)
     };
 
-    let addr = format!("{host}:{port}");
-
     // Reject any control characters in `host` or `path` before they reach
     // the raw HTTP request line. The cert's AIA URL is attacker-influenced
     // (the issuer can put arbitrary bytes there); a CR/LF would let an
@@ -132,7 +143,36 @@ async fn http_post_ocsp(url: &str, body: &[u8]) -> Result<Vec<u8>, OcspError> {
         ));
     }
 
-    let mut stream = tokio::time::timeout(OCSP_HTTP_TIMEOUT, TcpStream::connect(&addr))
+    // Resolve host → IPs, then filter against the SSRF blocklist before
+    // connecting. We deliberately do NOT hand the hostname to
+    // `TcpStream::connect` because its internal resolver would iterate
+    // candidates unchecked.
+    let resolve_target = format!("{host}:{port}");
+    let resolved: Vec<SocketAddr> = net::lookup_host(resolve_target.as_str())
+        .await
+        .map_err(|e| OcspError::HttpFetch(format!("DNS lookup failed for {host}: {e}")))?
+        .collect();
+
+    if resolved.is_empty() {
+        return Err(OcspError::HttpFetch(format!(
+            "no addresses resolved for OCSP host {host}"
+        )));
+    }
+
+    let target = resolved
+        .into_iter()
+        .find(|addr| !is_blocked_ocsp_target(addr.ip()))
+        .ok_or_else(|| {
+            warn!(
+                url = %url,
+                "OCSP responder resolved only to blocked IP ranges (SSRF guard)"
+            );
+            OcspError::HttpFetch(format!(
+                "OCSP responder {url} resolved only to blocked (private/loopback/link-local) addresses"
+            ))
+        })?;
+
+    let mut stream = tokio::time::timeout(OCSP_HTTP_TIMEOUT, TcpStream::connect(target))
         .await
         .map_err(|_| OcspError::HttpFetch("connection timed out".to_string()))?
         .map_err(|e| OcspError::HttpFetch(format!("connect failed: {e}")))?;
@@ -193,6 +233,66 @@ fn contains_ctl(s: &str) -> bool {
     s.bytes()
         .any(|b| b == b'\r' || b == b'\n' || b == 0 || b < 0x20)
 }
+
+/// Pure SSRF blocklist check — returns `true` iff `ip` belongs to any of the
+/// sensitive ranges (loopback, RFC1918 private, link-local, multicast,
+/// broadcast, unspecified, IPv6 ULA). Deterministic, no global state.
+///
+/// Used by both production (via the [`is_blocked_ocsp_target`] wrapper) and
+/// unit tests — unit tests call this variant directly so they can't race
+/// with the mock-responder integration tests that flip the loopback bypass.
+fn is_blocked_ocsp_target_raw(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                // 169.254.0.0/16 — link-local; AWS/GCP metadata lives here.
+                // `is_link_local` already covers this but we keep it explicit
+                // so the intent is obvious to the next reader.
+                || v4.octets()[0] == 169
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // fc00::/7 — unique local addresses (RFC 4193)
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                // fe80::/10 — link-local
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// SSRF guard: deny outbound OCSP connections to sensitive IP ranges (M-12).
+///
+/// Cert-embedded OCSP URLs are attacker-influenced (the issuer picks them).
+/// Without this gate, a compromised CA or mis-issued cert could point the
+/// proxy's OCSP fetcher at loopback, RFC1918 space, link-local, cloud
+/// metadata (`169.254.169.254`), or multicast/broadcast addresses — a
+/// perfect SSRF primitive for reaching internal services.
+///
+/// The test suite bypasses loopback via [`ALLOW_LOOPBACK_OCSP`] so the
+/// mock OCSP responder on `127.0.0.1` remains reachable. Production
+/// builds never flip that flag.
+fn is_blocked_ocsp_target(ip: IpAddr) -> bool {
+    // Test-only escape hatch for loopback. Production never sets this flag.
+    if ALLOW_LOOPBACK_OCSP.load(std::sync::atomic::Ordering::Relaxed) && ip.is_loopback() {
+        return false;
+    }
+    is_blocked_ocsp_target_raw(ip)
+}
+
+/// Global flag used only by integration tests in this crate to allow
+/// loopback OCSP targets (so mock responders bound on `127.0.0.1` remain
+/// reachable). Production code never writes to this; once enabled by a
+/// test setup helper it is never flipped back at runtime (per-IP unit
+/// tests use [`is_blocked_ocsp_target_raw`] instead).
+pub(crate) static ALLOW_LOOPBACK_OCSP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Validate an OCSP response: check status, verify signature, check cert status.
 fn validate_ocsp_response(
@@ -272,6 +372,98 @@ fn validate_ocsp_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Enable the loopback bypass so mock OCSP responders bound on 127.0.0.1
+    /// (used by the integration tests below) remain reachable past the SSRF
+    /// guard. Idempotent — we only ever flip this to `true`.
+    fn enable_loopback_ocsp_for_tests() {
+        ALLOW_LOOPBACK_OCSP.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    // Unit tests call `_raw` directly so they remain pure and never race with
+    // the integration tests that need the loopback bypass.
+    #[test]
+    fn blocklist_ipv4() {
+        assert!(is_blocked_ocsp_target_raw(
+            "10.0.0.1".parse().expect("literal IP must parse")
+        ));
+        assert!(is_blocked_ocsp_target_raw(
+            "192.168.1.1".parse().expect("literal IP must parse")
+        ));
+        assert!(is_blocked_ocsp_target_raw(
+            "172.16.0.1".parse().expect("literal IP must parse")
+        ));
+        assert!(is_blocked_ocsp_target_raw(
+            "169.254.169.254".parse().expect("literal IP must parse")
+        ));
+        assert!(is_blocked_ocsp_target_raw(
+            "224.0.0.1".parse().expect("literal IP must parse")
+        ));
+        assert!(is_blocked_ocsp_target_raw(
+            "255.255.255.255".parse().expect("literal IP must parse")
+        ));
+        assert!(is_blocked_ocsp_target_raw(
+            "0.0.0.0".parse().expect("literal IP must parse")
+        ));
+    }
+
+    #[test]
+    fn blocklist_ipv4_loopback() {
+        assert!(is_blocked_ocsp_target_raw(
+            "127.0.0.1".parse().expect("literal IP must parse")
+        ));
+        assert!(is_blocked_ocsp_target_raw(
+            "127.1.2.3".parse().expect("literal IP must parse")
+        ));
+    }
+
+    #[test]
+    fn blocklist_ipv6() {
+        assert!(is_blocked_ocsp_target_raw(
+            "::1".parse().expect("literal IP must parse")
+        ));
+        assert!(is_blocked_ocsp_target_raw(
+            "::".parse().expect("literal IP must parse")
+        ));
+        assert!(is_blocked_ocsp_target_raw(
+            "fd00::1".parse().expect("literal IP must parse")
+        ));
+        assert!(is_blocked_ocsp_target_raw(
+            "fc00::1".parse().expect("literal IP must parse")
+        ));
+        assert!(is_blocked_ocsp_target_raw(
+            "fe80::1".parse().expect("literal IP must parse")
+        ));
+        assert!(is_blocked_ocsp_target_raw(
+            "ff02::1".parse().expect("literal IP must parse")
+        ));
+    }
+
+    #[test]
+    fn blocklist_allows_public_addrs() {
+        assert!(!is_blocked_ocsp_target_raw(
+            "8.8.8.8".parse().expect("literal IP must parse")
+        ));
+        assert!(!is_blocked_ocsp_target_raw(
+            "1.1.1.1".parse().expect("literal IP must parse")
+        ));
+        assert!(!is_blocked_ocsp_target_raw(
+            "2001:4860:4860::8888"
+                .parse()
+                .expect("literal IP must parse")
+        ));
+        assert!(!is_blocked_ocsp_target_raw(
+            "2606:4700:4700::1111"
+                .parse()
+                .expect("literal IP must parse")
+        ));
+    }
+
+    #[tokio::test]
+    async fn http_post_ocsp_rejects_non_http_scheme() {
+        let result = http_post_ocsp("file:///etc/passwd", &[]).await;
+        assert!(matches!(result, Err(OcspError::HttpFetch(_))));
+    }
 
     #[test]
     fn build_ocsp_request_produces_valid_der() {
@@ -496,6 +688,7 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_ocsp_from_mock_responder() {
+        enable_loopback_ocsp_for_tests();
         // Bind first to grab a port, then generate the cert with that port in AIA
         let listener = mock_ocsp::bind_responder();
         let port = listener.local_addr().expect("addr").port();
@@ -526,6 +719,7 @@ mod tests {
 
     #[tokio::test]
     async fn revoked_cert_rejected_by_ocsp() {
+        enable_loopback_ocsp_for_tests();
         let listener = mock_ocsp::bind_responder();
         let port = listener.local_addr().expect("addr").port();
 

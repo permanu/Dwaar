@@ -208,6 +208,82 @@ fn uds_analytics_pull_without_auth() {
 }
 
 #[test]
+fn cors_allow_origin_null_on_every_response() {
+    let socket_path = "/tmp/dwaar-test-cors.sock";
+    let _server = start_test_server(socket_path, 16196);
+
+    let mut stream = UnixStream::connect(socket_path).expect("connect to UDS");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .expect("set read timeout");
+
+    // Simulate a browser cross-origin request with a hostile Origin header.
+    let response = send_http_request(
+        &mut stream,
+        "GET /routes HTTP/1.1\r\nHost: localhost\r\nOrigin: https://attacker.example\r\n\r\n",
+    );
+
+    assert!(response.contains("200"), "expected 200, got: {response}");
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("access-control-allow-origin: null"),
+        "expected Allow-Origin: null, got: {response}"
+    );
+    assert!(
+        response.to_ascii_lowercase().contains("vary: origin"),
+        "expected Vary: Origin, got: {response}"
+    );
+}
+
+#[test]
+fn options_preflight_rejected_with_405() {
+    let socket_path = "/tmp/dwaar-test-preflight.sock";
+    let _server = start_test_server(socket_path, 16197);
+
+    let mut stream = UnixStream::connect(socket_path).expect("connect to UDS");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .expect("set read timeout");
+
+    // Browser-issued preflight — must be rejected before it ever reaches auth.
+    let response = send_http_request(
+        &mut stream,
+        "OPTIONS /routes HTTP/1.1\r\nHost: localhost\r\n\
+         Origin: https://attacker.example\r\n\
+         Access-Control-Request-Method: POST\r\n\r\n",
+    );
+
+    assert!(response.contains("405"), "expected 405, got: {response}");
+    // CORS headers still applied so the browser blocks any stray read.
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("access-control-allow-origin: null"),
+        "expected Allow-Origin: null, got: {response}"
+    );
+}
+
+#[test]
+fn delete_route_rejects_oversize_domain_with_414() {
+    let socket_path = "/tmp/dwaar-test-oversize.sock";
+    let _server = start_test_server(socket_path, 16198);
+
+    let mut stream = UnixStream::connect(socket_path).expect("connect to UDS");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .expect("set read timeout");
+
+    // 1000 'a' characters — well above the 253-byte DNS cap.
+    let domain = "a".repeat(1000);
+    let request = format!("DELETE /routes/{domain} HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let response = send_http_request(&mut stream, &request);
+
+    assert!(response.contains("414"), "expected 414, got: {response}");
+    assert!(response.to_ascii_lowercase().contains("domain too long"));
+}
+
+#[test]
 fn stale_socket_does_not_block_startup() {
     let socket_path = "/tmp/dwaar-test-stale.sock";
 

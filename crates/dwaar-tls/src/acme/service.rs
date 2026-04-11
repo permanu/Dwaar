@@ -145,6 +145,38 @@ impl TlsBackgroundService {
     // For now, failed domains are retried on the next check cycle (12h later).
     // The fallback CA (GTS) provides immediate retry within a single attempt.
 
+    /// React to an OCSP-confirmed revocation: evict cache, delete on-disk
+    /// cert+key, and trigger an immediate re-issuance.
+    ///
+    /// Deliberately swallows I/O errors and re-issuance errors — the
+    /// *primary* safety goal is that the revoked cert stops being served,
+    /// and every branch here achieves that. Re-issuance failure is
+    /// recoverable: the next renewal cycle (12h) will retry, and the next
+    /// handshake for this domain will simply fail with "no cert" instead
+    /// of serving a revoked one, which is the correct behaviour.
+    async fn handle_revoked_cert(&self, domain: &str) {
+        // 1+2: Evict the LRU entry and delete the on-disk files.
+        evict_revoked_cert(&self.cert_store, &self.cert_dir, domain).await;
+
+        // 3. Kick off an immediate re-issuance through the normal fallback
+        //    chain. This runs inline (not spawned) because the OCSP refresh
+        //    loop is already a background task and inline keeps ordering
+        //    predictable — no risk of two re-issuance attempts racing.
+        match self.issue_with_fallback(domain).await {
+            Ok(()) => {
+                info!(domain, "revoked cert replaced with freshly issued cert");
+            }
+            Err(e) => {
+                error!(
+                    domain,
+                    error = %e,
+                    "re-issuance after revocation failed — next handshake will have no cert \
+                     (safer than serving a revoked cert). Will retry on next renewal cycle."
+                );
+            }
+        }
+    }
+
     /// Fetch fresh OCSP responses for all domains with cached certs.
     async fn refresh_ocsp_responses(&self) {
         debug!("OCSP refresh cycle started");
@@ -175,8 +207,17 @@ impl TlsBackgroundService {
                     error!(
                         domain = %revoked_domain,
                         serial = %serial,
-                        "CERTIFICATE IS REVOKED — not stapling"
+                        "CERTIFICATE IS REVOKED — evicting from cache and re-issuing"
                     );
+                    // A revoked cert MUST NOT be served on any subsequent
+                    // handshake. Evict from the in-memory LRU (so the next
+                    // get() misses), delete the on-disk PEM+key so the next
+                    // reload cannot pick up the same revoked bytes, and
+                    // kick off an immediate re-issuance via the ACME
+                    // fallback chain. We deliberately do not propagate
+                    // eviction failures — even a partial cleanup is
+                    // strictly safer than continuing to serve the cert.
+                    self.handle_revoked_cert(domain).await;
                 }
                 Err(e) => {
                     warn!(domain, error = %e, "OCSP fetch failed");
@@ -228,6 +269,59 @@ impl TlsBackgroundService {
             tokio::time::sleep(INTER_DOMAIN_DELAY).await;
         }
     }
+}
+
+/// Evict a revoked cert from both the in-memory LRU and the on-disk
+/// cert directory, without triggering re-issuance.
+///
+/// Factored out of [`TlsBackgroundService::handle_revoked_cert`] so a unit
+/// test can exercise the cleanup logic in isolation — the re-issuance leg
+/// of revocation handling requires a live ACME directory and is covered
+/// by integration tests instead.
+///
+/// Swallows per-file `NotFound` but logs other I/O errors, because the
+/// goal is "revoked bytes must not be reloadable"; a partial delete still
+/// meets that goal as long as the LRU entry is gone (since the next
+/// `get()` will look on disk and fail).
+async fn evict_revoked_cert(cert_store: &CertStore, cert_dir: &str, domain: &str) {
+    cert_store.invalidate(domain);
+
+    let (cert_path, key_path) = revoked_cert_paths(cert_dir, domain);
+
+    if let Err(e) = tokio::fs::remove_file(&cert_path).await
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            domain,
+            path = %cert_path.display(),
+            error = %e,
+            "failed to delete revoked cert file"
+        );
+    }
+    if let Err(e) = tokio::fs::remove_file(&key_path).await
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            domain,
+            path = %key_path.display(),
+            error = %e,
+            "failed to delete revoked key file"
+        );
+    }
+}
+
+/// Compute the `(cert.pem, cert.key)` paths for a domain under `cert_dir`.
+///
+/// Factored out so that the revoked-cert eviction logic can be exercised
+/// by a unit test without stubbing the whole `CertStore` + ACME issuer
+/// machinery. The naming convention is owned by the ACME issuer
+/// (`write_cert_files`) and mirrored here.
+fn revoked_cert_paths(cert_dir: &str, domain: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let base = Path::new(cert_dir);
+    (
+        base.join(format!("{domain}.pem")),
+        base.join(format!("{domain}.key")),
+    )
 }
 
 #[async_trait]
@@ -294,5 +388,87 @@ mod tests {
         let svc = make_service(vec!["valid.example.com".into()], dir.path());
         // generate_self_signed creates certs valid for 365 days
         assert!(!svc.needs_issuance("valid.example.com").await);
+    }
+
+    #[test]
+    fn revoked_cert_paths_match_issuer_convention() {
+        let (cert, key) = revoked_cert_paths("/tmp/certs", "example.com");
+        assert_eq!(cert, std::path::PathBuf::from("/tmp/certs/example.com.pem"));
+        assert_eq!(key, std::path::PathBuf::from("/tmp/certs/example.com.key"));
+    }
+
+    /// End-to-end check of the eviction leg of revocation handling:
+    /// seeding a cert on disk + in cache, calling the eviction helper,
+    /// and asserting both tiers are empty afterwards. The re-issuance leg
+    /// is covered separately by integration tests that can speak to a
+    /// live ACME directory — unit tests deliberately skip it so they do
+    /// not depend on network or a test ACME server.
+    #[tokio::test]
+    async fn evict_revoked_cert_clears_cache_and_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let domain = "revoked.example.com";
+
+        let (cert_pem, key_pem) = generate_self_signed(domain);
+        std::fs::write(dir.path().join(format!("{domain}.pem")), &cert_pem)
+            .expect("write cert pem");
+        std::fs::write(dir.path().join(format!("{domain}.key")), &key_pem).expect("write key pem");
+
+        let cert_store = CertStore::new(dir.path(), 100);
+
+        // Populate the in-memory LRU by loading the cert once.
+        assert!(
+            cert_store.get(domain).is_some(),
+            "fresh cert should load from disk"
+        );
+        assert_eq!(cert_store.cached_count(), 1, "LRU should now hold the cert");
+
+        // Trigger the eviction leg of revocation handling.
+        evict_revoked_cert(
+            &cert_store,
+            dir.path().to_str().expect("tempdir utf8"),
+            domain,
+        )
+        .await;
+
+        // LRU is empty.
+        assert_eq!(
+            cert_store.cached_count(),
+            0,
+            "LRU entry must be evicted after revocation"
+        );
+
+        // On-disk files are gone.
+        assert!(
+            !dir.path().join(format!("{domain}.pem")).exists(),
+            "cert PEM must be deleted from disk"
+        );
+        assert!(
+            !dir.path().join(format!("{domain}.key")).exists(),
+            "key PEM must be deleted from disk"
+        );
+
+        // A fresh get() miss also returns None (no re-hydration).
+        assert!(
+            cert_store.get(domain).is_none(),
+            "post-eviction lookup must miss"
+        );
+    }
+
+    /// Eviction must be idempotent — calling it when nothing is cached and
+    /// no files exist should complete cleanly without logging filesystem
+    /// errors above the `NotFound` threshold.
+    #[tokio::test]
+    async fn evict_revoked_cert_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert_store = CertStore::new(dir.path(), 100);
+
+        evict_revoked_cert(
+            &cert_store,
+            dir.path().to_str().expect("tempdir utf8"),
+            "never-seen.example.com",
+        )
+        .await;
+
+        assert_eq!(cert_store.cached_count(), 0);
     }
 }

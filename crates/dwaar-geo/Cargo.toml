@@ -16,6 +16,7 @@ default = []
 city = []
 
 [dependencies]
+arc-swap = { workspace = true }
 maxminddb = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

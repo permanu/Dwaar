@@ -53,18 +53,45 @@ impl CompressEncoding {
     }
 }
 
+/// Bitmask of explicitly-listed encodings in an `Accept-Encoding` header.
+///
+/// A manual bit-packed struct is cheaper than `HashSet<&str>` (M-21): no hash,
+/// no allocation, branchless membership checks via plain `&&`. We only care
+/// about the three encodings we support, so three bits is all we need.
+#[derive(Debug, Default, Clone, Copy)]
+struct Encodings {
+    br: bool,
+    gzip: bool,
+    zstd: bool,
+}
+
+impl Encodings {
+    fn contains(self, enc: CompressEncoding) -> bool {
+        match enc {
+            CompressEncoding::Brotli => self.br,
+            CompressEncoding::Gzip => self.gzip,
+            CompressEncoding::Zstd => self.zstd,
+        }
+    }
+}
+
 /// Parse `Accept-Encoding` header and pick the best encoding we support.
 ///
 /// Priority: brotli > gzip > zstd. Respects `q=0` (explicitly disabled).
 /// A wildcard `*` is treated as accepting any encoding at the specified quality
 /// (RFC 9110 §12.5.3), so `Accept-Encoding: *` picks the best we offer (brotli).
 /// Returns `None` if the client doesn't accept anything we support.
+///
+/// Zero-allocation: the old `HashSet` for tracking explicit tokens has been
+/// replaced with an inline `Encodings` bitmask so this function does not
+/// allocate on the hot response path (M-21).
 pub fn negotiate_encoding(accept_encoding: &str) -> Option<CompressEncoding> {
     let mut best: Option<(CompressEncoding, f32, u8)> = None;
     // Wildcard token quality, if seen. None = not present.
     let mut wildcard_quality: Option<f32> = None;
-    // Encoding names explicitly listed by the client (used to skip wildcard expansion).
-    let mut explicit = std::collections::HashSet::new();
+    // Which encodings the client named explicitly — used to skip wildcard
+    // expansion over an encoding the client already took a position on.
+    let mut explicit = Encodings::default();
 
     for part in accept_encoding.split(',') {
         let part = part.trim();
@@ -77,7 +104,12 @@ pub fn negotiate_encoding(accept_encoding: &str) -> Option<CompressEncoding> {
 
         // Track all explicit tokens regardless of quality, so wildcard
         // expansion can skip them (the client already made an explicit choice).
-        explicit.insert(name);
+        match name {
+            "br" => explicit.br = true,
+            "gzip" | "x-gzip" => explicit.gzip = true,
+            "zstd" => explicit.zstd = true,
+            _ => {}
+        }
 
         if quality <= 0.0 {
             continue;
@@ -110,12 +142,12 @@ pub fn negotiate_encoding(accept_encoding: &str) -> Option<CompressEncoding> {
     if let Some(wq) = wildcard_quality
         && wq > 0.0
     {
-        for &(enc_name, encoding, priority) in &[
-            ("br", CompressEncoding::Brotli, 3u8),
-            ("gzip", CompressEncoding::Gzip, 2u8),
-            ("zstd", CompressEncoding::Zstd, 1u8),
+        for &(encoding, priority) in &[
+            (CompressEncoding::Brotli, 3u8),
+            (CompressEncoding::Gzip, 2u8),
+            (CompressEncoding::Zstd, 1u8),
         ] {
-            if explicit.contains(enc_name) || (enc_name == "gzip" && explicit.contains("x-gzip")) {
+            if explicit.contains(encoding) {
                 continue;
             }
             #[allow(clippy::cast_possible_truncation)]
@@ -235,12 +267,20 @@ impl std::fmt::Debug for ResponseCompressor {
 
 impl ResponseCompressor {
     /// Create a new compressor for the given encoding.
+    ///
+    /// Encoder output buffers are pre-allocated to `INITIAL_BUF_CAP` (8 KiB)
+    /// so the first few compressed chunks don't trigger the `Vec` growth curve
+    /// (L-18). 8 KiB matches the brotli sliding-window chunk size and is also
+    /// in the ballpark of a typical gzip output burst.
     pub fn new(encoding: CompressEncoding) -> Self {
+        /// Starting capacity for every encoder's internal output `Vec`.
+        const INITIAL_BUF_CAP: usize = 8192;
+
         match encoding {
             CompressEncoding::Gzip => Self {
                 encoding,
                 gzip_encoder: Some(flate2::write::GzEncoder::new(
-                    Vec::new(),
+                    Vec::with_capacity(INITIAL_BUF_CAP),
                     flate2::Compression::fast(),
                 )),
                 brotli_encoder: None,
@@ -250,16 +290,22 @@ impl ResponseCompressor {
                 encoding,
                 gzip_encoder: None,
                 // quality 4 = good balance of speed and ratio (default is 11, too slow for proxying)
-                brotli_encoder: Some(brotli::CompressorWriter::new(Vec::new(), 4096, 4, 22)),
+                brotli_encoder: Some(brotli::CompressorWriter::new(
+                    Vec::with_capacity(INITIAL_BUF_CAP),
+                    4096,
+                    4,
+                    22,
+                )),
                 zstd_encoder: None,
             },
             CompressEncoding::Zstd => {
-                let zstd_encoder = zstd::stream::write::Encoder::new(Vec::new(), 3)
-                    .map_err(|e| {
-                        tracing::warn!(error = %e, "zstd encoder creation failed — compression disabled");
-                        e
-                    })
-                    .ok();
+                let zstd_encoder =
+                    zstd::stream::write::Encoder::new(Vec::with_capacity(INITIAL_BUF_CAP), 3)
+                        .map_err(|e| {
+                            tracing::warn!(error = %e, "zstd encoder creation failed — compression disabled");
+                            e
+                        })
+                        .ok();
                 Self {
                     encoding,
                     gzip_encoder: None,

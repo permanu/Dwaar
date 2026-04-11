@@ -164,8 +164,15 @@ fn fork_workers(
         .collect();
 
     // Supervisor loop — restart any worker that exits.
+    //
+    // H-05: the load below pairs with the SeqCst store inside the async-signal
+    // `handle_shutdown` handler. `Relaxed` is not safe across a signal / main
+    // thread boundary because the C11 memory model gives no happens-before
+    // edge there; only sequentially-consistent ordering on both ends gives a
+    // defined hand-off. The cost is a single cache-coherency barrier per loop
+    // iteration, which is already dominated by the blocking `waitpid` call.
     loop {
-        if SHUTTING_DOWN.load(std::sync::atomic::Ordering::Relaxed) {
+        if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
             info!("supervisor: shutdown signal received, terminating workers");
             for &pid in &children {
                 // SAFETY: sending SIGTERM to known child PIDs.
@@ -293,8 +300,13 @@ fn fork_workers(
 static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Signal handler for SIGTERM/SIGINT — sets shutdown flag.
+///
+/// H-05: uses `SeqCst` to guarantee the store is observed by the supervisor
+/// thread's matching load. `Relaxed` is a data race across the signal /
+/// main thread boundary — the C11 memory model provides no happens-before
+/// edge there, so the supervisor could spin forever missing the flag.
 extern "C" fn handle_shutdown(_sig: libc::c_int) {
-    SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::Relaxed);
+    SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 fn main() -> anyhow::Result<()> {

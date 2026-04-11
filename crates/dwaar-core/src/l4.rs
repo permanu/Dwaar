@@ -908,22 +908,26 @@ fn looks_like_http(data: &[u8]) -> bool {
         || data.starts_with(b"OPTIONS ")
         || data.starts_with(b"PATCH ")
         || data.starts_with(b"CONNECT ")
+        || data.starts_with(b"TRACE ")
 }
 
 /// Extract the Host header value from a peeked HTTP request.
+///
+/// HTTP header field names are case-insensitive per RFC 7230 §3.2, so we match
+/// `host:` without allocating by comparing bytes via `eq_ignore_ascii_case`.
 fn extract_http_host(data: &[u8]) -> Option<&str> {
     let text = std::str::from_utf8(data).ok()?;
     for line in text.lines().skip(1) {
         if line.is_empty() {
             break;
         }
-        if let Some(value) = line
-            .strip_prefix("Host: ")
-            .or_else(|| line.strip_prefix("host: "))
-        {
-            // Strip port if present
-            return Some(value.split(':').next().unwrap_or(value).trim());
+        let bytes = line.as_bytes();
+        if bytes.len() < 5 || !bytes[..5].eq_ignore_ascii_case(b"host:") {
+            continue;
         }
+        // Value starts after "host:" — trim leading whitespace and optional port.
+        let value = line[5..].trim_start();
+        return Some(value.split(':').next().unwrap_or(value).trim());
     }
     None
 }
@@ -1287,6 +1291,7 @@ mod tests {
     fn detect_http() {
         assert!(looks_like_http(b"GET / HTTP/1.1\r\n"));
         assert!(looks_like_http(b"POST /api HTTP/2\r\n"));
+        assert!(looks_like_http(b"TRACE / HTTP/1.1\r\n"));
         assert!(!looks_like_http(b"SSH-2.0-OpenSSH"));
         assert!(!looks_like_http(b"\x16\x03\x01"));
     }
@@ -1318,6 +1323,26 @@ mod tests {
 
         let req_port = b"GET / HTTP/1.1\r\nHost: example.com:8080\r\n\r\n";
         assert_eq!(extract_http_host(req_port), Some("example.com"));
+    }
+
+    #[test]
+    fn extract_http_host_is_case_insensitive() {
+        // RFC 7230 §3.2: header field names are case-insensitive.
+        let upper = b"GET / HTTP/1.1\r\nHOST: example.com\r\n\r\n";
+        assert_eq!(extract_http_host(upper), Some("example.com"));
+
+        let mixed = b"GET / HTTP/1.1\r\nhOsT: example.com\r\n\r\n";
+        assert_eq!(extract_http_host(mixed), Some("example.com"));
+
+        let lower = b"GET / HTTP/1.1\r\nhost: example.com\r\n\r\n";
+        assert_eq!(extract_http_host(lower), Some("example.com"));
+
+        let titled = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        assert_eq!(extract_http_host(titled), Some("example.com"));
+
+        // With port, mixed case.
+        let mixed_port = b"GET / HTTP/1.1\r\nHOST: example.com:8443\r\n\r\n";
+        assert_eq!(extract_http_host(mixed_port), Some("example.com"));
     }
 
     #[test]

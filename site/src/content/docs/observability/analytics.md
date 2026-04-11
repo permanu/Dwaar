@@ -222,14 +222,89 @@ example.com {
 
 Your consent banner must set one of the recognised cookies (`dwaar_consent=1` or `analytics_consent=1`) when the visitor accepts analytics. Until that cookie is present, the analytics script is not injected.
 
+## Beacon authentication (0.2.3)
+
+Analytics beacons are now cryptographically authenticated. Every POST to `/_dwaar/collect` must carry a nonce and an HMAC signature produced by the server-issued token on the matching page load. Unauthenticated beacons are dropped silently.
+
+### Why it exists
+
+The v0.2.1 Origin/Referer check defends against cross-origin replay — an attacker hosting a malicious page at `evil.example` could not aim beacons at `victim.example/_dwaar/collect` and have them credited to the victim's stats. It does not, however, stop a same-origin forgery: any page served through the same Dwaar instance (stored XSS, user-generated HTML, compromised upstream) could mint arbitrary beacons and poison the aggregate.
+
+The v0.2.3 beacon authentication closes that gap. Forging a beacon now requires the per-process secret, which never leaves the proxy.
+
+### How it works
+
+```mermaid
+sequenceDiagram
+    participant D as Dwaar
+    participant B as Browser
+    participant U as Upstream
+
+    Note over D: At startup:
+    D->>D: generate 32-byte random<br/>secret (process-wide)
+
+    B->>D: GET /page
+    D->>U: proxy request
+    U-->>D: 200 text/html
+    D->>D: generate random nonce
+    D->>D: sig = HMAC-SHA256(secret, nonce || host || window)
+    D->>D: inject <script>, <meta name="dwaar-beacon-auth"<br/>content="<nonce_b64>:<sig_hex>">
+    D-->>B: modified HTML
+
+    Note over B: page load, Web Vitals collected
+    B->>B: read meta[dwaar-beacon-auth]
+    B->>D: POST /_dwaar/collect<br/>{ ..., "auth": { "nonce": ..., "sig": ... } }
+    D->>D: recompute HMAC for current<br/>OR previous 5-minute window
+    D->>D: constant-time compare
+    alt match
+        D->>D: accept beacon, aggregate
+    else mismatch
+        D-->>B: 204 No Content<br/>(silently drop)
+    end
+```
+
+The MAC covers `nonce || host || window`, where `window` is the current Unix time rounded down to a 5-minute boundary. Server-side verification accepts the current window **or** the previous one, so a page loaded at 11:59:30 still validates beacons that arrive at 12:00:05.
+
+Comparison uses `subtle::ConstantTimeEq` to eliminate timing side-channels in the MAC check.
+
+### What operators see
+
+- **No config required.** The feature is always on. No Dwaarfile directive, no CLI flag.
+- **No extra 4xx noise.** Rejected beacons return `204 No Content` rather than a 4xx. Under an active attack, the access log will not flood with 401/403 lines that would themselves become a denial of service against the log pipeline.
+- **Secret is process-local.** A supervisor restart rotates the secret. Existing open pages whose injected nonces were signed by the old secret will see their beacons rejected until the next navigation — acceptable because analytics is a best-effort observation channel, not an audit trail.
+- **No upstream coordination.** The HTML injector runs inside Dwaar, so the upstream application never sees the nonce or signature. This is a transparent upgrade for any site already relying on analytics injection.
+
+Dropped beacons are counted internally and reflected in `dwaar_analytics_beacons_rejected_total` (if Prometheus metrics for analytics are enabled in your build).
+
+### Related sanitization
+
+v0.2.3 also tightens beacon input handling on the accept path:
+
+- `sanitize_url_to_path` refuses protocol-relative URLs, control bytes, and non-path inputs; paths are capped at 512 bytes.
+- `sanitize_referrer_host` extracts only the host component and caps it at 128 bytes.
+- Beacons that fail sanitization are silently dropped before aggregation.
+
 ## Privacy
 
 - **No cookies.** The analytics script does not set or read any cookies.
 - **No fingerprinting.** Screen dimensions and browser language are collected
   for cohort analysis but not combined into a fingerprint identifier.
+- **DNT + Sec-GPC honoured.** As of 0.2.3, `analytics.js` suppresses the beacon
+  when `navigator.doNotTrack === "1"` **or** `navigator.globalPrivacyControl === true`.
+  No beacon, no aggregation, no `country` lookup.
+- **fetch keepalive on unload.** As of 0.2.3, the unload-time beacon uses
+  `fetch(url, { keepalive: true })` instead of a synchronous `XMLHttpRequest`.
+  Synchronous XHR on `unload` is deprecated in every major browser and blocks
+  navigation on the main thread; `keepalive` delegates the flush to the network
+  layer so the outgoing request survives the page teardown without stalling the
+  next navigation.
 - **IP anonymization.** Client IPs are masked before being stored: IPv4
   addresses are truncated to `/24` (last octet zeroed); IPv6 addresses are
   truncated to `/48` (last 80 bits zeroed). The original IP is never persisted.
+  As of 0.2.3, the same `/48` mask is applied on both the client-side path
+  (server-derived IP from the connection) and the server-side path
+  (aggregation buckets), so HyperLogLog cardinality is consistent no matter
+  which code path produced the event.
 - **First-party only.** The beacon endpoint is `/_dwaar/collect` on the same
   origin as the page. No data leaves your infrastructure.
 - **No cross-site tracking.** Each domain's `DomainMetrics` is isolated. There

@@ -153,16 +153,24 @@ The body is empty. The `Retry-After: 1` header tells standards-compliant clients
 
 ## Plugin Priority
 
-`RateLimitPlugin` runs at **priority 20**.
+As of 0.2.3, `RateLimitPlugin` runs at **priority 15** — **before** `UnderAttackPlugin` at priority 20. The order was inverted in previous releases, which meant that a request over the per-IP limit would still be handed an under-attack challenge page, burn a proof-of-work on the client, and then be rejected. That produced noisy user-facing failures under flood and gave attackers free compute on legitimate clients.
 
 | Priority | Plugin | What it does |
 |----------|--------|-------------|
 | 10 | `BotDetectionPlugin` | Sets `ctx.is_bot` flag |
-| 15 | `UnderAttackPlugin` | JS proof-of-work challenge |
-| **20** | **`RateLimitPlugin`** | **Per-IP sliding-window limit** |
+| **15** | **`RateLimitPlugin`** | **Per-IP sliding-window limit — runs first** |
+| 20 | `UnderAttackPlugin` | JS proof-of-work challenge (only for requests the rate limiter allowed through) |
 | 30+ | Other plugins | Auth, headers, etc. |
 
 Running after bot detection (priority 10) means the rate limiter can see `ctx.is_bot` if you build custom logic on top of the plugin chain. It runs before forward auth and other higher-priority plugins so that rate-limited requests are rejected before any upstream credential checks are made.
+
+### IPv4-mapped IPv6 normalization (0.2.3)
+
+Rate-limit keys now canonicalize the client IP through `Ipv6Addr::to_canonical()` before they are inserted into the Count-Min Sketch. In practice this means `::ffff:127.0.0.1` (IPv4-mapped IPv6) and `127.0.0.1` produce the **same** composite key for the same route.
+
+Before 0.2.3, a dual-stack listener could accept the same client under two distinct keys, so an attacker straddling the mapping could effectively double their per-IP budget by toggling address families between requests. The canonicalization step eliminates that drift.
+
+The change is transparent to the Dwaarfile — no directive, no opt-in.
 
 ---
 

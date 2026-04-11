@@ -59,6 +59,21 @@ GeoLite2-Country is free to download with a MaxMind account.
 
 MaxMind updates GeoLite2 databases on the first Tuesday of each month. Replace the file with an atomic rename (`mv GeoLite2-Country.mmdb.new GeoLite2-Country.mmdb`) and send `SIGHUP` to reload config; the new file is opened on the next startup or reload.
 
+### Hot reload (0.2.3)
+
+`GeoLookup` now holds its mmap'd `Reader<Mmap>` behind an `ArcSwap`. A new API, `GeoLookup::reload(path)`, opens the new `.mmdb` file, validates it, and atomically swaps the active `Reader` — all without blocking concurrent lookups. Live requests continue to read from the old mmap until the swap completes; the next request picks up the new one. There is no stop-the-world pause and no handshake between worker threads.
+
+This is the mechanism that makes monthly GeoIP refresh possible without a process restart or connection drain.
+
+:::caution[CLI wiring deferred to a follow-up]
+As of 0.2.3, the reload API is in place but not yet hooked up to a CLI signal (e.g. `SIGHUP` triggering an automatic `GeoLookup::reload`). Until that wiring lands in a follow-up patch, operators who want to pick up a new database either:
+
+- Restart Dwaar (zero-downtime upgrade via `dwaar upgrade`) — the new process opens the new mmap from scratch.
+- Call `GeoLookup::reload` from a custom native plugin or admin endpoint. The public API is stable and the lock-free semantics are safe to drive on live traffic.
+
+The tracked work item for the CLI wiring is an `M-27` follow-up in the audit tracker.
+:::
+
 **Default search paths** (checked in order at startup):
 
 1. `fixtures/GeoLite2-Country-Test.mmdb` (only in test environments)

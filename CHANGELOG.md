@@ -7,7 +7,175 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-[Unreleased]: https://github.com/permanu/Dwaar/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/permanu/Dwaar/compare/v0.2.3...HEAD
+
+## [0.2.3] - 2026-04-11
+
+Hardening patch addressing ~50 findings from an external security and
+performance audit. See `local/ISSUES.md` for the full audit breakdown.
+v0.2.3 focuses on TLS, analytics, plugins, and observability; v0.2.2's
+glob-import and H3-streaming work remain in place unchanged.
+
+### Added — Security
+- **Beacon HMAC authentication (C-04)** — analytics beacons are now
+  cryptographically authenticated. The injector emits a
+  `<meta name="dwaar-beacon-auth" content="<nonce_b64>:<sig_hex>">` tag on
+  every injected page; the server verifies `HMAC-SHA256(nonce || host ||
+  window)` against a process-wide random 32-byte secret, accepting the
+  current or previous 5-minute window. Constant-time comparison via
+  `subtle::ConstantTimeEq`. Activates the previously-dormant `hmac`,
+  `sha2`, `hex`, and `rand` dependencies.
+- **OCSP SSRF blocklist (M-12)** — `http_post_ocsp` now resolves the
+  AIA-extracted responder host and rejects private, loopback, link-local,
+  broadcast, multicast, unspecified, ULA (`fc00::/7`), and metadata
+  (`169.254.0.0/16`) addresses. Non-HTTP(S) schemes rejected per RFC 6960.
+- **Revoked cert cache eviction (C-03)** — on OCSP `CertRevoked` detection,
+  the ACME service now invalidates the LRU cache entry and deletes the
+  on-disk `.pem`/`.key` files before re-issuance. Previously the revoked
+  cert stayed in cache.
+- **Wildcard SNI position enforcement (M-13)** — `is_valid_sni_hostname`
+  now requires `*` to be the entire first label per RFC 6125. Rejects
+  `exam*ple.com`, `*ample.com`, `foo.*.com`, `**.example.com`, etc.
+- **Domain validation on cert-store path construction (M-10)** —
+  `CertStore::get`/`get_async`/`get_or_load` reject invalid SNI hostnames
+  before interpolating into file paths.
+- **ACME private key zeroization (H-07)** — `generate_key_and_csr` now
+  returns `Zeroizing<String>` for the private key PEM, wiping on drop.
+- **CachedCert zeroization (H-08)** — `CachedCert` now has a manual `Drop`
+  that zeroes the OCSP response buffer; relies on OpenSSL's `EVP_PKEY_free`
+  + `OPENSSL_cleanse` for the private key.
+- **Beacon data sanitization (C-05)** — `sanitize_url_to_path` rejects
+  protocol-relative URLs, control bytes, and non-path inputs; caps paths
+  at 512 bytes. `sanitize_referrer_host` extracts only the host component,
+  caps at 128 bytes. Invalid beacons drop silently.
+- **Forward-auth plugin chain order (L-14)** — `rate_limit` now has
+  priority 15 (was 20); `under_attack` priority 20 (was 15). Rate-limited
+  requests no longer receive under-attack challenge pages.
+- **IPv4-mapped IPv6 rate-limit normalization (L-15)** — `rate_limit`
+  now canonicalizes IPs via `Ipv6Addr::to_canonical()`. `::ffff:127.0.0.1`
+  and `127.0.0.1` produce the same rate-limit key.
+- **Admin API CORS lockdown (M-14)** — every admin API response sets
+  `Access-Control-Allow-Origin: null`; `OPTIONS` preflight returns 405.
+- **Prometheus label injection escaping (H-11)** — user-controlled label
+  values (domain names) are now escaped per the exposition format spec
+  (`\`, `"`, `\n`). Hot path returns `Cow::Borrowed` when no escaping is
+  needed.
+- **Atomic write tempfile randomization (L-07)** — ACME cert PEM and
+  account JSON writes now use `tempfile::NamedTempFile::new_in(parent)`
+  + `persist(target)`, eliminating the predictable `.tmp` suffix that
+  enabled symlink attacks on shared systems.
+- **ACME token count bound (L-09)** — `ChallengeSolver::set` rejects new
+  tokens past `MAX_PENDING_TOKENS = 1024`. Updates to existing tokens
+  still allowed at cap.
+- **Upstream error body PII redaction (H-12)** — captured 5xx error body
+  fragments are now redacted for IPv4/IPv6 literals, emails, PEM blocks,
+  and bearer-token patterns before being written to access logs.
+- **Referer query-string redaction (M-24)** — Referer URLs in access logs
+  now go through the same query-param redaction as the request's own
+  query string (`token`, `key`, `secret`, `password`, `api_key`,
+  `access_token`, `auth`).
+- **Decompressor safe-body fallback (M-25)** — on HTML-injection decoder
+  overflow or error, the pipeline emits an empty body instead of leaking
+  raw compressed bytes into the response.
+- **Security-headers info-leak stripping (M-20)** — the plugin now strips
+  upstream `X-Powered-By`, `X-AspNet-Version`, `X-AspNetMvc-Version`,
+  `X-Runtime`, `X-Generator`, `Server` before applying its own banner.
+  Default CSP remains opt-in per the 0.2.1 design.
+- **Host header case-insensitive matching (L-03)** — L4 `extract_http_host`
+  now matches per RFC 7230 (e.g. `HOST:`, `hOsT:`).
+- **TRACE method detection (L-04)** — L4 `looks_like_http` now recognizes
+  TRACE requests.
+
+### Added — Privacy
+- **Sec-GPC header check (L-22)** — analytics.js now suppresses beacons
+  when `navigator.globalPrivacyControl === true`, alongside the existing
+  DNT check.
+- **fetch keepalive fallback (L-23)** — analytics.js replaced the sync
+  XHR unload fallback with `fetch(..., { keepalive: true })`.
+- **IPv6 anonymization consistency (M-22)** — client-side and server-side
+  aggregation paths now both mask IPv6 to `/48` before HyperLogLog insert.
+
+### Added — Reliability
+- **Leader election resourceVersion invariant (already v0.2.2 #123)** —
+  unchanged.
+- **Supervisor SHUTTING_DOWN SeqCst (H-05)** — signal handler and
+  supervisor loop now use `SeqCst` ordering on the shutdown flag per
+  C11 memory model + POSIX signal-safety rules.
+- **GeoIP hot reload (M-27)** — `GeoLookup::reader` moved behind
+  `ArcSwap<Reader<Mmap>>`. New `GeoLookup::reload(path)` swaps the
+  underlying mmap atomically; lookups remain lock-free. CLI wiring
+  deferred to a follow-up.
+- **OCSP staleness guard (M-11)** — `CachedCert` tracks `ocsp_last_refresh:
+  Option<Instant>`. Stale OCSP responses (>7 days) are no longer stapled.
+
+### Changed — Performance
+- **Async TLS filesystem reads (H-06)** — `CertStore::get_async` wraps
+  disk reads in `tokio::task::spawn_blocking`. The hot-path `certificate_callback`
+  is async (pingora trait permits this). Cache hits remain lock-free
+  and I/O-free.
+- **Bot-detect stack buffer (M-17)** — `classify()` uses a 512-byte stack
+  buffer for the User-Agent lowercase form, heap-fallback for longer
+  inputs. Eliminates per-request allocation on the hot path.
+- **Compress bitmask (M-21)** — `negotiate_encoding` replaced the
+  per-response `HashSet` allocation with an inline `Encodings` bitmask
+  struct.
+- **Compress encoder pre-allocation (L-18)** — gzip/brotli/zstd encoder
+  buffers start at 8 KiB capacity.
+- **Under-attack window boundary grace (M-19)** — `verify_challenge` now
+  accepts the current window OR the previous 5-minute window, matching
+  the beacon HMAC pattern. Eliminates boundary-crossing failures.
+- **Under-attack `strip_dwaar_params` (L-20)** — single-pass String
+  writer replaces the `Vec<&str>::collect::<Vec<_>>().join("&")` pattern.
+- **WASM adapter header Vec pre-alloc (L-16)** — `from_ctx_with_request`
+  and `from_ctx_with_response` use `Vec::with_capacity(headers.len())`
+  to avoid reallocation. Full lazy access is blocked by the WIT contract;
+  documented inline.
+- **WASM adapter Linker reuse (L-19)** — `Linker<PluginState>` built once
+  at plugin construction and reused per hook call.
+- **Analytics sink parking_lot (already v0.2.2 #125)** — no change.
+
+### Changed — Observability
+- **Per-window counter reset (H-13)** — `status_codes`, `bytes_sent`,
+  `bot_views`, `human_views` now reset to zero on each flush, matching
+  the doc comment's "cumulative since last flush" semantics. Previously
+  these accumulated as lifetime totals.
+- **Upstream health log masking (M-08)** — transition WARN/INFO logs now
+  mask the upstream address (`10.x.x.x:8080` for IPv4, `/48` prefix for
+  IPv6) to avoid leaking internal network topology in shared-log
+  deployments.
+- **Prometheus `MAX_TRACKED_DOMAINS` deduplication (L-25)** — the
+  `10_000` constant now lives in `dwaar-analytics::MAX_TRACKED_DOMAINS`
+  and is imported by both `prometheus.rs` and `rate_cache_metrics.rs`.
+- **Accurate process start time (L-24)** — `ProcessMetrics::start_time_secs`
+  now reads from `/proc/self/stat` on Linux and `libc::proc_pidinfo`
+  (`PROC_PIDTBSDINFO`) on macOS, cached in a `OnceLock`. Falls back to
+  construction time on unsupported platforms.
+
+### Fixed — Reliability
+- **ACME cert directory perms (M-09)** — `write_cert_files` now sets
+  0o700 on the cert directory after creation, mirroring the ACME account
+  directory.
+- **VarSlots bound (L-06)** — `VarSlots::set()` rejects slot indices past
+  `MAX_VAR_SLOTS = 256` (silent no-op), preventing unbounded Vec growth
+  from a config bug.
+- **Admin DELETE path length cap (L-12)** — `DELETE /routes/{domain}`
+  rejects domain paths longer than 253 bytes (RFC 1035 max) with HTTP
+  414 before any `to_lowercase()` allocation.
+- **DNS TXT exact-match (L-08)** — DNS propagation checker no longer
+  relies on substring matching; the dig output is now parsed line-by-line
+  and the quoted value is compared exactly.
+
+### Closed — Audit triage (no code change)
+- **H-04** (self-update OOM) — false positive; curl streams the download
+  to temp file before `fs::read`.
+- **H-09** (compression bomb) — false positive; Dwaar compresses
+  responses but does not decompress attacker-controlled input.
+- **L-01** (admin_client header tabs) — false positive; literal uses
+  spaces and headers are correctly terminated.
+- **L-21** (MinuteBuckets non-atomic) — false positive; DashMap shard
+  locks the containing struct.
+- **M-03** (directory listing URL encoding) — false positive; HTML
+  attribute escaping is correct for href context.
 
 ## [0.2.2] - 2026-04-11
 
@@ -254,4 +422,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Reload:** SNI cert cache entries are now invalidated for domains removed
   from config, preventing stale certs from being served via the LRU fallback.
 
+[0.2.3]: https://github.com/permanu/Dwaar/compare/v0.2.2...v0.2.3
+[0.2.2]: https://github.com/permanu/Dwaar/compare/v0.2.1...v0.2.2
 [0.1.1]: https://github.com/permanu/Dwaar/compare/v0.1.0...v0.1.1

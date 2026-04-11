@@ -123,6 +123,40 @@ Sensitive query-parameter values are replaced with `REDACTED` before the `query`
 
 For example, a request to `/search?q=hello&token=abc123` logs `query` as `q=hello&token=REDACTED`. Parameters not on the list are logged verbatim. No allocation occurs when the query string contains no sensitive keys.
 
+### Referer redaction (0.2.3)
+
+As of 0.2.3, the `referer` field goes through the **same** query-string redactor as the request's own query. If a visitor lands on your site from `https://partner.example/dashboard?token=abc123&user=42`, the logged `referer` becomes `https://partner.example/dashboard?token=REDACTED&user=42`.
+
+The redaction is applied after host validation, so an invalid or oversized Referer is still dropped before it reaches the redactor. Hosts with no query string pass through unchanged with no allocation.
+
+This closes a leak where credentials embedded in upstream referrer URLs — a surprisingly common pattern with OAuth redirect flows and single-page-app routers — would land verbatim in Dwaar's access log.
+
+### Upstream error body PII redaction (0.2.3)
+
+When an upstream returns a 5xx, Dwaar captures the first 256 bytes of the response body into the `upstream_error_body` field. Before 0.2.3, that capture was a verbatim byte copy — any PII that the upstream dumped into its error page (client IPs, email addresses, stack-trace-embedded secrets) would land in the access log.
+
+0.2.3 runs the captured fragment through a redactor before it is serialized. The following patterns are replaced with `REDACTED`:
+
+| Pattern | Example |
+|---|---|
+| IPv4 literal | `192.0.2.77` |
+| IPv6 literal | `2001:db8::1`, `::1` |
+| Email address | `ops@example.com` |
+| Bearer token | `Bearer eyJ...` |
+| PEM block | `-----BEGIN PRIVATE KEY-----...` |
+
+The redactor operates on the fragment in place, so there is no heap allocation on the no-match hot path. 5xx responses with clean bodies pay nothing.
+
+```json
+{
+  "timestamp": "2026-04-11T12:00:00Z",
+  "status": 500,
+  "upstream_error_body": "connection to database REDACTED failed: user REDACTED not found"
+}
+```
+
+The redactor does **not** try to unpack JSON, YAML, or any other structured format — it operates on the raw bytes. If the upstream is returning structured errors, apply your own redaction upstream and rely on this as defense-in-depth.
+
 ---
 
 ## Output Destinations

@@ -6,7 +6,7 @@ title: "Prometheus Metrics"
 
 Dwaar exposes every counter, gauge, and histogram in Prometheus text exposition format on the admin API. Scrape `GET /metrics` on port `6190` to feed your existing Prometheus deployment with per-domain request rates, latencies, byte counts, TLS timing, rate limiter activity, cache efficiency, and standard process resource usage.
 
-All metrics use lock-free atomics — no mutexes, no allocation on the hot path after the first request per domain. Up to 10,000 distinct domains are tracked; new domains beyond that limit are silently dropped to prevent unbounded memory growth.
+All metrics use lock-free atomics — no mutexes, no allocation on the hot path after the first request per domain. Up to 10,000 distinct domains are tracked (`MAX_TRACKED_DOMAINS` in `dwaar-analytics`); new domains beyond that limit are silently dropped to prevent unbounded memory growth. As of 0.2.3, this constant is imported by both `prometheus.rs` and `rate_cache_metrics.rs` from the same source rather than duplicated.
 
 ---
 
@@ -40,6 +40,38 @@ dwaar_requests_total{domain="example.com",method="GET",status="2xx"} 42
 | Auth | Bearer token required on TCP; bypassed on Unix socket |
 
 The endpoint renders a full snapshot on every request. There is no incremental or streaming mode.
+
+---
+
+## Label escaping (0.2.3)
+
+User-controlled label values — most importantly `domain` — are now escaped per the Prometheus text [exposition format](https://prometheus.io/docs/instrumenting/exposition_formats/#text-format-details):
+
+| Source byte | Escaped as |
+|---|---|
+| `\` (backslash) | `\\` |
+| `"` (double-quote) | `\"` |
+| `\n` (newline) | `\n` |
+
+Before 0.2.3, a domain name containing `"` or `\n` would break the exposition format — an attacker who could register a route with a crafted domain could inject synthetic metric lines into the scrape, corrupting dashboards or forging counter values. 0.2.3 escapes the label before serialization, and the hot path returns `Cow::Borrowed` when no escaping is needed, so clean domain names pay zero allocation cost.
+
+This is purely a server-side change — Prometheus itself already parses escaped labels correctly, so no scraper reconfiguration is required. Existing dashboards continue to work unchanged.
+
+---
+
+:::caution[Breaking change — per-window counter semantics (0.2.3)]
+
+The analytics-derived counters emitted via Prometheus — `status_codes`, `bytes_sent`, `bot_views`, `human_views` — now **reset to zero on every flush window**, matching the doc comment that has always said "cumulative since last flush." Before 0.2.3, these values accumulated as lifetime totals and never reset.
+
+**What changed for downstream consumers:**
+
+- **Per-window deltas.** A scraper that reads the snapshot now sees the delta for the just-closed window, not the lifetime sum. Dashboards that summed the values across flushes will now double-count if they still apply the same aggregation.
+- **Use the raw value directly.** The correct PromQL for "bytes sent per minute" on these fields is now `sum by (domain) (dwaar_bytes_sent_total)` within a single flush window, **not** `rate()` or `increase()` across scrapes. The counter is no longer monotonically increasing.
+- **Prometheus-native counters are unaffected.** `dwaar_requests_total`, `dwaar_bytes_sent_total` (the standard counter variant), and the histogram buckets all remain monotonic. Only the analytics-snapshot mirrors of these values were changed.
+
+If you are scraping the `/analytics` JSON endpoint or the analytics-sourced rows inside `/metrics`, update your dashboards and alerting to treat these fields as window-scoped. The simplest migration is to rely on the native Prometheus counters and histograms for rate math, and reserve the analytics snapshot for operator-facing per-window display.
+
+:::
 
 ---
 
@@ -99,7 +131,7 @@ These follow the standard Prometheus `process_*` naming convention recognised au
 | `process_resident_memory_bytes` | gauge | _(none)_ | Resident set size (RSS) in bytes. Read from `/proc/self/status` on Linux; `getrusage(RUSAGE_SELF)` on macOS. |
 | `process_open_fds` | gauge | _(none)_ | Number of open file descriptors. |
 | `process_max_fds` | gauge | _(none)_ | File descriptor limit (`RLIMIT_NOFILE` soft limit). |
-| `process_start_time_seconds` | gauge | _(none)_ | Unix timestamp of process start. Used to compute uptime: `time() - process_start_time_seconds`. |
+| `process_start_time_seconds` | gauge | _(none)_ | Unix timestamp of actual process start. As of 0.2.3, read from `/proc/self/stat` (`starttime` field, divided by `sysconf(_SC_CLK_TCK)` and added to boot time) on Linux, and from `libc::proc_pidinfo(PROC_PIDTBSDINFO)` on macOS. The value is cached in a `OnceLock` on first read. On unsupported platforms, falls back to the metrics struct construction time. Used to compute uptime: `time() - process_start_time_seconds`. |
 | `process_threads` | gauge | _(none)_ | Number of OS threads. Read from `/proc/self/status` on Linux; reports `0` on other platforms. |
 
 ---

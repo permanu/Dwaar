@@ -90,9 +90,15 @@ impl DomainMetrics {
     }
 
     /// Update from a server-side aggregation event.
+    ///
+    /// The client IP is anonymized via [`crate::beacon::anonymize_ip`]
+    /// before insertion into the unique-visitors sketch so the beacon
+    /// path and the log path agree on the same /24 (IPv4) or /48 (IPv6)
+    /// prefix — see M-22 in the audit remediation notes.
     pub fn ingest_log(&mut self, event: &AggEvent) {
         self.page_views.increment();
-        self.unique_visitors.insert(&event.client_ip);
+        let anon_ip = crate::beacon::anonymize_ip(event.client_ip);
+        self.unique_visitors.insert(&anon_ip);
         self.top_pages.insert(event.path.to_string());
         self.status_codes[status_bucket(event.status)] += 1;
         self.bytes_sent += event.bytes_sent;
@@ -112,13 +118,33 @@ impl DomainMetrics {
     }
 
     /// Update from a client-side beacon event.
+    ///
+    /// `beacon.url` and `beacon.referrer` are user-controlled, so both
+    /// go through [`crate::beacon::sanitize_url_to_path`] and
+    /// [`crate::beacon::sanitize_referrer_host`] before hitting the
+    /// bounded counters (C-05). Any beacon that fails URL validation
+    /// is dropped silently — the beacon is best-effort telemetry and
+    /// returning an error status would leak validation state to the
+    /// client.
+    ///
+    /// `client_ip` is already anonymized by `BeaconEvent::from_raw`,
+    /// which goes through the same [`crate::beacon::anonymize_ip`]
+    /// policy as `ingest_log` above.
     pub fn ingest_beacon(&mut self, beacon: &crate::beacon::BeaconEvent) {
+        let Some(path) = crate::beacon::sanitize_url_to_path(&beacon.url) else {
+            // Drop malformed beacons entirely — no partial aggregation.
+            return;
+        };
+
         self.unique_visitors.insert(&beacon.client_ip);
+        self.top_pages.insert(path);
 
-        self.top_pages.insert(extract_path(&beacon.url));
-
-        if let Some(domain) = beacon.referrer.as_deref().and_then(extract_domain) {
-            self.referrers.insert(domain);
+        if let Some(referrer) = beacon
+            .referrer
+            .as_deref()
+            .and_then(crate::beacon::sanitize_referrer_host)
+        {
+            self.referrers.insert(referrer);
         }
         if let Some(lcp) = beacon.lcp_ms {
             self.web_vitals.record_lcp(lcp);
@@ -163,18 +189,6 @@ fn extract_domain(url: &str) -> Option<String> {
     } else {
         Some(domain.to_lowercase())
     }
-}
-
-/// Extract path from a full URL (e.g., `https://example.com/about?q=1` → `/about`).
-fn extract_path(url: &str) -> String {
-    let without_scheme = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url);
-    let after_host = without_scheme.find('/').map(|i| &without_scheme[i..]);
-    let path = after_host.unwrap_or("/");
-    let path = path.split('?').next().unwrap_or(path);
-    path.to_string()
 }
 
 /// Sender handle for aggregation events.
@@ -282,13 +296,6 @@ mod tests {
             extract_domain("bare-domain.com/path"),
             Some("bare-domain.com".into())
         );
-    }
-
-    #[test]
-    fn extract_path_from_urls() {
-        assert_eq!(extract_path("https://example.com/about?q=1"), "/about");
-        assert_eq!(extract_path("https://example.com/"), "/");
-        assert_eq!(extract_path("https://example.com"), "/");
     }
 
     #[test]

@@ -60,6 +60,17 @@ Authorization: Bearer <token>
 
 Unix socket connections bypass token authentication — access is controlled by the socket file's filesystem permissions (mode `0600`, owner = the Dwaar process user).
 
+### CORS lockdown (0.2.3)
+
+The admin API is not designed for browser cross-origin use. As of 0.2.3:
+
+- **Every response** sets `Access-Control-Allow-Origin: null` — no origin is ever permitted.
+- **`OPTIONS` preflight** returns `405 Method Not Allowed` with an `Allow:` header listing only the real methods the endpoint accepts.
+
+If you had a browser-based management UI pointing directly at the admin API, it will fail with a CORS error. This is intentional. Route browser traffic through a dedicated backend service that holds the admin token, or proxy the admin endpoint from a same-origin path inside your application so the browser never sees the cross-origin response.
+
+Unix socket and `curl`-style clients are unaffected — they do not enforce the browser same-origin policy.
+
 ### Rate limit
 
 Authenticated requests are subject to a global rate limit of **60 requests per 60-second window**. Exceeding the limit returns `429 Too Many Requests`. The `GET /health` endpoint is exempt.
@@ -221,6 +232,7 @@ curl -X DELETE \
 | `400` | Domain segment is empty |
 | `401` | Missing or invalid bearer token (TCP only) |
 | `404` | No route with that domain exists |
+| `414` | Domain segment longer than 253 bytes (RFC 1035 max). Rejected before any `to_lowercase()` allocation. Added in 0.2.3. |
 | `429` | Rate limit exceeded |
 
 ---

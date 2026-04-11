@@ -16,7 +16,16 @@
 /// beacon to `/_dwaar/collect` on page exit.
 pub const ANALYTICS_JS: &[u8] = include_bytes!("../assets/analytics.js");
 
+/// Maximum number of distinct domains tracked in per-domain `DashMap`s.
+///
+/// Shared across [`prometheus`] and [`rate_cache_metrics`] so changing the
+/// ceiling in one place can't drift the other into a different limit.
+/// Beyond this count new domains are silently dropped to bound memory
+/// growth in multi-tenant or wildcard setups.
+pub const MAX_TRACKED_DOMAINS: usize = 10_000;
+
 pub mod aggregation;
+pub mod auth;
 pub mod beacon;
 pub mod decompress;
 pub mod injector;
@@ -41,10 +50,13 @@ mod tests {
 
     #[test]
     fn analytics_js_under_size_budget() {
-        // Raw JS must stay under 2500 bytes to meet <2.5KB gzip target
+        // Raw JS must stay under 3500 bytes to meet the <3.5KB gzip target.
+        // v0.2.3 raised the budget from 2500 after the beacon HMAC (C-04),
+        // Sec-GPC check (L-22), and fetch-keepalive fallback (L-23) were
+        // added. Gzipped size remains well under 1.5 KB in practice.
         assert!(
-            ANALYTICS_JS.len() < 2500,
-            "analytics JS is {} bytes, budget is 2500",
+            ANALYTICS_JS.len() < 3500,
+            "analytics JS is {} bytes, budget is 3500",
             ANALYTICS_JS.len()
         );
     }

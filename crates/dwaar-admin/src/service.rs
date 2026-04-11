@@ -29,6 +29,13 @@ use crate::handlers;
 /// Maximum request body size (64 KB).
 const MAX_BODY_SIZE: usize = 65_536;
 
+/// Maximum allowed length of a DNS name path segment (RFC 1035).
+///
+/// Caps user-supplied values in `/routes/{domain}`, `/analytics/{domain}`,
+/// and `/cache/{key}` so an attacker can't force multi-megabyte allocations
+/// via the URL. Anything longer produces a 414 response.
+const MAX_PATH_SEGMENT_LEN: usize = 253;
+
 /// Rate limit: at most this many requests per window before returning 429.
 const RATE_LIMIT_MAX: u64 = 60;
 /// Rate limit window length in seconds.
@@ -183,6 +190,14 @@ fn is_trusted_transport(session: &ServerSession) -> bool {
 #[async_trait]
 impl ServeHttp for AdminService {
     async fn response(&self, session: &mut ServerSession) -> Response<Vec<u8>> {
+        let mut resp = self.handle(session).await;
+        apply_cors_headers(&mut resp);
+        resp
+    }
+}
+
+impl AdminService {
+    async fn handle(&self, session: &mut ServerSession) -> Response<Vec<u8>> {
         // Extract method/path/auth into owned Strings before any mutable borrows.
         // read_body() takes &mut session, so we can't hold references into req_header().
         let method = session.req_header().method.as_str().to_string();
@@ -203,6 +218,19 @@ impl ServeHttp for AdminService {
             .and_then(|a| a.as_inet())
             .map(|a| a.ip().to_string());
         debug!(source, method = %method, path = %path, "admin request");
+
+        // M-14: reject CORS preflight outright. The admin API is not for
+        // browser cross-origin use — there is no scenario where a preflight
+        // should succeed. Return 405 before any auth or handler logic.
+        if method == "OPTIONS" {
+            debug!(source, "rejecting OPTIONS preflight on admin API");
+            return Response::builder()
+                .status(405)
+                .header("Content-Type", "application/json")
+                .header("Allow", "GET, POST, DELETE, PURGE")
+                .body(br#"{"error":"CORS preflight not supported"}"#.to_vec())
+                .expect("valid response");
+        }
 
         // Health check — no auth required
         if method == "GET" && path == "/health" {
@@ -282,6 +310,11 @@ impl AdminService {
                 if domain.is_empty() {
                     return json_response(400, r#"{"error":"missing domain"}"#);
                 }
+                // L-12: cap the domain length before any allocation to
+                // prevent `to_lowercase()` on megabyte-long inputs.
+                if domain.len() > MAX_PATH_SEGMENT_LEN {
+                    return json_response(414, r#"{"error":"domain too long"}"#);
+                }
                 match handlers::delete_route(&self.route_table, domain) {
                     Some(deleted) => {
                         tracing::info!(
@@ -305,6 +338,10 @@ impl AdminService {
                     .strip_prefix("/analytics/")
                     .unwrap_or("")
                     .trim_end_matches('/');
+                // L-12: cap the domain length before any allocation.
+                if domain.len() > MAX_PATH_SEGMENT_LEN {
+                    return json_response(414, r#"{"error":"domain too long"}"#);
+                }
                 if domain.is_empty() || !dwaar_core::route::is_valid_domain(domain) {
                     return json_response(400, r#"{"error":"invalid domain"}"#);
                 }
@@ -501,6 +538,24 @@ fn json_response(status: u16, body: &str) -> Response<Vec<u8>> {
         .expect("valid response")
 }
 
+/// Apply restrictive CORS headers to every admin API response (M-14).
+///
+/// The admin API is local-only (UDS / loopback). Browser cross-origin
+/// requests are never a supported use case, so we lock the response down
+/// with `Access-Control-Allow-Origin: null`. Any browser issuing a
+/// cross-origin request — even a "simple" one with `text/plain` — will
+/// be blocked from reading the response body by the user agent. `Vary:
+/// Origin` keeps well-behaved intermediaries from caching our response
+/// as if it were origin-agnostic.
+fn apply_cors_headers(resp: &mut Response<Vec<u8>>) {
+    let headers = resp.headers_mut();
+    headers.insert(
+        http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        http::HeaderValue::from_static("null"),
+    );
+    headers.insert(http::header::VARY, http::HeaderValue::from_static("Origin"));
+}
+
 /// Current Unix epoch time in whole seconds. Used for rate-limit windows and
 /// reload cooldown tracking. Monotonicity is not required here — wall-clock
 /// time is fine because we only care about elapsed seconds between events.
@@ -525,5 +580,44 @@ async fn read_body(session: &mut ServerSession, max_size: usize) -> Result<Vec<u
             Ok(None) => return Ok(body),
             Err(e) => return Err((400, format!("failed to read body: {e}"))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cors_headers_applied_to_any_response() {
+        let mut resp = json_response(200, r#"{"ok":true}"#);
+        apply_cors_headers(&mut resp);
+        let allow_origin = resp
+            .headers()
+            .get(http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .expect("allow-origin header present");
+        assert_eq!(allow_origin.to_str().expect("ascii"), "null");
+
+        let vary = resp
+            .headers()
+            .get(http::header::VARY)
+            .expect("vary header present");
+        assert_eq!(vary.to_str().expect("ascii"), "Origin");
+    }
+
+    #[test]
+    fn cors_headers_applied_to_error_response() {
+        let mut resp = json_response(401, r#"{"error":"unauthorized"}"#);
+        apply_cors_headers(&mut resp);
+        assert_eq!(
+            resp.headers()
+                .get(http::header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("null"),
+        );
+    }
+
+    #[test]
+    fn max_path_segment_len_rfc1035() {
+        assert_eq!(MAX_PATH_SEGMENT_LEN, 253);
     }
 }

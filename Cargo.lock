@@ -1399,6 +1399,7 @@ dependencies = [
 name = "dwaar-geo"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "criterion",
  "maxminddb",
  "thiserror 2.0.18",

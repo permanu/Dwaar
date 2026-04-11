@@ -1,12 +1,28 @@
 (function() {
+  // Honour Do Not Track and Global Privacy Control (GPC). Either signal
+  // causes the beacon to be suppressed entirely — no data leaves the browser.
   if (navigator.doNotTrack === "1") return;
+  if (navigator.globalPrivacyControl === true) return;
+
+  // Read the server-issued beacon auth token from the meta tag the injector
+  // embedded at page-load time. Format: "<nonce_b64>:<sig_hex>". If the tag
+  // is absent (e.g. the response wasn't HTML-injectable) we still send the
+  // beacon but without authentication — the server will reject it at the
+  // verification step, which is the desired fail-closed behaviour.
+  var authMeta = document.querySelector('meta[name="dwaar-beacon-auth"]');
+  var authVal = authMeta ? authMeta.getAttribute("content") || "" : "";
+  var authParts = authVal.split(":");
+  var nonce = authParts[0] || "";
+  var sig = authParts[1] || "";
 
   var d = {
     u: location.href,
     r: document.referrer || undefined,
     sw: screen.width,
     sh: screen.height,
-    lg: navigator.language
+    lg: navigator.language,
+    nonce: nonce,
+    sig: sig
   };
 
   // LCP (Largest Contentful Paint)
@@ -53,12 +69,14 @@
     var body = JSON.stringify(d);
     if (navigator.sendBeacon) {
       navigator.sendBeacon(url, body);
-    } else {
-      var xhr = new XMLHttpRequest();
-      xhr.open("POST", url, false);
-      xhr.setRequestHeader("Content-Type", "application/json");
-      xhr.send(body);
+    } else if (typeof fetch === "function") {
+      // keepalive allows the request to outlive the page, same semantics
+      // as sendBeacon. We swallow errors — this is best-effort telemetry
+      // and the page is unloading.
+      fetch(url, { method: "POST", body: body, keepalive: true }).catch(function() {});
     }
+    // Else: drop silently. Sync XHR on unload is a UX regression we will
+    // not inflict on legacy browsers (L-23).
   }
 
   document.addEventListener("visibilitychange", function() {

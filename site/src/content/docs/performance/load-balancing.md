@@ -81,10 +81,14 @@ Health state changes are logged as `tracing` events at the point of transition �
 
 | Edge | Level | Example |
 |---|---|---|
-| Healthy → unhealthy | `WARN` | `upstream transitioned to unhealthy backend=app1:8080 reason="connection refused (os error 111)"` |
-| Unhealthy → healthy | `INFO` | `upstream transitioned to healthy backend=app1:8080` |
+| Healthy → unhealthy | `WARN` | `upstream transitioned to unhealthy backend=10.x.x.x:8080 reason="connection refused (os error 111)"` |
+| Unhealthy → healthy | `INFO` | `upstream transitioned to healthy backend=10.x.x.x:8080` |
 
 The probe error string is captured in `Backend::last_error` (a `parking_lot::Mutex<Option<String>>`) and included in the `WARN` event as the `reason=` field. On the `INFO` transition the error is cleared. This gives operators a precise "when did each backend flip" timeline without needing the full health-check debug log turned on.
+
+**Address masking (0.2.3).** Transition logs mask the upstream address before it reaches the log sink. IPv4 addresses are rendered as `10.x.x.x:8080` (octets 2–4 replaced with `x`); IPv6 addresses are truncated to their `/48` prefix. The port and the backend name are preserved.
+
+This prevents internal network topology from leaking into shared log aggregators in multi-tenant deployments. The full address is still available in debug logs (`RUST_LOG=dwaar=debug`) for on-host troubleshooting, and the unmasked `Backend::addr` value is unchanged in the Admin API — only the `tracing` events on the transition path are redacted.
 
 In a structured-logging pipeline (e.g. Vector, Loki), alert rules can trigger directly on the event name:
 

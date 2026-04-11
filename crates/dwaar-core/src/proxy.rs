@@ -25,7 +25,7 @@ use pingora_core::upstreams::peer::{ALPN, HttpPeer};
 use pingora_error::{Error, ErrorType::HTTPStatus};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{ProxyHttp, Session};
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use bytes::Bytes;
 use compact_str::CompactString;
@@ -248,11 +248,30 @@ impl DwaarProxy {
 
             match beacon::parse_beacon(&body) {
                 Ok(raw) => {
+                    // --- C-04: HMAC verification ---------------------------
+                    // Every beacon must carry a server-issued nonce + sig
+                    // (see `dwaar_analytics::auth`). Missing or invalid
+                    // tokens are silently rejected with 401 at trace level
+                    // so repeated failures during an attack don't flood
+                    // logs. The Origin check earlier in this handler is
+                    // defence-in-depth — HMAC is the authoritative gate.
+                    let host = ctx.plugin_ctx.host.clone().unwrap_or_default();
+                    let nonce = raw.nonce.as_deref().unwrap_or("");
+                    let sig = raw.sig.as_deref().unwrap_or("");
+                    if !dwaar_analytics::auth::verify(nonce, sig, &host) {
+                        trace!(
+                            request_id = %ctx.request_id(),
+                            "beacon rejected: HMAC verification failed"
+                        );
+                        let resp = ResponseHeader::build(401, Some(0))?;
+                        session.write_response_header(Box::new(resp), true).await?;
+                        return Ok(true);
+                    }
+
                     let client_ip = ctx
                         .plugin_ctx
                         .client_ip
                         .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-                    let host = ctx.plugin_ctx.host.clone().unwrap_or_default();
                     let event = BeaconEvent::from_raw(raw, client_ip, host.to_string());
                     let _ = sender.try_send(event);
                     debug!(request_id = %ctx.request_id(), "beacon collected");
@@ -1646,7 +1665,18 @@ impl ProxyHttp for DwaarProxy {
                     debug!(request_id = %ctx.request_id(), "HTML response detected, enabling script injection");
                 }
 
-                ctx.injector = Some(HtmlInjector::new());
+                // C-04: issue a signed beacon-auth nonce bound to the
+                // serving host and embed it in a `<meta>` tag alongside
+                // the analytics script. Without the host the injector
+                // falls back to an unsigned script tag; that path still
+                // injects but the beacon handler will reject posts that
+                // lack a valid signature (fail-closed).
+                let host = ctx.plugin_ctx.host.as_deref().unwrap_or("");
+                ctx.injector = Some(if host.is_empty() {
+                    HtmlInjector::new()
+                } else {
+                    HtmlInjector::new_with_auth(host)
+                });
                 upstream_response.remove_header("Content-Length");
             }
         }

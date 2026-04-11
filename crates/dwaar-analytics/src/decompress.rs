@@ -88,9 +88,23 @@ impl Decompressor {
 
     /// Decompress a chunk. Appends to internal buffer and attempts
     /// decompression. On success, replaces `body` with decompressed data.
-    /// On failure, marks as failed and passes through unchanged.
+    ///
+    /// On failure (overflow or decoder error) the decompressor enters a
+    /// terminal `failed` state. Per M-25 we never emit raw compressed
+    /// bytes as HTML body — browsers can charset-guess binary into
+    /// executable text. Instead, once failed, every subsequent chunk is
+    /// replaced with an empty `Bytes::new()` so the client gets a safely
+    /// truncated response instead of garbled binary. Injection is
+    /// abandoned for this request (the outer layer stripped the
+    /// `Content-Encoding` header so we cannot recover the compressed
+    /// stream either way).
     pub fn decompress(&mut self, body: &mut Option<Bytes>, end_of_stream: bool) {
         if self.failed {
+            // Drop every subsequent chunk so no binary bytes reach the
+            // wire. The client sees a clean truncation.
+            if body.is_some() {
+                *body = Some(Bytes::new());
+            }
             return;
         }
 
@@ -102,16 +116,29 @@ impl Decompressor {
             return;
         }
 
-        // Bound buffer to prevent OOM from adversarial compressed responses
+        // Bound buffer to prevent OOM from adversarial compressed responses.
+        //
+        // M-25: On overflow we MUST NOT emit the raw compressed bytes as a
+        // body. Browsers that charset-guess can misinterpret binary content
+        // as HTML and potentially render attacker-controlled sequences.
+        // Instead, drop the accumulated buffer and emit an empty body. The
+        // outer `HtmlInjector` then has nothing to scan → injection is
+        // abandoned and subsequent chunks pass through untouched via the
+        // `failed` flag below. The client still gets the upstream response
+        // (Pingora continues streaming future chunks unmodified); we just
+        // skip the analytics injection for this request.
         if self.buffer.len() + data.len() > MAX_BUFFER_SIZE {
             tracing::warn!(
                 buffered = self.buffer.len(),
                 chunk = data.len(),
                 limit = MAX_BUFFER_SIZE,
-                "compressed response exceeded buffer limit, passing through raw"
+                "compressed response exceeded buffer limit, skipping injection"
             );
             self.failed = true;
-            *body = Some(Bytes::from(std::mem::take(&mut self.buffer)));
+            // Zeroize the buffered compressed data — we never emit it.
+            self.buffer.clear();
+            self.buffer.shrink_to_fit();
+            *body = Some(Bytes::new());
             return;
         }
 
@@ -122,9 +149,16 @@ impl Decompressor {
             if let Ok(decompressed) = self.try_decompress_all() {
                 *body = Some(Bytes::from(decompressed));
             } else {
-                // Decompression failed — emit whatever we buffered raw
+                // Decompression failed — emit an empty body rather than
+                // leaking raw compressed bytes as HTML (M-25). The
+                // response is effectively truncated; better UX would
+                // require the upstream layer to restore Content-Encoding,
+                // which isn't currently possible from inside the
+                // body filter.
                 self.failed = true;
-                *body = Some(Bytes::from(std::mem::take(&mut self.buffer)));
+                self.buffer.clear();
+                self.buffer.shrink_to_fit();
+                *body = Some(Bytes::new());
             }
         } else {
             // Try partial decompression — might need more data
@@ -270,14 +304,54 @@ mod tests {
     }
 
     #[test]
-    fn failed_decompression_passes_through() {
+    fn failed_decompression_emits_empty_body() {
+        // M-25: on overflow/decoder error we must NEVER emit the
+        // raw compressed bytes — they could be charset-guessed as HTML
+        // and interpreted as attacker-controlled markup.
         let garbage = b"this is not compressed data";
         let mut decomp = Decompressor::new(Encoding::Gzip);
         let mut body = Some(Bytes::from(garbage.to_vec()));
         decomp.decompress(&mut body, true);
 
-        // Should pass through the raw data on failure
         assert!(decomp.failed);
+        let out = body.expect("body");
+        assert!(
+            out.is_empty(),
+            "failed decompressor must emit empty body, got {} bytes",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn overflow_does_not_leak_compressed_bytes() {
+        // Feed more than MAX_BUFFER_SIZE of "compressed" data. The body
+        // must become empty — we never want the raw buffer on the wire.
+        let mut decomp = Decompressor::new(Encoding::Gzip);
+        let huge = vec![0xffu8; MAX_BUFFER_SIZE + 1];
+        let mut body = Some(Bytes::from(huge));
+        decomp.decompress(&mut body, false);
+        assert!(decomp.failed);
+        assert_eq!(body.expect("body").len(), 0);
+    }
+
+    #[test]
+    fn failed_decompressor_drops_subsequent_chunks() {
+        let mut decomp = Decompressor::new(Encoding::Gzip);
+        // First chunk triggers overflow.
+        let huge = vec![0u8; MAX_BUFFER_SIZE + 1];
+        let mut body1 = Some(Bytes::from(huge));
+        decomp.decompress(&mut body1, false);
+        assert!(decomp.failed);
+
+        // Every subsequent chunk must be replaced with empty so no
+        // binary bytes reach the client.
+        let mut body2 = Some(Bytes::from_static(b"follow-up chunk"));
+        decomp.decompress(&mut body2, false);
+        assert_eq!(body2.expect("body").len(), 0);
+
+        let mut body3 = Some(Bytes::from_static(b"another"));
+        decomp.decompress(&mut body3, true);
+        assert_eq!(body3.expect("body").len(), 0);
     }
 
     #[test]

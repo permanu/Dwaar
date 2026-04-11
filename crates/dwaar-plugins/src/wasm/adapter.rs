@@ -118,17 +118,29 @@ impl PluginState {
     /// Construct state from a `PluginCtx`, populating request headers from the
     /// actual `RequestHeader`. Host functions like `get-header` read from these
     /// snapshots, so they must be populated before the hook is invoked.
+    ///
+    /// # Why this eager copy (L-16)
+    ///
+    /// The current `dwaar-plugin` WIT world types `request-info.headers` as
+    /// `list<header-entry>`, meaning the host hands the whole list to the
+    /// guest by value on every hook call. A lazy `get-header(name)` host
+    /// function would eliminate the per-request copy, but adding one is a
+    /// breaking WIT change that reshapes every existing guest binding. That
+    /// migration is tracked under plugin-system redesign work.
+    ///
+    /// Until then, the best we can do is pre-size the `Vec` to the exact
+    /// header count so we don't pay the `Vec` growth curve on top of the
+    /// required copy. `HeaderMap::iter()` isn't `ExactSizeIterator`, so
+    /// `.collect()` starts small and reallocates — an explicit
+    /// `Vec::with_capacity` + `push` loop avoids that.
     fn from_ctx_with_request(ctx: &PluginCtx, plugin_name: &str, req: &RequestHeader) -> Self {
-        let request_headers = req
-            .headers
-            .iter()
-            .map(|(k, v)| {
-                (
-                    k.as_str().to_lowercase(),
-                    v.to_str().unwrap_or("").to_owned(),
-                )
-            })
-            .collect();
+        let mut request_headers = Vec::with_capacity(req.headers.len());
+        for (k, v) in req.headers.iter() {
+            request_headers.push((
+                k.as_str().to_lowercase(),
+                v.to_str().unwrap_or("").to_owned(),
+            ));
+        }
 
         Self {
             plugin_name: plugin_name.to_owned(),
@@ -143,18 +155,17 @@ impl PluginState {
     }
 
     /// Construct state from a `PluginCtx`, populating response headers from the
-    /// actual `ResponseHeader`. Used for `on_response` hook calls.
+    /// actual `ResponseHeader`. Used for `on_response` hook calls. Uses the
+    /// same explicit `with_capacity` pattern as [`from_ctx_with_request`] so
+    /// the header Vec never reallocates during population (L-16).
     fn from_ctx_with_response(ctx: &PluginCtx, plugin_name: &str, resp: &ResponseHeader) -> Self {
-        let response_headers = resp
-            .headers
-            .iter()
-            .map(|(k, v)| {
-                (
-                    k.as_str().to_lowercase(),
-                    v.to_str().unwrap_or("").to_owned(),
-                )
-            })
-            .collect();
+        let mut response_headers = Vec::with_capacity(resp.headers.len());
+        for (k, v) in resp.headers.iter() {
+            response_headers.push((
+                k.as_str().to_lowercase(),
+                v.to_str().unwrap_or("").to_owned(),
+            ));
+        }
 
         Self {
             plugin_name: plugin_name.to_owned(),
@@ -182,6 +193,12 @@ pub struct WasmPlugin {
     engine: Arc<wasmtime::Engine>,
     /// Compiled component artifact. Immutable after compilation; `Send + Sync`.
     component: Component,
+    /// Linker built once at construction and reused for every hook call (L-19).
+    /// `wasmtime::component::Linker` is `Send + Sync` as long as the
+    /// `PluginState` type parameter is, so it's safe to share across worker
+    /// threads without interior mutability. Constructing a fresh linker per
+    /// call showed up as a repeated per-request cost in the audit.
+    linker: Linker<PluginState>,
     /// Human-readable name derived from the filename, leaked for `'static`.
     name: &'static str,
     /// Execution priority — lower values run first in the plugin chain.
@@ -222,7 +239,18 @@ impl WasmPlugin {
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("unknown-wasm-plugin");
-        // One allocation per plugin at startup; never reclaimed. See GUARDRAILS §5.
+        // L-17: Box::leak produces a `&'static str` that satisfies the
+        // DwaarPlugin::name() trait contract. Every config reload leaks a new
+        // copy of the plugin name. Fixing this for real requires changing
+        // `DwaarPlugin::name()` from `&'static str` to `&str` (or `Arc<str>`),
+        // which touches every plugin impl in the workspace — several of which
+        // live outside the exclusive scope of this patch (forward_auth,
+        // ip_filter, basic_auth). Tracking under a future plugin-trait cleanup.
+        //
+        // Until then the leak is bounded: plugin names are short (typically
+        // under 32 bytes) and config reloads are rare. A weekly reload with a
+        // 32-byte name leaks ~1.6 KiB/year — orders of magnitude below the
+        // guardrail noise floor.
         let name: &'static str = Box::leak(stem.to_owned().into_boxed_str());
 
         let component =
@@ -231,9 +259,15 @@ impl WasmPlugin {
                 source,
             })?;
 
+        // Build the linker once (L-19). Today no host functions are registered,
+        // but any future `dwaar-host` imports should also be added here so the
+        // per-call path stays zero-setup.
+        let linker: Linker<PluginState> = Linker::new(&engine.engine);
+
         Ok(Self {
             engine: engine.engine.clone(),
             component,
+            linker,
             name,
             priority,
             consecutive_traps: AtomicU32::new(0),
@@ -257,9 +291,11 @@ impl WasmPlugin {
                 path: format!("<in-memory:{name}>"),
                 source,
             })?;
+        let linker: Linker<PluginState> = Linker::new(&engine.engine);
         Ok(Self {
             engine: engine.engine.clone(),
             component,
+            linker,
             name,
             priority,
             consecutive_traps: AtomicU32::new(0),
@@ -319,9 +355,10 @@ impl WasmPlugin {
             return PluginAction::Continue;
         }
 
-        let linker: Linker<PluginState> = Linker::new(&self.engine);
-
-        let result = WitInstance::instantiate(&mut store, &self.component, &linker)
+        // Reuse the linker built at construction time (L-19). Linker has no
+        // per-call state: `instantiate` reads imports out of it but never
+        // mutates.
+        let result = WitInstance::instantiate(&mut store, &self.component, &self.linker)
             .and_then(|instance| f(&mut store, &instance));
 
         match result {

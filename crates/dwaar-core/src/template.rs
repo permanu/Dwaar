@@ -229,6 +229,15 @@ impl Default for VarRegistry {
 
 // ── Variable slots (runtime) ─────────────────────────────────
 
+/// Hard upper bound on the number of user variable slots per route.
+///
+/// `VarRegistry` assigns slots densely starting at 0, so in a well-formed
+/// config the highest slot index is bounded by the number of `vars`/`map`
+/// directives. This constant caps `VarSlots::set` to prevent a mis-wired
+/// compiler or a malicious config from triggering unbounded `Vec` growth
+/// — an out-of-range `set` becomes a silent no-op rather than allocating.
+pub const MAX_VAR_SLOTS: usize = 256;
+
 /// Runtime storage for user variable values, indexed by slot.
 ///
 /// Created from `VarRegistry::len()` and populated at request time.
@@ -255,8 +264,17 @@ impl VarSlots {
     }
 
     /// Set the value for a slot.
+    ///
+    /// Slot indices at or beyond [`MAX_VAR_SLOTS`] are silently dropped.
+    /// The compiler assigns slots densely from 0 and a well-formed config
+    /// cannot exceed this bound, so an out-of-range `set` only happens on
+    /// a mis-wired compiler or a malicious/bogus call — in which case we
+    /// refuse to resize the backing `Vec` unboundedly.
     pub fn set(&mut self, slot: u16, value: CompactString) {
         let idx = slot as usize;
+        if idx >= MAX_VAR_SLOTS {
+            return;
+        }
         if idx >= self.values.len() {
             self.values.resize(idx + 1, None);
         }
@@ -1114,5 +1132,36 @@ mod tests {
         assert!(!result.contains('\r'));
         assert!(!result.contains('\n'));
         assert_eq!(result, "https://evil.comX-Bad: true");
+    }
+
+    // ── VarSlots bounds (L-06) ──────────────────────────────
+
+    #[test]
+    fn var_slots_set_rejects_out_of_range_index() {
+        // A bogus slot index must not grow the backing Vec unboundedly.
+        let mut slots = VarSlots::with_capacity(4);
+        assert_eq!(slots.len(), 4);
+
+        slots.set(10_000, CompactString::from("boom"));
+        assert_eq!(
+            slots.len(),
+            4,
+            "out-of-range slot must not resize the backing Vec"
+        );
+        assert_eq!(slots.get(10_000), None);
+    }
+
+    #[test]
+    fn var_slots_set_allows_up_to_max_var_slots() {
+        let mut slots = VarSlots::with_capacity(0);
+        // Last accepted slot is MAX_VAR_SLOTS - 1.
+        let last = (MAX_VAR_SLOTS - 1) as u16;
+        slots.set(last, CompactString::from("ok"));
+        assert_eq!(slots.get(last), Some("ok"));
+        assert_eq!(slots.len(), MAX_VAR_SLOTS);
+
+        // One past the cap is rejected; len stays capped.
+        slots.set(MAX_VAR_SLOTS as u16, CompactString::from("reject"));
+        assert_eq!(slots.len(), MAX_VAR_SLOTS);
     }
 }

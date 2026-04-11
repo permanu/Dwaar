@@ -11,6 +11,29 @@
 
 use dashmap::DashMap;
 
+/// Upper bound on the number of pending ACME challenge tokens kept in memory.
+///
+/// Prevents a compromised or misbehaving ACME directory from flooding the
+/// proxy with authorization tokens and exhausting memory. 1024 is generous
+/// for realistic parallel issuance — a single typical order holds 1 token,
+/// so this gives headroom for hundreds of concurrent orders while capping
+/// total RAM use at a few megabytes.
+pub const MAX_PENDING_TOKENS: usize = 1024;
+
+/// Errors produced by the [`ChallengeSolver`].
+#[derive(Debug, thiserror::Error)]
+pub enum SolverError {
+    /// The pending token map is full (>= [`MAX_PENDING_TOKENS`]).
+    ///
+    /// Callers should treat this as transient and retry after pending
+    /// challenges complete (ACME orders free tokens after validation).
+    #[error(
+        "too many pending ACME challenge tokens (cap is {cap}); refusing to \
+         accept new token to prevent memory exhaustion"
+    )]
+    TooManyPendingTokens { cap: usize },
+}
+
 /// Stores pending ACME HTTP-01 challenge tokens.
 ///
 /// The ACME service inserts `token → key_authorization` entries when
@@ -31,9 +54,22 @@ impl ChallengeSolver {
     }
 
     /// Insert a challenge token and its key authorization.
-    pub fn set(&self, token: &str, key_authorization: &str) {
+    ///
+    /// Returns [`SolverError::TooManyPendingTokens`] if the map is already at
+    /// [`MAX_PENDING_TOKENS`] and the token is not already present. Updating
+    /// an existing token (re-setting the same key) is always allowed so that
+    /// in-flight retries don't spuriously fail.
+    pub fn set(&self, token: &str, key_authorization: &str) -> Result<(), SolverError> {
+        // Allow updating an existing entry even at cap — this is an in-place
+        // mutation, not a growth event, so it cannot exhaust memory further.
+        if !self.pending.contains_key(token) && self.pending.len() >= MAX_PENDING_TOKENS {
+            return Err(SolverError::TooManyPendingTokens {
+                cap: MAX_PENDING_TOKENS,
+            });
+        }
         self.pending
             .insert(token.to_string(), key_authorization.to_string());
+        Ok(())
     }
 
     /// Look up the key authorization for a token.
@@ -77,7 +113,9 @@ mod tests {
     #[test]
     fn insert_and_get_token() {
         let solver = ChallengeSolver::new();
-        solver.set("test-token-abc", "key-auth-xyz");
+        solver
+            .set("test-token-abc", "key-auth-xyz")
+            .expect("set should succeed");
         assert_eq!(
             solver.get("test-token-abc").as_deref(),
             Some("key-auth-xyz")
@@ -93,7 +131,7 @@ mod tests {
     #[test]
     fn remove_token() {
         let solver = ChallengeSolver::new();
-        solver.set("token", "auth");
+        solver.set("token", "auth").expect("set should succeed");
         solver.remove("token");
         assert!(solver.get("token").is_none());
     }
@@ -118,7 +156,9 @@ mod tests {
         use std::time::Duration;
 
         let solver = Arc::new(ChallengeSolver::new());
-        solver.set("cleanup-token", "auth-value");
+        solver
+            .set("cleanup-token", "auth-value")
+            .expect("set should succeed");
 
         // Simulate the cleanup spawn (with a much shorter delay for testing)
         let s = Arc::clone(&solver);
@@ -147,7 +187,7 @@ mod tests {
             handles.push(thread::spawn(move || {
                 let token = format!("token-{i}");
                 let auth = format!("auth-{i}");
-                s.set(&token, &auth);
+                s.set(&token, &auth).expect("set should succeed");
                 assert_eq!(s.get(&token).as_deref(), Some(auth.as_str()));
             }));
         }
@@ -156,5 +196,43 @@ mod tests {
             h.join().expect("thread panicked");
         }
         assert_eq!(solver.pending_count(), 10);
+    }
+
+    #[test]
+    fn set_rejects_beyond_capacity() {
+        let solver = ChallengeSolver::new();
+
+        // Fill the solver exactly to capacity
+        for i in 0..MAX_PENDING_TOKENS {
+            let token = format!("cap-token-{i}");
+            solver
+                .set(&token, "auth")
+                .expect("under cap should succeed");
+        }
+        assert_eq!(solver.pending_count(), MAX_PENDING_TOKENS);
+
+        // One more new token must be rejected
+        let err = solver
+            .set("overflow-token", "auth")
+            .expect_err("beyond cap should fail");
+        assert!(matches!(
+            err,
+            SolverError::TooManyPendingTokens {
+                cap: MAX_PENDING_TOKENS
+            }
+        ));
+        assert_eq!(solver.pending_count(), MAX_PENDING_TOKENS);
+
+        // Updating an existing entry stays allowed (no growth, no risk)
+        solver
+            .set("cap-token-0", "refreshed-auth")
+            .expect("updating existing entry at cap should succeed");
+        assert_eq!(solver.get("cap-token-0").as_deref(), Some("refreshed-auth"));
+
+        // After freeing a slot, a new token fits again
+        solver.remove("cap-token-1");
+        solver
+            .set("fresh-token", "auth")
+            .expect("after eviction there is room");
     }
 }

@@ -16,7 +16,8 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use compact_str::CompactString;
 use dashmap::DashMap;
 
-const MAX_TRACKED_DOMAINS: usize = 10_000;
+use crate::MAX_TRACKED_DOMAINS;
+use crate::prometheus::escape_label_value;
 
 /// Prometheus counters for rate limiting and HTTP cache activity.
 ///
@@ -107,10 +108,10 @@ impl RateCacheMetrics {
             for entry in &self.rate_limit_rejected {
                 let val = entry.value().load(Relaxed);
                 if val > 0 {
+                    let domain = escape_label_value(entry.key());
                     let _ = writeln!(
                         out,
-                        "dwaar_rate_limit_rejected_total{{domain=\"{}\"}} {val}",
-                        entry.key()
+                        "dwaar_rate_limit_rejected_total{{domain=\"{domain}\"}} {val}"
                     );
                 }
             }
@@ -122,10 +123,10 @@ impl RateCacheMetrics {
             for entry in &self.rate_limit_allowed {
                 let val = entry.value().load(Relaxed);
                 if val > 0 {
+                    let domain = escape_label_value(entry.key());
                     let _ = writeln!(
                         out,
-                        "dwaar_rate_limit_allowed_total{{domain=\"{}\"}} {val}",
-                        entry.key()
+                        "dwaar_rate_limit_allowed_total{{domain=\"{domain}\"}} {val}"
                     );
                 }
             }
@@ -146,11 +147,8 @@ impl RateCacheMetrics {
         for entry in &self.cache_hits {
             let val = entry.value().load(Relaxed);
             if val > 0 {
-                let _ = writeln!(
-                    out,
-                    "dwaar_cache_hits_total{{domain=\"{}\"}} {val}",
-                    entry.key()
-                );
+                let domain = escape_label_value(entry.key());
+                let _ = writeln!(out, "dwaar_cache_hits_total{{domain=\"{domain}\"}} {val}");
             }
         }
 
@@ -159,11 +157,8 @@ impl RateCacheMetrics {
         for entry in &self.cache_misses {
             let val = entry.value().load(Relaxed);
             if val > 0 {
-                let _ = writeln!(
-                    out,
-                    "dwaar_cache_misses_total{{domain=\"{}\"}} {val}",
-                    entry.key()
-                );
+                let domain = escape_label_value(entry.key());
+                let _ = writeln!(out, "dwaar_cache_misses_total{{domain=\"{domain}\"}} {val}");
             }
         }
 

@@ -53,8 +53,13 @@ pub trait DnsProvider: Send + Sync + std::fmt::Debug {
 
 /// Check whether a DNS TXT record has propagated by shelling out to `dig`.
 ///
-/// Uses `dig +short TXT _acme-challenge.{domain}` and checks if the expected
-/// value appears in the output. Falls back gracefully if `dig` isn't available.
+/// Uses `dig +short TXT _acme-challenge.{domain}` and parses the output
+/// line-by-line. TXT records are returned as `"quoted strings"` — we compare
+/// the **exact** unquoted value on each line rather than doing a substring
+/// match, so a short challenge value can't accidentally match an unrelated
+/// TXT record that happens to contain it (L-08).
+///
+/// Falls back gracefully if `dig` isn't available.
 pub async fn check_txt_propagated(domain: &str, expected_value: &str) -> Result<bool, DnsError> {
     let fqdn = format!("_acme-challenge.{domain}");
 
@@ -65,9 +70,84 @@ pub async fn check_txt_propagated(domain: &str, expected_value: &str) -> Result<
         .map_err(|e| DnsError::PropagationCheck(format!("failed to run dig: {e}")))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(dig_txt_contains_exact(&stdout, expected_value))
+}
 
-    // dig returns TXT values in double quotes, e.g. `"abc123"`
-    Ok(stdout.contains(expected_value))
+/// Parse `dig +short TXT` output and return `true` iff any TXT record matches
+/// `expected_value` exactly (after unquoting). Split out so we can unit-test
+/// the parser without shelling out to `dig`.
+///
+/// `dig +short TXT` output format (one record per line):
+///
+/// ```text
+/// "first record value"
+/// "second record value"
+/// "multi" "string" "record"
+/// ```
+///
+/// Multi-string records (RFC 1035 §3.3.14) are concatenated after
+/// unquoting before comparison — a single logical TXT value may be split
+/// across several quoted chunks.
+fn dig_txt_contains_exact(stdout: &str, expected_value: &str) -> bool {
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(joined) = parse_dig_txt_line(line)
+            && joined == expected_value
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Parse a single line of `dig +short TXT` output. Returns the concatenation
+/// of all quoted substrings on the line, or `None` if the line is malformed
+/// (unterminated quote, contains no quoted string, etc.).
+///
+/// Implemented as a tiny state machine rather than pulling in a regex dep
+/// (Guardrail: dependency policy keeps the crate lean).
+fn parse_dig_txt_line(line: &str) -> Option<String> {
+    let bytes = line.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    let mut saw_any = false;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            // Skip whitespace between chunks
+            b' ' | b'\t' => i += 1,
+            b'"' => {
+                saw_any = true;
+                i += 1;
+                let start = i;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    // Honor backslash-escapes within the quoted string.
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                if i >= bytes.len() {
+                    return None; // unterminated quote
+                }
+                // Append the raw slice (preserving escape bytes); we only
+                // need exact match against expected_value which should be
+                // the raw challenge token anyway.
+                out.push_str(std::str::from_utf8(&bytes[start..i]).ok()?);
+                i += 1; // consume closing quote
+            }
+            _ => {
+                // Unexpected unquoted character — bail on this line.
+                return None;
+            }
+        }
+    }
+
+    if saw_any { Some(out) } else { None }
 }
 
 /// Poll DNS until the TXT record is visible, with exponential backoff.
@@ -174,6 +254,56 @@ mod tests {
 
         provider.delete_txt_record(&id).await.expect("delete");
         assert!(provider.records.lock().await.is_empty());
+    }
+
+    #[test]
+    fn dig_parser_exact_match() {
+        let stdout = "\"abc123xyz\"\n";
+        assert!(dig_txt_contains_exact(stdout, "abc123xyz"));
+        // Substring match must fail — that was the bug.
+        assert!(!dig_txt_contains_exact(stdout, "abc"));
+        assert!(!dig_txt_contains_exact(stdout, "123"));
+    }
+
+    #[test]
+    fn dig_parser_substring_does_not_match() {
+        // An unrelated TXT record contains the expected value as substring.
+        // Under the old contains() implementation this would incorrectly
+        // return true; the new exact parser must return false.
+        let stdout = "\"v=spf1 include:_spf.abc123.example ~all\"\n";
+        assert!(!dig_txt_contains_exact(stdout, "abc123"));
+    }
+
+    #[test]
+    fn dig_parser_multiple_records_one_matches() {
+        let stdout = "\"other-record\"\n\"abc123\"\n\"another\"\n";
+        assert!(dig_txt_contains_exact(stdout, "abc123"));
+        assert!(dig_txt_contains_exact(stdout, "another"));
+        assert!(dig_txt_contains_exact(stdout, "other-record"));
+        assert!(!dig_txt_contains_exact(stdout, "nope"));
+    }
+
+    #[test]
+    fn dig_parser_multi_string_record() {
+        // TXT records can be split across multiple quoted chunks per RFC 1035.
+        // dig +short concatenates them with spaces in its output.
+        let stdout = "\"hello\" \"world\"\n";
+        assert!(dig_txt_contains_exact(stdout, "helloworld"));
+        assert!(!dig_txt_contains_exact(stdout, "hello"));
+    }
+
+    #[test]
+    fn dig_parser_ignores_blank_lines() {
+        let stdout = "\n\"value\"\n\n";
+        assert!(dig_txt_contains_exact(stdout, "value"));
+    }
+
+    #[test]
+    fn dig_parser_malformed_line_does_not_match() {
+        let stdout = "\"unterminated\n";
+        assert!(!dig_txt_contains_exact(stdout, "unterminated"));
+        let stdout = "no-quotes-at-all\n";
+        assert!(!dig_txt_contains_exact(stdout, "no-quotes-at-all"));
     }
 
     #[tokio::test]
