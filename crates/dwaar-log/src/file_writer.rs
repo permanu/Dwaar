@@ -9,8 +9,14 @@
 //! Writes JSON lines to a file and rotates when `max_bytes` is exceeded.
 //! Rotation uses POSIX rename (atomic) to shift files: `access.log` →
 //! `access.log.1` → `access.log.2` → ... up to `keep` files.
+//!
+//! An optional `max_age_secs` field enables time-based TTL pruning of rotated
+//! files. Pruning runs at rotation time and, when set, also runs periodically
+//! in a background task at half the TTL interval.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
@@ -28,6 +34,9 @@ pub struct FileRotationWriter {
     path: PathBuf,
     max_bytes: u64,
     keep: u32,
+    /// Optional TTL for rotated files. When set, rotated files older than this
+    /// duration are deleted at rotation time and periodically in the background.
+    pub max_age_secs: Option<u64>,
     state: Mutex<FileState>,
 }
 
@@ -42,6 +51,7 @@ impl std::fmt::Debug for FileRotationWriter {
             .field("path", &self.path)
             .field("max_bytes", &self.max_bytes)
             .field("keep", &self.keep)
+            .field("max_age_secs", &self.max_age_secs)
             .finish_non_exhaustive()
     }
 }
@@ -52,11 +62,68 @@ impl FileRotationWriter {
             path,
             max_bytes,
             keep,
+            max_age_secs: None,
             state: Mutex::new(FileState {
                 file: None,
                 current_size: 0,
             }),
         }
+    }
+
+    /// Create a writer with time-based TTL pruning enabled.
+    ///
+    /// Spawns a background task that prunes rotated files older than
+    /// `max_age_secs` at an interval of `max_age_secs / 2`.
+    pub fn new_with_max_age(
+        path: PathBuf,
+        max_bytes: u64,
+        keep: u32,
+        max_age_secs: u64,
+    ) -> Arc<Self> {
+        let writer = Arc::new(Self {
+            path,
+            max_bytes,
+            keep,
+            max_age_secs: Some(max_age_secs),
+            state: Mutex::new(FileState {
+                file: None,
+                current_size: 0,
+            }),
+        });
+
+        // Spawn background pruning task. Uses the directory of the log path and
+        // the TTL. The task runs independently; if the writer is dropped the
+        // task will eventually notice and exit (Arc weak ref not needed here
+        // because the task holds a clone of the Arc, keeping the writer alive
+        // as long as rotation is needed — acceptable for a long-lived service).
+        let dir = writer
+            .path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
+        let base_name = writer
+            .path
+            .file_name()
+            .map(std::ffi::OsStr::to_os_string)
+            .unwrap_or_default();
+        let max_age = Duration::from_secs(max_age_secs);
+        let interval_secs = (max_age_secs / 2).max(1);
+
+        tokio::task::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+            loop {
+                ticker.tick().await;
+                let dir = dir.clone();
+                let base_name = base_name.clone();
+                tokio::task::spawn_blocking(move || {
+                    prune_old_files(&dir, &base_name, max_age);
+                })
+                .await
+                .ok();
+            }
+        });
+
+        writer
     }
 
     async fn open_file(&self) -> Result<(tokio::fs::File, u64), std::io::Error> {
@@ -99,7 +166,129 @@ impl FileRotationWriter {
             tokio::fs::rename(&self.path, &first_rotated).await?;
         }
 
+        // Time-based TTL pruning: remove rotated files older than max_age_secs.
+        if let Some(max_age_secs) = self.max_age_secs {
+            let max_age = Duration::from_secs(max_age_secs);
+            let dir = self
+                .path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf();
+            let base_name = self
+                .path
+                .file_name()
+                .map(std::ffi::OsStr::to_os_string)
+                .unwrap_or_default();
+            tokio::task::spawn_blocking(move || {
+                prune_old_files(&dir, &base_name, max_age);
+            })
+            .await
+            .ok();
+        }
+
         Ok(())
+    }
+}
+
+/// Walk `dir` and delete rotated log files (those whose names start with
+/// `base_name` followed by `.`) whose mtime is older than `max_age`.
+///
+/// Only ROTATED files (e.g., `access.log.1`, `access.log.2`) are considered;
+/// the active log file itself is never touched. I/O errors on individual files
+/// are silently ignored after a `warn!` log — one bad file must not abort
+/// cleanup.
+fn prune_old_files(dir: &Path, base_name: &std::ffi::OsStr, max_age: Duration) {
+    let now = SystemTime::now();
+
+    // Build the prefix string we expect rotated files to start with:
+    // e.g., "access.log." so that "access.log" itself is excluded.
+    let prefix = {
+        let mut s = base_name.to_string_lossy().into_owned();
+        s.push('.');
+        s
+    };
+
+    let read_dir = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            warn!(
+                target: "dwaar::log::retention",
+                error = %e,
+                dir = %dir.display(),
+                "failed to read log directory for pruning"
+            );
+            return;
+        }
+    };
+
+    for entry_result in read_dir {
+        let entry = match entry_result {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(
+                    target: "dwaar::log::retention",
+                    error = %e,
+                    "failed to read directory entry during pruning"
+                );
+                continue;
+            }
+        };
+
+        let file_name = entry.file_name();
+        let name_str = file_name.to_string_lossy();
+
+        // Only process rotated files (e.g., access.log.1, access.log.2).
+        if !name_str.starts_with(&prefix) {
+            continue;
+        }
+
+        // Verify the suffix after the prefix is numeric (pure rotation files).
+        let suffix = &name_str[prefix.len()..];
+        if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+
+        let metadata = match std::fs::metadata(entry.path()) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(
+                    target: "dwaar::log::retention",
+                    error = %e,
+                    path = %entry.path().display(),
+                    "failed to stat rotated log file"
+                );
+                continue;
+            }
+        };
+
+        let mtime = match metadata.modified() {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(
+                    target: "dwaar::log::retention",
+                    error = %e,
+                    path = %entry.path().display(),
+                    "failed to get mtime for rotated log file"
+                );
+                continue;
+            }
+        };
+
+        // mtime in the future is clock skew — skip.
+        let Ok(age) = now.duration_since(mtime) else {
+            continue;
+        };
+
+        if age > max_age
+            && let Err(e) = std::fs::remove_file(entry.path())
+        {
+            warn!(
+                target: "dwaar::log::retention",
+                error = %e,
+                path = %entry.path().display(),
+                "failed to delete expired rotated log file"
+            );
+        }
     }
 }
 
@@ -239,5 +428,44 @@ mod tests {
     fn is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<FileRotationWriter>();
+    }
+
+    #[tokio::test]
+    async fn max_age_secs_field_defaults_to_none() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("access.log");
+        let writer = FileRotationWriter::new(path, 1_000_000, 3);
+        assert!(writer.max_age_secs.is_none());
+    }
+
+    #[test]
+    fn prune_old_files_does_not_touch_active_or_non_rotated_files() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let base = std::ffi::OsStr::new("access.log");
+
+        // The active log file — must never be pruned.
+        let active_path = dir.path().join("access.log");
+        std::fs::write(&active_path, b"active").expect("create active file");
+
+        // A file with a non-numeric suffix — must not be pruned.
+        let unrelated = dir.path().join("access.log.bak");
+        std::fs::write(&unrelated, b"backup").expect("create unrelated file");
+
+        // A recently created rotated file — age is ~0s, far below any TTL.
+        let recent = dir.path().join("access.log.1");
+        std::fs::write(&recent, b"recent rotation").expect("create rotated file");
+
+        // Prune with a generous TTL so recently-written files stay put.
+        prune_old_files(dir.path(), base, Duration::from_secs(86400));
+
+        assert!(active_path.exists(), "active log must not be touched");
+        assert!(
+            unrelated.exists(),
+            "non-numeric suffix file must not be touched"
+        );
+        assert!(
+            recent.exists(),
+            "recently rotated file within TTL must be kept"
+        );
     }
 }

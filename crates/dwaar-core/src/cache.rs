@@ -51,6 +51,20 @@ pub fn leaked_cache_backend_bytes() -> u64 {
     LEAKED_BACKEND_BYTES.load(Ordering::Relaxed)
 }
 
+/// Total number of individual `Box::leak` calls made for cache reload structs
+/// since process start. Each [`new_cache_backend`] call increments this by 3
+/// (one for each of `LruManager`, `MemCache`, and `CacheLock`). Exposed so the
+/// metrics crate can surface cumulative leak pressure without requiring a
+/// Prometheus integration here.
+static CACHE_RELOAD_LEAKS: AtomicU64 = AtomicU64::new(0);
+
+/// Total individual `Box::leak` calls for cache backend structs since process
+/// start. Exposed for metrics; the Prometheus exporter can read this via its
+/// own scheduled scrape without any direct wiring here.
+pub fn leaked_reload_count() -> u64 {
+    CACHE_RELOAD_LEAKS.load(Ordering::Relaxed)
+}
+
 // ---------------------------------------------------------------------------
 // Per-route cache configuration
 // ---------------------------------------------------------------------------
@@ -155,14 +169,59 @@ pub type SharedCacheBackend = std::sync::Arc<arc_swap::ArcSwap<Option<CacheBacke
 /// most a handful of times per deployment the cumulative leak is
 /// negligible.
 pub fn new_cache_backend(max_size: usize) -> CacheBackend {
-    let eviction = Box::leak(Box::new(LruManager::<16>::with_capacity(max_size, 1024)));
-    let storage = Box::leak(Box::new(MemCache::new()));
-    let lock = Box::leak(Box::new(CacheLock::new(Duration::from_secs(10))));
+    // WHY Box::leak: Pingora's Storage trait requires `&'static` references to
+    // the backing store, eviction manager, and cache lock.  The only safe way
+    // to produce a `'static` reference from a heap allocation (without a true
+    // program-lifetime static) is `Box::leak`, which forfeits ownership to the
+    // allocator and prevents the destructor from ever running.
+    //
+    // On the first call this is effectively free.  On subsequent calls (config
+    // reload / eviction-budget resize) the *old* structs are abandoned — their
+    // control-struct memory (~1 KB total) leaks permanently because in-flight
+    // requests may still hold `&'static` refs to them.  The actual cached data
+    // inside the old `MemCache` is freed when those refs drop; only the tiny
+    // control structs accumulate.  Reloads are rare (operator-driven), so the
+    // total leak stays negligible over a typical deployment lifetime.
+    // Monitor via `leaked_reload_count()` / `leaked_cache_backend_bytes()`.
+
+    // SAFETY: Box::leak is intentional — see comment above.
+    let eviction: &'static LruManager<16> =
+        Box::leak(Box::new(LruManager::<16>::with_capacity(max_size, 1024)));
+    CACHE_RELOAD_LEAKS.fetch_add(1, Ordering::Relaxed);
+    tracing::debug!(
+        target: "dwaar::cache::reload",
+        leaked_bytes = std::mem::size_of::<LruManager<16>>(),
+        "Box::leak: LruManager<16> promoted to 'static for Pingora cache backend"
+    );
+
+    let storage: &'static MemCache = Box::leak(Box::new(MemCache::new()));
+    CACHE_RELOAD_LEAKS.fetch_add(1, Ordering::Relaxed);
+    tracing::debug!(
+        target: "dwaar::cache::reload",
+        leaked_bytes = std::mem::size_of::<MemCache>(),
+        "Box::leak: MemCache promoted to 'static for Pingora cache backend"
+    );
+
+    let lock: &'static CacheLock = Box::leak(Box::new(CacheLock::new(Duration::from_secs(10))));
+    CACHE_RELOAD_LEAKS.fetch_add(1, Ordering::Relaxed);
+    tracing::debug!(
+        target: "dwaar::cache::reload",
+        leaked_bytes = std::mem::size_of::<CacheLock>(),
+        "Box::leak: CacheLock promoted to 'static for Pingora cache backend"
+    );
 
     // Record the leak so operators can monitor cumulative growth and
     // recycle the process if rebuilds happen far more often than expected.
     LEAKED_BACKEND_COUNT.fetch_add(1, Ordering::Relaxed);
     LEAKED_BACKEND_BYTES.fetch_add(APPROX_BACKEND_OVERHEAD_BYTES, Ordering::Relaxed);
+
+    tracing::warn!(
+        target: "dwaar::cache::reload",
+        total_leaked_backends = LEAKED_BACKEND_COUNT.load(Ordering::Relaxed),
+        total_leak_calls = CACHE_RELOAD_LEAKS.load(Ordering::Relaxed),
+        "cache backend structs leaked for 'static lifetime; \
+         monitor leaked_reload_count() for accumulation"
+    );
 
     CacheBackend {
         storage,

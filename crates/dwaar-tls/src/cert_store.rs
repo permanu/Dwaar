@@ -11,7 +11,8 @@
 
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+
+use parking_lot::Mutex;
 
 use lru::LruCache;
 use openssl::pkey::{PKey, Private};
@@ -51,16 +52,9 @@ impl std::fmt::Debug for CertStore {
 }
 
 impl CertStore {
-    fn lock_cache(&self) -> std::sync::MutexGuard<'_, LruCache<String, CachedCert>> {
-        // Fail-fast on poisoning. A poisoned mutex means a previous holder
-        // panicked mid-update, leaving the cache in a partially-mutated state.
-        // Continuing on a corrupted cert cache risks serving the wrong cert
-        // (or no cert) to a TLS handshake — strictly worse than a restart,
-        // because the supervisor will recover us cleanly while the security
-        // posture stays intact.
-        self.cache
-            .lock()
-            .expect("cert cache mutex poisoned — refusing to serve from corrupted state")
+    fn lock_cache(&self) -> parking_lot::MutexGuard<'_, LruCache<String, CachedCert>> {
+        // parking_lot::Mutex cannot be poisoned — lock() always succeeds.
+        self.cache.lock()
     }
 
     /// Create a new cert store loading from `cert_dir` with the given cache capacity.

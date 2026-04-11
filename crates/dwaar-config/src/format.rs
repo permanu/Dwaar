@@ -141,6 +141,7 @@ fn format_directive_at_depth(out: &mut String, directive: &Directive, depth: usi
         Directive::AcmeServer(r) => format_recognized(out, "acme_server", r),
         Directive::Cache(c) => format_cache(out, c, depth),
         Directive::WasmPlugin(wp) => format_wasm_plugin(out, wp, depth),
+        Directive::Grpc => out.push_str("grpc"),
     }
 }
 

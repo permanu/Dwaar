@@ -12,7 +12,7 @@
 
 use std::fmt::Write as FmtWrite;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, bail};
@@ -21,6 +21,8 @@ const BASE_URL: &str = "https://releases.dwaar.dev";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Run the self-update flow. Returns a human-readable status message.
+// Self-update is an interactive CLI subcommand; println! is correct here.
+#[allow(clippy::disallowed_macros, clippy::print_stdout)]
 pub(crate) fn run(force: bool) -> anyhow::Result<()> {
     let latest_tag = fetch_latest_version()?;
     let latest_version = latest_tag.strip_prefix('v').unwrap_or(&latest_tag);
@@ -57,9 +59,9 @@ pub(crate) fn run(force: bool) -> anyhow::Result<()> {
     println!("Checksum OK.");
 
     // Find current binary path
-    let current_exe = std::env::current_exe().context("cannot determine current executable path")?;
-    let install_path = fs::canonicalize(&current_exe)
-        .unwrap_or(current_exe);
+    let current_exe =
+        std::env::current_exe().context("cannot determine current executable path")?;
+    let install_path = fs::canonicalize(&current_exe).unwrap_or(current_exe);
 
     // Atomic replace: write to .new, rename over old
     let new_path = install_path.with_extension("new");
@@ -132,8 +134,8 @@ fn curl_download(url: &str, dest: &Path) -> anyhow::Result<()> {
 /// The checksum file is expected to be in the format produced by `sha256sum`:
 /// `<hex>  <filename>\n`
 fn verify_sha256(binary: &Path, checksum_file: &Path) -> anyhow::Result<()> {
-    let expected_line = fs::read_to_string(checksum_file)
-        .context("failed to read checksum file")?;
+    let expected_line =
+        fs::read_to_string(checksum_file).context("failed to read checksum file")?;
     let expected_hash = expected_line
         .split_whitespace()
         .next()
@@ -231,8 +233,8 @@ mod tests {
         let content = b"hello world";
         std::fs::write(&bin_path, content).expect("write bin");
 
-        let digest = openssl::hash::hash(openssl::hash::MessageDigest::sha256(), content)
-            .expect("hash");
+        let digest =
+            openssl::hash::hash(openssl::hash::MessageDigest::sha256(), content).expect("hash");
         let hex = hex_encode(&digest);
         std::fs::write(&sha_path, format!("{hex}  test-binary\n")).expect("write sha");
 
@@ -246,12 +248,17 @@ mod tests {
         let sha_path = dir.path().join("test-binary.sha256");
 
         std::fs::write(&bin_path, b"hello world").expect("write bin");
-        std::fs::write(&sha_path, "0000000000000000000000000000000000000000000000000000000000000000  test-binary\n")
-            .expect("write sha");
+        std::fs::write(
+            &sha_path,
+            "0000000000000000000000000000000000000000000000000000000000000000  test-binary\n",
+        )
+        .expect("write sha");
 
         let result = verify_sha256(&bin_path, &sha_path);
         assert!(result.is_err(), "should fail on mismatch");
-        let err = result.unwrap_err().to_string();
+        let err = result
+            .expect_err("verify_sha256 should fail on mismatch")
+            .to_string();
         assert!(err.contains("checksum mismatch"), "error: {err}");
     }
 }

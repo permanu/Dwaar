@@ -14,6 +14,7 @@
 use async_trait::async_trait;
 use tokio::io::AsyncWriteExt as _;
 use tracing::{debug, warn};
+use zeroize::Zeroizing;
 
 use crate::dns::{DnsError, DnsProvider};
 
@@ -25,13 +26,13 @@ const CF_API_BASE: &str = "https://api.cloudflare.com/client/v4";
 /// target zone. The token is passed via config: `tls { dns cloudflare <token> }`.
 #[derive(Debug)]
 pub struct CloudflareDnsProvider {
-    api_token: String,
+    api_token: Zeroizing<String>,
 }
 
 impl CloudflareDnsProvider {
     pub fn new(api_token: impl Into<String>) -> Self {
         Self {
-            api_token: api_token.into(),
+            api_token: Zeroizing::new(api_token.into()),
         }
     }
 
@@ -57,7 +58,7 @@ impl CloudflareDnsProvider {
 
         // Write the auth header to the child's stdin, then close it
         if let Some(mut stdin) = child.stdin.take() {
-            let header = format!("Authorization: Bearer {}\n", self.api_token);
+            let header = format!("Authorization: Bearer {}\n", self.api_token.as_str());
             stdin
                 .write_all(header.as_bytes())
                 .await

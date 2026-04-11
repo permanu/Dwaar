@@ -63,10 +63,10 @@ fn start_test_server(socket_path: &str, tcp_port: u16) -> std::thread::JoinHandl
     let socket_path_owned = socket_path.to_string();
     let socket_path_poll = socket_path.to_string();
     let handle = std::thread::spawn(move || {
-        let socket_path = socket_path_owned;
         use pingora_core::server::Server;
         use pingora_core::server::configuration::{Opt as PingoraOpt, ServerConf};
 
+        let socket_path = socket_path_owned;
         let conf = ServerConf {
             grace_period_seconds: Some(1),
             graceful_shutdown_timeout_seconds: Some(1),

@@ -696,23 +696,27 @@ pub(super) fn parse_forward_auth(
         });
     }
 
-    let (uri, copy_headers, tls) = parse_forward_auth_body(t)?;
+    let (uri, copy_headers, tls, insecure_plaintext) = parse_forward_auth_body(t)?;
 
     Ok(ForwardAuthDirective {
         upstream,
         uri,
         copy_headers,
         tls,
+        insecure_plaintext,
     })
 }
 
 /// Parse the body of a `forward_auth { ... }` block.
+// Flat directive-dispatch loop — splitting it would scatter related parse arms.
+#[allow(clippy::too_many_lines)]
 fn parse_forward_auth_body(
     t: &mut Tokenizer<'_>,
-) -> Result<(Option<String>, Vec<String>, bool), ParseError> {
+) -> Result<(Option<String>, Vec<String>, bool, bool), ParseError> {
     let mut uri = None;
     let mut copy_headers = Vec::new();
     let mut tls = false;
+    let mut insecure_plaintext = false;
 
     loop {
         let tok = t.peek();
@@ -774,6 +778,25 @@ fn parse_forward_auth_body(
                     }
                     tls = true;
                 }
+                "insecure_plaintext" => {
+                    t.next_token();
+                    // Accept bare `insecure_plaintext` or `insecure_plaintext true/false`
+                    let next = t.peek();
+                    match &next.kind {
+                        TokenKind::Word(v) if v == "true" => {
+                            t.next_token();
+                            insecure_plaintext = true;
+                        }
+                        TokenKind::Word(v) if v == "false" => {
+                            t.next_token();
+                            insecure_plaintext = false;
+                        }
+                        // bare word (no value) — treat as true
+                        _ => {
+                            insecure_plaintext = true;
+                        }
+                    }
+                }
                 other => {
                     return Err(ParseError {
                         line: tok.line,
@@ -798,7 +821,7 @@ fn parse_forward_auth_body(
         }
     }
 
-    Ok((uri, copy_headers, tls))
+    Ok((uri, copy_headers, tls, insecure_plaintext))
 }
 
 /// `try_files /index.html /fallback.html`

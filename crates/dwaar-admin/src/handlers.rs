@@ -64,6 +64,13 @@ pub fn add_route(route_table: &ArcSwap<RouteTable>, body: &[u8]) -> Result<Strin
         Arc::new(RouteTable::new(routes))
     });
 
+    tracing::info!(
+        target: "dwaar::admin::audit",
+        action = "route_add",
+        principal = "admin",
+        resource = %route.domain,
+        "admin mutation"
+    );
     serde_json::to_string(&route).map_err(|e| format!("serialize error: {e}"))
 }
 
@@ -106,6 +113,15 @@ pub fn delete_route(route_table: &ArcSwap<RouteTable>, domain: &str) -> Option<S
         Arc::new(RouteTable::new(routes))
     });
 
+    if existed {
+        tracing::info!(
+            target: "dwaar::admin::audit",
+            action = "route_delete",
+            principal = "admin",
+            resource = %domain_lower,
+            "admin mutation"
+        );
+    }
     existed.then_some(domain_lower)
 }
 
@@ -133,10 +149,21 @@ pub async fn purge_cache_key(
     let span = Span::inactive();
     let handle = span.handle();
 
-    storage
+    let purged = storage
         .purge(&compact, PurgeType::Invalidation, &handle)
         .await
-        .unwrap_or(false)
+        .unwrap_or(false);
+
+    if purged {
+        tracing::info!(
+            target: "dwaar::admin::audit",
+            action = "cache_purge",
+            principal = "admin",
+            resource = %key_str,
+            "admin mutation"
+        );
+    }
+    purged
 }
 
 #[cfg(test)]

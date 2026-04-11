@@ -43,6 +43,12 @@ pub struct GlobalOptions {
     /// When set, a background service periodically checks releases.dwaar.dev
     /// for newer versions and applies them within the configured window.
     pub auto_update: Option<AutoUpdateConfig>,
+    /// Top-level `layer4 { ... }` app block — raw L4 TCP proxy servers.
+    /// Compiled into runtime `CompiledL4Server`s by `compile_l4_servers`.
+    pub layer4: Option<Layer4Config>,
+    /// Listener-wrapper form: sites that share a listener with an L4 matcher
+    /// front (caddy-l4 fall-through). Compiled by `compile_l4_wrappers`.
+    pub layer4_listener_wrappers: Vec<Layer4ListenerWrapper>,
     /// Options we recognized but don't act on — stored so we never error
     /// on valid Caddyfile syntax we haven't implemented yet.
     pub passthrough: Vec<(String, Vec<String>)>,
@@ -403,6 +409,13 @@ pub enum Directive {
     // ── ISSUE-101: WASM plugin directive ─────────────────────────────────────
     /// `wasm_plugin /path/to/plugin.wasm { priority 50; fuel 1000000; ... }`
     WasmPlugin(WasmPluginDirective),
+
+    // ── H2: gRPC route marker ─────────────────────────────────────────────
+    /// `grpc` — bare marker that designates this handler block as a gRPC route.
+    ///
+    /// When present, the runtime applies H2 ALPN enforcement and a 1 GiB body
+    /// cap regardless of `Content-Type`. No arguments.
+    Grpc,
 }
 
 /// `cache { max_size 1g; match_path /static/* /assets/*; default_ttl 3600; stale_while_revalidate 60 }`
@@ -786,6 +799,12 @@ pub struct ForwardAuthDirective {
     pub copy_headers: Vec<String>,
     /// Use TLS when connecting to the auth service (`transport tls`).
     pub tls: bool,
+    /// Explicit opt-in to plaintext subrequests to non-loopback auth services.
+    ///
+    /// Defaults to `false`. Set to `true` only for development environments
+    /// where TLS to the auth service is not available. The runtime will still
+    /// log a warning on first use.
+    pub insecure_plaintext: bool,
 }
 
 /// `root` — set the filesystem root for `file_server`.
@@ -985,6 +1004,148 @@ pub struct WasmPluginDirective {
     /// Plugins receive these via the host API during initialisation.
     pub config: Vec<(String, String)>,
 }
+
+// ── Layer 4 (TCP proxy) model types ──────────────────────────────────────────
+//
+// These types represent the output of `parser/layer4.rs` and are consumed by
+// `compile.rs` to produce runtime-ready `CompiledL4Server` values.
+
+/// Top-level `layer4 { ... }` app block from a Caddyfile.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Layer4Config {
+    /// All server stanzas inside the `layer4 { }` block.
+    pub servers: Vec<Layer4Server>,
+}
+
+/// One server entry: one or more listen addresses sharing the same routes.
+///
+/// ```text
+/// :443 :8443 {
+///     route { ... }
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Layer4Server {
+    /// Raw listen addresses (e.g. `":443"`, `"0.0.0.0:8080"`).
+    pub listen: Vec<String>,
+    /// Named matcher definitions declared inside the server block.
+    pub matchers: Vec<Layer4MatcherDef>,
+    /// Routes declared inside the server block.
+    pub routes: Vec<Layer4Route>,
+}
+
+/// An intermediate parse result for a block that contains matchers + routes.
+///
+/// Used for both `Layer4Server` bodies and `subroute` bodies. `Default` is
+/// required by `parse_subroute_handler` which starts with an empty route set.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Layer4RouteSet {
+    pub matchers: Vec<Layer4MatcherDef>,
+    pub routes: Vec<Layer4Route>,
+}
+
+/// A named L4 matcher definition: `@name matcher …`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Layer4MatcherDef {
+    /// Name without the `@` prefix.
+    pub name: String,
+    /// Matcher conditions. All must pass (AND logic).
+    pub matchers: Vec<Layer4Matcher>,
+}
+
+/// A single L4 matcher condition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Layer4Matcher {
+    /// `tls [sni …] [alpn …]` — match TLS `ClientHello` fields.
+    Tls {
+        sni: Vec<String>,
+        alpn: Vec<String>,
+        options: Vec<Layer4Option>,
+    },
+    /// `http [host …]` — match HTTP/1.1 Host header.
+    Http {
+        host: Vec<String>,
+        options: Vec<Layer4Option>,
+    },
+    /// `ssh` — match SSH protocol handshake.
+    Ssh,
+    /// `postgres` — match `PostgreSQL` wire-protocol startup.
+    Postgres,
+    /// `remote_ip 10.0.0.0/8 …` — match peer CIDR.
+    RemoteIp(Vec<String>),
+    /// `not <matcher>` — invert the inner matcher.
+    Not(Box<Layer4Matcher>),
+    /// Unknown matcher keyword — stored verbatim for forward compat.
+    Unknown { name: String, args: Vec<String> },
+}
+
+/// A generic key + args option used inside L4 handlers and matchers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Layer4Option {
+    pub name: String,
+    pub args: Vec<String>,
+}
+
+/// One `route` block inside an L4 server or subroute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Layer4Route {
+    /// Named matchers that must ALL pass (AND logic). Empty = catch-all.
+    pub matcher_names: Vec<String>,
+    /// Handlers executed in order for matching connections.
+    pub handlers: Vec<Layer4Handler>,
+}
+
+/// An L4 route handler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Layer4Handler {
+    /// `proxy <upstream> …` — forward raw TCP bytes to upstream.
+    Proxy(Layer4ProxyHandler),
+    /// `tls { … }` — TLS termination / pass-through.
+    Tls(Layer4TlsHandler),
+    /// `subroute { … }` — nested route set with optional matching timeout.
+    Subroute(Layer4SubrouteHandler),
+    /// Unknown handler keyword — stored verbatim for forward compat.
+    Unknown { name: String, args: Vec<String> },
+}
+
+/// `proxy` handler configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Layer4ProxyHandler {
+    /// Upstream addresses (raw strings, resolved at compile time).
+    pub upstreams: Vec<String>,
+    /// Generic options (`lb_policy`, `max_fails`, `health_timeout`, …).
+    pub options: Vec<Layer4Option>,
+}
+
+/// `tls` handler configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Layer4TlsHandler {
+    /// Generic TLS sub-directives (cert, key, ca, …).
+    pub options: Vec<Layer4Option>,
+}
+
+/// `subroute` handler — a nested L4 route set with an optional detect timeout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Layer4SubrouteHandler {
+    /// `matching_timeout 3s` — how long to buffer data for protocol detection.
+    pub matching_timeout: Option<String>,
+    /// Named matcher definitions inside the subroute block.
+    pub matchers: Vec<Layer4MatcherDef>,
+    /// Routes inside the subroute block.
+    pub routes: Vec<Layer4Route>,
+}
+
+/// Listener-wrapper fallthrough — a site block address that carries an embedded
+/// L4 route set (used when a listener is shared between HTTP and raw TCP).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Layer4ListenerWrapper {
+    /// The listen address this wrapper is attached to (e.g. `":443"`).
+    pub listen: String,
+    /// The L4 route set parsed from the wrapper block.
+    pub layer4: Layer4RouteSet,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 impl DwaarConfig {
     /// Create an empty config with no global options and no sites.

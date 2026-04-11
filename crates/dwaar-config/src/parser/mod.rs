@@ -33,6 +33,7 @@
 
 mod directives;
 mod helpers;
+pub(super) mod layer4;
 mod matchers;
 mod observe;
 mod transforms;
@@ -336,6 +337,7 @@ fn parse_timeout_duration(val: &str, directive: &str, tok: &Token) -> Result<u32
 }
 
 /// Parse the `auto_update { ... }` global block.
+#[allow(clippy::too_many_lines)] // Structurally flat: each directive is one match arm; splitting harms readability
 fn parse_auto_update_block(
     t: &mut Tokenizer<'_>,
     key_tok: &Token,
@@ -461,7 +463,7 @@ fn parse_auto_update_block(
     Ok(cfg)
 }
 
-/// Parse "HH:MM-HH:MM" into (start_minutes_from_midnight, end_minutes_from_midnight).
+/// Parse "HH:MM-HH:MM" into (`start_minutes_from_midnight`, `end_minutes_from_midnight`).
 fn parse_time_window(s: &str) -> Option<(u16, u16)> {
     let (start, end) = s.split_once('-')?;
     let parse_hm = |hm: &str| -> Option<u16> {
@@ -790,6 +792,7 @@ fn parse_directive(t: &mut Tokenizer<'_>) -> Result<Directive, ParseError> {
         // ── Simple flags ────────────────────────────────────────────────────
         "abort" => Ok(Directive::Abort),
         "skip_log" | "log_skip" => Ok(Directive::SkipLog),
+        "grpc" => Ok(Directive::Grpc),
 
         // import directives are expanded by the preprocessor before parsing.
         // If one reaches here, the preprocessor missed it — that's a bug.

@@ -20,7 +20,7 @@ use http::Response;
 use pingora_core::apps::http_app::ServeHttp;
 use pingora_core::protocols::http::ServerSession;
 use tokio::sync::Notify;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::auth::Auth;
 use crate::handlers;
@@ -224,7 +224,7 @@ impl AdminService {
         session: &mut ServerSession,
         method: &str,
         path: &str,
-        source: &str,
+        _source: &str,
     ) -> Response<Vec<u8>> {
         match (method, path) {
             ("GET", "/routes") => match handlers::list_routes(&self.route_table) {
@@ -237,7 +237,17 @@ impl AdminService {
                     Err((status, msg)) => json_error(status, &msg),
                     Ok(data) => match handlers::add_route(&self.route_table, &data) {
                         Ok(json) => {
-                            info!(source, "route added/updated via admin API");
+                            let resource = serde_json::from_slice::<serde_json::Value>(&data)
+                                .ok()
+                                .and_then(|v| v["domain"].as_str().map(str::to_owned))
+                                .unwrap_or_else(|| "<unknown>".to_owned());
+                            tracing::info!(
+                                target: "dwaar::admin::audit",
+                                action = "route_add",
+                                principal = "admin",
+                                resource = %resource,
+                                "admin mutation"
+                            );
                             json_response(201, &json)
                         }
                         Err(e) => json_error(400, &e),
@@ -254,7 +264,13 @@ impl AdminService {
                 }
                 match handlers::delete_route(&self.route_table, domain) {
                     Some(deleted) => {
-                        info!(source, domain = %deleted, "route deleted via admin API");
+                        tracing::info!(
+                            target: "dwaar::admin::audit",
+                            action = "route_delete",
+                            principal = "admin",
+                            resource = %deleted,
+                            "admin mutation"
+                        );
                         json_deleted(&deleted)
                     }
                     None => json_response(404, r#"{"error":"route not found"}"#),
@@ -306,7 +322,13 @@ impl AdminService {
                     }
                     self.last_reload.store(now, Ordering::Relaxed);
                     notify.notify_waiters();
-                    info!(source, "config reload triggered via admin API");
+                    tracing::info!(
+                        target: "dwaar::admin::audit",
+                        action = "config_reload",
+                        principal = "admin",
+                        resource = "dwaarfile",
+                        "admin mutation"
+                    );
                     json_response(200, r#"{"message":"config reload triggered"}"#)
                 }
                 None => json_response(
@@ -332,7 +354,13 @@ impl AdminService {
                 match storage {
                     Some(storage) => {
                         if handlers::purge_cache_key(storage, key_path).await {
-                            info!(source, key = key_path, "cache entry purged");
+                            tracing::info!(
+                                target: "dwaar::admin::audit",
+                                action = "cache_purge",
+                                principal = "admin",
+                                resource = %key_path,
+                                "admin mutation"
+                            );
                             json_response(200, r#"{"purged":true}"#)
                         } else {
                             json_response(404, r#"{"purged":false,"reason":"not found"}"#)

@@ -41,8 +41,7 @@ impl BackgroundService for AutoUpdateService {
         // Initial delay: jitter up to 10% of the check interval to prevent
         // thundering herd when many instances start at the same time
         // (e.g. Kubernetes rolling restart).
-        let jitter_secs = (fastrand::u64(0..=self.config.check_interval_secs / 10))
-            .max(30);
+        let jitter_secs = (fastrand::u64(0..=self.config.check_interval_secs / 10)).max(30);
         info!(
             check_interval = ?base_interval,
             initial_delay_secs = jitter_secs,
@@ -104,23 +103,29 @@ impl AutoUpdateService {
         );
 
         // Check maintenance window
-        if let Some((start, end)) = self.config.window {
-            if !in_maintenance_window(start, end) {
-                let (sh, sm) = (start / 60, start % 60);
-                let (eh, em) = (end / 60, end % 60);
-                info!(
-                    window = format_args!("{sh:02}:{sm:02}-{eh:02}:{em:02} UTC"),
-                    "auto-update: deferring until maintenance window"
-                );
-                return;
-            }
+        if let Some((start, end)) = self.config.window
+            && !in_maintenance_window(start, end)
+        {
+            let (sh, sm) = (start / 60, start % 60);
+            let (eh, em) = (end / 60, end % 60);
+            info!(
+                window = format_args!("{sh:02}:{sm:02}-{eh:02}:{em:02} UTC"),
+                "auto-update: deferring until maintenance window"
+            );
+            return;
         }
 
         // Apply the update
-        info!(target_version = latest_version, "auto-update: applying update");
+        info!(
+            target_version = latest_version,
+            "auto-update: applying update"
+        );
         match tokio::task::spawn_blocking(|| crate::self_update::run(true)).await {
             Ok(Ok(())) => {
-                info!(version = latest_version, "auto-update: binary replaced successfully");
+                info!(
+                    version = latest_version,
+                    "auto-update: binary replaced successfully"
+                );
             }
             Ok(Err(e)) => {
                 error!(error = %e, "auto-update: failed to apply update");
@@ -157,10 +162,7 @@ fn fetch_latest_version() -> anyhow::Result<String> {
         .output()?;
 
     if !output.status.success() {
-        anyhow::bail!(
-            "curl failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        anyhow::bail!("curl failed: {}", String::from_utf8_lossy(&output.stderr));
     }
 
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
@@ -187,9 +189,7 @@ fn in_maintenance_window(start: u16, end: u16) -> bool {
 /// Trigger a zero-downtime upgrade by execing `dwaar upgrade`.
 fn trigger_reload() -> anyhow::Result<()> {
     let current_exe = std::env::current_exe()?;
-    let status = Command::new(&current_exe)
-        .args(["upgrade"])
-        .status()?;
+    let status = Command::new(&current_exe).args(["upgrade"]).status()?;
 
     if !status.success() {
         anyhow::bail!("dwaar upgrade exited with status {status}");

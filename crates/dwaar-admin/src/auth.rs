@@ -10,13 +10,15 @@
 /// the `DWAAR_ADMIN_TOKEN` environment variable.
 #[derive(Debug)]
 pub struct Auth {
-    token: Option<String>,
+    token: Option<zeroize::Zeroizing<String>>,
 }
 
 impl Auth {
     /// Create a new authenticator. `None` means no token configured (fail-closed).
     pub fn new(token: Option<String>) -> Self {
-        Self { token }
+        Self {
+            token: token.map(zeroize::Zeroizing::new),
+        }
     }
 
     /// Check an `Authorization` header value. Returns `Ok(())` if valid.

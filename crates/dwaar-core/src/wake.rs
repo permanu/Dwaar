@@ -17,7 +17,7 @@
 //! |---|---|
 //! | Performance | `AtomicU8` state + `Notify` — no mutex on the wake-check fast path |
 //! | Reliability | Single wake command per upstream (coalesced); bounded timeout prevents hangs |
-//! | Security | Wake command runs via shell — operator controls what runs |
+//! | Security | Wake command runs via direct `Command::new` — no shell, no interpolation; binary must be an absolute path |
 //! | Competitive Parity | Matches Traefik's `ServersTransport` wake behavior |
 
 use std::net::SocketAddr;
@@ -142,9 +142,21 @@ impl ScaleToZeroConfig {
 
     /// Execute the wake command and poll health until the backend responds.
     async fn run_wake_cycle(&self, upstream_addr: SocketAddr) -> Result<(), WakeError> {
-        // Run the wake command via shell.
+        // Split the wake command into binary + args and validate the binary path.
+        let mut parts = self.wake_command.split_whitespace();
+        let binary = parts.next().unwrap_or("");
+        if !binary.starts_with('/') {
+            warn!(
+                "wake command '{}' is not an absolute path — specify absolute path to avoid PATH-based injection",
+                binary
+            );
+            return Err(WakeError::CommandPathNotAbsolute(binary.to_string()));
+        }
+        let args: Vec<String> = parts.map(str::to_owned).collect();
+
+        // Run the wake command directly — no shell, no interpolation.
         let cmd_result =
-            tokio::time::timeout(self.wake_timeout, run_shell_command(&self.wake_command)).await;
+            tokio::time::timeout(self.wake_timeout, run_direct_command(binary, &args)).await;
 
         match cmd_result {
             Ok(Ok(output)) => {
@@ -202,6 +214,8 @@ pub enum WakeError {
     CommandExecFailed(String),
     /// The health poll timed out — backend never became reachable.
     HealthPollTimeout,
+    /// The wake command binary is not an absolute path.
+    CommandPathNotAbsolute(String),
 }
 
 impl std::fmt::Display for WakeError {
@@ -213,15 +227,20 @@ impl std::fmt::Display for WakeError {
             }
             Self::CommandExecFailed(msg) => write!(f, "failed to exec wake command: {msg}"),
             Self::HealthPollTimeout => write!(f, "health poll timed out after wake command"),
+            Self::CommandPathNotAbsolute(bin) => {
+                write!(f, "wake command binary '{bin}' is not an absolute path")
+            }
         }
     }
 }
 
-/// Run a shell command asynchronously.
-async fn run_shell_command(command: &str) -> Result<std::process::Output, std::io::Error> {
-    tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg(command)
+/// Run a command directly — no shell, no interpolation.
+async fn run_direct_command(
+    binary: &str,
+    args: &[String],
+) -> Result<std::process::Output, std::io::Error> {
+    tokio::process::Command::new(binary)
+        .args(args)
         .output()
         .await
 }
@@ -315,10 +334,11 @@ mod tests {
 
     #[tokio::test]
     async fn wake_and_wait_with_successful_command() {
-        // Use "true" as the wake command — always succeeds.
+        // `/usr/bin/true` — always succeeds. Absolute path is required by the
+        // command validation added for M3 (shell-injection hardening).
         // Use a port that won't be listening so health poll fails,
         // but set a short timeout to avoid hanging.
-        let cfg = ScaleToZeroConfig::new(Duration::from_millis(500), "true".to_string());
+        let cfg = ScaleToZeroConfig::new(Duration::from_millis(500), "/usr/bin/true".to_string());
         let addr = test_addr();
 
         // This should fail with HealthPollTimeout because nothing is listening.
@@ -330,10 +350,8 @@ mod tests {
 
     #[tokio::test]
     async fn wake_and_wait_with_failing_command() {
-        let cfg = ScaleToZeroConfig::new(
-            Duration::from_secs(2),
-            "false".to_string(), // "false" exits with code 1
-        );
+        // `/usr/bin/false` exits with code 1. Absolute path required by M3.
+        let cfg = ScaleToZeroConfig::new(Duration::from_secs(2), "/usr/bin/false".to_string());
         let addr = test_addr();
 
         let result = cfg.wake_and_wait(addr).await;
@@ -355,7 +373,7 @@ mod tests {
 
         let cfg = Arc::new(ScaleToZeroConfig::new(
             Duration::from_secs(5),
-            "true".to_string(),
+            "/usr/bin/true".to_string(),
         ));
 
         // Spawn multiple concurrent wake requests.

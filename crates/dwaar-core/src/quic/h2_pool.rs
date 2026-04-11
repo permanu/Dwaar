@@ -33,8 +33,9 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Mutex;
 use std::time::Duration;
+
+use parking_lot::Mutex;
 
 use bytes::Bytes;
 use h2::client::SendRequest;
@@ -101,10 +102,7 @@ impl H2ConnPool {
     /// returns an error on `send_request()` if the connection is dead.
     /// The caller should call `evict_and_reconnect()` on failure.
     pub fn acquire(&self, addr: SocketAddr) -> Option<SendRequest<Bytes>> {
-        let conns = self
-            .conns
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let conns = self.conns.lock();
         let entries = conns.get(&addr)?;
         if entries.is_empty() {
             return None;
@@ -115,10 +113,7 @@ impl H2ConnPool {
 
     /// Remove all connections for a host (called after `send_request` fails).
     pub fn evict(&self, addr: SocketAddr) {
-        let mut conns = self
-            .conns
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut conns = self.conns.lock();
         conns.remove(&addr);
     }
 
@@ -154,14 +149,9 @@ impl H2ConnPool {
         // Spawn the connection driver — it must be polled to completion
         // for the H2 protocol to function. On error/GOAWAY, it removes
         // itself from the pool.
-        let pool_ref = self
-            .conns
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // We need a way for the driver to remove itself. Since we can't
         // give it &self (lifetime issues), we use a separate approach:
         // the driver just logs. Dead connections are evicted lazily in acquire().
-        drop(pool_ref);
 
         tokio::spawn({
             let addr_copy = addr;
@@ -177,10 +167,7 @@ impl H2ConnPool {
         // Insert into pool.
         let cloned = sender.clone();
         {
-            let mut conns = self
-                .conns
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut conns = self.conns.lock();
             let entries = conns.entry(addr).or_default();
             if entries.len() < MAX_CONNS_PER_HOST {
                 entries.push(H2Conn { sender });
@@ -307,8 +294,8 @@ mod tests {
         let _s3 = pool.connect(addr).await.expect("connect 3");
 
         // Pool should have at most MAX_CONNS_PER_HOST entries.
-        let conns = pool.conns.lock().unwrap();
-        let count = conns.get(&addr).map_or(0, |v| v.len());
+        let conns = pool.conns.lock();
+        let count = conns.get(&addr).map_or(0, Vec::len);
         assert!(
             count <= MAX_CONNS_PER_HOST,
             "pool has {count} conns, expected <= {MAX_CONNS_PER_HOST}"
@@ -330,9 +317,8 @@ mod tests {
                     break;
                 };
                 tokio::spawn(async move {
-                    let mut conn = match server::handshake(tcp).await {
-                        Ok(c) => c,
-                        Err(_) => return,
+                    let Ok(mut conn) = server::handshake(tcp).await else {
+                        return;
                     };
                     while let Some(Ok((_req, mut respond))) = conn.accept().await {
                         let response = http::Response::builder()
@@ -357,7 +343,7 @@ mod tests {
         let req = http::Request::builder()
             .uri("http://localhost/a")
             .body(())
-            .unwrap();
+            .expect("build request a");
         let (resp, _) = sender1.send_request(req, true).expect("send");
         let resp: http::Response<h2::RecvStream> = resp.await.expect("response");
         assert_eq!(resp.status(), 200);
@@ -371,7 +357,7 @@ mod tests {
         let req = http::Request::builder()
             .uri("http://localhost/b")
             .body(())
-            .unwrap();
+            .expect("build request b");
         let (resp, _) = sender2
             .send_request(req, true)
             .expect("send after reconnect");

@@ -18,18 +18,15 @@ use crate::plugin::{DwaarPlugin, PluginAction, PluginCtx};
 ///
 /// Priority 100 — runs after feature plugins (bot, rate limit) but the
 /// exact ordering doesn't matter since it only modifies response headers.
-#[derive(Debug)]
-pub struct SecurityHeadersPlugin;
+#[derive(Debug, Default)]
+pub struct SecurityHeadersPlugin {
+    pub content_security_policy: Option<String>,
+    pub content_security_policy_report_only: Option<String>,
+}
 
 impl SecurityHeadersPlugin {
     pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for SecurityHeadersPlugin {
-    fn default() -> Self {
-        Self::new()
+        Self::default()
     }
 }
 
@@ -68,6 +65,13 @@ impl DwaarPlugin for SecurityHeadersPlugin {
         // Replace upstream server banner to avoid fingerprinting
         resp.insert_header("Server", "Dwaar")
             .expect("static header value");
+
+        if let Some(ref csp) = self.content_security_policy {
+            let _ = resp.insert_header("Content-Security-Policy", csp.as_str());
+        }
+        if let Some(ref csp_ro) = self.content_security_policy_report_only {
+            let _ = resp.insert_header("Content-Security-Policy-Report-Only", csp_ro.as_str());
+        }
 
         PluginAction::Continue
     }

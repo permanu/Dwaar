@@ -35,13 +35,15 @@ use dwaar_tls::cert_store::CertStore;
 
 /// Default matching timeout — how long we wait for enough bytes to arrive
 /// for protocol detection before dropping the connection.
+#[allow(dead_code)] // reserved for per-server timeout default wiring
 const DEFAULT_MATCHING_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Maximum bytes to peek for protocol detection. TLS ClientHello is
+/// Maximum bytes to peek for protocol detection. TLS `ClientHello` is
 /// typically <500 bytes; we allow up to 4 KB to handle large SNI lists.
 const MAX_PEEK_BYTES: usize = 4096;
 
 /// Buffer size for the bidirectional splice loop.
+#[allow(dead_code)] // reserved for future zero-copy splice path
 const SPLICE_BUF_SIZE: usize = 64 * 1024;
 
 // ── Compiled L4 config (runtime representation) ─────────────────────────
@@ -64,18 +66,13 @@ pub struct CompiledL4Route {
 /// Protocol matchers compiled from config.
 #[derive(Debug, Clone)]
 pub enum CompiledL4Matcher {
-    /// Match TLS ClientHello. If sni/alpn are empty, matches any TLS.
-    Tls {
-        sni: Vec<String>,
-        alpn: Vec<String>,
-    },
+    /// Match TLS `ClientHello`. If sni/alpn are empty, matches any TLS.
+    Tls { sni: Vec<String>, alpn: Vec<String> },
     /// Match HTTP request line.
-    Http {
-        host: Vec<String>,
-    },
+    Http { host: Vec<String> },
     /// Match SSH version string (`SSH-`).
     Ssh,
-    /// Match PostgreSQL startup message.
+    /// Match `PostgreSQL` startup message.
     Postgres,
     /// Match source IP against CIDR ranges.
     RemoteIp(Vec<ipnet::IpNet>),
@@ -200,7 +197,7 @@ pub enum CompiledL4Handler {
     /// TLS termination — decrypt then pass to the next handler in the chain.
     ///
     /// Carries the cert store so the acceptor can look up the right cert for
-    /// the SNI hostname parsed from the ClientHello peek. We avoid baking in
+    /// the SNI hostname parsed from the `ClientHello` peek. We avoid baking in
     /// an `SslAcceptor` because certs are hot-reloadable; the store handles
     /// its own LRU cache.
     Tls {
@@ -237,8 +234,13 @@ impl Clone for CompiledL4Handler {
                 fail_duration: *fail_duration,
                 connect_timeout: *connect_timeout,
             },
-            Self::Tls { cert_store } => Self::Tls { cert_store: cert_store.clone() },
-            Self::Subroute { routes, matching_timeout } => Self::Subroute {
+            Self::Tls { cert_store } => Self::Tls {
+                cert_store: cert_store.clone(),
+            },
+            Self::Subroute {
+                routes,
+                matching_timeout,
+            } => Self::Subroute {
                 routes: routes.clone(),
                 matching_timeout: *matching_timeout,
             },
@@ -355,7 +357,7 @@ async fn run_listener(
                     }
                 }
             }
-            _ = shutdown_signal(&shutdown) => {
+            () = shutdown_signal(&shutdown) => {
                 info!("L4 listener shutting down");
                 return;
             }
@@ -408,7 +410,10 @@ fn route_matches(route: &CompiledL4Route, peeked: &[u8], peer: SocketAddr) -> bo
         return true;
     }
     // All matchers must match (AND logic within a route).
-    route.matchers.iter().all(|m| matcher_matches(m, peeked, peer))
+    route
+        .matchers
+        .iter()
+        .all(|m| matcher_matches(m, peeked, peer))
 }
 
 fn matcher_matches(matcher: &CompiledL4Matcher, peeked: &[u8], peer: SocketAddr) -> bool {
@@ -422,8 +427,7 @@ fn matcher_matches(matcher: &CompiledL4Matcher, peeked: &[u8], peer: SocketAddr)
                             .sni
                             .as_ref()
                             .is_some_and(|s| sni.iter().any(|pattern| sni_matches(pattern, s)));
-                    let alpn_ok = alpn.is_empty()
-                        || hello.alpn.iter().any(|a| alpn.contains(a));
+                    let alpn_ok = alpn.is_empty() || hello.alpn.iter().any(|a| alpn.contains(a));
                     sni_ok && alpn_ok
                 }
                 None => false,
@@ -475,174 +479,160 @@ fn sni_matches(pattern: &str, sni: &str) -> bool {
 
 // ── Handler execution ───────────────────────────────────────────────────
 
+// The handler dispatch is inherently wide: each match arm handles a distinct
+// protocol path (proxy, TLS termination, subroute) with its own error paths.
+// Splitting it would require threading state across functions without clarity gain.
+#[allow(clippy::too_many_lines)]
 async fn execute_handlers(
     handlers: &[CompiledL4Handler],
     stream: TcpStream,
     peer: SocketAddr,
-    _peeked: &[u8],
+    peeked: &[u8],
 ) -> Result<(), L4Error> {
-    // Walk handlers in order. The Tls handler converts the stream to a
-    // decrypted trait object and delegates the remaining chain.
-    for (idx, handler) in handlers.iter().enumerate() {
-        match handler {
-            CompiledL4Handler::Proxy {
-                upstreams,
-                health,
-                lb_policy,
-                rr_counter,
-                max_fails,
-                fail_duration,
-                connect_timeout,
-            } => {
-                if upstreams.is_empty() {
-                    return Err(L4Error::NoUpstream);
-                }
+    // Dispatch the first handler, then delegate the tail recursively.
+    // Each arm always returns — the handler either completes the connection
+    // or hands off the remainder of the chain (Tls, Subroute).
+    let Some((idx, handler)) = handlers.iter().enumerate().next() else {
+        return Ok(());
+    };
+    match handler {
+        CompiledL4Handler::Proxy {
+            upstreams,
+            health,
+            lb_policy,
+            rr_counter,
+            max_fails,
+            fail_duration,
+            connect_timeout,
+        } => {
+            if upstreams.is_empty() {
+                return Err(L4Error::NoUpstream);
+            }
 
-                let upstream_addr = select_upstream(
-                    upstreams,
-                    health,
-                    *lb_policy,
-                    rr_counter,
-                    peer,
-                )
+            let upstream_addr = select_upstream(upstreams, health, *lb_policy, rr_counter, peer)
                 .ok_or(L4Error::AllUpstreamsUnhealthy)?;
 
-                // Find the health slot for the selected upstream so we can
-                // record the outcome after the connect attempt.
-                let health_slot = health.iter().find(|h| h.addr == upstream_addr);
+            // Find the health slot for the selected upstream so we can
+            // record the outcome after the connect attempt.
+            let health_slot = health.iter().find(|h| h.addr == upstream_addr);
 
-                debug!(
-                    peer = %peer,
-                    upstream = %upstream_addr,
-                    policy = ?lb_policy,
-                    "L4 proxy: connecting to upstream"
-                );
+            debug!(
+                peer = %peer,
+                upstream = %upstream_addr,
+                policy = ?lb_policy,
+                "L4 proxy: connecting to upstream"
+            );
 
-                match tokio::time::timeout(
-                    *connect_timeout,
-                    TcpStream::connect(upstream_addr),
-                )
-                .await
-                {
-                    Err(_) => {
-                        // Connect timed out — record passive failure.
-                        if let Some(slot) = health_slot {
-                            if slot.record_failure(*max_fails, *fail_duration) {
-                                warn!(
-                                    upstream = %upstream_addr,
-                                    max_fails,
-                                    fail_secs = fail_duration.as_secs(),
-                                    "L4 upstream quarantined after repeated connect timeouts"
-                                );
-                            }
-                        }
-                        return Err(L4Error::UpstreamTimeout(upstream_addr));
+            match tokio::time::timeout(*connect_timeout, TcpStream::connect(upstream_addr)).await {
+                Err(_) => {
+                    // Connect timed out — record passive failure.
+                    if let Some(slot) = health_slot
+                        && slot.record_failure(*max_fails, *fail_duration)
+                    {
+                        warn!(
+                            upstream = %upstream_addr,
+                            max_fails,
+                            fail_secs = fail_duration.as_secs(),
+                            "L4 upstream quarantined after repeated connect timeouts"
+                        );
                     }
-                    Ok(Err(e)) => {
-                        // Connect refused or I/O error — record passive failure.
-                        if let Some(slot) = health_slot {
-                            if slot.record_failure(*max_fails, *fail_duration) {
-                                warn!(
-                                    upstream = %upstream_addr,
-                                    max_fails,
-                                    fail_secs = fail_duration.as_secs(),
-                                    "L4 upstream quarantined after repeated connect failures"
-                                );
-                            }
-                        }
-                        return Err(L4Error::UpstreamConnect(upstream_addr, e));
+                    Err(L4Error::UpstreamTimeout(upstream_addr))
+                }
+                Ok(Err(e)) => {
+                    // Connect refused or I/O error — record passive failure.
+                    if let Some(slot) = health_slot
+                        && slot.record_failure(*max_fails, *fail_duration)
+                    {
+                        warn!(
+                            upstream = %upstream_addr,
+                            max_fails,
+                            fail_secs = fail_duration.as_secs(),
+                            "L4 upstream quarantined after repeated connect failures"
+                        );
                     }
-                    Ok(Ok(upstream)) => {
-                        // Successful connect — clear any prior failure streak.
-                        if let Some(slot) = health_slot {
-                            slot.record_success();
-                            slot.active_conns.fetch_add(1, Ordering::Relaxed);
-                        }
-
-                        let result = splice(stream, upstream).await;
-
-                        if let Some(slot) = health_slot {
-                            // Saturating sub prevents underflow if something is
-                            // very wrong and release is called twice.
-                            slot.active_conns
-                                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                                    Some(v.saturating_sub(1))
-                                })
-                                .ok();
-                        }
-
-                        return result;
+                    Err(L4Error::UpstreamConnect(upstream_addr, e))
+                }
+                Ok(Ok(upstream)) => {
+                    // Successful connect — clear any prior failure streak.
+                    if let Some(slot) = health_slot {
+                        slot.record_success();
+                        slot.active_conns.fetch_add(1, Ordering::Relaxed);
                     }
+
+                    let result = splice(stream, upstream).await;
+
+                    if let Some(slot) = health_slot {
+                        // Saturating sub prevents underflow if something is
+                        // very wrong and release is called twice.
+                        slot.active_conns
+                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                                Some(v.saturating_sub(1))
+                            })
+                            .ok();
+                    }
+
+                    result
                 }
             }
-            CompiledL4Handler::Tls { cert_store } => {
-                let Some(cert_store) = cert_store else {
-                    warn!(peer = %peer, "L4 TLS handler: no cert store injected — dropping connection");
-                    return Ok(());
-                };
+        }
+        CompiledL4Handler::Tls { cert_store } => {
+            let Some(cert_store) = cert_store else {
+                warn!(peer = %peer, "L4 TLS handler: no cert store injected — dropping connection");
+                return Ok(());
+            };
 
-                // Build an acceptor using the cert for the SNI we already parsed
-                // from the peeked ClientHello. The acceptor is built per-connection
-                // because each connection may carry a different SNI. CertStore
-                // handles its own LRU caching of the parsed cert+key.
-                let sni = parse_tls_client_hello(_peeked).and_then(|h| h.sni);
+            // Build an acceptor using the cert for the SNI we already parsed
+            // from the peeked `ClientHello`. The acceptor is built per-connection
+            // because each connection may carry a different SNI. CertStore
+            // handles its own LRU caching of the parsed cert+key.
+            let sni = parse_tls_client_hello(peeked).and_then(|h| h.sni);
 
-                let acceptor = build_ssl_acceptor(cert_store, sni.as_deref(), peer)?;
+            let acceptor = build_ssl_acceptor(cert_store, sni.as_deref(), peer)?;
 
-                // Drive the TLS handshake asynchronously.
-                // The ClientHello bytes are still in the kernel socket buffer
-                // (we only peeked, never consumed) so openssl reads them naturally.
-                // `SslStream::new` + `accept()` is the correct tokio-openssl API —
-                // there is no free `tokio_openssl::accept` function.
-                let ssl = openssl::ssl::Ssl::new(acceptor.context())
-                    .map_err(|e| L4Error::TlsConfig(e.to_string()))?;
-                let mut tls_stream =
-                    tokio_openssl::SslStream::new(ssl, stream)
-                        .map_err(|e| L4Error::TlsConfig(e.to_string()))?;
-                tokio::time::timeout(
-                    Duration::from_secs(10),
-                    std::pin::Pin::new(&mut tls_stream).accept(),
-                )
-                .await
-                .map_err(|_| L4Error::TlsHandshakeTimeout)?
-                .map_err(|e| L4Error::TlsHandshake(e.to_string()))?;
+            // Drive the TLS handshake asynchronously.
+            // The `ClientHello` bytes are still in the kernel socket buffer
+            // (we only peeked, never consumed) so openssl reads them naturally.
+            // `SslStream::new` + `accept()` is the correct tokio-openssl API —
+            // there is no free `tokio_openssl::accept` function.
+            let ssl = openssl::ssl::Ssl::new(acceptor.context())
+                .map_err(|e| L4Error::TlsConfig(e.to_string()))?;
+            let mut tls_stream = tokio_openssl::SslStream::new(ssl, stream)
+                .map_err(|e| L4Error::TlsConfig(e.to_string()))?;
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                std::pin::Pin::new(&mut tls_stream).accept(),
+            )
+            .await
+            .map_err(|_| L4Error::TlsHandshakeTimeout)?
+            .map_err(|e| L4Error::TlsHandshake(e.to_string()))?;
 
-                debug!(peer = %peer, sni = ?sni, "L4 TLS handshake complete");
+            debug!(peer = %peer, sni = ?sni, "L4 TLS handshake complete");
 
-                // Delegate the remaining handlers to the decrypted stream path.
-                let decrypted: Box<dyn RwStream> = Box::new(tls_stream);
-                return execute_handlers_on_decrypted(&handlers[idx + 1..], decrypted, peer)
-                    .await;
-            }
-            CompiledL4Handler::Subroute { routes, matching_timeout } => {
-                // Subroute on a raw TCP stream: the bytes were peeked in
-                // handle_connection and are still in the kernel socket buffer
-                // (peek does not advance the read position). Re-match against
-                // nested routes using those same bytes, then delegate.
-                let matched = routes.iter().find(|r| route_matches(r, _peeked, peer));
-                let route = match matched {
-                    Some(r) => r,
-                    None => {
-                        debug!(
-                            peer = %peer,
-                            timeout = ?matching_timeout,
-                            "L4 subroute: no sub-route matched"
-                        );
-                        return Ok(());
-                    }
-                };
-                // Box::pin breaks the infinite future size caused by async recursion.
-                return Box::pin(execute_handlers(
-                    &route.handlers,
-                    stream,
-                    peer,
-                    _peeked,
-                ))
-                .await;
-            }
+            // Delegate the remaining handlers to the decrypted stream path.
+            let decrypted: Box<dyn RwStream> = Box::new(tls_stream);
+            execute_handlers_on_decrypted(&handlers[idx + 1..], decrypted, peer).await
+        }
+        CompiledL4Handler::Subroute {
+            routes,
+            matching_timeout,
+        } => {
+            // Subroute on a raw TCP stream: the bytes were peeked in
+            // handle_connection and are still in the kernel socket buffer
+            // (peek does not advance the read position). Re-match against
+            // nested routes using those same bytes, then delegate.
+            let matched = routes.iter().find(|r| route_matches(r, peeked, peer));
+            let Some(route) = matched else {
+                debug!(
+                    peer = %peer,
+                    timeout = ?matching_timeout,
+                    "L4 subroute: no sub-route matched"
+                );
+                return Ok(());
+            };
+            // Box::pin breaks the infinite future size caused by async recursion.
+            Box::pin(execute_handlers(&route.handlers, stream, peer, peeked)).await
         }
     }
-    Ok(())
 }
 
 // ── Load balancing ──────────────────────────────────────────────────────
@@ -792,17 +782,17 @@ async fn splice(client: TcpStream, upstream: TcpStream) -> Result<(), L4Error> {
 
 // ── Protocol detection ──────────────────────────────────────────────────
 
-/// Minimal TLS ClientHello fields we care about for matching.
+/// Minimal TLS `ClientHello` fields we care about for matching.
 struct TlsClientHello {
     sni: Option<String>,
     alpn: Vec<String>,
 }
 
-/// Parse a TLS ClientHello to extract SNI and ALPN.
+/// Parse a TLS `ClientHello` to extract SNI and ALPN.
 ///
 /// Only parses enough to find the extensions we need — doesn't validate
 /// the full handshake. Returns None if the bytes don't look like a
-/// ClientHello.
+/// `ClientHello`.
 fn parse_tls_client_hello(data: &[u8]) -> Option<TlsClientHello> {
     // TLS record: type(1) + version(2) + length(2) + handshake
     if data.len() < 5 || data[0] != 0x16 {
@@ -873,29 +863,27 @@ fn parse_tls_client_hello(data: &[u8]) -> Option<TlsClientHello> {
             0x0000 => {
                 // SNI extension
                 if ext_len >= 5 {
-                    let name_len =
-                        u16::from_be_bytes([hs[pos + 3], hs[pos + 4]]) as usize;
-                    if pos + 5 + name_len <= ext_end {
-                        if let Ok(name) = std::str::from_utf8(&hs[pos + 5..pos + 5 + name_len]) {
-                            sni = Some(name.to_lowercase());
-                        }
+                    let name_len = u16::from_be_bytes([hs[pos + 3], hs[pos + 4]]) as usize;
+                    if pos + 5 + name_len <= ext_end
+                        && let Ok(name) = std::str::from_utf8(&hs[pos + 5..pos + 5 + name_len])
+                    {
+                        sni = Some(name.to_lowercase());
                     }
                 }
             }
             0x0010 => {
                 // ALPN extension
                 if ext_len >= 2 {
-                    let list_len =
-                        u16::from_be_bytes([hs[pos], hs[pos + 1]]) as usize;
+                    let list_len = u16::from_be_bytes([hs[pos], hs[pos + 1]]) as usize;
                     let mut apos = pos + 2;
                     let aend = (pos + 2 + list_len).min(ext_end);
                     while apos < aend {
                         let proto_len = hs[apos] as usize;
                         apos += 1;
-                        if apos + proto_len <= aend {
-                            if let Ok(proto) = std::str::from_utf8(&hs[apos..apos + proto_len]) {
-                                alpn.push(proto.to_string());
-                            }
+                        if apos + proto_len <= aend
+                            && let Ok(proto) = std::str::from_utf8(&hs[apos..apos + proto_len])
+                        {
+                            alpn.push(proto.to_string());
                         }
                         apos += proto_len;
                     }
@@ -929,7 +917,10 @@ fn extract_http_host(data: &[u8]) -> Option<&str> {
         if line.is_empty() {
             break;
         }
-        if let Some(value) = line.strip_prefix("Host: ").or_else(|| line.strip_prefix("host: ")) {
+        if let Some(value) = line
+            .strip_prefix("Host: ")
+            .or_else(|| line.strip_prefix("host: "))
+        {
             // Strip port if present
             return Some(value.split(':').next().unwrap_or(value).trim());
         }
@@ -991,7 +982,11 @@ struct PrefixedStream<S> {
 
 impl<S> PrefixedStream<S> {
     fn new(prefix: Vec<u8>, inner: S) -> Self {
-        Self { prefix, pos: 0, inner }
+        Self {
+            prefix,
+            pos: 0,
+            inner,
+        }
     }
 }
 
@@ -1045,120 +1040,117 @@ async fn execute_handlers_on_decrypted(
     mut stream: Box<dyn RwStream>,
     peer: SocketAddr,
 ) -> Result<(), L4Error> {
-    for (_idx, handler) in handlers.iter().enumerate() {
-        match handler {
-            CompiledL4Handler::Proxy {
-                upstreams,
-                health,
-                lb_policy,
-                rr_counter,
-                max_fails,
-                fail_duration,
-                connect_timeout,
-            } => {
-                if upstreams.is_empty() {
-                    return Err(L4Error::NoUpstream);
-                }
-                let upstream_addr =
-                    select_upstream(upstreams, health, *lb_policy, rr_counter, peer)
-                        .ok_or(L4Error::AllUpstreamsUnhealthy)?;
-
-                let health_slot = health.iter().find(|h| h.addr == upstream_addr);
-
-                debug!(
-                    peer = %peer,
-                    upstream = %upstream_addr,
-                    "L4 proxy (post-TLS): connecting to upstream"
-                );
-
-                match tokio::time::timeout(*connect_timeout, TcpStream::connect(upstream_addr))
-                    .await
-                {
-                    Err(_) => {
-                        if let Some(slot) = health_slot {
-                            if slot.record_failure(*max_fails, *fail_duration) {
-                                warn!(
-                                    upstream = %upstream_addr,
-                                    "L4 upstream quarantined after connect timeout (post-TLS)"
-                                );
-                            }
-                        }
-                        return Err(L4Error::UpstreamTimeout(upstream_addr));
-                    }
-                    Ok(Err(e)) => {
-                        if let Some(slot) = health_slot {
-                            if slot.record_failure(*max_fails, *fail_duration) {
-                                warn!(
-                                    upstream = %upstream_addr,
-                                    "L4 upstream quarantined after connect failure (post-TLS)"
-                                );
-                            }
-                        }
-                        return Err(L4Error::UpstreamConnect(upstream_addr, e));
-                    }
-                    Ok(Ok(upstream)) => {
-                        if let Some(slot) = health_slot {
-                            slot.record_success();
-                            slot.active_conns.fetch_add(1, Ordering::Relaxed);
-                        }
-                        let result = copy_bidirectional(stream, upstream).await;
-                        if let Some(slot) = health_slot {
-                            slot.active_conns
-                                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                                    Some(v.saturating_sub(1))
-                                })
-                                .ok();
-                        }
-                        return result;
-                    }
-                }
+    // Dispatch the first handler; each arm always returns or delegates the tail.
+    let Some(handler) = handlers.first() else {
+        return Ok(());
+    };
+    match handler {
+        CompiledL4Handler::Proxy {
+            upstreams,
+            health,
+            lb_policy,
+            rr_counter,
+            max_fails,
+            fail_duration,
+            connect_timeout,
+        } => {
+            if upstreams.is_empty() {
+                return Err(L4Error::NoUpstream);
             }
+            let upstream_addr = select_upstream(upstreams, health, *lb_policy, rr_counter, peer)
+                .ok_or(L4Error::AllUpstreamsUnhealthy)?;
 
-            CompiledL4Handler::Tls { .. } => {
-                // Nested TLS after TLS is not a valid config — wrapping an
-                // already-decrypted stream in another SSL layer would corrupt
-                // the protocol. Fail fast rather than produce undefined behaviour.
-                warn!(peer = %peer, "L4: nested Tls handler after TLS — dropping connection");
-                return Err(L4Error::InvalidHandlerChain(
-                    "Tls handler cannot follow another Tls handler".into(),
-                ));
-            }
+            let health_slot = health.iter().find(|h| h.addr == upstream_addr);
 
-            CompiledL4Handler::Subroute { routes, matching_timeout } => {
-                // We cannot peek on an SslStream, so we do a real read into a
-                // prefix buffer for protocol detection, then replay those bytes
-                // via PrefixedStream so the downstream handler sees a complete
-                // stream including what we already consumed.
-                let mut prefix = vec![0u8; MAX_PEEK_BYTES];
-                let n = tokio::time::timeout(*matching_timeout, stream.read(&mut prefix))
-                    .await
-                    .map_err(|_| L4Error::MatchingTimeout)?
-                    .map_err(L4Error::Io)?;
-                prefix.truncate(n);
+            debug!(
+                peer = %peer,
+                upstream = %upstream_addr,
+                "L4 proxy (post-TLS): connecting to upstream"
+            );
 
-                let matched = routes.iter().find(|r| route_matches(r, &prefix, peer));
-                let route = match matched {
-                    Some(r) => r,
-                    None => {
-                        debug!(peer = %peer, "L4 post-TLS subroute: no sub-route matched");
-                        return Ok(());
+            match tokio::time::timeout(*connect_timeout, TcpStream::connect(upstream_addr)).await {
+                Err(_) => {
+                    if let Some(slot) = health_slot
+                        && slot.record_failure(*max_fails, *fail_duration)
+                    {
+                        warn!(
+                            upstream = %upstream_addr,
+                            "L4 upstream quarantined after connect timeout (post-TLS)"
+                        );
                     }
-                };
-
-                let prefixed: Box<dyn RwStream> =
-                    Box::new(PrefixedStream::new(prefix, stream));
-
-                // Box::pin breaks the infinite future size caused by async recursion.
-                return Box::pin(execute_handlers_on_decrypted(
-                    &route.handlers,
-                    prefixed,
-                    peer,
-                ))
-                .await;
+                    Err(L4Error::UpstreamTimeout(upstream_addr))
+                }
+                Ok(Err(e)) => {
+                    if let Some(slot) = health_slot
+                        && slot.record_failure(*max_fails, *fail_duration)
+                    {
+                        warn!(
+                            upstream = %upstream_addr,
+                            "L4 upstream quarantined after connect failure (post-TLS)"
+                        );
+                    }
+                    Err(L4Error::UpstreamConnect(upstream_addr, e))
+                }
+                Ok(Ok(upstream)) => {
+                    if let Some(slot) = health_slot {
+                        slot.record_success();
+                        slot.active_conns.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let result = copy_bidirectional(stream, upstream).await;
+                    if let Some(slot) = health_slot {
+                        slot.active_conns
+                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                                Some(v.saturating_sub(1))
+                            })
+                            .ok();
+                    }
+                    result
+                }
             }
         }
+
+        CompiledL4Handler::Tls { .. } => {
+            // Nested TLS after TLS is not a valid config — wrapping an
+            // already-decrypted stream in another SSL layer would corrupt
+            // the protocol. Fail fast rather than produce undefined behaviour.
+            warn!(peer = %peer, "L4: nested Tls handler after TLS — dropping connection");
+            Err(L4Error::InvalidHandlerChain(
+                "Tls handler cannot follow another Tls handler".into(),
+            ))
+        }
+
+        CompiledL4Handler::Subroute {
+            routes,
+            matching_timeout,
+        } => {
+            // We cannot peek on an SslStream, so we do a real read into a
+            // prefix buffer for protocol detection, then replay those bytes
+            // via PrefixedStream so the downstream handler sees a complete
+            // stream including what we already consumed.
+            let mut prefix = vec![0u8; MAX_PEEK_BYTES];
+            let n = tokio::time::timeout(*matching_timeout, stream.read(&mut prefix))
+                .await
+                .map_err(|_| L4Error::MatchingTimeout)?
+                .map_err(L4Error::Io)?;
+            prefix.truncate(n);
+
+            let matched = routes.iter().find(|r| route_matches(r, &prefix, peer));
+            let Some(route) = matched else {
+                debug!(peer = %peer, "L4 post-TLS subroute: no sub-route matched");
+                return Ok(());
+            };
+
+            let prefixed: Box<dyn RwStream> = Box::new(PrefixedStream::new(prefix, stream));
+
+            // Box::pin breaks the infinite future size caused by async recursion.
+            Box::pin(execute_handlers_on_decrypted(
+                &route.handlers,
+                prefixed,
+                peer,
+            ))
+            .await
+        }
     }
-    Ok(())
 }
 
 /// Build an `SslAcceptor` for a single TLS handshake.
@@ -1179,12 +1171,10 @@ fn build_ssl_acceptor(
     // No client cert verification at L4 — mTLS is the HTTP layer's concern.
     builder.set_verify(SslVerifyMode::NONE);
 
-    let cached = sni
-        .and_then(|name| cert_store.get(name))
-        .ok_or_else(|| {
-            warn!(peer = %peer, sni = ?sni, "L4 TLS: no cert for SNI — dropping");
-            L4Error::TlsNoCert(sni.map(str::to_owned))
-        })?;
+    let cached = sni.and_then(|name| cert_store.get(name)).ok_or_else(|| {
+        warn!(peer = %peer, sni = ?sni, "L4 TLS: no cert for SNI — dropping");
+        L4Error::TlsNoCert(sni.map(str::to_owned))
+    })?;
 
     builder
         .set_certificate(&cached.cert)
@@ -1205,10 +1195,7 @@ fn build_ssl_acceptor(
 ///
 /// Mirrors `splice` but works on `Box<dyn RwStream>` (post-TLS) instead of
 /// two `TcpStream`s.
-async fn copy_bidirectional(
-    client: Box<dyn RwStream>,
-    upstream: TcpStream,
-) -> Result<(), L4Error> {
+async fn copy_bidirectional(client: Box<dyn RwStream>, upstream: TcpStream) -> Result<(), L4Error> {
     let (mut cr, mut cw) = tokio::io::split(client);
     let (mut ur, mut uw) = tokio::io::split(upstream);
 
@@ -1237,6 +1224,7 @@ async fn copy_bidirectional(
 // ── Compilation helpers (no config model dependency) ────────────────────
 
 /// Parse a listen address like `:8443`, `127.0.0.1:5000`, or `0.0.0.0:443`.
+#[allow(dead_code)] // used in tests and compile.rs (not yet wired)
 fn parse_listen_addr(s: &str) -> Option<SocketAddr> {
     // Handle `:port` shorthand → `0.0.0.0:port`
     let normalized = if s.starts_with(':') {
@@ -1254,13 +1242,16 @@ fn parse_listen_addr(s: &str) -> Option<SocketAddr> {
 }
 
 /// Parse a duration string like "3s", "500ms", "1m".
+#[allow(dead_code)] // used in tests and compile.rs (not yet wired)
 fn parse_duration(s: &str) -> Option<Duration> {
     if let Some(rest) = s.strip_suffix("ms") {
         rest.parse().ok().map(Duration::from_millis)
     } else if let Some(rest) = s.strip_suffix('s') {
         rest.parse().ok().map(Duration::from_secs)
     } else if let Some(rest) = s.strip_suffix('m') {
-        rest.parse::<u64>().ok().map(|m| Duration::from_secs(m * 60))
+        rest.parse::<u64>()
+            .ok()
+            .map(|m| Duration::from_secs(m * 60))
     } else {
         s.parse().ok().map(Duration::from_secs)
     }
@@ -1269,6 +1260,7 @@ fn parse_duration(s: &str) -> Option<Duration> {
 // ── Tests ───────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // unwrap() is idiomatic in test code
 mod tests {
     use super::*;
 
@@ -1314,7 +1306,7 @@ mod tests {
         // PostgreSQL v3.0 startup: length(4) + version 196608(4) + params
         let mut msg = vec![0u8; 16];
         msg[0..4].copy_from_slice(&12u32.to_be_bytes()); // length
-        msg[4..8].copy_from_slice(&196608u32.to_be_bytes()); // version 3.0
+        msg[4..8].copy_from_slice(&196_608_u32.to_be_bytes()); // version 3.0
         assert!(matcher_matches(&matcher, &msg, peer));
         assert!(!matcher_matches(&matcher, b"GET /", peer));
     }
@@ -1401,13 +1393,20 @@ mod tests {
     #[test]
     fn round_robin_distributes_evenly() {
         let handler = make_proxy_handler(&[8080, 8081, 8082], L4LoadBalancePolicy::RoundRobin);
-        let CompiledL4Handler::Proxy { upstreams, health, lb_policy, ref rr_counter, .. } = handler else {
+        let CompiledL4Handler::Proxy {
+            upstreams,
+            health,
+            lb_policy,
+            ref rr_counter,
+            ..
+        } = handler
+        else {
             panic!("expected Proxy");
         };
         let mut counts = [0usize; 3];
         let ports = [8080u16, 8081, 8082];
         for _ in 0..30 {
-            let sel = select_upstream(&upstreams, &health, lb_policy, &rr_counter, peer(9000))
+            let sel = select_upstream(&upstreams, &health, lb_policy, rr_counter, peer(9000))
                 .expect("should select");
             if let Some(idx) = ports.iter().position(|&p| sel.port() == p) {
                 counts[idx] += 1;
@@ -1419,28 +1418,46 @@ mod tests {
     #[test]
     fn round_robin_skips_quarantined() {
         let handler = make_proxy_handler(&[8080, 8081, 8082], L4LoadBalancePolicy::RoundRobin);
-        let CompiledL4Handler::Proxy { upstreams, health, lb_policy, ref rr_counter, .. } = handler else {
+        let CompiledL4Handler::Proxy {
+            upstreams,
+            health,
+            lb_policy,
+            ref rr_counter,
+            ..
+        } = handler
+        else {
             panic!("expected Proxy");
         };
         // Force 8081 (index 1) into quarantine.
         health[1].record_failure(1, Duration::from_secs(60));
         for _ in 0..20 {
-            let sel = select_upstream(&upstreams, &health, lb_policy, &rr_counter, peer(9000))
+            let sel = select_upstream(&upstreams, &health, lb_policy, rr_counter, peer(9000))
                 .expect("should select a healthy upstream");
-            assert_ne!(sel.port(), 8081, "quarantined upstream must not be selected");
+            assert_ne!(
+                sel.port(),
+                8081,
+                "quarantined upstream must not be selected"
+            );
         }
     }
 
     #[test]
     fn least_conn_picks_fewest_active() {
         let handler = make_proxy_handler(&[8080, 8081, 8082], L4LoadBalancePolicy::LeastConn);
-        let CompiledL4Handler::Proxy { upstreams, health, lb_policy, ref rr_counter, .. } = handler else {
+        let CompiledL4Handler::Proxy {
+            upstreams,
+            health,
+            lb_policy,
+            ref rr_counter,
+            ..
+        } = handler
+        else {
             panic!("expected Proxy");
         };
         // Simulate load: 8080 has 5, 8081 has 3, 8082 has 0.
         health[0].active_conns.store(5, Ordering::Relaxed);
         health[1].active_conns.store(3, Ordering::Relaxed);
-        let sel = select_upstream(&upstreams, &health, lb_policy, &rr_counter, peer(9000))
+        let sel = select_upstream(&upstreams, &health, lb_policy, rr_counter, peer(9000))
             .expect("should select");
         assert_eq!(sel.port(), 8082, "least-conn should pick 8082 (0 active)");
     }
@@ -1448,12 +1465,19 @@ mod tests {
     #[test]
     fn least_conn_skips_quarantined() {
         let handler = make_proxy_handler(&[8080, 8081], L4LoadBalancePolicy::LeastConn);
-        let CompiledL4Handler::Proxy { upstreams, health, lb_policy, ref rr_counter, .. } = handler else {
+        let CompiledL4Handler::Proxy {
+            upstreams,
+            health,
+            lb_policy,
+            ref rr_counter,
+            ..
+        } = handler
+        else {
             panic!("expected Proxy");
         };
         // 8080 has 0 conns but is quarantined.
         health[0].record_failure(1, Duration::from_secs(60));
-        let sel = select_upstream(&upstreams, &health, lb_policy, &rr_counter, peer(9000))
+        let sel = select_upstream(&upstreams, &health, lb_policy, rr_counter, peer(9000))
             .expect("should select");
         assert_eq!(sel.port(), 8081);
     }
@@ -1461,12 +1485,19 @@ mod tests {
     #[test]
     fn random_selects_only_from_configured_backends() {
         let handler = make_proxy_handler(&[8080, 8081, 8082], L4LoadBalancePolicy::Random);
-        let CompiledL4Handler::Proxy { upstreams, health, lb_policy, ref rr_counter, .. } = handler else {
+        let CompiledL4Handler::Proxy {
+            upstreams,
+            health,
+            lb_policy,
+            ref rr_counter,
+            ..
+        } = handler
+        else {
             panic!("expected Proxy");
         };
         let valid_ports = [8080u16, 8081, 8082];
         for _ in 0..50 {
-            let sel = select_upstream(&upstreams, &health, lb_policy, &rr_counter, peer(9000))
+            let sel = select_upstream(&upstreams, &health, lb_policy, rr_counter, peer(9000))
                 .expect("should always select one");
             assert!(
                 valid_ports.contains(&sel.port()),
@@ -1478,12 +1509,19 @@ mod tests {
     #[test]
     fn random_skips_quarantined() {
         let handler = make_proxy_handler(&[8080, 8081], L4LoadBalancePolicy::Random);
-        let CompiledL4Handler::Proxy { upstreams, health, lb_policy, ref rr_counter, .. } = handler else {
+        let CompiledL4Handler::Proxy {
+            upstreams,
+            health,
+            lb_policy,
+            ref rr_counter,
+            ..
+        } = handler
+        else {
             panic!("expected Proxy");
         };
         health[0].record_failure(1, Duration::from_secs(60));
         for _ in 0..30 {
-            let sel = select_upstream(&upstreams, &health, lb_policy, &rr_counter, peer(9000))
+            let sel = select_upstream(&upstreams, &health, lb_policy, rr_counter, peer(9000))
                 .expect("should select");
             assert_eq!(sel.port(), 8081);
         }
@@ -1492,15 +1530,22 @@ mod tests {
     #[test]
     fn ip_hash_is_deterministic_for_same_client_ip() {
         let handler = make_proxy_handler(&[8080, 8081, 8082], L4LoadBalancePolicy::IpHash);
-        let CompiledL4Handler::Proxy { upstreams, health, lb_policy, ref rr_counter, .. } = handler else {
+        let CompiledL4Handler::Proxy {
+            upstreams,
+            health,
+            lb_policy,
+            ref rr_counter,
+            ..
+        } = handler
+        else {
             panic!("expected Proxy");
         };
         // Same source IP → same upstream every time.
         let client = peer(54321);
-        let first = select_upstream(&upstreams, &health, lb_policy, &rr_counter, client)
+        let first = select_upstream(&upstreams, &health, lb_policy, rr_counter, client)
             .expect("should select");
         for _ in 0..20 {
-            let sel = select_upstream(&upstreams, &health, lb_policy, &rr_counter, client)
+            let sel = select_upstream(&upstreams, &health, lb_policy, rr_counter, client)
                 .expect("should select");
             assert_eq!(sel, first, "ip_hash must be deterministic");
         }
@@ -1509,7 +1554,14 @@ mod tests {
     #[test]
     fn ip_hash_different_ips_can_land_on_different_upstreams() {
         let handler = make_proxy_handler(&[8080, 8081, 8082], L4LoadBalancePolicy::IpHash);
-        let CompiledL4Handler::Proxy { upstreams, health, lb_policy, ref rr_counter, .. } = handler else {
+        let CompiledL4Handler::Proxy {
+            upstreams,
+            health,
+            lb_policy,
+            ref rr_counter,
+            ..
+        } = handler
+        else {
             panic!("expected Proxy");
         };
         let mut seen_ports = std::collections::HashSet::new();
@@ -1526,23 +1578,33 @@ mod tests {
             "203.0.113.42:9000".parse().unwrap(),
         ];
         for &client in clients {
-            if let Some(sel) = select_upstream(&upstreams, &health, lb_policy, &rr_counter, client) {
+            if let Some(sel) = select_upstream(&upstreams, &health, lb_policy, rr_counter, client) {
                 seen_ports.insert(sel.port());
             }
         }
-        assert!(seen_ports.len() > 1, "ip_hash should spread different client IPs across upstreams");
+        assert!(
+            seen_ports.len() > 1,
+            "ip_hash should spread different client IPs across upstreams"
+        );
     }
 
     #[test]
     fn all_quarantined_returns_none() {
         let handler = make_proxy_handler(&[8080, 8081], L4LoadBalancePolicy::RoundRobin);
-        let CompiledL4Handler::Proxy { upstreams, health, lb_policy, ref rr_counter, .. } = handler else {
+        let CompiledL4Handler::Proxy {
+            upstreams,
+            health,
+            lb_policy,
+            ref rr_counter,
+            ..
+        } = handler
+        else {
             panic!("expected Proxy");
         };
         health[0].record_failure(1, Duration::from_secs(60));
         health[1].record_failure(1, Duration::from_secs(60));
         assert!(
-            select_upstream(&upstreams, &health, lb_policy, &rr_counter, peer(9000)).is_none(),
+            select_upstream(&upstreams, &health, lb_policy, rr_counter, peer(9000)).is_none(),
             "all upstreams quarantined must return None"
         );
     }
@@ -1583,7 +1645,10 @@ mod tests {
             .unwrap_or(0)
             .saturating_sub(1);
         slot.retry_after_secs.store(past, Ordering::Relaxed);
-        assert!(!slot.is_quarantined(), "quarantine must expire after fail_duration");
+        assert!(
+            !slot.is_quarantined(),
+            "quarantine must expire after fail_duration"
+        );
     }
 
     // -- Subroute integration test --
@@ -1600,7 +1665,7 @@ mod tests {
     async fn subroute_matches_http_host_and_proxies_full_request() {
         // Upstream A: echoes every byte it receives, then closes.
         let upstream_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream_a_addr = upstream_a.local_addr().unwrap();
+        let echo_addr = upstream_a.local_addr().unwrap();
         tokio::spawn(async move {
             let (mut sock, _) = upstream_a.accept().await.unwrap();
             let mut buf = Vec::new();
@@ -1611,7 +1676,7 @@ mod tests {
 
         // Upstream B: must NOT be reached by this test.
         let upstream_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream_b_addr = upstream_b.local_addr().unwrap();
+        let wrong_addr = upstream_b.local_addr().unwrap();
         tokio::spawn(async move {
             if let Ok((mut sock, _)) = upstream_b.accept().await {
                 let _ = sock.write_all(b"WRONG\r\n").await;
@@ -1625,7 +1690,7 @@ mod tests {
                         host: vec!["api.example.com".to_string()],
                     }],
                     handlers: vec![CompiledL4Handler::new_proxy(
-                        vec![upstream_a_addr],
+                        vec![echo_addr],
                         L4LoadBalancePolicy::RoundRobin,
                         3,
                         Duration::from_secs(10),
@@ -1635,7 +1700,7 @@ mod tests {
                 CompiledL4Route {
                     matchers: vec![],
                     handlers: vec![CompiledL4Handler::new_proxy(
-                        vec![upstream_b_addr],
+                        vec![wrong_addr],
                         L4LoadBalancePolicy::RoundRobin,
                         3,
                         Duration::from_secs(10),
@@ -1656,7 +1721,7 @@ mod tests {
             let n = conn.peek(&mut peek_buf).await.unwrap();
             let peeked = &peek_buf[..n];
             if let Err(e) = execute_handlers(&handlers, conn, peer, peeked).await {
-                eprintln!("handler error in test: {e}");
+                tracing::error!("handler error in test: {e}");
             }
         });
 

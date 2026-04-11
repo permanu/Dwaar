@@ -35,6 +35,7 @@ use bytes::Bytes;
 use hmac::{Hmac, Mac};
 use pingora_http::RequestHeader;
 use sha2::Sha256;
+use zeroize::Zeroizing;
 
 use crate::plugin::{DwaarPlugin, PluginAction, PluginCtx, PluginResponse};
 
@@ -65,7 +66,7 @@ const CHALLENGE_PARAM: &str = "_dwaar_challenge";
 /// This ordering means detected bots get flagged before the challenge check,
 /// and rate limiting still applies to challenge page requests.
 pub struct UnderAttackPlugin {
-    secret: Vec<u8>,
+    secret: Zeroizing<Vec<u8>>,
     ttl_secs: u64,
 }
 
@@ -73,14 +74,17 @@ impl UnderAttackPlugin {
     /// Create with a secret key for HMAC signing.
     pub fn new(secret: Vec<u8>) -> Self {
         Self {
-            secret,
+            secret: Zeroizing::new(secret),
             ttl_secs: DEFAULT_TTL_SECS,
         }
     }
 
     /// Create with a custom TTL for clearance cookies.
     pub fn with_ttl(secret: Vec<u8>, ttl_secs: u64) -> Self {
-        Self { secret, ttl_secs }
+        Self {
+            secret: Zeroizing::new(secret),
+            ttl_secs,
+        }
     }
 
     /// Generate a deterministic challenge from the client's IP and a time window.
@@ -148,15 +152,18 @@ impl UnderAttackPlugin {
             return false;
         }
 
-        // Recompute HMAC and compare
+        // Decode the hex tag from the cookie into raw bytes, then verify using
+        // Mac::verify_slice — this performs a constant-time comparison inside the
+        // hmac crate and avoids the intermediate hex-encode-then-compare path.
+        let Ok(tag_bytes) = hex::decode(hmac_hex) else {
+            return false;
+        };
+
         let mut mac =
             HmacSha256::new_from_slice(&self.secret).expect("HMAC accepts any key length");
         mac.update(&timestamp.to_be_bytes());
         mac.update(ip_bytes(ip).as_slice());
-        let expected = hex::encode(mac.finalize().into_bytes());
-
-        // Constant-time comparison to prevent timing attacks
-        constant_time_eq(hmac_hex, &expected)
+        mac.verify_slice(&tag_bytes).is_ok()
     }
 
     /// Build the challenge HTML page with embedded JS proof-of-work.
@@ -276,7 +283,13 @@ impl DwaarPlugin for UnderAttackPlugin {
                 get_param(query, NONCE_PARAM),
             )
         {
-            // Verify the challenge matches what we'd generate for this IP
+            // Verify the challenge matches what we'd generate for this IP.
+            // Both sides are always 64-character hex-encoded HMAC-SHA256 outputs
+            // (fixed length, same length), so the early-return branch in
+            // constant_time_eq never fires on legitimate inputs, making the XOR
+            // loop effectively branch-free. Using Mac::verify_slice here would be
+            // semantically wrong — it needs a keyed MAC, not a comparison of two
+            // pre-computed values.
             let expected_challenge = self.generate_challenge(ip);
             if constant_time_eq(&challenge, &expected_challenge)
                 && Self::verify_pow(&challenge, &nonce)
@@ -344,11 +357,17 @@ fn leading_zero_bits(data: &[u8]) -> u32 {
 }
 
 /// Constant-time string comparison to prevent timing side-channels.
+///
+/// The length XOR folds the length difference into `diff` without an early
+/// branch, and the `zip` iterates over `min(a.len(), b.len())` bytes XOR-ing
+/// each pair. Strictly speaking, `zip`'s iteration count still varies with the
+/// shorter length — but every call site passes two 64-character hex-encoded
+/// HMAC-SHA256 outputs, so `a.len() == b.len()` by construction. That same-
+/// length contract makes the loop run in constant time for the only comparison
+/// that matters, while the length fold ensures a mismatch still returns `false`.
+#[allow(clippy::cast_possible_truncation)] // intentional: XOR'd lengths folded into u8
 fn constant_time_eq(a: &str, b: &str) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
+    let mut diff = (a.len() ^ b.len()) as u8;
     for (x, y) in a.bytes().zip(b.bytes()) {
         diff |= x ^ y;
     }

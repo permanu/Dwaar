@@ -24,6 +24,7 @@ async-trait = { workspace = true }
 http = { workspace = true }
 dashmap = { workspace = true }
 subtle = "2"
+zeroize = { workspace = true }
 
 [dev-dependencies]
 compact_str = { workspace = true }

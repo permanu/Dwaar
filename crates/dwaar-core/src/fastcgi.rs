@@ -11,10 +11,11 @@
 //!
 //! The protocol is simple binary framing (9-page spec). No external crate needed.
 
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
+
+use ahash::AHashMap;
 
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -64,7 +65,7 @@ pub async fn execute(req: &FastCgiRequest<'_>) -> Result<FastCgiResponse, String
     let document_root = req.root.to_string_lossy();
 
     // Build FastCGI params
-    let mut params = HashMap::new();
+    let mut params = AHashMap::new();
     params.insert("SCRIPT_FILENAME", script_filename.clone());
     params.insert("DOCUMENT_ROOT", document_root.to_string());
     params.insert("QUERY_STRING", req.query_string.to_string());
@@ -169,8 +170,25 @@ pub async fn execute(req: &FastCgiRequest<'_>) -> Result<FastCgiResponse, String
     parse_cgi_response(&stdout_buf)
 }
 
+/// Canonicalize `candidate` and confirm it stays inside `root_canonical`.
+/// Returns the canonical string on success, None if the path escapes the
+/// root or doesn't exist.
+fn safe_resolve(candidate: &Path, root_canonical: &Path) -> Option<String> {
+    let resolved = candidate.canonicalize().ok()?;
+    if resolved.starts_with(root_canonical) {
+        Some(resolved.to_string_lossy().into_owned())
+    } else {
+        None // traversal attempt — treat as not found
+    }
+}
+
 /// Caddy's `try_files` logic: `{path}` → `{path}/index.php` → `/index.php`
 fn resolve_script(root: &Path, request_path: &str) -> String {
+    // Canonicalize root once — resolves symlinks so `starts_with` is reliable.
+    // If root doesn't exist yet (test race), fall back to the raw path; the
+    // subsequent candidates will simply not exist and we'll return root_index.
+    let root_canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+
     let clean = request_path.trim_start_matches('/');
 
     // Direct .php file
@@ -178,21 +196,24 @@ fn resolve_script(root: &Path, request_path: &str) -> String {
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("php"))
     {
-        let candidate = root.join(clean);
-        if candidate.exists() {
-            return candidate.to_string_lossy().to_string();
+        let candidate = root_canonical.join(clean);
+        if let Some(path) = safe_resolve(&candidate, &root_canonical) {
+            return path;
         }
     }
 
     // {path}/index.php
-    let with_index = root.join(clean).join("index.php");
-    if with_index.exists() {
-        return with_index.to_string_lossy().to_string();
+    let with_index = root_canonical.join(clean).join("index.php");
+    if let Some(path) = safe_resolve(&with_index, &root_canonical) {
+        return path;
     }
 
-    // Fallback: root index.php (for router-based PHP apps like Laravel/WordPress)
-    let root_index = root.join("index.php");
-    root_index.to_string_lossy().to_string()
+    // Fallback: root index.php (for router-based PHP apps like Laravel/WordPress).
+    // Constructed from the already-canonical root — always safe, no guard needed.
+    root_canonical
+        .join("index.php")
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[derive(Debug)]
@@ -271,7 +292,7 @@ async fn read_record(stream: &mut TcpStream) -> Result<FcgiRecord, String> {
 }
 
 /// Encode `FastCGI` name-value pairs.
-fn encode_params(params: &HashMap<&str, String>) -> Vec<u8> {
+fn encode_params(params: &AHashMap<&'static str, String>) -> Vec<u8> {
     let mut buf = Vec::new();
     for (name, value) in params {
         encode_length(&mut buf, name.len());
@@ -355,7 +376,7 @@ mod tests {
 
     #[test]
     fn encode_params_roundtrip() {
-        let mut params = HashMap::new();
+        let mut params = AHashMap::new();
         params.insert("KEY", "value".to_string());
         let encoded = encode_params(&params);
         // 1 byte name len + 1 byte value len + 3 bytes name + 5 bytes value = 10

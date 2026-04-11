@@ -88,6 +88,7 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
         let rewrites = collect_rewrites(&site.directives, &var_registry);
         let basic_auth = compile_basic_auth(&site.directives);
         let forward_auth = compile_forward_auth(&site.directives);
+        let is_grpc_route = site.directives.iter().any(|d| matches!(d, Directive::Grpc));
 
         // Compile response-phase directives shared across all flat-site handler types.
         let intercepts = compile_intercepts(&site.directives);
@@ -117,6 +118,7 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
                 request_body_max_size,
                 response_body_max_size,
                 cache: cache.clone(),
+                is_grpc_route,
             };
             routes.push(Route::with_handlers(
                 &site.address,
@@ -150,6 +152,7 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
                 request_body_max_size,
                 response_body_max_size,
                 cache: cache.clone(),
+                is_grpc_route,
             };
             routes.push(Route::with_handlers(
                 &site.address,
@@ -190,6 +193,7 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
                 request_body_max_size,
                 response_body_max_size,
                 cache: cache.clone(),
+                is_grpc_route,
             };
             routes.push(Route::with_handlers(
                 &site.address,
@@ -229,6 +233,7 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
                 request_body_max_size,
                 response_body_max_size,
                 cache,
+                is_grpc_route,
             };
             routes.push(Route::with_handlers(
                 &site.address,
@@ -321,7 +326,11 @@ fn compile_l4_routes(
                 })
                 .flatten()
                 .collect();
-            let handlers = route.handlers.iter().filter_map(compile_l4_handler).collect();
+            let handlers = route
+                .handlers
+                .iter()
+                .filter_map(compile_l4_handler)
+                .collect();
             CompiledL4Route { matchers, handlers }
         })
         .collect()
@@ -341,7 +350,10 @@ fn compile_l4_matcher(matcher: &Layer4Matcher) -> Option<CompiledL4Matcher> {
         Layer4Matcher::Ssh => Some(CompiledL4Matcher::Ssh),
         Layer4Matcher::Postgres => Some(CompiledL4Matcher::Postgres),
         Layer4Matcher::RemoteIp(ranges) => {
-            let nets: Vec<ipnet::IpNet> = ranges.iter().filter_map(|r| r.parse().ok()).collect();
+            let nets: Vec<ipnet::IpNet> = ranges
+                .iter()
+                .filter_map(|r| r.parse::<ipnet::IpNet>().ok())
+                .collect();
             if nets.is_empty() && !ranges.is_empty() {
                 warn!(ranges = ?ranges, "L4 remote_ip: failed to parse some CIDR ranges");
             }
@@ -393,14 +405,10 @@ fn compile_l4_handler(handler: &Layer4Handler) -> Option<CompiledL4Handler> {
                 match opt.name.as_str() {
                     "lb_policy" => {
                         lb_policy = match opt.args.first().map(String::as_str) {
-                            Some("round_robin") | Some("roundrobin") => {
-                                L4LoadBalancePolicy::RoundRobin
-                            }
-                            Some("least_conn") | Some("leastconn") => {
-                                L4LoadBalancePolicy::LeastConn
-                            }
+                            Some("round_robin" | "roundrobin") => L4LoadBalancePolicy::RoundRobin,
+                            Some("least_conn" | "leastconn") => L4LoadBalancePolicy::LeastConn,
                             Some("random") => L4LoadBalancePolicy::Random,
-                            Some("ip_hash") | Some("iphash") => L4LoadBalancePolicy::IpHash,
+                            Some("ip_hash" | "iphash") => L4LoadBalancePolicy::IpHash,
                             other => {
                                 warn!(
                                     value = ?other,
@@ -411,7 +419,11 @@ fn compile_l4_handler(handler: &Layer4Handler) -> Option<CompiledL4Handler> {
                         };
                     }
                     "max_fails" => {
-                        if let Some(v) = opt.args.first().and_then(|s| s.parse::<u32>().ok()) {
+                        if let Some(v) = opt
+                            .args
+                            .first()
+                            .and_then(|s: &String| s.parse::<u32>().ok())
+                        {
                             max_fails = v;
                         }
                     }
@@ -744,6 +756,13 @@ fn compile_single_block(
     let rewrites = collect_rewrites(inner_directives, registry);
     let basic_auth = compile_basic_auth(inner_directives);
     let forward_auth = compile_forward_auth(inner_directives);
+    let mut is_grpc_route = false;
+    for d in inner_directives {
+        if matches!(d, Directive::Grpc) {
+            is_grpc_route = true;
+            break;
+        }
+    }
 
     // Find the handler directive inside the block
     let handler = if let Some(rp) = find_reverse_proxy(inner_directives) {
@@ -791,6 +810,7 @@ fn compile_single_block(
         request_body_max_size,
         response_body_max_size,
         cache,
+        is_grpc_route,
     })
 }
 
@@ -830,6 +850,7 @@ fn compile_forward_auth(directives: &[Directive]) -> Option<std::sync::Arc<Forwa
         copy_headers,
         tls: fa.tls,
         sni_hostname,
+        allow_plaintext: fa.insecure_plaintext,
     }))
 }
 
@@ -1313,7 +1334,9 @@ fn compile_one_map(m: &MapDirective, registry: &VarRegistry) -> Result<CompiledM
         let pattern = match &entry.pattern {
             MapPattern::Exact(e) => CompiledMapPattern::Exact(e.clone()),
             MapPattern::Regex(re) => {
-                let compiled = regex::Regex::new(&format!("(?i)^{re}$"))
+                let compiled = regex::RegexBuilder::new(&format!("(?i)^{re}$"))
+                    .size_limit(1 << 20) // 1 MiB NFA budget — blocks pathological patterns like (a+)+$
+                    .build()
                     .map_err(|e| format!("map regex '{re}': {e}"))?;
                 CompiledMapPattern::Regex(compiled)
             }

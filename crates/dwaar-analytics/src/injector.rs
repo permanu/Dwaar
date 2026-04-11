@@ -55,6 +55,13 @@ pub struct HtmlInjector {
     /// Last `CARRYOVER_SIZE` bytes from the previous chunk, held back so we can
     /// detect `</head>` tags split across chunk boundaries without duplicating data.
     carryover: BytesMut,
+    /// When `true`, analytics injection is gated on user consent signals (GDPR/CCPA).
+    ///
+    /// This is a privacy-compliance aid, not a security boundary. When enabled,
+    /// `process_with_consent()` checks for DNT and recognised consent cookies before
+    /// injecting; without a positive consent signal the response passes through
+    /// unmodified. Has no effect on calls to `process()` directly.
+    pub respect_consent: bool,
 }
 
 impl Default for HtmlInjector {
@@ -64,12 +71,27 @@ impl Default for HtmlInjector {
 }
 
 impl HtmlInjector {
-    /// Create a new injector in the Scanning state.
+    /// Create a new injector in the Scanning state with consent gating disabled.
     pub fn new() -> Self {
         Self {
             state: State::Scanning,
             bytes_scanned: 0,
             carryover: BytesMut::new(),
+            respect_consent: false,
+        }
+    }
+
+    /// Create a new injector with explicit consent-gating configuration.
+    ///
+    /// When `respect_consent` is `true`, callers must use
+    /// [`process_with_consent()`] to supply DNT and cookie signals; injection
+    /// will be skipped unless a positive consent signal is present.
+    pub fn new_with_consent(respect_consent: bool) -> Self {
+        Self {
+            state: State::Scanning,
+            bytes_scanned: 0,
+            carryover: BytesMut::new(),
+            respect_consent,
         }
     }
 
@@ -159,6 +181,64 @@ impl HtmlInjector {
             }
             self.state = State::Skipped;
         }
+    }
+
+    /// Process one body chunk with consent-gate enforcement.
+    ///
+    /// When `respect_consent` is `false` this is identical to calling
+    /// [`process()`] directly. When `true`, consent is evaluated first:
+    ///
+    /// - `dnt == true` (the request carried `DNT: 1`) → pass through, no injection.
+    /// - `cookie` contains `dwaar_consent=1` or `analytics_consent=1`
+    ///   (semicolon-separated `Cookie` header, case-insensitive key) → inject.
+    /// - Otherwise → pass through, no injection.
+    pub fn process_with_consent(
+        &mut self,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        cookie: Option<&str>,
+        dnt: bool,
+    ) {
+        if !self.respect_consent {
+            self.process(body, end_of_stream);
+            return;
+        }
+
+        if !Self::has_analytics_consent(cookie, dnt) {
+            self.state = State::Skipped;
+            return;
+        }
+
+        self.process(body, end_of_stream);
+    }
+
+    /// Returns `true` when the request carries a positive analytics-consent signal.
+    ///
+    /// Consent is present when ALL of the following hold:
+    /// - `dnt` is `false` (no Do Not Track signal)
+    /// - `cookie` contains a `dwaar_consent=1` or `analytics_consent=1` pair
+    ///   (semicolon-separated; key comparison is case-insensitive)
+    fn has_analytics_consent(cookie: Option<&str>, dnt: bool) -> bool {
+        if dnt {
+            return false;
+        }
+        let Some(cookie_str) = cookie else {
+            return false;
+        };
+        for pair in cookie_str.split(';') {
+            let pair = pair.trim();
+            if let Some((key, value)) = pair.split_once('=') {
+                let key = key.trim();
+                let value = value.trim();
+                if (key.eq_ignore_ascii_case("dwaar_consent")
+                    || key.eq_ignore_ascii_case("analytics_consent"))
+                    && value == "1"
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 
@@ -412,5 +492,118 @@ mod tests {
         assert_eq!(find_case_insensitive(b"Hello", b"xyz"), None);
         assert_eq!(find_case_insensitive(b"Hi", b"Hello"), None);
         assert_eq!(find_case_insensitive(b"anything", b""), None);
+    }
+
+    // --- consent-gate tests ---
+
+    #[allow(clippy::unnecessary_wraps)] // callers need `Option<Bytes>` for process_with_consent
+    fn html_chunk() -> Option<Bytes> {
+        Some(Bytes::from_static(
+            b"<html><head><title>T</title></head><body></body></html>",
+        ))
+    }
+
+    #[test]
+    fn consent_disabled_injects_unconditionally() {
+        let mut injector = HtmlInjector::new_with_consent(false);
+        let mut body = html_chunk();
+        injector.process_with_consent(&mut body, true, None, false);
+        let result = std::str::from_utf8(body.as_ref().expect("body")).expect("utf8");
+        assert!(result.contains("/_dwaar/a.js"));
+    }
+
+    #[test]
+    fn consent_dnt_blocks_injection() {
+        let mut injector = HtmlInjector::new_with_consent(true);
+        let mut body = html_chunk();
+        injector.process_with_consent(&mut body, true, Some("dwaar_consent=1"), true);
+        // DNT wins even with a consent cookie present
+        let result = body.expect("body");
+        assert!(!result.windows(12).any(|w| w == b"/_dwaar/a.js"));
+        assert_eq!(injector.state, State::Skipped);
+    }
+
+    #[test]
+    fn consent_no_cookie_blocks_injection() {
+        let mut injector = HtmlInjector::new_with_consent(true);
+        let mut body = html_chunk();
+        injector.process_with_consent(&mut body, true, None, false);
+        let result = body.expect("body");
+        assert!(!result.windows(12).any(|w| w == b"/_dwaar/a.js"));
+        assert_eq!(injector.state, State::Skipped);
+    }
+
+    #[test]
+    fn consent_wrong_cookie_blocks_injection() {
+        let mut injector = HtmlInjector::new_with_consent(true);
+        let mut body = html_chunk();
+        injector.process_with_consent(&mut body, true, Some("session=abc; other=1"), false);
+        let result = body.expect("body");
+        assert!(!result.windows(12).any(|w| w == b"/_dwaar/a.js"));
+    }
+
+    #[test]
+    fn consent_dwaar_consent_cookie_injects() {
+        let mut injector = HtmlInjector::new_with_consent(true);
+        let mut body = html_chunk();
+        injector.process_with_consent(&mut body, true, Some("dwaar_consent=1"), false);
+        let result = std::str::from_utf8(body.as_ref().expect("body")).expect("utf8");
+        assert!(result.contains("/_dwaar/a.js"));
+    }
+
+    #[test]
+    fn consent_analytics_consent_cookie_injects() {
+        let mut injector = HtmlInjector::new_with_consent(true);
+        let mut body = html_chunk();
+        injector.process_with_consent(
+            &mut body,
+            true,
+            Some("session=x; analytics_consent=1"),
+            false,
+        );
+        let result = std::str::from_utf8(body.as_ref().expect("body")).expect("utf8");
+        assert!(result.contains("/_dwaar/a.js"));
+    }
+
+    #[test]
+    fn consent_cookie_key_case_insensitive() {
+        let mut injector = HtmlInjector::new_with_consent(true);
+        let mut body = html_chunk();
+        injector.process_with_consent(&mut body, true, Some("DWAAR_CONSENT=1"), false);
+        let result = std::str::from_utf8(body.as_ref().expect("body")).expect("utf8");
+        assert!(result.contains("/_dwaar/a.js"));
+    }
+
+    #[test]
+    fn has_analytics_consent_dnt_overrides_cookie() {
+        assert!(!HtmlInjector::has_analytics_consent(
+            Some("dwaar_consent=1"),
+            true
+        ));
+    }
+
+    #[test]
+    fn has_analytics_consent_no_cookie() {
+        assert!(!HtmlInjector::has_analytics_consent(None, false));
+    }
+
+    #[test]
+    fn has_analytics_consent_positive() {
+        assert!(HtmlInjector::has_analytics_consent(
+            Some("dwaar_consent=1"),
+            false
+        ));
+        assert!(HtmlInjector::has_analytics_consent(
+            Some("analytics_consent=1"),
+            false
+        ));
+    }
+
+    #[test]
+    fn respect_consent_field_accessible() {
+        let a = HtmlInjector::new();
+        assert!(!a.respect_consent);
+        let b = HtmlInjector::new_with_consent(true);
+        assert!(b.respect_consent);
     }
 }

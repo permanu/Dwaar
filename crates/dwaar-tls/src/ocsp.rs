@@ -190,7 +190,8 @@ async fn http_post_ocsp(url: &str, body: &[u8]) -> Result<Vec<u8>, OcspError> {
 /// or header (CR, LF, NUL, or any C0 control). Used to harden the OCSP
 /// fetcher against header injection from a hostile certificate's AIA URL.
 fn contains_ctl(s: &str) -> bool {
-    s.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0 || b < 0x20)
+    s.bytes()
+        .any(|b| b == b'\r' || b == b'\n' || b == 0 || b < 0x20)
 }
 
 /// Validate an OCSP response: check status, verify signature, check cert status.

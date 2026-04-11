@@ -95,7 +95,9 @@ fn start_dwaar_with_config(config: Option<&std::path::Path>) -> std::process::Ch
 
     // Poll until the proxy is accepting connections (or timeout after 10s).
     let start = std::time::Instant::now();
-    let addr = "127.0.0.1:8080".parse::<std::net::SocketAddr>().unwrap();
+    let addr = "127.0.0.1:8080"
+        .parse::<std::net::SocketAddr>()
+        .expect("valid literal socket addr");
     while start.elapsed() < Duration::from_secs(10) {
         if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
             break;

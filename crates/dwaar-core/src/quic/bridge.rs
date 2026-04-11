@@ -725,8 +725,8 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
 
         tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.expect("accept");
             use tokio::io::AsyncWriteExt;
+            let (mut sock, _) = listener.accept().await.expect("accept");
             // All chunks in one write.
             sock.write_all(b"5\r\nhello\r\n3\r\nfoo\r\n0\r\n\r\n")
                 .await
@@ -768,8 +768,8 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
 
         tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.expect("accept");
             use tokio::io::AsyncWriteExt;
+            let (mut sock, _) = listener.accept().await.expect("accept");
             sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
                 .await
                 .expect("write");
@@ -793,8 +793,8 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
 
         tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.expect("accept");
             use tokio::io::AsyncWriteExt;
+            let (mut sock, _) = listener.accept().await.expect("accept");
             // Write a 10-byte body.
             sock.write_all(b"0123456789").await.expect("write");
         });

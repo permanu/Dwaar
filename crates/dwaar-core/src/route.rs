@@ -377,13 +377,18 @@ impl RewriteRule {
                 }
             }),
             RewriteRule::SubstringReplace { find, replace } => {
-                if path.contains(find.as_str()) {
-                    Some(CompactString::from(
-                        path.replace(find.as_str(), replace.as_str()),
-                    ))
-                } else {
-                    None
+                if !path.contains(find.as_str()) {
+                    return None;
                 }
+                let mut out = CompactString::with_capacity(path.len());
+                let mut remaining = path;
+                while let Some(idx) = remaining.find(find.as_str()) {
+                    out.push_str(&remaining[..idx]);
+                    out.push_str(replace.as_str());
+                    remaining = &remaining[idx + find.len()..];
+                }
+                out.push_str(remaining);
+                Some(out)
             }
         }
     }
@@ -424,6 +429,11 @@ pub struct HandlerBlock {
     /// HTTP response cache config (ISSUE-073). Compiled from `cache {}` directive.
     /// `None` = caching disabled for this handler block.
     pub cache: Option<std::sync::Arc<crate::cache::CacheConfig>>,
+    /// Route-config-driven gRPC flag. Set to `true` when the `grpc` directive
+    /// is present in this handler block (wired by the config compiler).
+    /// When `true`, gRPC treatment (H2 ALPN, 1 GiB body cap) is applied
+    /// regardless of the request `Content-Type` header.
+    pub is_grpc_route: bool,
 }
 
 // ── Compiled Map (ISSUE-056) ──────────────────────────────────────
@@ -595,6 +605,7 @@ impl Route {
                 request_body_max_size: None,
                 response_body_max_size: None,
                 cache: None,
+                is_grpc_route: false,
             }],
             var_defaults: VarSlots::default(),
             active_connections: Arc::new(AtomicU32::new(0)),

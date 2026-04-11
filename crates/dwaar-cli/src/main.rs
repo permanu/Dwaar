@@ -240,7 +240,7 @@ fn main() -> anyhow::Result<()> {
             return cmd_upgrade(binary.as_deref(), pid_file);
         }
         Some(Commands::SelfUpdate { force }) => {
-            return self_update::run(*force).map_err(Into::into);
+            return self_update::run(*force);
         }
         None => {}
     }
@@ -261,10 +261,6 @@ fn main() -> anyhow::Result<()> {
         info!("config valid");
         return Ok(());
     }
-
-    let cpu_count = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(1);
 
     // One worker, all cores. Multiple workers fragment the upstream connection
     // pool and duplicate background services across processes. A single worker
@@ -693,13 +689,17 @@ fn run_server(
         use dwaar_config::compile::{compile_l4_servers, compile_l4_wrappers};
 
         let mut l4_servers = Vec::new();
-        if let Some(ref l4_cfg) = dwaar_config.global_options.as_ref().and_then(|g| g.layer4.as_ref()) {
+        if let Some(l4_cfg) = dwaar_config
+            .global_options
+            .as_ref()
+            .and_then(|g| g.layer4.as_ref())
+        {
             l4_servers.extend(compile_l4_servers(l4_cfg));
         }
-        if let Some(ref opts) = dwaar_config.global_options {
-            if !opts.layer4_listener_wrappers.is_empty() {
-                l4_servers.extend(compile_l4_wrappers(&opts.layer4_listener_wrappers));
-            }
+        if let Some(ref opts) = dwaar_config.global_options
+            && !opts.layer4_listener_wrappers.is_empty()
+        {
+            l4_servers.extend(compile_l4_wrappers(&opts.layer4_listener_wrappers));
         }
         if !l4_servers.is_empty() {
             // Inject the shared cert store into any L4 TLS handlers so they
@@ -715,7 +715,8 @@ fn run_server(
             }
             let count = l4_servers.len();
             let l4_service = dwaar_core::l4::Layer4Service::new(l4_servers);
-            let l4_bg = pingora_core::services::background::background_service("layer4", l4_service);
+            let l4_bg =
+                pingora_core::services::background::background_service("layer4", l4_service);
             server.add_service(l4_bg);
             info!(listeners = count, "layer4 TCP proxy service registered");
         }
@@ -748,7 +749,8 @@ fn run_server(
     server.run_forever();
 }
 
-#[allow(clippy::too_many_arguments)]
+// Flat background-service registration; splitting would make call-sites worse.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn register_background_services(
     server: &mut Server,
     cli: &Cli,
@@ -832,7 +834,7 @@ fn register_background_services(
     .with_sni_domain_map(sni_domain_map)
     .with_health_pools(health_pools)
     .with_acme_domains(acme_domains)
-    .with_cert_store(Arc::clone(&cert_store));
+    .with_cert_store(Arc::clone(cert_store));
     let config_watcher = if let Some(cb) = cache_backend {
         config_watcher.with_cache_backend(cb)
     } else {
@@ -1465,10 +1467,10 @@ fn init_logging(cli: &Cli) {
     let level = match level_str.to_ascii_lowercase().as_str() {
         "error" => LevelFilter::ERROR,
         "warn" => LevelFilter::WARN,
-        "info" => LevelFilter::INFO,
         "debug" => LevelFilter::DEBUG,
         "trace" => LevelFilter::TRACE,
         "off" => LevelFilter::OFF,
+        // "info" and any unrecognised value both default to INFO
         _ => LevelFilter::INFO,
     };
 

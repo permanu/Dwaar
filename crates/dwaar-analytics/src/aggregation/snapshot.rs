@@ -61,7 +61,7 @@ pub struct VitalsSnapshot {
     pub inp: Percentiles,
 }
 
-/// Current schema version of the AnalyticsSnapshot wire format.
+/// Current schema version of the `AnalyticsSnapshot` wire format.
 ///
 /// Consumers reject any snapshot whose `schema_version` doesn't match
 /// the version they were compiled against. Bumping this on a breaking

@@ -17,10 +17,9 @@ pub mod snapshot;
 pub mod top_k;
 pub mod web_vitals;
 
-use std::net::IpAddr;
-
-use compact_str::CompactString;
 use hyperloglog::HyperLogLog;
+use std::net::IpAddr;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::warn;
 
@@ -36,13 +35,13 @@ const CHANNEL_CAPACITY: usize = 8192;
 /// on every request when only 7 are needed.
 #[derive(Debug, Clone)]
 pub struct AggEvent {
-    pub host: CompactString,
-    pub path: CompactString,
+    pub host: Arc<str>,
+    pub path: Arc<str>,
     pub status: u16,
     pub bytes_sent: u64,
     pub client_ip: IpAddr,
-    pub country: Option<CompactString>,
-    pub referer: Option<CompactString>,
+    pub country: Option<Arc<str>>,
+    pub referer: Option<Arc<str>>,
     /// Bot classification from the bot-detect plugin (priority 10),
     /// propagated so the aggregation snapshot can surface bot-vs-human
     /// pageview ratios. Default `false` is treated as a human request.
@@ -66,8 +65,8 @@ pub struct DomainMetrics {
     pub status_codes: [u64; 6],
     pub bytes_sent: u64,
     pub web_vitals: WebVitals,
-    /// Cumulative bot vs human pageview counters. The page_views
-    /// MinuteBuckets counter is the union of both — these counters
+    /// Cumulative bot vs human pageview counters. The `page_views`
+    /// `MinuteBuckets` counter is the union of both — these counters
     /// answer "what fraction of traffic is bot?" without needing a
     /// separate time-windowed structure.
     pub bot_views: u64,

@@ -46,6 +46,11 @@ pub struct ForwardAuthConfig {
     /// correctly even though we connect to the resolved IP address.
     /// `None` when the upstream was a literal IP address.
     pub sni_hostname: Option<CompactString>,
+    /// Explicit opt-in to plaintext (non-TLS) subrequests to non-loopback
+    /// auth services. Defaults to `false`; must be set to `true` to bypass
+    /// the runtime enforcement that errors on plaintext non-loopback targets.
+    /// A warning is still logged on first use even when opted in.
+    pub allow_plaintext: bool,
 }
 
 /// Result of an auth subrequest.
@@ -82,19 +87,37 @@ impl ForwardAuthConfig {
         }
     }
 
+    // do_request is a flat request pipeline: socket connect → write request →
+    // read status → parse — splitting it fragments the error-handling flow.
+    #[allow(clippy::too_many_lines)]
     async fn do_request(
         &self,
         method: &str,
         original_uri: &str,
         client_ip: Option<&str>,
     ) -> Result<AuthResult, String> {
-        if !self.tls {
-            static WARNED: std::sync::Once = std::sync::Once::new();
-            WARNED.call_once(|| {
+        if !self.tls && !self.upstream.ip().is_loopback() && !self.allow_plaintext {
+            return Err(format!(
+                "forward_auth target '{}' is plaintext and non-loopback; \
+                 set tls: true or allow_plaintext: true",
+                if let Some(host) = self.sni_hostname.as_deref() {
+                    format!("{host}:{}", self.upstream.port())
+                } else {
+                    self.upstream.to_string()
+                }
+            ));
+        }
+
+        if !self.tls && !self.upstream.ip().is_loopback() {
+            static WARN_ONCE: std::sync::Once = std::sync::Once::new();
+            WARN_ONCE.call_once(|| {
+                let target = if let Some(host) = self.sni_hostname.as_deref() {
+                    format!("{host}:{}", self.upstream.port())
+                } else {
+                    self.upstream.to_string()
+                };
                 tracing::warn!(
-                    upstream = %self.upstream,
-                    "forward_auth uses plaintext TCP — auth responses are not integrity-protected; \
-                     set tls: true and point to a TLS-capable endpoint to fix this"
+                    "forward_auth target '{target}' is plaintext; credentials will transit unencrypted — set tls: true"
                 );
             });
         }

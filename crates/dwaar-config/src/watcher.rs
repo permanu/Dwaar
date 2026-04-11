@@ -171,6 +171,7 @@ impl ConfigWatcher {
     }
 
     /// Process a file change: hash -> compare -> parse -> compile -> swap.
+    #[allow(clippy::too_many_lines)] // Sequential pipeline steps; each step is necessary and splitting would fragment the flow
     fn try_reload(&self, shutdown: &ShutdownWatch) {
         // File I/O is blocking — move it off the async executor so we don't
         // stall other tokio tasks during hot-reload.
@@ -526,8 +527,7 @@ fn refresh_sni_map(
 
     // Snapshot the old domain set before we swap in the new map, so we can
     // diff them afterward and invalidate removed entries from the cert cache.
-    let old_domains: std::collections::HashSet<String> =
-        map.load().keys().cloned().collect();
+    let old_domains: std::collections::HashSet<String> = map.load().keys().cloned().collect();
 
     let new_tls = compile_tls_configs(config);
     let domain_map: std::collections::HashMap<String, dwaar_tls::sni::DomainTlsConfig> = new_tls

@@ -20,8 +20,9 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
 
 use bytes::{Bytes, BytesMut};
 use tokio::io::AsyncReadExt;
@@ -195,10 +196,7 @@ impl UpstreamConnPool {
     /// Expired connections are silently discarded. Returns `None` when the
     /// pool is empty or all connections have expired.
     pub fn take(&self, addr: SocketAddr) -> Option<BufferedConn> {
-        let mut pools = self
-            .pools
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pools = self.pools.lock();
         let deque = pools.get_mut(&addr)?;
         let now = Instant::now();
 
@@ -227,10 +225,7 @@ impl UpstreamConnPool {
     pub fn put(&self, addr: SocketAddr, mut conn: BufferedConn) {
         conn.reset_for_reuse();
 
-        let mut pools = self
-            .pools
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pools = self.pools.lock();
         let deque = pools.entry(addr).or_default();
 
         if deque.len() >= self.max_per_host {
@@ -248,7 +243,7 @@ impl UpstreamConnPool {
 mod tests {
     use super::*;
 
-    /// Create a connected pair of TcpStreams for testing.
+    /// Create a connected pair of `TcpStream`s for testing.
     async fn connected_pair() -> (TcpStream, TcpStream) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -355,11 +350,11 @@ mod tests {
 
     #[tokio::test]
     async fn read_into_buf_and_take_bytes() {
+        use tokio::io::AsyncWriteExt;
         let (client, mut server) = connected_pair().await;
         let mut conn = BufferedConn::new(client);
 
         // Write some data from the server side
-        use tokio::io::AsyncWriteExt;
         server.write_all(b"hello world").await.expect("write");
 
         // Read into conn's buffer

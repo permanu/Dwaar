@@ -24,6 +24,11 @@ use tracing::{debug, warn};
 use crate::route::RouteTable;
 
 use super::bridge::{self, BodyFraming, MAX_REQUEST_BODY, UPSTREAM_TIMEOUT_SECS, UpstreamError};
+
+/// Maximum cumulative bytes accepted from a close-delimited upstream body.
+/// Close-delimited responses have no declared length — cap them to prevent
+/// unbounded memory growth and downstream stream exhaustion.
+const MAX_CLOSE_DELIMITED_BODY: u64 = 1 << 30; // 1 GiB
 use super::convert::{
     build_plugin_ctx, h3_to_pingora_headers, is_hop_by_hop, is_idempotent_method,
     pingora_resp_to_h3, resolve_upstream_addr,
@@ -127,9 +132,7 @@ pub async fn handle_h3_connection(
     // Graceful drain: give still-running request handlers a bounded window
     // to finish writing their responses before tearing down the connection.
     if !in_flight.is_empty() {
-        let drain = async {
-            while in_flight.join_next().await.is_some() {}
-        };
+        let drain = async { while in_flight.join_next().await.is_some() {} };
         if tokio::time::timeout(H3_DRAIN_TIMEOUT, drain).await.is_err() {
             warn!(
                 outstanding = in_flight.len(),
@@ -491,7 +494,13 @@ where
             Ok(true)
         }
         BodyFraming::CloseDelimited => {
+            let mut total_bytes: u64 = 0;
+
             if !body_prefix.is_empty() {
+                total_bytes += body_prefix.len() as u64;
+                if total_bytes > MAX_CLOSE_DELIMITED_BODY {
+                    return Err(StreamProxyError::Upstream(UpstreamError::ResponseTooLarge));
+                }
                 send_chunk(
                     h3_stream,
                     plugin_chain,
@@ -510,6 +519,10 @@ where
                 if n == 0 {
                     send_chunk(h3_stream, plugin_chain, ctx, Bytes::new(), true).await?;
                     break;
+                }
+                total_bytes += n as u64;
+                if total_bytes > MAX_CLOSE_DELIMITED_BODY {
+                    return Err(StreamProxyError::Upstream(UpstreamError::ResponseTooLarge));
                 }
                 let chunk = conn.take_bytes(n);
                 send_chunk(h3_stream, plugin_chain, ctx, chunk, false).await?;

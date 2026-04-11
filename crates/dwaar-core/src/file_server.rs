@@ -65,7 +65,7 @@ pub enum FileResponse {
 /// `root`: the configured filesystem root (already canonicalized at compile time).
 /// `request_path`: the URL path from the client (e.g., `/css/style.css`).
 /// `browse`: whether directory listing is enabled.
-pub fn serve_file(root: &Path, request_path: &str, browse: bool) -> FileResponse {
+pub async fn serve_file(root: &Path, request_path: &str, browse: bool) -> FileResponse {
     // Reject null bytes before any filesystem access
     if request_path.contains('\0') {
         return FileResponse::Forbidden;
@@ -95,7 +95,11 @@ pub fn serve_file(root: &Path, request_path: &str, browse: bool) -> FileResponse
     // Canonicalize to resolve symlinks that could escape the root.
     // This is the only per-request syscall and can't be skipped — a
     // symlink inside the root could point anywhere.
-    let Ok(resolved) = candidate.canonicalize() else {
+    let candidate_owned = candidate.clone();
+    let Ok(resolved) = tokio::task::spawn_blocking(move || candidate_owned.canonicalize())
+        .await
+        .unwrap_or_else(|_| Err(std::io::Error::other("spawn_blocking panicked")))
+    else {
         return FileResponse::NotFound;
     };
 
@@ -104,41 +108,60 @@ pub fn serve_file(root: &Path, request_path: &str, browse: bool) -> FileResponse
         return FileResponse::Forbidden;
     }
 
-    if resolved.is_dir() {
+    let resolved_for_is_dir = resolved.clone();
+    let is_dir = tokio::task::spawn_blocking(move || resolved_for_is_dir.is_dir())
+        .await
+        .unwrap_or(false);
+
+    if is_dir {
         // Try index files
         for index in &["index.html", "index.txt"] {
             let index_path = resolved.join(index);
-            if index_path.is_file() {
-                return read_file(&index_path);
+            let index_path_owned = index_path.clone();
+            let is_file = tokio::task::spawn_blocking(move || index_path_owned.is_file())
+                .await
+                .unwrap_or(false);
+            if is_file {
+                return read_file(&index_path).await;
             }
         }
         if browse {
-            return generate_directory_listing(&resolved, request_path);
+            return generate_directory_listing(&resolved, request_path).await;
         }
         return FileResponse::NotFound;
     }
 
-    if resolved.is_file() {
+    let resolved_for_is_file = resolved.clone();
+    let is_file = tokio::task::spawn_blocking(move || resolved_for_is_file.is_file())
+        .await
+        .unwrap_or(false);
+
+    if is_file {
         // Check for precompressed variants
         // (caller would need Accept-Encoding — for now serve the original)
-        return read_file(&resolved);
+        return read_file(&resolved).await;
     }
 
     FileResponse::NotFound
 }
 
-fn read_file(path: &Path) -> FileResponse {
+async fn read_file(path: &Path) -> FileResponse {
     let content_type = mime_type_for_path(path);
 
-    let Ok(metadata) = std::fs::metadata(path) else {
+    let path_owned = path.to_path_buf();
+    let result = tokio::task::spawn_blocking(move || {
+        let metadata = std::fs::metadata(&path_owned)?;
+        let data = std::fs::read(&path_owned)?;
+        Ok::<_, std::io::Error>((metadata, data))
+    })
+    .await
+    .unwrap_or_else(|_| Err(std::io::Error::other("spawn_blocking panicked")));
+
+    let Ok((metadata, data)) = result else {
         return FileResponse::NotFound;
     };
 
-    let body = match std::fs::read(path) {
-        Ok(data) => Bytes::from(data),
-        Err(_) => return FileResponse::NotFound,
-    };
-
+    let body = Bytes::from(data);
     let last_modified = metadata.modified().ok();
     let etag = last_modified.map(|lm| {
         let duration = lm
@@ -156,8 +179,29 @@ fn read_file(path: &Path) -> FileResponse {
     }
 }
 
-fn generate_directory_listing(dir: &Path, request_path: &str) -> FileResponse {
+async fn generate_directory_listing(dir: &Path, request_path: &str) -> FileResponse {
     use std::fmt::Write;
+
+    let dir_owned = dir.to_path_buf();
+    let items_result = tokio::task::spawn_blocking(move || {
+        let mut items: Vec<(String, bool)> = Vec::new();
+        let entries = std::fs::read_dir(&dir_owned)?;
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') {
+                continue;
+            }
+            let is_dir = entry.file_type().is_ok_and(|ft| ft.is_dir());
+            items.push((name, is_dir));
+        }
+        items.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok::<_, std::io::Error>(items)
+    })
+    .await
+    .unwrap_or_else(|_| Err(std::io::Error::other("spawn_blocking panicked")));
+
+    let items = items_result.unwrap_or_default();
+
     let mut html = String::with_capacity(4096);
     html.push_str("<!DOCTYPE html><html><head><meta charset=\"utf-8\">");
     html.push_str("<title>Index of ");
@@ -174,34 +218,19 @@ fn generate_directory_listing(dir: &Path, request_path: &str) -> FileResponse {
         html.push_str("<a href=\"../\">../</a>\n");
     }
 
-    // Read directory entries, sorted
-    if let Ok(mut entries) = std::fs::read_dir(dir) {
-        let mut items: Vec<(String, bool)> = Vec::new();
-        while let Some(Ok(entry)) = entries.next() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            // Skip dotfiles in listing
-            if name.starts_with('.') {
-                continue;
-            }
-            let is_dir = entry.file_type().is_ok_and(|ft| ft.is_dir());
-            items.push((name, is_dir));
-        }
-        items.sort_by(|a, b| a.0.cmp(&b.0));
-
-        for (name, is_dir) in &items {
-            let escaped = html_escape(name);
-            let display = if *is_dir {
-                format!("{escaped}/")
-            } else {
-                escaped.clone()
-            };
-            let href = if *is_dir {
-                format!("{escaped}/")
-            } else {
-                escaped
-            };
-            let _ = writeln!(html, "<a href=\"{href}\">{display}</a>");
-        }
+    for (name, is_dir) in &items {
+        let escaped = html_escape(name);
+        let display = if *is_dir {
+            format!("{escaped}/")
+        } else {
+            escaped.clone()
+        };
+        let href = if *is_dir {
+            format!("{escaped}/")
+        } else {
+            escaped
+        };
+        let _ = writeln!(html, "<a href=\"{href}\">{display}</a>");
     }
 
     html.push_str("</pre><hr></body></html>");
@@ -279,10 +308,10 @@ mod tests {
         (dir, canonical)
     }
 
-    #[test]
-    fn serves_existing_file() {
+    #[tokio::test]
+    async fn serves_existing_file() {
         let (_dir, root) = setup_test_dir();
-        let resp = serve_file(&root, "/style.css", false);
+        let resp = serve_file(&root, "/style.css", false).await;
         match resp {
             FileResponse::Found {
                 content_type, body, ..
@@ -294,48 +323,48 @@ mod tests {
         }
     }
 
-    #[test]
-    fn serves_index_html_for_directory() {
+    #[tokio::test]
+    async fn serves_index_html_for_directory() {
         let (_dir, root) = setup_test_dir();
-        let resp = serve_file(&root, "/", false);
+        let resp = serve_file(&root, "/", false).await;
         assert!(matches!(resp, FileResponse::Found { .. }));
     }
 
-    #[test]
-    fn not_found_for_missing_file() {
+    #[tokio::test]
+    async fn not_found_for_missing_file() {
         let (_dir, root) = setup_test_dir();
-        let resp = serve_file(&root, "/nonexistent.txt", false);
+        let resp = serve_file(&root, "/nonexistent.txt", false).await;
         assert!(matches!(resp, FileResponse::NotFound));
     }
 
-    #[test]
-    fn rejects_path_traversal() {
+    #[tokio::test]
+    async fn rejects_path_traversal() {
         let (_dir, root) = setup_test_dir();
-        let resp = serve_file(&root, "/../../../etc/passwd", false);
+        let resp = serve_file(&root, "/../../../etc/passwd", false).await;
         assert!(matches!(
             resp,
             FileResponse::Forbidden | FileResponse::NotFound
         ));
     }
 
-    #[test]
-    fn rejects_null_bytes() {
+    #[tokio::test]
+    async fn rejects_null_bytes() {
         let (_dir, root) = setup_test_dir();
-        let resp = serve_file(&root, "/style.css\0.txt", false);
+        let resp = serve_file(&root, "/style.css\0.txt", false).await;
         assert!(matches!(resp, FileResponse::Forbidden));
     }
 
-    #[test]
-    fn rejects_dotfiles() {
+    #[tokio::test]
+    async fn rejects_dotfiles() {
         let (_dir, root) = setup_test_dir();
-        let resp = serve_file(&root, "/.env", false);
+        let resp = serve_file(&root, "/.env", false).await;
         assert!(matches!(resp, FileResponse::Forbidden));
     }
 
-    #[test]
-    fn directory_listing_when_browse_enabled() {
+    #[tokio::test]
+    async fn directory_listing_when_browse_enabled() {
         let (_dir, root) = setup_test_dir();
-        let resp = serve_file(&root, "/sub/", true);
+        let resp = serve_file(&root, "/sub/", true).await;
         match resp {
             FileResponse::DirectoryListing { body } => {
                 let html = std::str::from_utf8(&body).expect("valid utf8");
@@ -346,25 +375,25 @@ mod tests {
         }
     }
 
-    #[test]
-    fn no_listing_when_browse_disabled() {
+    #[tokio::test]
+    async fn no_listing_when_browse_disabled() {
         let (_dir, root) = setup_test_dir();
         // /sub/ has page.html but no index.html — without browse, returns NotFound
-        let resp = serve_file(&root, "/sub/", false);
+        let resp = serve_file(&root, "/sub/", false).await;
         assert!(matches!(resp, FileResponse::NotFound));
     }
 
-    #[test]
-    fn serves_subdirectory_file() {
+    #[tokio::test]
+    async fn serves_subdirectory_file() {
         let (_dir, root) = setup_test_dir();
-        let resp = serve_file(&root, "/sub/page.html", false);
+        let resp = serve_file(&root, "/sub/page.html", false).await;
         assert!(matches!(resp, FileResponse::Found { .. }));
     }
 
-    #[test]
-    fn etag_is_set() {
+    #[tokio::test]
+    async fn etag_is_set() {
         let (_dir, root) = setup_test_dir();
-        if let FileResponse::Found { etag, .. } = serve_file(&root, "/style.css", false) {
+        if let FileResponse::Found { etag, .. } = serve_file(&root, "/style.css", false).await {
             assert!(etag.is_some());
             let tag = etag.expect("etag");
             assert!(tag.starts_with('"'));

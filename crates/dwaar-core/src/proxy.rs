@@ -199,6 +199,39 @@ impl DwaarProxy {
     }
 
     async fn handle_beacon(&self, session: &mut Session, ctx: &RequestContext) -> Result<bool> {
+        // Cross-origin beacon guard: if the browser sent an Origin header, verify
+        // it matches the host we're serving. A missing Origin is allowed — it means
+        // the request came from a same-origin context (server-rendered page, curl,
+        // etc.) where browsers don't add the header. A present but mismatched Origin
+        // is a cross-origin POST from a foreign page and must be rejected.
+        if let Some(origin_val) = session.req_header().headers.get("origin") {
+            let origin_str = origin_val.to_str().unwrap_or("");
+            let expected_host = ctx.plugin_ctx.host.as_deref().unwrap_or("");
+            // The Origin header is scheme://host[:port]. We check whether the host
+            // portion of the origin contains our expected host rather than doing a
+            // full URL parse so we avoid a dependency purely for this guard.
+            let host_in_origin = origin_str
+                .trim_start_matches("https://")
+                .trim_start_matches("http://")
+                // Strip any trailing path (origin never has a path, but be safe)
+                .split('/')
+                .next()
+                .unwrap_or("");
+            // Compare host ignoring port (e.g. "example.com:3000" matches "example.com").
+            let origin_host_no_port = host_in_origin.split(':').next().unwrap_or("");
+            if !expected_host.is_empty() && origin_host_no_port != expected_host {
+                warn!(
+                    request_id = %ctx.request_id(),
+                    origin = %origin_str,
+                    expected = %expected_host,
+                    "beacon rejected: Origin does not match serving host"
+                );
+                let resp = ResponseHeader::build(403, Some(0))?;
+                session.write_response_header(Box::new(resp), true).await?;
+                return Ok(true);
+            }
+        }
+
         if let Some(ref sender) = self.beacon_sender {
             let mut body = Vec::with_capacity(1024);
             while let Ok(Some(chunk)) = session.downstream_session.read_request_body().await {
@@ -239,7 +272,8 @@ impl DwaarProxy {
         let end_of_body = body.is_empty();
         let mut resp = ResponseHeader::build(status, Some(1))?;
         if !end_of_body {
-            resp.insert_header("Content-Length", body.len().to_string())
+            let mut cl_buf = itoa::Buffer::new();
+            resp.insert_header("Content-Length", cl_buf.format(body.len()))
                 .map_err(|e| Error::explain(HTTPStatus(status), format!("bad header: {e}")))?;
         }
         session
@@ -632,10 +666,25 @@ impl ProxyHttp for DwaarProxy {
                         ctx.response_body_max_size = limit;
                     }
 
-                    // gRPC streaming RPCs have unbounded body — disable limits
+                    // Route-config-driven gRPC: trust the block's `is_grpc_route` flag
+                    // first, then fall back to the Content-Type header set earlier.
+                    // This lets the operator mark a route as gRPC without relying on
+                    // clients always sending the correct Content-Type.
+                    ctx.is_grpc = block.is_grpc_route
+                        || session
+                            .req_header()
+                            .headers
+                            .get("content-type")
+                            .and_then(|v| v.to_str().ok())
+                            .is_some_and(|ct| ct.starts_with("application/grpc"));
+
+                    // gRPC streaming RPCs are unbounded by nature, but we cap at 1 GiB
+                    // rather than u64::MAX to prevent a misconfigured or malicious
+                    // client from exhausting memory on a route that happens to send
+                    // grpc Content-Type without actually being a controlled gRPC service.
                     if ctx.is_grpc {
-                        ctx.request_body_max_size = u64::MAX;
-                        ctx.response_body_max_size = u64::MAX;
+                        ctx.request_body_max_size = ctx.request_body_max_size.max(1u64 << 30);
+                        ctx.response_body_max_size = ctx.response_body_max_size.max(1u64 << 30);
                     }
 
                     // Cache config (ISSUE-073) — only for GET requests on matching paths
@@ -681,11 +730,8 @@ impl ProxyHttp for DwaarProxy {
 
                     // Apply rewrite rules (with template evaluation)
                     if !block.rewrites.is_empty() {
-                        let mut path = ctx
-                            .effective_path
-                            .as_deref()
-                            .unwrap_or(request_path)
-                            .to_string();
+                        let mut path: CompactString =
+                            ctx.effective_path.as_deref().unwrap_or(request_path).into();
 
                         for rule in &block.rewrites {
                             // Build template context from current path state.
@@ -707,10 +753,10 @@ impl ProxyHttp for DwaarProxy {
                                 vars: ctx.var_slots.as_ref(),
                             };
                             if let Some(rewritten) = rule.apply(&path, Some(&tmpl_ctx)) {
-                                path = rewritten.into_string();
+                                path = rewritten;
                             }
                         }
-                        ctx.effective_path = Some(CompactString::from(path));
+                        ctx.effective_path = Some(path);
                     }
 
                     // For handle/handle_path: first match wins — stop iterating
@@ -851,7 +897,8 @@ impl ProxyHttp for DwaarProxy {
                         b"Forbidden"
                     };
                     let mut resp = ResponseHeader::build(status, Some(1))?;
-                    resp.insert_header("Content-Length", generic_body.len().to_string())
+                    let mut cl_buf = itoa::Buffer::new();
+                    resp.insert_header("Content-Length", cl_buf.format(generic_body.len()))
                         .map_err(|e| {
                             Error::explain(HTTPStatus(status), format!("bad header: {e}"))
                         })?;
@@ -896,7 +943,7 @@ impl ProxyHttp for DwaarProxy {
                 .as_deref()
                 .unwrap_or(ctx.plugin_ctx.path.as_str());
 
-            match crate::file_server::serve_file(root, request_path, browse) {
+            match crate::file_server::serve_file(root, request_path, browse).await {
                 crate::file_server::FileResponse::Found {
                     body,
                     content_type,
@@ -913,7 +960,8 @@ impl ProxyHttp for DwaarProxy {
                     let mut resp = ResponseHeader::build(200, Some(4))?;
                     resp.insert_header("Content-Type", content_type)
                         .map_err(|e| Error::explain(HTTPStatus(200), format!("bad header: {e}")))?;
-                    resp.insert_header("Content-Length", content_length.to_string())
+                    let mut cl_buf = itoa::Buffer::new();
+                    resp.insert_header("Content-Length", cl_buf.format(content_length))
                         .map_err(|e| Error::explain(HTTPStatus(200), format!("bad header: {e}")))?;
                     resp.insert_header("Accept-Ranges", "bytes")
                         .map_err(|e| Error::explain(HTTPStatus(200), format!("bad header: {e}")))?;
@@ -930,7 +978,8 @@ impl ProxyHttp for DwaarProxy {
                     let mut resp = ResponseHeader::build(200, Some(2))?;
                     resp.insert_header("Content-Type", "text/html; charset=utf-8")
                         .map_err(|e| Error::explain(HTTPStatus(200), format!("bad header: {e}")))?;
-                    resp.insert_header("Content-Length", body.len().to_string())
+                    let mut cl_buf = itoa::Buffer::new();
+                    resp.insert_header("Content-Length", cl_buf.format(body.len()))
                         .map_err(|e| Error::explain(HTTPStatus(200), format!("bad header: {e}")))?;
                     session.write_response_header(Box::new(resp), false).await?;
                     session.write_response_body(Some(body), true).await?;
@@ -1011,7 +1060,8 @@ impl ProxyHttp for DwaarProxy {
                     }
                     let end_of_body = fcgi_resp.body.is_empty();
                     if !end_of_body {
-                        resp.insert_header("Content-Length", fcgi_resp.body.len().to_string())
+                        let mut cl_buf = itoa::Buffer::new();
+                        resp.insert_header("Content-Length", cl_buf.format(fcgi_resp.body.len()))
                             .map_err(|e| {
                                 Error::explain(HTTPStatus(fcgi_resp.status), format!("header: {e}"))
                             })?;
@@ -1047,7 +1097,8 @@ impl ProxyHttp for DwaarProxy {
                 .map_err(|e| Error::explain(HTTPStatus(500), format!("bad header: {e}")))?;
             resp.insert_header("Cache-Control", "public, max-age=86400")
                 .map_err(|e| Error::explain(HTTPStatus(500), format!("bad header: {e}")))?;
-            resp.insert_header("Content-Length", ANALYTICS_JS.len().to_string())
+            let mut cl_buf = itoa::Buffer::new();
+            resp.insert_header("Content-Length", cl_buf.format(ANALYTICS_JS.len()))
                 .map_err(|e| Error::explain(HTTPStatus(500), format!("bad header: {e}")))?;
             session.write_response_header(Box::new(resp), false).await?;
             session
@@ -1075,7 +1126,8 @@ impl ProxyHttp for DwaarProxy {
                         "serving ACME challenge response"
                     );
                     let mut resp = ResponseHeader::build(200, Some(1))?;
-                    resp.insert_header("Content-Length", key_auth.len().to_string())
+                    let mut cl_buf = itoa::Buffer::new();
+                    resp.insert_header("Content-Length", cl_buf.format(key_auth.len()))
                         .map_err(|e| Error::explain(HTTPStatus(500), format!("bad header: {e}")))?;
                     session.write_response_header(Box::new(resp), false).await?;
                     session
@@ -1459,8 +1511,11 @@ impl ProxyHttp for DwaarProxy {
                         intercept
                             .set_headers
                             .iter()
-                            .map(|(n, v)| (n.as_str().to_owned(), v.as_str().to_owned()))
-                            .collect::<Vec<_>>(),
+                            .map(|(n, v)| (
+                                compact_str::CompactString::from(n.as_str()),
+                                compact_str::CompactString::from(v.as_str()),
+                            ))
+                            .collect::<Vec<(compact_str::CompactString, compact_str::CompactString)>>(),
                         intercept.replace_body.clone(),
                     ))
                 } else {
@@ -1478,7 +1533,7 @@ impl ProxyHttp for DwaarProxy {
                 }
                 for (name, value) in set_headers {
                     upstream_response
-                        .insert_header(name, value)
+                        .insert_header(name.into_string(), value.into_string())
                         .expect("intercept header name/value must be valid");
                 }
                 if let Some(body) = replace_body {
@@ -1594,6 +1649,10 @@ impl ProxyHttp for DwaarProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // Cap for captured 5xx error body — enough to identify the error type
+        // without risking large allocations on fat error pages.
+        const ERROR_BODY_CAP: usize = 256;
+
         // --- Response body size check (ISSUE-070) ---
         // Track accumulated response bytes. If the upstream sends more than the
         // configured limit, abort the connection and return 502 to the client.
@@ -1614,22 +1673,33 @@ impl ProxyHttp for DwaarProxy {
         }
 
         // --- Capture 5xx error body for logging (ISSUE-117) ---
-        // Only reads body on 5xx, caps at 1KB. Zero overhead on happy path.
+        // Capped above at 256 bytes — enough to identify the error type without
+        // risking large allocations on fat error pages or binary upstream responses.
         if (500..600).contains(&ctx.upstream_status)
             && let Some(chunk) = body.as_ref()
         {
             let existing = ctx.upstream_error_body.as_ref().map_or(0, String::len);
-            if existing < 1024 {
-                let remaining = 1024 - existing;
-                let slice = &chunk[..chunk.len().min(remaining)];
-                let text = if let Ok(s) = std::str::from_utf8(slice) {
-                    s.to_string()
+            if existing < ERROR_BODY_CAP {
+                let remaining = ERROR_BODY_CAP - existing;
+                let raw_slice = &chunk[..chunk.len().min(remaining)];
+                // Only add the truncation marker when the chunk actually overflows
+                // the cap so readers know the body was cut short.
+                let truncated = chunk.len() > remaining;
+                let text = if let Ok(s) = std::str::from_utf8(raw_slice) {
+                    if truncated {
+                        format!("{s}…")
+                    } else {
+                        s.to_string()
+                    }
                 } else {
                     // Non-UTF-8 body: hex encode so the log entry stays valid JSON.
-                    let mut hex = String::with_capacity(slice.len() * 2);
-                    for &b in slice {
+                    let mut hex = String::with_capacity(raw_slice.len() * 2 + 3);
+                    for &b in raw_slice {
                         use std::fmt::Write as _;
                         let _ = write!(hex, "{b:02x}");
+                    }
+                    if truncated {
+                        hex.push('…');
                     }
                     hex
                 };
@@ -1761,14 +1831,16 @@ impl ProxyHttp for DwaarProxy {
             .map(CompactString::from);
 
         if let Some(ref agg) = self.agg_sender {
+            // AggEvent fields are Arc<str>: construction pays one Arc alloc per field,
+            // but subsequent clones (at the batch boundary) are pointer bumps only.
             let event = AggEvent {
-                host: host.clone(),
-                path: path.clone(),
+                host: Arc::from(host.as_str()),
+                path: Arc::from(path.as_str()),
                 status,
                 bytes_sent,
                 client_ip,
-                country: country.clone(),
-                referer: referer.clone(),
+                country: country.as_deref().map(Arc::from),
+                referer: referer.as_deref().map(Arc::from),
                 // bot-detect plugin classifies the request on PluginCtx;
                 // the aggregator splits bot vs human counters in DomainMetrics.
                 is_bot: ctx.plugin_ctx.is_bot,

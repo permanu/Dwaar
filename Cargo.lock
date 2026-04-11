@@ -1231,6 +1231,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -1261,7 +1262,7 @@ dependencies = [
 
 [[package]]
 name = "dwaar-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1347,7 +1348,9 @@ dependencies = [
  "http",
  "httparse",
  "ipnet",
+ "itoa",
  "openssl",
+ "parking_lot",
  "pingora",
  "pingora-cache",
  "pingora-core",
@@ -1485,6 +1488,7 @@ dependencies = [
  "lru",
  "openssl",
  "openssl-sys",
+ "parking_lot",
  "pingora-core",
  "serde",
  "serde_json",
@@ -1492,6 +1496,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

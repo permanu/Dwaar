@@ -227,11 +227,19 @@ fn read_tls_token_value(t: &mut Tokenizer<'_>, _context_tok: &Token) -> Result<S
                 },
             })
         }
-        // Literal token string or quoted string
+        // Literal token string or quoted string — warn if not a placeholder
         TokenKind::Word(_) | TokenKind::QuotedString(_) => {
             let tok = t.next_token();
             match tok.kind {
-                TokenKind::Word(w) | TokenKind::QuotedString(w) => Ok(w),
+                TokenKind::Word(w) | TokenKind::QuotedString(w) => {
+                    if !w.starts_with("{env.") && !w.starts_with("{file.") {
+                        tracing::warn!(
+                            "DNS provider token is specified as a literal in the Dwaarfile — \
+                             use {{env.VAR_NAME}} or {{file./path}} to avoid leaking secrets via config files"
+                        );
+                    }
+                    Ok(w)
+                }
                 _ => unreachable!(),
             }
         }
