@@ -109,6 +109,8 @@ instant-acme = "0.7"
 
 # OpenSSL (for TLS cert handling in dwaar-tls)
 openssl = { version = "0.10.76", features = ["vendored"] }
+# Async OpenSSL wrapper — used by L4 TLS termination handler
+tokio-openssl = "0.6.5"
 
 # Memory allocator
 tikv-jemallocator = "0.6"

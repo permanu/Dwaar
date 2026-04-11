@@ -702,6 +702,17 @@ fn run_server(
             }
         }
         if !l4_servers.is_empty() {
+            // Inject the shared cert store into any L4 TLS handlers so they
+            // can look up certs by SNI at accept time.
+            for server_cfg in &mut l4_servers {
+                for route in &mut server_cfg.routes {
+                    for handler in &mut route.handlers {
+                        if let dwaar_core::l4::CompiledL4Handler::Tls { cert_store: cs } = handler {
+                            *cs = Some(Arc::clone(&cert_store));
+                        }
+                    }
+                }
+            }
             let count = l4_servers.len();
             let l4_service = dwaar_core::l4::Layer4Service::new(l4_servers);
             let l4_bg = pingora_core::services::background::background_service("layer4", l4_service);

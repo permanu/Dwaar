@@ -257,7 +257,7 @@ fn warn_pending_global_runtime(_config: &DwaarConfig) {
 // ── Layer 4 compilation ─────────────────────────────────────────────────
 
 use dwaar_core::l4::{
-    CompiledL4Handler, CompiledL4Matcher, CompiledL4Route, CompiledL4Server,
+    CompiledL4Handler, CompiledL4Matcher, CompiledL4Route, CompiledL4Server, L4LoadBalancePolicy,
 };
 
 use crate::model::{
@@ -357,6 +357,13 @@ fn compile_l4_matcher(matcher: &Layer4Matcher) -> Option<CompiledL4Matcher> {
     }
 }
 
+/// Default: quarantine after 3 consecutive connect failures.
+const L4_DEFAULT_MAX_FAILS: u32 = 3;
+/// Default: keep a failing upstream out of rotation for 10 seconds.
+const L4_DEFAULT_FAIL_DURATION: std::time::Duration = std::time::Duration::from_secs(10);
+/// Default: give up on a connect attempt after 10 seconds.
+const L4_DEFAULT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 fn compile_l4_handler(handler: &Layer4Handler) -> Option<CompiledL4Handler> {
     match handler {
         Layer4Handler::Proxy(p) => {
@@ -369,9 +376,74 @@ fn compile_l4_handler(handler: &Layer4Handler) -> Option<CompiledL4Handler> {
                 warn!(raw = ?p.upstreams, "L4 proxy: no valid upstream addresses");
                 return None;
             }
-            Some(CompiledL4Handler::Proxy { upstreams })
+
+            // Extract LB and health options from the generic options list.
+            // Options follow caddy-l4 naming conventions:
+            //   lb_policy round_robin|least_conn|random|ip_hash
+            //   health_interval 10s
+            //   health_timeout  5s   (used as connect_timeout)
+            //   max_fails       3
+            //   fail_duration   10s
+            let mut lb_policy = L4LoadBalancePolicy::RoundRobin;
+            let mut max_fails = L4_DEFAULT_MAX_FAILS;
+            let mut fail_duration = L4_DEFAULT_FAIL_DURATION;
+            let mut connect_timeout = L4_DEFAULT_CONNECT_TIMEOUT;
+
+            for opt in &p.options {
+                match opt.name.as_str() {
+                    "lb_policy" => {
+                        lb_policy = match opt.args.first().map(String::as_str) {
+                            Some("round_robin") | Some("roundrobin") => {
+                                L4LoadBalancePolicy::RoundRobin
+                            }
+                            Some("least_conn") | Some("leastconn") => {
+                                L4LoadBalancePolicy::LeastConn
+                            }
+                            Some("random") => L4LoadBalancePolicy::Random,
+                            Some("ip_hash") | Some("iphash") => L4LoadBalancePolicy::IpHash,
+                            other => {
+                                warn!(
+                                    value = ?other,
+                                    "L4 proxy: unknown lb_policy — defaulting to round_robin"
+                                );
+                                L4LoadBalancePolicy::RoundRobin
+                            }
+                        };
+                    }
+                    "max_fails" => {
+                        if let Some(v) = opt.args.first().and_then(|s| s.parse::<u32>().ok()) {
+                            max_fails = v;
+                        }
+                    }
+                    "fail_duration" => {
+                        if let Some(d) = opt.args.first().and_then(|s| parse_l4_duration(s)) {
+                            fail_duration = d;
+                        }
+                    }
+                    // health_timeout is the per-connect deadline for upstream attempts.
+                    "health_timeout" | "connect_timeout" => {
+                        if let Some(d) = opt.args.first().and_then(|s| parse_l4_duration(s)) {
+                            connect_timeout = d;
+                        }
+                    }
+                    // health_interval is only relevant to active health checkers,
+                    // which the L4 proxy does not yet support. Recognised but ignored.
+                    "health_interval" | "health_uri" => {}
+                    other => {
+                        warn!(option = %other, "L4 proxy: unrecognised option — ignoring");
+                    }
+                }
+            }
+
+            Some(CompiledL4Handler::new_proxy(
+                upstreams,
+                lb_policy,
+                max_fails,
+                fail_duration,
+                connect_timeout,
+            ))
         }
-        Layer4Handler::Tls(_) => Some(CompiledL4Handler::Tls),
+        Layer4Handler::Tls(_) => Some(CompiledL4Handler::Tls { cert_store: None }),
         Layer4Handler::Subroute(sub) => {
             let routes = compile_l4_routes(&sub.matchers, &sub.routes);
             let timeout = sub

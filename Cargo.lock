@@ -1261,12 +1261,13 @@ dependencies = [
 
 [[package]]
 name = "dwaar-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arc-swap",
  "assert_cmd",
  "async-trait",
+ "chrono",
  "clap",
  "dashmap",
  "dwaar-admin",
@@ -1278,6 +1279,7 @@ dependencies = [
  "dwaar-log",
  "dwaar-plugins",
  "dwaar-tls",
+ "fastrand",
  "libc",
  "openssl",
  "pingora",
@@ -1307,6 +1309,7 @@ dependencies = [
  "dwaar-core",
  "dwaar-plugins",
  "dwaar-tls",
+ "ipnet",
  "notify",
  "openssl",
  "pingora-core",
@@ -1343,6 +1346,8 @@ dependencies = [
  "h3-quinn",
  "http",
  "httparse",
+ "ipnet",
+ "openssl",
  "pingora",
  "pingora-cache",
  "pingora-core",
@@ -1360,6 +1365,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-openssl",
  "tokio-test",
  "tracing",
  "uuid",
