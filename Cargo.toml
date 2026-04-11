@@ -116,7 +116,7 @@ tokio-openssl = "0.6.5"
 tikv-jemallocator = "0.6"
 
 # Inline strings (≤24 bytes stored on stack, no heap allocation)
-compact_str = { version = "0.8", features = ["serde"] }
+compact_str = { version = "0.9", features = ["serde"] }
 
 # Fast JSON serialization (SIMD-accelerated)
 sonic-rs = "0.3"
