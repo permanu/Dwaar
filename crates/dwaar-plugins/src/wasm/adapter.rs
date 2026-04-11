@@ -49,10 +49,11 @@ use wasmtime::Store;
 use wasmtime::component::{Component, Linker};
 
 use super::bindings::{
-    WitInstance, headers_to_wit, response_headers_to_wit, wit_action_to_native, wit_types,
+    HostImports, WitInstance, add_host_to_linker, wit_action_to_native, wit_types,
 };
 use super::engine::WasmEngine;
 use super::error::WasmError;
+use super::host::{MAX_HEADER_VALUE_BYTES, is_valid_header_name, truncate_utf8};
 use super::limits::{MemoryLimiter, WasmLimits, apply_limits};
 use crate::plugin::{DwaarPlugin, PluginAction, PluginCtx};
 
@@ -65,34 +66,64 @@ const MAX_CONSECUTIVE_TRAPS: u32 = 10;
 
 /// Data stored in each per-request wasmtime `Store`.
 ///
-/// These fields populate the store's data slot and are available to host
-/// functions that may be added in the future. Current WASM plugins are
-/// pure computation — they receive data as typed call arguments and return
-/// an action, with no host callbacks needed yet. Host function support
-/// (e.g., letting plugins call back into Dwaar for rate-limit state) is
-/// tracked in ISSUE-097.
+/// `PluginState` carries the per-hook data that host-imported functions
+/// read when the guest calls into them. It implements the bindgen-generated
+/// [`HostImports`] trait so guests can call
+/// `get-request-header` / `list-request-header-names` /
+/// `get-response-header` / `list-response-header-names` and receive live
+/// values without the host paying an eager copy cost.
 ///
-/// `memory_limiter` is here because wasmtime's `store.limiter()` closure must
-/// return a `&mut dyn ResourceLimiter` from the store's data — the limiter
-/// must live inside the store, not alongside it.
+/// # v0.2.3 — raw-pointer header access (L-16)
+///
+/// The request and response headers are held as raw pointers into the
+/// Pingora `RequestHeader` / `ResponseHeader` that owns them. The pointers
+/// are set in [`WasmPlugin::on_request`] / [`WasmPlugin::on_response`]
+/// *before* the guest is invoked, and those hook methods hold the source
+/// reference for their entire synchronous duration. The host-function
+/// closures registered on the linker only read through these pointers
+/// while the guest is running — so by construction the pointer is always
+/// valid during the read.
+///
+/// The raw-pointer approach is used because wasmtime's `Store<T>` fixes
+/// `T` for the store's full lifetime; parameterising `PluginState<'a>`
+/// would push the lifetime into the linker signature, preventing the L-19
+/// optimisation where the linker is built once at plugin construction and
+/// reused for every call. Raw pointers isolate the unsafety to the
+/// host-function bodies with an explicit safety argument.
+///
+/// `memory_limiter` is here because wasmtime's `store.limiter()` closure
+/// must return a `&mut dyn ResourceLimiter` from the store's data — the
+/// limiter must live inside the store, not alongside it.
 pub(crate) struct PluginState {
     /// Human-readable plugin name (used in log fields by host functions).
     pub(crate) plugin_name: String,
-    /// Client IP address, if available.
-    pub(crate) client_ip: Option<std::net::IpAddr>,
-    /// HTTP method of the inbound request (e.g., "GET").
-    pub(crate) method: String,
-    /// Request path (e.g., "/api/v1/users").
-    pub(crate) path: String,
-    /// True when the downstream connection used TLS.
-    pub(crate) is_tls: bool,
-    /// Snapshot of request headers for the current hook call.
-    pub(crate) request_headers: Vec<(String, String)>,
-    /// Snapshot of response headers for the current hook call.
-    pub(crate) response_headers: Vec<(String, String)>,
+    /// Raw pointer to the live `RequestHeader` for the current hook call.
+    /// `null` outside the valid window.
+    ///
+    /// SAFETY: dereferenced only inside `Host` trait methods, which can
+    /// only run while the guest is executing — i.e. while the enclosing
+    /// `on_request` / `on_response` hook is still on its stack holding
+    /// the original `&RequestHeader`. No async gap, no cross-thread move.
+    pub(crate) request_headers_ptr: *const RequestHeader,
+    /// Raw pointer to the live `ResponseHeader` for the current hook call.
+    /// `null` outside the valid window. Same safety argument as
+    /// `request_headers_ptr`.
+    pub(crate) response_headers_ptr: *const ResponseHeader,
     /// Memory growth limiter — consulted by wasmtime on every `memory.grow`.
     pub(crate) memory_limiter: MemoryLimiter,
 }
+
+// SAFETY: the raw pointers inside `PluginState` are never dereferenced
+// outside the synchronous scope of `WasmPlugin::on_request`/`on_response`,
+// both of which hold the source reference for their entire duration and
+// neither of which crosses an `.await` or a thread boundary. The
+// `Send + Sync` marker is required by `wasmtime::Store<T>` (which itself
+// is `Send + Sync` as long as `T` is) and by the fact that `WasmPlugin`
+// lives in the plugin chain behind an `Arc`.
+#[allow(unsafe_code)]
+unsafe impl Send for PluginState {}
+#[allow(unsafe_code)]
+unsafe impl Sync for PluginState {}
 
 impl AsMut<MemoryLimiter> for PluginState {
     fn as_mut(&mut self) -> &mut MemoryLimiter {
@@ -101,80 +132,29 @@ impl AsMut<MemoryLimiter> for PluginState {
 }
 
 impl PluginState {
-    /// Create a new state with just the plugin name (for tests).
-    pub(crate) fn new(plugin_name: String) -> Self {
+    /// Construct state from a `PluginCtx`, stashing a raw pointer to the
+    /// live request header map. Zero allocations for headers — the guest's
+    /// `get-request-header` / `list-request-header-names` calls read
+    /// through this pointer lazily (audit finding L-16). The `_ctx`
+    /// parameter is kept in the signature so future host imports that
+    /// expose client-IP / method / path have a place to read from.
+    fn from_ctx_with_request(_ctx: &PluginCtx, plugin_name: &str, req: &RequestHeader) -> Self {
         Self {
-            plugin_name,
-            client_ip: None,
-            method: String::new(),
-            path: String::new(),
-            is_tls: false,
-            request_headers: Vec::new(),
-            response_headers: Vec::new(),
+            plugin_name: plugin_name.to_owned(),
+            request_headers_ptr: std::ptr::from_ref::<RequestHeader>(req),
+            response_headers_ptr: std::ptr::null(),
             memory_limiter: MemoryLimiter::new(WasmLimits::default().memory_mb),
         }
     }
 
-    /// Construct state from a `PluginCtx`, populating request headers from the
-    /// actual `RequestHeader`. Host functions like `get-header` read from these
-    /// snapshots, so they must be populated before the hook is invoked.
-    ///
-    /// # Why this eager copy (L-16)
-    ///
-    /// The current `dwaar-plugin` WIT world types `request-info.headers` as
-    /// `list<header-entry>`, meaning the host hands the whole list to the
-    /// guest by value on every hook call. A lazy `get-header(name)` host
-    /// function would eliminate the per-request copy, but adding one is a
-    /// breaking WIT change that reshapes every existing guest binding. That
-    /// migration is tracked under plugin-system redesign work.
-    ///
-    /// Until then, the best we can do is pre-size the `Vec` to the exact
-    /// header count so we don't pay the `Vec` growth curve on top of the
-    /// required copy. `HeaderMap::iter()` isn't `ExactSizeIterator`, so
-    /// `.collect()` starts small and reallocates — an explicit
-    /// `Vec::with_capacity` + `push` loop avoids that.
-    fn from_ctx_with_request(ctx: &PluginCtx, plugin_name: &str, req: &RequestHeader) -> Self {
-        let mut request_headers = Vec::with_capacity(req.headers.len());
-        for (k, v) in req.headers.iter() {
-            request_headers.push((
-                k.as_str().to_lowercase(),
-                v.to_str().unwrap_or("").to_owned(),
-            ));
-        }
-
+    /// Construct state from a `PluginCtx`, stashing a raw pointer to the
+    /// live response header map. See [`Self::from_ctx_with_request`] for
+    /// the safety argument; this variant is used inside `on_response`.
+    fn from_ctx_with_response(_ctx: &PluginCtx, plugin_name: &str, resp: &ResponseHeader) -> Self {
         Self {
             plugin_name: plugin_name.to_owned(),
-            client_ip: ctx.client_ip,
-            method: ctx.method.to_string(),
-            path: ctx.path.to_string(),
-            is_tls: ctx.is_tls,
-            request_headers,
-            response_headers: Vec::new(),
-            memory_limiter: MemoryLimiter::new(WasmLimits::default().memory_mb),
-        }
-    }
-
-    /// Construct state from a `PluginCtx`, populating response headers from the
-    /// actual `ResponseHeader`. Used for `on_response` hook calls. Uses the
-    /// same explicit `with_capacity` pattern as [`from_ctx_with_request`] so
-    /// the header Vec never reallocates during population (L-16).
-    fn from_ctx_with_response(ctx: &PluginCtx, plugin_name: &str, resp: &ResponseHeader) -> Self {
-        let mut response_headers = Vec::with_capacity(resp.headers.len());
-        for (k, v) in resp.headers.iter() {
-            response_headers.push((
-                k.as_str().to_lowercase(),
-                v.to_str().unwrap_or("").to_owned(),
-            ));
-        }
-
-        Self {
-            plugin_name: plugin_name.to_owned(),
-            client_ip: ctx.client_ip,
-            method: ctx.method.to_string(),
-            path: ctx.path.to_string(),
-            is_tls: ctx.is_tls,
-            request_headers: Vec::new(),
-            response_headers,
+            request_headers_ptr: std::ptr::null(),
+            response_headers_ptr: std::ptr::from_ref::<ResponseHeader>(resp),
             memory_limiter: MemoryLimiter::new(WasmLimits::default().memory_mb),
         }
     }
@@ -199,8 +179,11 @@ pub struct WasmPlugin {
     /// threads without interior mutability. Constructing a fresh linker per
     /// call showed up as a repeated per-request cost in the audit.
     linker: Linker<PluginState>,
-    /// Human-readable name derived from the filename, leaked for `'static`.
-    name: &'static str,
+    /// Human-readable name derived from the filename. Owned `String` — no
+    /// leak. `DwaarPlugin::name()` returns `&self.name`, which satisfies the
+    /// trait's `&str` contract for as long as this plugin instance is in
+    /// the chain (closes L-17).
+    name: String,
     /// Execution priority — lower values run first in the plugin chain.
     priority: u16,
     /// How many hook calls in a row have trapped. Reset to zero on success.
@@ -229,40 +212,38 @@ impl WasmPlugin {
     /// The returned `WasmPlugin` is cheap to keep and call for every request.
     ///
     /// The plugin `name` is derived from the filename stem (e.g., `bot.wasm`
-    /// → `"bot"`). The string is leaked so it satisfies `DwaarPlugin::name()`'s
-    /// `&'static str` contract — plugins are created once at startup and the
-    /// process never drops them.
+    /// → `"bot"`). Owned `String` field — no leak. `DwaarPlugin::name()`
+    /// returns `&self.name` with a lifetime bounded by the plugin's place
+    /// in the chain, which is fine because every caller of `name()` only
+    /// borrows for the duration of a single request or log line.
     pub fn from_file(engine: &WasmEngine, path: &Path, priority: u16) -> Result<Self, WasmError> {
+        // Kept as owned String so both the Component load and the linker-wire
+        // error paths can attach it without fighting over moves.
         let path_str = path.display().to_string();
 
-        let stem = path
+        let name = path
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or("unknown-wasm-plugin");
-        // L-17: Box::leak produces a `&'static str` that satisfies the
-        // DwaarPlugin::name() trait contract. Every config reload leaks a new
-        // copy of the plugin name. Fixing this for real requires changing
-        // `DwaarPlugin::name()` from `&'static str` to `&str` (or `Arc<str>`),
-        // which touches every plugin impl in the workspace — several of which
-        // live outside the exclusive scope of this patch (forward_auth,
-        // ip_filter, basic_auth). Tracking under a future plugin-trait cleanup.
-        //
-        // Until then the leak is bounded: plugin names are short (typically
-        // under 32 bytes) and config reloads are rare. A weekly reload with a
-        // 32-byte name leaks ~1.6 KiB/year — orders of magnitude below the
-        // guardrail noise floor.
-        let name: &'static str = Box::leak(stem.to_owned().into_boxed_str());
+            .unwrap_or("unknown-wasm-plugin")
+            .to_owned();
 
         let component =
             Component::from_file(&engine.engine, path).map_err(|source| WasmError::Compile {
-                path: path_str,
+                path: path_str.clone(),
                 source,
             })?;
 
-        // Build the linker once (L-19). Today no host functions are registered,
-        // but any future `dwaar-host` imports should also be added here so the
-        // per-call path stays zero-setup.
-        let linker: Linker<PluginState> = Linker::new(&engine.engine);
+        // Build the linker once (L-19) and register the `host` interface
+        // imports (L-16) so guest calls to `get-request-header`,
+        // `list-request-header-names`, `get-response-header`, and
+        // `list-response-header-names` resolve without any per-call setup.
+        let mut linker: Linker<PluginState> = Linker::new(&engine.engine);
+        add_host_to_linker(&mut linker, |state: &mut PluginState| state).map_err(|source| {
+            WasmError::Compile {
+                path: path_str,
+                source,
+            }
+        })?;
 
         Ok(Self {
             engine: engine.engine.clone(),
@@ -291,12 +272,18 @@ impl WasmPlugin {
                 path: format!("<in-memory:{name}>"),
                 source,
             })?;
-        let linker: Linker<PluginState> = Linker::new(&engine.engine);
+        let mut linker: Linker<PluginState> = Linker::new(&engine.engine);
+        add_host_to_linker(&mut linker, |state: &mut PluginState| state).map_err(|source| {
+            WasmError::Compile {
+                path: format!("<in-memory:{name}>"),
+                source,
+            }
+        })?;
         Ok(Self {
             engine: engine.engine.clone(),
             component,
             linker,
-            name,
+            name: name.to_owned(),
             priority,
             consecutive_traps: AtomicU32::new(0),
             disabled: AtomicBool::new(false),
@@ -405,8 +392,8 @@ impl WasmPlugin {
 }
 
 impl DwaarPlugin for WasmPlugin {
-    fn name(&self) -> &'static str {
-        self.name
+    fn name(&self) -> &str {
+        &self.name
     }
 
     fn priority(&self) -> u16 {
@@ -417,16 +404,22 @@ impl DwaarPlugin for WasmPlugin {
         if self.disabled.load(Ordering::Relaxed) {
             return PluginAction::Continue;
         }
-        debug!(plugin = self.name, "on-request");
+        debug!(plugin = self.name.as_str(), "on-request");
+        // Headers are NOT included here — the guest reads them lazily via
+        // the host-imported `get-request-header` / `list-request-header-names`
+        // functions, which resolve through `state.request_headers_ptr`.
         let req_info = wit_types::RequestInfo {
             method: ctx.method.to_string(),
             path: ctx.path.to_string(),
-            headers: headers_to_wit(req),
             is_tls: ctx.is_tls,
             client_ip: ctx.client_ip.map(|ip| ip.to_string()).unwrap_or_default(),
         };
-        // Populate request_headers so host functions like get-header can read them.
-        let state = PluginState::from_ctx_with_request(ctx, self.name, req);
+        // SAFETY: PluginState holds a raw pointer to `req` for the duration of
+        // this synchronous hook call. Host function closures registered on
+        // the linker only run while the guest is executing inside
+        // `with_instance`, which never outlives this stack frame — so the
+        // pointer is always valid during the deref.
+        let state = PluginState::from_ctx_with_request(ctx, &self.name, req);
         self.with_instance(state, "on-request", |store, plugin| {
             let raw = plugin.call_on_request(store, &req_info)?;
             Ok(wit_action_to_native(raw))
@@ -437,15 +430,13 @@ impl DwaarPlugin for WasmPlugin {
         if self.disabled.load(Ordering::Relaxed) {
             return PluginAction::Continue;
         }
-        debug!(plugin = self.name, "on-response");
+        debug!(plugin = self.name.as_str(), "on-response");
         let resp_info = wit_types::ResponseInfo {
             status: resp.status.as_u16(),
-            headers: response_headers_to_wit(resp),
         };
-        // Populate response_headers so host functions like get-header can read them.
-        let state = PluginState::from_ctx_with_response(ctx, self.name, resp);
+        let state = PluginState::from_ctx_with_response(ctx, &self.name, resp);
         self.with_instance(state, "on-response", |store, plugin| {
-            let raw = plugin.call_on_response(store, &resp_info)?;
+            let raw = plugin.call_on_response(store, resp_info)?;
             Ok(wit_action_to_native(raw))
         })
     }
@@ -454,22 +445,119 @@ impl DwaarPlugin for WasmPlugin {
         if self.disabled.load(Ordering::Relaxed) {
             return PluginAction::Continue;
         }
-        debug!(plugin = self.name, eos, "on-body");
-        // Body hook has no headers to snapshot — use a bare ctx-based state.
+        debug!(plugin = self.name.as_str(), eos, "on-body");
+        let _ = ctx;
+        // Body hook has no headers to snapshot — use a bare state with both
+        // header pointers set to null.
         let state = PluginState {
-            plugin_name: self.name.to_owned(),
-            client_ip: ctx.client_ip,
-            method: ctx.method.to_string(),
-            path: ctx.path.to_string(),
-            is_tls: ctx.is_tls,
-            request_headers: Vec::new(),
-            response_headers: Vec::new(),
+            plugin_name: self.name.clone(),
+            request_headers_ptr: std::ptr::null(),
+            response_headers_ptr: std::ptr::null(),
             memory_limiter: MemoryLimiter::new(WasmLimits::default().memory_mb),
         };
         self.with_instance(state, "on-body", |store, plugin| {
             let raw = plugin.call_on_body(store, eos)?;
             Ok(wit_action_to_native(raw))
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host function implementation (audit finding L-16)
+// ---------------------------------------------------------------------------
+//
+// SAFETY BOUNDARY:
+//
+// The `request_headers_ptr` / `response_headers_ptr` raw pointers on
+// `PluginState` are **only** dereferenced inside this impl block. The
+// pointers are set by `WasmPlugin::on_request` and `::on_response` just
+// before `with_instance` is called, and those hook methods hold the
+// source `&RequestHeader` / `&ResponseHeader` for their entire
+// synchronous duration. The guest runs inside `with_instance`, the guest
+// calls back into these host functions synchronously, and both hook
+// methods return from the Dwaar plugin trait before the caller's borrow
+// of the header map ends. There is no `.await`, no thread hand-off, and
+// no path where the pointer outlives the `&HeaderMap` it points at.
+//
+// We use raw pointers rather than `PluginState<'a>` because
+// `wasmtime::Store<T>` fixes `T` for the store's whole lifetime; a
+// lifetime parameter on `PluginState` would force a matching lifetime on
+// the `Linker<T>`, preventing the "build once at construction and reuse"
+// optimisation from audit finding L-19.
+#[allow(unsafe_code)]
+impl HostImports for PluginState {
+    fn get_request_header(&mut self, name: String) -> Option<String> {
+        // Reject invalid (CRLF, non-ASCII, control-byte) header names before
+        // touching the HeaderMap — classic CRLF-injection defense.
+        if !is_valid_header_name(&name) {
+            tracing::debug!(
+                plugin = self.plugin_name.as_str(),
+                header_name = %name,
+                "guest requested request header with invalid name — rejected"
+            );
+            return None;
+        }
+        if self.request_headers_ptr.is_null() {
+            return None;
+        }
+        // SAFETY: pointer is non-null only inside the on_request hook scope,
+        // which holds the source `&RequestHeader` for its full duration.
+        let req: &RequestHeader = unsafe { &*self.request_headers_ptr };
+        let value = req
+            .headers
+            .get(name.as_str())
+            .and_then(|v| v.to_str().ok())?;
+        // Cap value size handed back to the guest (8 KB) so a malicious plugin
+        // can't request huge values and pin them in linear memory.
+        Some(truncate_utf8(value, MAX_HEADER_VALUE_BYTES).to_owned())
+    }
+
+    fn list_request_header_names(&mut self) -> Vec<String> {
+        if self.request_headers_ptr.is_null() {
+            return Vec::new();
+        }
+        // SAFETY: see `get_request_header`.
+        let req: &RequestHeader = unsafe { &*self.request_headers_ptr };
+        let mut names = Vec::with_capacity(req.headers.len());
+        for (k, _) in &req.headers {
+            names.push(k.as_str().to_lowercase());
+        }
+        names
+    }
+
+    fn get_response_header(&mut self, name: String) -> Option<String> {
+        if !is_valid_header_name(&name) {
+            tracing::debug!(
+                plugin = self.plugin_name.as_str(),
+                header_name = %name,
+                "guest requested response header with invalid name — rejected"
+            );
+            return None;
+        }
+        if self.response_headers_ptr.is_null() {
+            return None;
+        }
+        // SAFETY: see `get_request_header`. This pointer is set in
+        // `from_ctx_with_response`, used during `on_response`.
+        let resp: &ResponseHeader = unsafe { &*self.response_headers_ptr };
+        let value = resp
+            .headers
+            .get(name.as_str())
+            .and_then(|v| v.to_str().ok())?;
+        Some(truncate_utf8(value, MAX_HEADER_VALUE_BYTES).to_owned())
+    }
+
+    fn list_response_header_names(&mut self) -> Vec<String> {
+        if self.response_headers_ptr.is_null() {
+            return Vec::new();
+        }
+        // SAFETY: see `get_request_header`.
+        let resp: &ResponseHeader = unsafe { &*self.response_headers_ptr };
+        let mut names = Vec::with_capacity(resp.headers.len());
+        for (k, _) in &resp.headers {
+            names.push(k.as_str().to_lowercase());
+        }
+        names
     }
 }
 

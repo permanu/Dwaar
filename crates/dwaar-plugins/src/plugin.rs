@@ -109,7 +109,14 @@ pub enum PluginAction {
 ///   override the hooks they care about.
 pub trait DwaarPlugin: Send + Sync {
     /// Human-readable name for logging and diagnostics.
-    fn name(&self) -> &'static str;
+    ///
+    /// Returns a borrow from `self`, not `&'static str`. Dynamically-named
+    /// plugins (e.g., WASM components whose name is derived from the file
+    /// path at load time) hold their name in an owned `String` field and
+    /// return `&self.name`. Static-named plugins return a string literal
+    /// which coerces to `&str`. This removes the v0.2.2 `Box::leak` that
+    /// tracked finding L-17.
+    fn name(&self) -> &str;
 
     /// Execution priority — lower values run first.
     fn priority(&self) -> u16;
@@ -225,7 +232,7 @@ mod tests {
     }
 
     impl DwaarPlugin for RecorderPlugin {
-        fn name(&self) -> &'static str {
+        fn name(&self) -> &str {
             self.name
         }
         fn priority(&self) -> u16 {

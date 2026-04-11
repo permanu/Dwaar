@@ -2,15 +2,59 @@
 //
 // WASM plugins implement this interface to hook into Dwaar's request lifecycle.
 // Each hook corresponds to one of the three proxy phases: request, response, body.
+//
+// # v0.2.3 — Lazy header access (audit finding L-16)
+//
+// Earlier versions of this interface passed the full header list by value on
+// every hook call via `request-info.headers: list<header-entry>`. That meant
+// the host had to copy every header on every request, even if the guest only
+// cared about one of them (or none at all).
+//
+// This version removes the eager list and exposes host-imported functions
+// `get-request-header`, `get-response-header`, `list-request-header-names`,
+// and `list-response-header-names`. Guests read only the headers they need,
+// and the host serves each lookup directly from the live Pingora `HeaderMap`
+// with no intermediate copy.
+//
+// **Breaking change for guest binaries:** guests that previously read
+// `req.headers` must migrate to `get-request-header(name)`. The shape of the
+// record types has changed and existing `.wasm` binaries will fail to link
+// against the new host imports.
 
 package dwaar:plugin@0.1.0;
 
+/// Host-provided imports for lazy, zero-copy request/response inspection.
+///
+/// These are called by the guest from inside hook bodies. Each call goes
+/// through wasmtime's component-model FFI boundary once — cheap relative
+/// to the old bulk-copy model for plugins that only read a few headers.
+interface host {
+    /// Look up a single request header by lowercase name. Returns `None`
+    /// when the header is absent. Multi-value headers return the first
+    /// value; callers who need every instance should consult the header
+    /// names list and resolve explicitly.
+    get-request-header: func(name: string) -> option<string>;
+
+    /// Return the lowercase names of every request header, in wire order.
+    /// Costs one allocation (the name vector) but no per-value copying.
+    list-request-header-names: func() -> list<string>;
+
+    /// Look up a single response header by lowercase name.
+    get-response-header: func(name: string) -> option<string>;
+
+    /// Return the lowercase names of every response header, in wire order.
+    list-response-header-names: func() -> list<string>;
+}
+
 /// Per-request context passed to every plugin hook.
 ///
-/// Populated by the proxy engine before the plugin chain runs. Strings are
-/// passed as values (not references) because WASM memory is isolated — the host
-/// copies data in when calling, then reads mutations out when the call returns.
+/// Strings are passed by value because WASM memory is isolated — the host
+/// copies scalar fields in when calling, then reads mutations out when the
+/// call returns. Headers are explicitly NOT in this record — see the `host`
+/// interface above for lazy access.
 world dwaar-plugin {
+    import host;
+
     /// The action a plugin hook returns to control chain execution.
     enum plugin-action {
         /// Pass control to the next plugin in the chain.
@@ -22,18 +66,14 @@ world dwaar-plugin {
         skip,
     }
 
-    /// An HTTP header name/value pair.
-    record header-entry {
-        name: string,
-        value: string,
-    }
-
     /// Snapshot of the inbound request, passed to on-request.
+    ///
+    /// Headers are NOT in this record. Use the `host` interface functions
+    /// `get-request-header` / `list-request-header-names` to access them
+    /// without the host paying the eager copy cost.
     record request-info {
         method: string,
         path: string,
-        /// Raw headers — all names lowercased for uniform matching.
-        headers: list<header-entry>,
         /// True when the downstream connection used TLS.
         is-tls: bool,
         /// Client IP as a string (empty if unavailable).
@@ -41,13 +81,16 @@ world dwaar-plugin {
     }
 
     /// Snapshot of the upstream response, passed to on-response.
+    ///
+    /// Headers are NOT in this record. Use the `host` interface functions
+    /// `get-response-header` / `list-response-header-names` to access them.
     record response-info {
         status: u16,
-        headers: list<header-entry>,
     }
 
-    /// Called during request_filter(). Inspect request headers, return the
-    /// desired action. Use `respond` to short-circuit with an error.
+    /// Called during request_filter(). Inspect request headers (via host
+    /// imports), return the desired action. Use `respond` to short-circuit
+    /// with an error.
     export on-request: func(req: request-info) -> plugin-action;
 
     /// Called during response_filter(). Inspect or modify response headers.

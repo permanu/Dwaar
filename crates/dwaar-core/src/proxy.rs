@@ -1155,8 +1155,13 @@ impl ProxyHttp for DwaarProxy {
             const CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
             if ctx.plugin_ctx.path.starts_with(CHALLENGE_PREFIX) {
                 let token = &ctx.plugin_ctx.path[CHALLENGE_PREFIX.len()..];
+                // Pass the source IP so the solver can throttle per-IP
+                // bursts during active issuance (audit finding L-05).
+                // `None` just bypasses the throttle, which is fine for
+                // unit tests and loopback-only sessions that have no
+                // downstream IP recorded on the ctx.
                 if ChallengeSolver::is_valid_token(token)
-                    && let Some(key_auth) = solver.get(token)
+                    && let Some(key_auth) = solver.get(token, ctx.plugin_ctx.client_ip)
                 {
                     debug!(
                         request_id = %ctx.request_id(),

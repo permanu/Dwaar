@@ -11,23 +11,31 @@
 //! `dwaar-plugin` world. We isolate the generated code in `generated`
 //! to avoid name collisions with Dwaar's native `DwaarPlugin` trait.
 //!
+//! # v0.2.3 — Lazy header access (audit finding L-16)
+//!
+//! The WIT contract no longer ships headers inside `request-info` /
+//! `response-info`. Guests fetch headers through host-imported functions
+//! declared on the `host` interface. `bindgen!` generates a
+//! `dwaar::plugin::host::Host` trait that `PluginState` implements, and an
+//! `add_to_linker` helper that registers the host functions on the linker
+//! once at plugin construction.
+//!
 //! # Generated layout (wasmtime 29)
 //!
 //! For a world named `dwaar-plugin` with direct function exports:
 //! - `generated::DwaarPlugin` — the binding struct; `instantiate()` + `call_*` methods
-//! - `generated::PluginAction`, `generated::RequestInfo`, `generated::ResponseInfo`,
-//!   `generated::HeaderEntry` — the WIT record/enum types
-//!
-//! We re-export these under cleaner names so adapter.rs doesn't have to
-//! navigate the internal `generated::` path.
-
-use pingora_http::{RequestHeader, ResponseHeader};
+//! - `generated::PluginAction`, `generated::RequestInfo`, `generated::ResponseInfo`
+//!   — the WIT record/enum types (no `HeaderEntry` any more)
+//! - `generated::dwaar::plugin::host::Host` — the trait every store-data type
+//!   must implement to service guest imports
+//! - `generated::dwaar::plugin::host::add_to_linker` — one-shot host wiring helper
 
 use crate::plugin::PluginAction;
 
 /// Isolated module for bindgen! output to avoid the name clash between the
 /// generated `DwaarPlugin` struct and our native `DwaarPlugin` trait.
 #[allow(clippy::pedantic)]
+#[allow(unreachable_pub)]
 mod generated {
     wasmtime::component::bindgen!({
         path: "wit/dwaar-plugin.wit",
@@ -45,8 +53,17 @@ pub use generated::DwaarPlugin as WitInstance;
 /// Named `wit_types` (not `types`) to make import sites self-documenting:
 /// `wit_types::RequestInfo` reads clearly as "the WIT definition of `RequestInfo`".
 pub mod wit_types {
-    pub use super::generated::{HeaderEntry, PluginAction, RequestInfo, ResponseInfo};
+    pub use super::generated::{PluginAction, RequestInfo, ResponseInfo};
 }
+
+/// Re-export of the bindgen-generated `host::Host` trait. Implemented by
+/// `PluginState` in `adapter.rs` to service guest calls to
+/// `get-request-header`, `list-request-header-names`, etc. (L-16).
+pub use generated::dwaar::plugin::host::Host as HostImports;
+
+/// Re-export of the bindgen-generated `add_to_linker` helper for the `host`
+/// import interface. Called once at `WasmPlugin::from_file` construction.
+pub use generated::dwaar::plugin::host::add_to_linker as add_host_to_linker;
 
 // ---------------------------------------------------------------------------
 // Type conversions
@@ -67,29 +84,4 @@ pub fn wit_action_to_native(action: wit_types::PluginAction) -> PluginAction {
         }),
         wit_types::PluginAction::Skip => PluginAction::Skip,
     }
-}
-
-/// Build the WIT `list<header-entry>` from a Pingora `RequestHeader`.
-///
-/// Names are lowercased (HTTP/2 wire convention) so plugins match headers
-/// without case folding.
-pub fn headers_to_wit(req: &RequestHeader) -> Vec<wit_types::HeaderEntry> {
-    req.headers
-        .iter()
-        .map(|(name, value)| wit_types::HeaderEntry {
-            name: name.as_str().to_lowercase(),
-            value: value.to_str().unwrap_or("").to_owned(),
-        })
-        .collect()
-}
-
-/// Build the WIT `list<header-entry>` from a Pingora `ResponseHeader`.
-pub fn response_headers_to_wit(resp: &ResponseHeader) -> Vec<wit_types::HeaderEntry> {
-    resp.headers
-        .iter()
-        .map(|(name, value)| wit_types::HeaderEntry {
-            name: name.as_str().to_lowercase(),
-            value: value.to_str().unwrap_or("").to_owned(),
-        })
-        .collect()
 }

@@ -13,10 +13,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Hardening patch addressing the external security and performance audit.
 Triage identified 51 real findings (after filtering 5 false positives
-and ~15 items already remediated in v0.2.1/v0.2.2). v0.2.3 closes all
-51 — 43 in the main wave plus 8 in a follow-up close-out pass (see
-the "Audit close-out" section). v0.2.2's glob-import and H3-streaming
-work remain in place unchanged.
+and ~15 items already remediated in v0.2.1/v0.2.2). v0.2.3 closes
+**all 51** — 43 in the main wave, 5 in a close-out pass, plus the final
+3 (L-05, L-16, L-17) that were previously documented as deferred now
+fully implemented as real structural fixes. Zero accepted-design
+exits, zero deferrals. v0.2.2's glob-import and H3-streaming work
+remain in place unchanged.
+
+### Fixed — Final close-out (3)
+
+- **L-05 — Per-IP ACME challenge throttle.** `ChallengeSolver::get` now
+  takes an optional source IP and throttles probes to
+  `PROBE_MAX_PER_WINDOW = 120` per `PROBE_WINDOW_SECS = 60` per-IP
+  sliding window during active issuance. The tracked-IP counter map
+  is hard-capped at `PROBES_MAX_TRACKED_IPS = 10_000` with opportunistic
+  cleanup of expired windows to block rotating-source amplification.
+  The `is_empty()` fast-path from the earlier close-out still short-
+  circuits the steady-state case at zero cost. `None` source IP
+  (loopback, UDS, unit tests) bypasses the throttle.
+- **L-16 — Lazy WASM header access.** Replaced the eager
+  `list<header-entry>` field on `request-info` / `response-info` in the
+  `dwaar-plugin` WIT contract with host-imported functions
+  `get-request-header`, `list-request-header-names`,
+  `get-response-header`, `list-response-header-names`. Guests read only
+  the headers they need. `PluginState` holds raw `*const RequestHeader`
+  / `*const ResponseHeader` pointers set by the enclosing hook call
+  and dereferenced only inside the host-function closures — zero
+  header copies on the hot path. The 8 KiB per-value cap and CRLF-
+  injection name filter from `host.rs` are still applied on every
+  lookup. **Breaking WIT ABI** — existing guest binaries that read
+  `req.headers` must migrate to `get-request-header(name)`.
+- **L-17 — DwaarPlugin::name() trait refactor.** Changed the trait
+  signature from `fn name(&self) -> &'static str` to
+  `fn name(&self) -> &str`. `WasmPlugin` now holds the plugin name as
+  an owned `String` field and returns `&self.name`, eliminating the
+  `Box::leak` on every config reload. Literal-returning impls in
+  `bot_detect`, `compress`, `ip_filter`, `rate_limit`,
+  `security_headers`, and `under_attack` keep their
+  `fn name(&self) -> &'static str` signatures (string literals satisfy
+  `&str` trivially) — zero behaviour change for those. Plugin tests:
+  141 passing with the wasm feature enabled.
 
 ### Fixed — Audit close-out (8)
 
@@ -58,15 +94,12 @@ work remain in place unchanged.
   host function is a breaking WIT change tracked under plugin-system
   redesign.
 
-### Deferred — Cross-cutting refactor (1)
+### Previously deferred — now fully fixed
 
-- **L-17** — WASM `DwaarPlugin::name()` returns `&'static str`, so the
-  plugin adapter `Box::leak`s the name string. Fixing this requires
-  changing the `DwaarPlugin` trait signature to return `&str` or
-  `Arc<str>`, which cascades across every plugin impl in the workspace
-  (forward_auth, basic_auth, ip_filter, …). Leak is bounded at ~1.6 KiB
-  per year under weekly config reloads. Tracked under future plugin-
-  trait cleanup.
+L-16 and L-17 were listed as deferred in an earlier close-out pass.
+Both are now implemented as real structural fixes — see "Final
+close-out" above. There are **no accepted-design exits and no deferred
+items** remaining in the v0.2.3 audit scope.
 
 ### Main wave (43 fixes)
 
