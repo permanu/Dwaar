@@ -9,6 +9,7 @@ debug/
 
 # Local build helpers (use .github/workflows/release.yml for real releases)
 /Dockerfile.amd64build
+/Dockerfile.arm64build
 /bench/profile.sh
 
 # IDE
