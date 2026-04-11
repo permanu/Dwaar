@@ -415,6 +415,28 @@ The `Content-Type` is always `application/json`. The message is safe to display 
 
 ---
 
+## Audit Logging
+
+Mutating operations emit a structured `tracing::info!` event at target `dwaar::admin::audit`. The following operations produce an audit event:
+
+| Operation | `action` value | `resource` value |
+|---|---|---|
+| `POST /routes` | `route_add` | domain name |
+| `DELETE /routes/{domain}` | `route_delete` | domain name |
+| `PURGE /cache/{host}/{path}` | `cache_purge` | `{host}/{path}` key |
+
+Every audit event includes the fields `action`, `principal` (always `"admin"` for API-driven mutations), and `resource`.
+
+To capture only audit events, set:
+
+```
+RUST_LOG=dwaar::admin::audit=info
+```
+
+This lets you route audit entries to a separate log sink without increasing the overall log verbosity. Audit events are `INFO` level and flow through the normal `tracing` subscriber — they appear in whatever output format your subscriber is configured to use.
+
+---
+
 ## Related
 
 - [Analytics API](analytics.md) — full response schema for `/analytics` and `/analytics/{domain}`

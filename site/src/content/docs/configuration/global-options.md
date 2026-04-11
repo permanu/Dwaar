@@ -92,6 +92,12 @@ sequenceDiagram
     D->>C: Connection close
 ```
 
+## Body Size Limits and gRPC
+
+Configured `request_body_max_size` and `response_body_max_size` limits apply to all requests. For requests detected as gRPC (by a `Content-Type` starting with `application/grpc`), the effective limit is raised to **1 GiB** if the configured limit is lower — gRPC streaming RPCs are unbounded by nature. Configured limits above 1 GiB continue to apply as-is. This cap prevents a client advertising a gRPC content type from exhausting memory on an unconstrained route.
+
+---
+
 ## HTTP/3
 
 Enable HTTP/3 (QUIC) by adding `h3 on` inside a `servers { }` block in global options:

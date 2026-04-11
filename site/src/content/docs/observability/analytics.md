@@ -199,6 +199,29 @@ received no traffic.
 - The full snapshot is flushed to stdout as newline-delimited JSON every 60
   seconds for log aggregation pipelines.
 
+## Privacy / Consent Gating
+
+Analytics injection can be restricted to visitors who have given explicit consent, which aids GDPR and CCPA compliance. This is controlled by the `respect_consent` field on the `HtmlInjector` (defaults to `false` — injection is unconditional).
+
+When `respect_consent` is `true`, each response body chunk is processed through the consent gate before injection:
+
+- If the request carried `DNT: 1`, injection is skipped regardless of cookies.
+- If the `Cookie` header contains `dwaar_consent=1` or `analytics_consent=1` (key comparison is case-insensitive; semicolon-separated pairs), injection proceeds.
+- Otherwise injection is skipped and the response passes through unmodified.
+
+Enable consent gating in the analytics configuration block:
+
+```
+example.com {
+    reverse_proxy localhost:3000
+    analytics {
+        respect_consent true
+    }
+}
+```
+
+Your consent banner must set one of the recognised cookies (`dwaar_consent=1` or `analytics_consent=1`) when the visitor accepts analytics. Until that cookie is present, the analytics script is not injected.
+
 ## Privacy
 
 - **No cookies.** The analytics script does not set or read any cookies.

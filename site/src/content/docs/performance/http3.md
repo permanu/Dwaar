@@ -131,6 +131,12 @@ connection is already TLS-encrypted.
 
 ---
 
+## Body Size Limits
+
+Close-delimited upstream response bodies (responses with no `Content-Length` and no `Transfer-Encoding: chunked`) are capped at **1 GiB** on the HTTP/3 bridge path (`MAX_CLOSE_DELIMITED_BODY`). Bodies that exceed this limit are truncated. This prevents unbounded memory growth when an upstream omits length framing.
+
+---
+
 ## Current Limitations
 
 | Limitation | Impact |

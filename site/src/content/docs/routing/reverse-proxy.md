@@ -238,9 +238,19 @@ myapp.example.com {
 | Field | Default | Description |
 |---|---|---|
 | `wake_timeout` | `30` | Seconds to wait for the backend to become reachable before giving up with 502. |
-| `wake_command` | — | Shell command to execute to start the backend. Run once per unreachable event; concurrent requests wait on the same wake attempt. |
+| `wake_command` | — | Command to execute to start the backend. Must be an absolute path. Run once per unreachable event; concurrent requests wait on the same wake attempt. |
 
 `health_uri` is required for scale-to-zero to detect when the backend is ready. Without it, Dwaar cannot know when to forward the held request.
+
+> **Breaking change:** `wake_command` must now begin with `/`. A relative path (e.g. `docker start myapp`) is rejected at runtime with a `WakeError::CommandPathNotAbsolute` error and a warning log — the held request receives a 502. The command is executed directly via `Command::new` with arguments split on whitespace; it is **not** passed to a shell, so shell metacharacters, pipes, and redirects are not interpreted. Use a wrapper script at an absolute path if shell features are required:
+>
+> ```
+> # Correct
+> wake_command /usr/local/bin/start-myapp.sh
+>
+> # Incorrect — will fail at runtime
+> wake_command docker start myapp
+> ```
 
 ---
 

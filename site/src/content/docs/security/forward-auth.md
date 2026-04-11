@@ -89,13 +89,13 @@ forward_auth 127.0.0.1:9000 { ... }
 
 When `transport tls` is set, Dwaar upgrades the connection using `tokio-rustls` with the `webpki-roots` trust store. If the upstream address was a DNS hostname (e.g. `authelia:9091`), the hostname is used as the TLS SNI value so certificate validation works correctly. If the upstream is a literal IP address, SNI is set to the IP.
 
-Without `transport tls`, Dwaar emits a one-time warning at startup:
+Without `transport tls`, and when the auth service address is not a loopback address, Dwaar emits a one-time warning on the first request processed:
 
 ```
-WARN forward_auth uses plaintext TCP — auth responses are not integrity-protected
+WARN forward_auth target '<host>:<port>' is plaintext; credentials will transit unencrypted — set tls: true
 ```
 
-An on-path attacker could forge a `2xx` response and inject arbitrary values for `copy_headers` fields. Use `transport tls` whenever the auth service is not on loopback.
+The warning fires at most once per process (via a `std::sync::Once` gate). There is no behaviour change — auth subrequests still proceed. An on-path attacker can forge a `2xx` response and inject arbitrary `copy_headers` values. Use `transport tls` whenever the auth service is not on loopback.
 
 ---
 

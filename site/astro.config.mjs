@@ -73,6 +73,7 @@ export default defineConfig({
 						{ label: 'Redirects & Rewrites', slug: 'routing/redirects-rewrites' },
 						{ label: 'Handle & Route Blocks', slug: 'routing/handle' },
 						{ label: 'Respond & Error Pages', slug: 'routing/respond-errors' },
+						{ label: 'Layer 4 TCP Proxy', slug: 'routing/layer4-tcp-proxy' },
 					],
 				},
 				{

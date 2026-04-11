@@ -85,6 +85,27 @@ All timing fields use **microseconds** for sub-millisecond precision. Both `resp
 
 ---
 
+## Privacy
+
+### Client IP anonymization
+
+Client IP addresses are anonymized at serialization time. This behaviour is currently compiled in (`ANONYMIZE_CLIENT_IP = true`) and is always active:
+
+- **IPv4** — the last octet is zeroed, retaining the `/24` prefix. `203.0.113.42` logs as `203.0.113.0`.
+- **IPv6** — segments 3–7 are zeroed, retaining the `/48` prefix (first 3 segments). `2001:db8:1234:5678::1` logs as `2001:db8:1234::`.
+
+The full client IP is never written to the log. The `client_ip` field always contains the anonymized form.
+
+### Query-string redaction
+
+Sensitive query-parameter values are replaced with `REDACTED` before the `query` field is serialized. The following parameter names are treated as sensitive (matching is case-insensitive):
+
+`token`, `key`, `secret`, `password`, `api_key`, `access_token`, `auth`
+
+For example, a request to `/search?q=hello&token=abc123` logs `query` as `q=hello&token=REDACTED`. Parameters not on the list are logged verbatim. No allocation occurs when the query string contains no sensitive keys.
+
+---
+
 ## Output Destinations
 
 ### stdout

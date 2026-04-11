@@ -52,6 +52,25 @@ If your deployment includes subdomains that intentionally serve only HTTP (e.g. 
 
 ---
 
+## Content Security Policy
+
+The `SecurityHeadersPlugin` has two optional CSP fields: `content_security_policy` and `content_security_policy_report_only`. Both default to `None` — no `Content-Security-Policy` or `Content-Security-Policy-Report-Only` header is sent unless explicitly configured. Configure them via the `header` directive inside a site block (the plugin picks up overrides at response-header time):
+
+```
+api.example.com {
+    reverse_proxy localhost:8080
+
+    header {
+        Content-Security-Policy "default-src 'self'; script-src 'self' cdn.example.com"
+        Content-Security-Policy-Report-Only "default-src 'self'; report-uri /csp-report"
+    }
+}
+```
+
+Use `Content-Security-Policy-Report-Only` during rollout to log violations without blocking requests. Once the policy is stable, switch to `Content-Security-Policy`.
+
+---
+
 ## Configuration
 
 ### Overriding individual headers

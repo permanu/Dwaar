@@ -163,6 +163,20 @@ With this configuration:
 
 ---
 
+## Cache Reload Memory
+
+Each config reload that reconfigures the cache backend calls `Box::leak` three times (once each for `LruManager`, `MemCache`, and `CacheLock`). The leaked control structs are small (~1 KB total) and are promoted to `'static` so in-flight requests can continue referencing them safely. The cached data itself is freed when those references drop.
+
+Operators can monitor accumulated leak pressure via the `leaked_reload_count()` function (exposed to the metrics crate), which returns the cumulative count of `Box::leak` calls since process start (`CACHE_RELOAD_LEAKS` static counter). Each config reload increments this by 3. The value appears in the `dwaar::cache::reload` tracing target at `WARN` level on every reload:
+
+```
+WARN dwaar::cache::reload total_leaked_backends=2 total_leak_calls=6 cache backend structs leaked for 'static lifetime; monitor leaked_reload_count() for accumulation
+```
+
+This counter is informational. For typical deployments with infrequent operator-driven reloads, the total leaked memory remains negligible.
+
+---
+
 ## Related
 
 - [Compression](./compression.md) — `encode` directive for on-the-fly gzip and Brotli
