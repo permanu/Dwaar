@@ -1249,22 +1249,27 @@ dependencies = [
  "dashmap",
  "dwaar-log",
  "flate2",
+ "hex",
+ "hmac",
  "hyperloglog",
  "libc",
  "parking_lot",
  "rand 0.10.0",
  "serde",
  "serde_json",
+ "sha2",
+ "subtle",
  "tdigest",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
 name = "dwaar-cli"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "arc-swap",
