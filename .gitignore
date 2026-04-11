@@ -7,6 +7,10 @@ debug/
 /dist/
 *.trace/
 
+# Local build helpers (use .github/workflows/release.yml for real releases)
+/Dockerfile.amd64build
+/bench/profile.sh
+
 # IDE
 .idea/
 .vscode/
@@ -24,9 +28,10 @@ Thumbs.db
 # Local development docs (not for repo)
 /local/
 
-# Built docs
-/target/docs/
-/docs/book/
+# Built docs (Astro site)
+site/dist/
+site/node_modules/
+site/.astro/
 
 # Wrangler / Cloudflare local state
 .wrangler/
