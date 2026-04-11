@@ -7,7 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-[Unreleased]: https://github.com/permanu/Dwaar/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/permanu/Dwaar/compare/v0.2.0...HEAD
+
+## [0.2.0] - 2026-04-11
+
+### Added
+- **Layer 4 TCP proxy** — caddy-l4 compatible `layer4 {}` global block with
+  protocol-aware matchers (TLS SNI/ALPN, HTTP Host, SSH, PostgreSQL,
+  remote_ip CIDR) and bidirectional TCP splice. Supports both standalone
+  L4 servers and `listener_wrappers` for port-sharing with HTTP.
+- Auto-update background service (`auto_update {}` Dwaarfile block) —
+  periodically checks releases.dwaar.dev, downloads with SHA-256
+  verification, and triggers zero-downtime reload within a configurable
+  maintenance window.
+
+[0.2.0]: https://github.com/permanu/Dwaar/compare/v0.1.1...v0.2.0
 
 ## [0.1.1] - 2026-04-10
 
