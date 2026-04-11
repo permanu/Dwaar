@@ -11,7 +11,7 @@
 set -euo pipefail
 
 VERSION="${1:?Usage: bump-license-date.sh <version> [--years N]}"
-YEARS=6  # default: 6 years protection (same as SpacetimeDB)
+YEARS=10 # default: 10 years protection — see LICENSE rationale
 
 # Parse optional --years flag
 while [[ $# -gt 1 ]]; do
