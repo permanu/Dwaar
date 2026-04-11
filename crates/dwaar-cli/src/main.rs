@@ -688,6 +688,28 @@ fn run_server(
 
     server.add_service(admin_listening);
 
+    // Layer 4 TCP proxy — bind separate listeners for non-HTTP protocols.
+    {
+        use dwaar_config::compile::{compile_l4_servers, compile_l4_wrappers};
+
+        let mut l4_servers = Vec::new();
+        if let Some(ref l4_cfg) = dwaar_config.global_options.as_ref().and_then(|g| g.layer4.as_ref()) {
+            l4_servers.extend(compile_l4_servers(l4_cfg));
+        }
+        if let Some(ref opts) = dwaar_config.global_options {
+            if !opts.layer4_listener_wrappers.is_empty() {
+                l4_servers.extend(compile_l4_wrappers(&opts.layer4_listener_wrappers));
+            }
+        }
+        if !l4_servers.is_empty() {
+            let count = l4_servers.len();
+            let l4_service = dwaar_core::l4::Layer4Service::new(l4_servers);
+            let l4_bg = pingora_core::services::background::background_service("layer4", l4_service);
+            server.add_service(l4_bg);
+            info!(listeners = count, "layer4 TCP proxy service registered");
+        }
+    }
+
     register_background_services(
         &mut server,
         cli,

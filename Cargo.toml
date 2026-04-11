@@ -78,6 +78,9 @@ chrono = { version = "0.4.44", default-features = false, features = ["clock", "s
 # Pattern matching (bot detection)
 daachorse = "1.0"
 
+# IP network / CIDR parsing (L4 remote_ip matcher)
+ipnet = "2"
+
 # File watching
 notify = { version = "8.2.0", default-features = false, features = ["macos_kqueue"] }
 

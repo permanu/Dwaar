@@ -43,6 +43,8 @@ use dwaar_plugins::forward_auth::ForwardAuthConfig;
 pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
     let mut routes = Vec::with_capacity(config.sites.len());
 
+    warn_pending_global_runtime(config);
+
     for site in &config.sites {
         if !is_valid_domain(&site.address) {
             warn!(
@@ -245,6 +247,180 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
 
     RouteTable::new(routes)
 }
+
+fn warn_pending_global_runtime(_config: &DwaarConfig) {
+    // Layer 4 runtime is now implemented — no more warnings needed.
+    // This function remains as a hook point for future global-level
+    // features that are parse-only before their runtime ships.
+}
+
+// ── Layer 4 compilation ─────────────────────────────────────────────────
+
+use dwaar_core::l4::{
+    CompiledL4Handler, CompiledL4Matcher, CompiledL4Route, CompiledL4Server,
+};
+
+use crate::model::{
+    Layer4Config, Layer4Handler, Layer4ListenerWrapper, Layer4Matcher, Layer4MatcherDef,
+    Layer4Route,
+};
+
+/// Default matching timeout for L4 protocol detection.
+const L4_DEFAULT_MATCHING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Compile parsed L4 config into runtime-ready servers.
+pub fn compile_l4_servers(config: &Layer4Config) -> Vec<CompiledL4Server> {
+    config
+        .servers
+        .iter()
+        .flat_map(|server| {
+            let routes = compile_l4_routes(&server.matchers, &server.routes);
+            server.listen.iter().filter_map(move |addr_str| {
+                let listen = parse_l4_listen_addr(addr_str)?;
+                Some(CompiledL4Server {
+                    listen,
+                    routes: routes.clone(),
+                    matching_timeout: L4_DEFAULT_MATCHING_TIMEOUT,
+                })
+            })
+        })
+        .collect()
+}
+
+/// Compile listener-wrapper L4 configs into runtime servers.
+pub fn compile_l4_wrappers(wrappers: &[Layer4ListenerWrapper]) -> Vec<CompiledL4Server> {
+    wrappers
+        .iter()
+        .filter_map(|wrapper| {
+            let listen = parse_l4_listen_addr(&wrapper.listen)?;
+            let routes = compile_l4_routes(&wrapper.layer4.matchers, &wrapper.layer4.routes);
+            Some(CompiledL4Server {
+                listen,
+                routes,
+                matching_timeout: L4_DEFAULT_MATCHING_TIMEOUT,
+            })
+        })
+        .collect()
+}
+
+fn compile_l4_routes(
+    matcher_defs: &[Layer4MatcherDef],
+    routes: &[Layer4Route],
+) -> Vec<CompiledL4Route> {
+    routes
+        .iter()
+        .map(|route| {
+            let matchers = route
+                .matcher_names
+                .iter()
+                .filter_map(|name| {
+                    matcher_defs
+                        .iter()
+                        .find(|def| def.name == *name)
+                        .map(compile_l4_matcher_def)
+                })
+                .flatten()
+                .collect();
+            let handlers = route.handlers.iter().filter_map(compile_l4_handler).collect();
+            CompiledL4Route { matchers, handlers }
+        })
+        .collect()
+}
+
+fn compile_l4_matcher_def(def: &Layer4MatcherDef) -> Vec<CompiledL4Matcher> {
+    def.matchers.iter().filter_map(compile_l4_matcher).collect()
+}
+
+fn compile_l4_matcher(matcher: &Layer4Matcher) -> Option<CompiledL4Matcher> {
+    match matcher {
+        Layer4Matcher::Tls { sni, alpn, .. } => Some(CompiledL4Matcher::Tls {
+            sni: sni.clone(),
+            alpn: alpn.clone(),
+        }),
+        Layer4Matcher::Http { host, .. } => Some(CompiledL4Matcher::Http { host: host.clone() }),
+        Layer4Matcher::Ssh => Some(CompiledL4Matcher::Ssh),
+        Layer4Matcher::Postgres => Some(CompiledL4Matcher::Postgres),
+        Layer4Matcher::RemoteIp(ranges) => {
+            let nets: Vec<ipnet::IpNet> = ranges.iter().filter_map(|r| r.parse().ok()).collect();
+            if nets.is_empty() && !ranges.is_empty() {
+                warn!(ranges = ?ranges, "L4 remote_ip: failed to parse some CIDR ranges");
+            }
+            Some(CompiledL4Matcher::RemoteIp(nets))
+        }
+        Layer4Matcher::Not(inner) => {
+            compile_l4_matcher(inner).map(|m| CompiledL4Matcher::Not(Box::new(m)))
+        }
+        Layer4Matcher::Unknown { name, .. } => {
+            warn!(matcher = %name, "unknown L4 matcher — skipping");
+            None
+        }
+    }
+}
+
+fn compile_l4_handler(handler: &Layer4Handler) -> Option<CompiledL4Handler> {
+    match handler {
+        Layer4Handler::Proxy(p) => {
+            let upstreams: Vec<std::net::SocketAddr> = p
+                .upstreams
+                .iter()
+                .filter_map(|u| parse_l4_listen_addr(u))
+                .collect();
+            if upstreams.is_empty() {
+                warn!(raw = ?p.upstreams, "L4 proxy: no valid upstream addresses");
+                return None;
+            }
+            Some(CompiledL4Handler::Proxy { upstreams })
+        }
+        Layer4Handler::Tls(_) => Some(CompiledL4Handler::Tls),
+        Layer4Handler::Subroute(sub) => {
+            let routes = compile_l4_routes(&sub.matchers, &sub.routes);
+            let timeout = sub
+                .matching_timeout
+                .as_deref()
+                .and_then(parse_l4_duration)
+                .unwrap_or(L4_DEFAULT_MATCHING_TIMEOUT);
+            Some(CompiledL4Handler::Subroute {
+                routes,
+                matching_timeout: timeout,
+            })
+        }
+        Layer4Handler::Unknown { name, .. } => {
+            warn!(handler = %name, "unknown L4 handler — skipping");
+            None
+        }
+    }
+}
+
+fn parse_l4_listen_addr(s: &str) -> Option<std::net::SocketAddr> {
+    let normalized = if s.starts_with(':') {
+        format!("0.0.0.0{s}")
+    } else {
+        s.to_string()
+    };
+    match normalized.parse() {
+        Ok(addr) => Some(addr),
+        Err(e) => {
+            warn!(addr = %s, error = %e, "L4: invalid listen address");
+            None
+        }
+    }
+}
+
+fn parse_l4_duration(s: &str) -> Option<std::time::Duration> {
+    if let Some(rest) = s.strip_suffix("ms") {
+        rest.parse().ok().map(std::time::Duration::from_millis)
+    } else if let Some(rest) = s.strip_suffix('s') {
+        rest.parse().ok().map(std::time::Duration::from_secs)
+    } else if let Some(rest) = s.strip_suffix('m') {
+        rest.parse::<u64>()
+            .ok()
+            .map(|m| std::time::Duration::from_secs(m * 60))
+    } else {
+        s.parse().ok().map(std::time::Duration::from_secs)
+    }
+}
+
+// ── HTTP route compilation (continued) ──────────────────────────────────
 
 /// Per-domain TLS config extracted from the parsed Dwaarfile.
 #[derive(Debug, Clone)]

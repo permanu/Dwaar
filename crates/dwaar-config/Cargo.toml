@@ -14,6 +14,7 @@ bcrypt = { workspace = true }
 bytes = { workspace = true }
 compact_str = { workspace = true }
 dwaar-core = { workspace = true }
+ipnet = { workspace = true }
 dwaar-plugins = { workspace = true }
 dwaar-tls = { workspace = true }
 serde = { workspace = true }
