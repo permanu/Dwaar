@@ -94,7 +94,7 @@ tdigest = "0.2.3"
 # Crypto (visitor cookies, HMAC challenge signing, password hashing)
 aes-gcm = "0.10.3"
 bcrypt = "0.17"
-hmac = "0.12"
+hmac = "0.13"
 sha2 = "0.10"
 hex = "0.4"
 rand = "0.10.0"
