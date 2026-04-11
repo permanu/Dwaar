@@ -1220,6 +1220,7 @@ dependencies = [
  "compact_str",
  "dashmap",
  "dwaar-analytics",
+ "dwaar-config",
  "dwaar-core",
  "dwaar-log",
  "http",
@@ -1250,6 +1251,7 @@ dependencies = [
  "flate2",
  "hyperloglog",
  "libc",
+ "parking_lot",
  "rand 0.10.0",
  "serde",
  "serde_json",
@@ -1262,7 +1264,7 @@ dependencies = [
 
 [[package]]
 name = "dwaar-cli"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1310,9 +1312,11 @@ dependencies = [
  "dwaar-core",
  "dwaar-plugins",
  "dwaar-tls",
+ "glob",
  "ipnet",
  "notify",
  "openssl",
+ "parking_lot",
  "pingora-core",
  "proptest",
  "regex",
@@ -1462,6 +1466,7 @@ dependencies = [
  "proptest",
  "rustls",
  "sha2",
+ "subtle",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -1894,6 +1899,12 @@ name = "gimli"
 version = "0.32.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
+
+[[package]]
+name = "glob"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "h2"
