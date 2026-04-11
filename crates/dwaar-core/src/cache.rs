@@ -261,8 +261,16 @@ pub fn realloc_cache_backend(shared: &SharedCacheBackend, new_size: usize) {
 ///
 /// Namespace isolates entries per virtual host so that
 /// `site-a.com/index.html` and `site-b.com/index.html` never collide.
+///
+/// Pre-sizes the composite `method path` string exactly so the allocation
+/// count on the hot path is `1` (was `1 + format!` machinery overhead via
+/// `format!("{method} {path}")` — audit finding M-07).
 pub fn build_cache_key(host: &str, path: &str, method: &str) -> CacheKey {
-    CacheKey::new(host, format!("{method} {path}"), "")
+    let mut composite = String::with_capacity(method.len() + 1 + path.len());
+    composite.push_str(method);
+    composite.push(' ');
+    composite.push_str(path);
+    CacheKey::new(host, composite, "")
 }
 
 // ---------------------------------------------------------------------------

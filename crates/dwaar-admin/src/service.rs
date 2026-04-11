@@ -145,6 +145,23 @@ impl AdminService {
     ///
     /// Uses a single global counter — the admin API is low-traffic and does
     /// not need per-IP accounting. The window resets atomically when it expires.
+    ///
+    /// # On `Ordering::Relaxed` (audit finding M-15, accepted design)
+    ///
+    /// The `compare_exchange` boundary has a benign race: two threads that
+    /// both observe an expired window can both win their own CAS against
+    /// different expected values (if one sees the reset between loads), or
+    /// both fall through to `fetch_add` against a just-reset counter. In
+    /// the worst case this produces a ~2× burst at window boundaries — one
+    /// thread increments past `RATE_LIMIT_MAX - 1` before the reset lands.
+    ///
+    /// This is accepted because (a) the admin API is token-authenticated
+    /// and not exposed to adversarial load, (b) stronger ordering
+    /// (`SeqCst` or Acquire/Release) would add a memory barrier per call
+    /// and the endpoint is already rate-limited at 1 req/sec, (c) the
+    /// 2× burst caps at 2 × `RATE_LIMIT_MAX` = 120 requests and is still
+    /// several orders of magnitude below the admin API's capacity budget.
+    /// Closes M-15 as documented.
     fn check_rate_limit(&self) -> Result<(), Box<Response<Vec<u8>>>> {
         let now = epoch_secs();
         let window = self.window_start.load(Ordering::Relaxed);
@@ -382,8 +399,12 @@ impl AdminService {
                     // first. This lets us return the full parser error body
                     // to the caller instead of a generic "reload triggered"
                     // message. Only signal the watcher if parsing succeeds.
+                    //
+                    // Uses async fs (audit finding L-10) — the admin API is
+                    // driven by a Pingora BackgroundService on the tokio
+                    // runtime; a blocking read would stall the worker thread.
                     if let Some(path) = &self.config_path {
-                        match std::fs::read_to_string(path) {
+                        match tokio::fs::read_to_string(path).await {
                             Ok(src) => match handlers::validate_config_source(&src) {
                                 handlers::ConfigValidation::Ok => {}
                                 handlers::ConfigValidation::Err { status, body } => {
@@ -392,7 +413,12 @@ impl AdminService {
                                         status,
                                         "reload rejected — parse error"
                                     );
-                                    return plain_text_response(status, &body);
+                                    // L-11: strip absolute filesystem path from
+                                    // the response body before returning to
+                                    // the client. Parse errors keep line/col
+                                    // but drop the /etc/dwaar/... prefix.
+                                    let redacted = redact_config_path(&body, path);
+                                    return plain_text_response(status, &redacted);
                                 }
                             },
                             Err(e) => {
@@ -401,9 +427,12 @@ impl AdminService {
                                     path = %path.display(),
                                     "reload rejected — cannot read config file"
                                 );
+                                // L-11: do not leak the absolute path in the
+                                // response body — operators can still find it
+                                // in the structured warn log above.
                                 return plain_text_response(
                                     400,
-                                    &format!("cannot read config file '{}': {e}", path.display()),
+                                    &format!("cannot read config file: {e}"),
                                 );
                             }
                         }
@@ -536,6 +565,27 @@ fn json_response(status: u16, body: &str) -> Response<Vec<u8>> {
         .header("Content-Length", body.len())
         .body(body.as_bytes().to_vec())
         .expect("valid response")
+}
+
+/// Replace occurrences of the config file path with a non-identifying
+/// placeholder in parse-error output (audit finding L-11).
+///
+/// Operators keep the absolute path in the structured `warn!` log (for
+/// correlation) but callers of the admin API — which could be a hosted
+/// dashboard on a TCP-exposed socket — only see `Dwaarfile` + line:col.
+/// This strips both the full absolute form and the file stem.
+fn redact_config_path(body: &str, path: &std::path::Path) -> String {
+    let abs = path.display().to_string();
+    let stem = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let placeholder = "<config>";
+    let mut out = body.replace(&abs, placeholder);
+    if !stem.is_empty() && stem != placeholder {
+        out = out.replace(&stem, placeholder);
+    }
+    out
 }
 
 /// Apply restrictive CORS headers to every admin API response (M-14).

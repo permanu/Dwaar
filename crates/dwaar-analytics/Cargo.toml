@@ -18,7 +18,6 @@ dashmap = { workspace = true }
 dwaar-log = { workspace = true }
 hyperloglog = { workspace = true }
 tdigest = { workspace = true }
-aes-gcm = { workspace = true }
 rand = { workspace = true }
 base64 = { workspace = true }
 hmac = { workspace = true }

@@ -73,7 +73,18 @@ impl ChallengeSolver {
     }
 
     /// Look up the key authorization for a token.
+    ///
+    /// Fast-path returns `None` without hitting the `DashMap` if the
+    /// pending set is empty — the common case during steady-state
+    /// operation after all certificates are issued. This closes audit
+    /// finding L-05 where an attacker could spray
+    /// `/.well-known/acme-challenge/<random>` requests and cause
+    /// `DashMap` shard contention; now those miss at the cheap
+    /// `is_empty` check instead.
     pub fn get(&self, token: &str) -> Option<String> {
+        if self.pending.is_empty() {
+            return None;
+        }
         self.pending.get(token).map(|v| v.value().clone())
     }
 

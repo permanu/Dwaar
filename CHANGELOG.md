@@ -9,12 +9,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [Unreleased]: https://github.com/permanu/Dwaar/compare/v0.2.3...HEAD
 
-## [0.2.3] - 2026-04-11
+## [0.2.3] - 2026-04-12
 
-Hardening patch addressing ~50 findings from an external security and
-performance audit. See `local/ISSUES.md` for the full audit breakdown.
-v0.2.3 focuses on TLS, analytics, plugins, and observability; v0.2.2's
-glob-import and H3-streaming work remain in place unchanged.
+Hardening patch addressing the external security and performance audit.
+Triage identified 51 real findings (after filtering 5 false positives
+and ~15 items already remediated in v0.2.1/v0.2.2). v0.2.3 closes all
+51 — 43 in the main wave plus 8 in a follow-up close-out pass (see
+the "Audit close-out" section). v0.2.2's glob-import and H3-streaming
+work remain in place unchanged.
+
+### Fixed — Audit close-out (8)
+
+- **M-07** — `build_cache_key` now uses `String::with_capacity` + `push_str`
+  instead of `format!("{method} {path}")`, guaranteeing a single exact-
+  sized allocation on the cacheable-request hot path.
+- **L-05** — `ChallengeSolver::get` fast-returns `None` when the pending
+  set is empty, so an attacker spraying
+  `/.well-known/acme-challenge/<random>` requests at a fully-issued
+  instance no longer touches the `DashMap` at all. Closes the shard-
+  contention DoS surface.
+- **L-10** — `/admin/reload` handler now uses `tokio::fs::read_to_string`
+  instead of blocking `std::fs::read_to_string`. The admin endpoint is
+  already async-contextual (Pingora `BackgroundService`); the blocking
+  call was a v0.2.2 oversight when `#133` added the in-process parse.
+- **L-11** — Parse-error response bodies from `/admin/reload` now
+  replace the absolute config path + basename with `<config>` before
+  returning to the client. Line/column remain. Operators still see the
+  full path in the structured `warn!` audit log for correlation.
+- **M-23** — Removed the unused `aes-gcm` dependency from
+  `dwaar-analytics/Cargo.toml`. The crate is no longer pulled in by the
+  beacon HMAC implementation (which uses `hmac` + `sha2`), and the
+  libc-cfg cascade that blocked the initial removal attempt is gone
+  after Wave D's `process_metrics.rs` rewrite.
+
+### Documented — Accepted design (2)
+
+- **M-15** — Added an extensive doc comment on
+  `AdminService::check_rate_limit` documenting the accepted
+  `Ordering::Relaxed` race: the `compare_exchange` boundary can produce
+  a ~2× burst at window boundaries, capped at 120 requests, which is
+  acceptable for a token-authenticated admin API that sees at most 1
+  req/sec in practice. Stronger ordering would add a memory barrier
+  per call without changing the behaviour at realistic rates.
+- **L-16** — WASM plugin `from_ctx_with_request` pre-sizes the header
+  `Vec` to avoid reallocation. Full lazy header access is blocked by
+  the `dwaar-plugin` WIT contract (`request-info.headers` is a
+  by-value `list<header-entry>`); migrating to a lazy `get-header`
+  host function is a breaking WIT change tracked under plugin-system
+  redesign.
+
+### Deferred — Cross-cutting refactor (1)
+
+- **L-17** — WASM `DwaarPlugin::name()` returns `&'static str`, so the
+  plugin adapter `Box::leak`s the name string. Fixing this requires
+  changing the `DwaarPlugin` trait signature to return `&str` or
+  `Arc<str>`, which cascades across every plugin impl in the workspace
+  (forward_auth, basic_auth, ip_filter, …). Leak is bounded at ~1.6 KiB
+  per year under weekly config reloads. Tracked under future plugin-
+  trait cleanup.
+
+### Main wave (43 fixes)
 
 ### Added — Security
 - **Beacon HMAC authentication (C-04)** — analytics beacons are now
