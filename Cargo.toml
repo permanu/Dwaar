@@ -97,7 +97,7 @@ bcrypt = "0.17"
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
-rand = "0.10.0"
+rand = "0.10.1"
 base64 = "0.22.1"
 zeroize = "1"
 

@@ -4,7 +4,7 @@
 // This file is part of Dwaar — https://dwaar.dev
 // Licensed under the Business Source License 1.1
 
-//! Self-update: check releases.dwaar.dev, download, verify, replace.
+//! Self-update: check GitHub Releases, download, verify, replace.
 //!
 //! Uses the system `curl` to avoid pulling in an HTTP+TLS stack just
 //! for this subcommand. The installer already depends on curl, so every
@@ -17,7 +17,17 @@ use std::process::Command;
 
 use anyhow::{Context, bail};
 
-const BASE_URL: &str = "https://releases.dwaar.dev";
+/// GitHub Releases base URL for download assets. The URL format for a
+/// specific asset is: `{BASE_URL}/v{version}/{artifact}`.
+///
+/// Previously pointed to `releases.dwaar.dev` (Cloudflare R2). Migrated
+/// to GitHub Releases so the project has a single authoritative asset host
+/// and the R2 bucket can be decommissioned.
+const BASE_URL: &str = "https://github.com/permanu/Dwaar/releases/download";
+
+/// GitHub API endpoint to resolve the latest release tag.
+const LATEST_API: &str = "https://api.github.com/repos/permanu/Dwaar/releases/latest";
+
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Run the self-update flow. Returns a human-readable status message.
@@ -90,28 +100,63 @@ pub(crate) fn run(force: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Fetch the latest version tag from releases.dwaar.dev/latest.
+/// Fetch the latest release tag from the GitHub API.
+///
+/// Uses `curl -H "Accept: application/vnd.github+json"` to get JSON, then
+/// extracts `tag_name` with a simple string search — avoids pulling in a
+/// JSON parser just for this one field. Falls back to the GitHub Releases
+/// redirect URL if the API call fails.
 fn fetch_latest_version() -> anyhow::Result<String> {
+    // Primary: GitHub API
     let output = Command::new("curl")
-        .args(["-fsSL", &format!("{BASE_URL}/latest")])
+        .args([
+            "-fsSL",
+            "-H",
+            "Accept: application/vnd.github+json",
+            "-H",
+            "X-GitHub-Api-Version: 2022-11-28",
+            LATEST_API,
+        ])
         .output()
         .context("failed to run curl — is it installed?")?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("failed to fetch latest version: {stderr}");
+    if output.status.success() {
+        let body = String::from_utf8(output.stdout).context("GitHub API response is not UTF-8")?;
+        // Extract "tag_name":"vX.Y.Z" without a JSON parser.
+        if let Some(start) = body.find("\"tag_name\":\"") {
+            let rest = &body[start + 12..];
+            if let Some(end) = rest.find('"') {
+                let tag = rest[..end].trim().to_string();
+                if !tag.is_empty() {
+                    return Ok(tag);
+                }
+            }
+        }
     }
 
-    let version = String::from_utf8(output.stdout)
-        .context("latest version response is not UTF-8")?
-        .trim()
-        .to_string();
+    // Fallback: follow the /releases/latest redirect and parse the tag
+    // from the final URL. GitHub redirects to /releases/tag/vX.Y.Z.
+    let output = Command::new("curl")
+        .args([
+            "-fsSL",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{url_effective}",
+            "https://github.com/permanu/Dwaar/releases/latest",
+        ])
+        .output()
+        .context("failed to resolve latest release via redirect")?;
 
-    if version.is_empty() {
-        bail!("releases.dwaar.dev/latest returned empty response");
-    }
+    let url = String::from_utf8(output.stdout).context("redirect URL is not UTF-8")?;
+    let tag = url
+        .rsplit('/')
+        .next()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .context("could not extract tag from GitHub redirect URL")?;
 
-    Ok(version)
+    Ok(tag)
 }
 
 /// Download a URL to a local file via curl.
