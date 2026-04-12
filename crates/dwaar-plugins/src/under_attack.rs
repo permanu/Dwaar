@@ -44,7 +44,7 @@ use std::net::IpAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use pingora_http::RequestHeader;
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
