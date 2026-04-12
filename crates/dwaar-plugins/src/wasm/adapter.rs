@@ -46,7 +46,7 @@ use bytes::Bytes;
 use pingora_http::{RequestHeader, ResponseHeader};
 use tracing::{debug, error, warn};
 use wasmtime::Store;
-use wasmtime::component::{Component, Linker};
+use wasmtime::component::{Component, HasSelf, Linker};
 
 use super::bindings::{
     HostImports, WitInstance, add_host_to_linker, wit_action_to_native, wit_types,
@@ -238,12 +238,11 @@ impl WasmPlugin {
         // `list-request-header-names`, `get-response-header`, and
         // `list-response-header-names` resolve without any per-call setup.
         let mut linker: Linker<PluginState> = Linker::new(&engine.engine);
-        add_host_to_linker(&mut linker, |state: &mut PluginState| state).map_err(|source| {
-            WasmError::Compile {
+        add_host_to_linker::<PluginState, HasSelf<PluginState>>(&mut linker, |state| state)
+            .map_err(|source| WasmError::Compile {
                 path: path_str,
                 source,
-            }
-        })?;
+            })?;
 
         Ok(Self {
             engine: engine.engine.clone(),
@@ -273,12 +272,11 @@ impl WasmPlugin {
                 source,
             })?;
         let mut linker: Linker<PluginState> = Linker::new(&engine.engine);
-        add_host_to_linker(&mut linker, |state: &mut PluginState| state).map_err(|source| {
-            WasmError::Compile {
+        add_host_to_linker::<PluginState, HasSelf<PluginState>>(&mut linker, |state| state)
+            .map_err(|source| WasmError::Compile {
                 path: format!("<in-memory:{name}>"),
                 source,
-            }
-        })?;
+            })?;
         Ok(Self {
             engine: engine.engine.clone(),
             component,
@@ -574,9 +572,10 @@ mod tests {
     // discriminant in the canonical ABI for a 3-variant enum).
     //
     // Canonical ABI notes for the parameter counts:
-    // - `request-info` flattened: method(ptr+len) + path(ptr+len) + headers(ptr+len)
-    //   + is-tls(i32) + client-ip(ptr+len) = 9 i32 params.
-    // - `response-info` flattened: status(i32) + headers(ptr+len) = 3 i32 params.
+    // - `request-info` flattened: method(ptr+len) + path(ptr+len)
+    //   + is-tls(i32) + client-ip(ptr+len) = 7 i32 params.
+    //   (headers removed in v0.2.3 — lazy access via host imports)
+    // - `response-info` flattened: status(i32) = 1 i32 param.
     // - `bool` → 1 i32 param.
     // - All results are a 3-variant enum → fits in 1 i32.
     //

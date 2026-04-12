@@ -20,7 +20,7 @@
 //! `add_to_linker` helper that registers the host functions on the linker
 //! once at plugin construction.
 //!
-//! # Generated layout (wasmtime 29)
+//! # Generated layout (wasmtime 43)
 //!
 //! For a world named `dwaar-plugin` with direct function exports:
 //! - `generated::DwaarPlugin` — the binding struct; `instantiate()` + `call_*` methods
@@ -28,7 +28,8 @@
 //!   — the WIT record/enum types (no `HeaderEntry` any more)
 //! - `generated::dwaar::plugin::host::Host` — the trait every store-data type
 //!   must implement to service guest imports
-//! - `generated::dwaar::plugin::host::add_to_linker` — one-shot host wiring helper
+//! - `generated::dwaar::plugin::host::add_to_linker` — host wiring helper;
+//!   takes a `D: HasData` type param (`HasSelf<T>` when `T` impls `Host` directly)
 
 use crate::plugin::PluginAction;
 
@@ -40,7 +41,6 @@ mod generated {
     wasmtime::component::bindgen!({
         path: "wit/dwaar-plugin.wit",
         world: "dwaar-plugin",
-        async: false,
     });
 }
 
@@ -63,6 +63,10 @@ pub use generated::dwaar::plugin::host::Host as HostImports;
 
 /// Re-export of the bindgen-generated `add_to_linker` helper for the `host`
 /// import interface. Called once at `WasmPlugin::from_file` construction.
+///
+/// wasmtime >= 36 signature: `add_to_linker<T, D>(linker, getter)` where
+/// `D: HostWithStore`. When `T` directly implements `Host`, pass
+/// `HasSelf<T>` as `D`.
 pub use generated::dwaar::plugin::host::add_to_linker as add_host_to_linker;
 
 // ---------------------------------------------------------------------------

@@ -147,7 +147,7 @@ impl BeaconAuth {
 /// against the current 5-minute window, and returns both encoded forms.
 pub fn issue(host: &str) -> BeaconAuth {
     use rand::Rng;
-    let mut nonce = [0u8; NONCE_LEN];
+    let mut nonce = [0u8; NONCE_LEN]; // lgtm[rs/hardcoded-credentials] — zero-init overwritten by CSPRNG below
     rand::rng().fill_bytes(&mut nonce);
 
     let window = current_window();
@@ -294,6 +294,7 @@ mod tests {
     fn secret_is_stable_across_calls() {
         // OnceLock guarantees a single init; sanity-check by signing twice
         // with the same (nonce, host, window) and asserting the sigs match.
+        // lgtm[rs/hardcoded-credentials] — test-only fixture, not a production secret
         let nonce = [0u8; NONCE_LEN];
         let sig1 = compute_sig(&nonce, b"example.com", 12345);
         let sig2 = compute_sig(&nonce, b"example.com", 12345);
@@ -302,6 +303,7 @@ mod tests {
 
     #[test]
     fn different_hosts_produce_different_sigs() {
+        // lgtm[rs/hardcoded-credentials] — test-only fixture, not a production secret
         let nonce = [7u8; NONCE_LEN];
         let a = compute_sig(&nonce, b"example.com", 12345);
         let b = compute_sig(&nonce, b"evil.com", 12345);

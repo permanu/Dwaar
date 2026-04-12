@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -47,7 +50,7 @@ jobs:
       # port 8080 (ISSUE-010). Exclude dwaar-cli integration tests from
       # CI; run lib + bin tests only.
       - run: cargo test --workspace --exclude dwaar-cli
-      - run: cargo test -p dwaar-cli --lib --bins
+      - run: cargo test -p dwaar-cli --bins --test cli_integration
       - name: Run ignored tests
         run: cargo test --workspace --exclude dwaar-cli -- --ignored --nocapture
         timeout-minutes: 15

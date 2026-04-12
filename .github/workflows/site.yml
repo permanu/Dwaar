@@ -10,6 +10,9 @@ on:
     paths:
       - 'site/**'
 
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Build Site
