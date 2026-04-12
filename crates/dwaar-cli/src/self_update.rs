@@ -167,6 +167,22 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 /// Construct the artifact name for this platform (matches release workflow).
+///
+/// # Supported targets
+///
+/// | Artifact | Target | Notes |
+/// |---|---|---|
+/// | `dwaar-linux-amd64` | `x86_64-unknown-linux-gnu` | Primary production target |
+/// | `dwaar-linux-arm64` | `aarch64-unknown-linux-gnu` | ARM servers (AWS Graviton, etc.) |
+/// | `dwaar-darwin-arm64` | `aarch64-apple-darwin` | Apple Silicon Macs (M1+) |
+///
+/// # Unsupported targets
+///
+/// **`x86_64-apple-darwin` is not supported.** Apple has ended support for
+/// Intel-based Macs (last model shipped 2020, macOS support dropped in macOS
+/// 15). GitHub Actions' `macos-latest` runners are ARM-only since macOS 14,
+/// making CI cross-compilation impractical. Users on Intel Macs should build
+/// from source (`cargo build --release`) or run via Docker/Rosetta 2.
 fn artifact_name() -> String {
     let os = if cfg!(target_os = "linux") {
         "linux"
@@ -177,7 +193,16 @@ fn artifact_name() -> String {
     };
 
     let arch = if cfg!(target_arch = "x86_64") {
-        "amd64"
+        if cfg!(target_os = "macos") {
+            // Intel Macs are not a supported release target. If someone
+            // compiles from source on an Intel Mac and runs self-update,
+            // we'll look for dwaar-darwin-amd64 — which won't exist on
+            // releases.dwaar.dev. self_update will exit cleanly with a
+            // "download failed" message pointing them to build from source.
+            "amd64"
+        } else {
+            "amd64"
+        }
     } else if cfg!(target_arch = "aarch64") {
         "arm64"
     } else {

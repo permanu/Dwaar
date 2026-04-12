@@ -25,9 +25,8 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             artifact: dwaar-linux-arm64
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            artifact: dwaar-darwin-amd64
+          # x86_64-apple-darwin dropped — Apple ended support for Intel Macs
+          # and macos-latest runners are ARM-only since macOS 14.
           - target: aarch64-apple-darwin
             os: macos-latest
             artifact: dwaar-darwin-arm64
@@ -38,6 +37,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      # Explicit target add — belt-and-braces for cross-compile targets
+      # where dtolnay/rust-toolchain may not install the std library.
+      - name: Ensure Rust target is installed
+        run: rustup target add ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
 
