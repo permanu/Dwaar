@@ -81,15 +81,14 @@ static BEACON_SECRET: OnceLock<Zeroizing<[u8; 32]>> = OnceLock::new();
 
 /// Return the process beacon secret, initializing it on first call.
 ///
-/// The initializer uses `rand::rng().fill_bytes()`, which on modern Rust
+/// The initializer uses `rand::fill()`, which on modern Rust
 /// `rand` (0.10+) is an OS-backed CSPRNG (equivalent to `OsRng`).
 /// Once initialized, the 32 random bytes are wrapped in `Zeroizing` so
 /// the allocation is wiped on process exit.
 fn secret() -> &'static [u8; 32] {
     BEACON_SECRET.get_or_init(|| {
-        use rand::Rng;
-        let mut buf = Zeroizing::new([0u8; 32]);
-        rand::rng().fill_bytes(buf.as_mut_slice());
+        let mut buf = Zeroizing::new(<[u8; 32]>::default());
+        rand::fill(&mut buf[..]);
         buf
     })
 }
