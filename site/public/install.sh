@@ -3,7 +3,7 @@
 # Usage: curl -fsSL https://dwaar.dev/install.sh | sh
 set -eu
 
-BASE_URL="https://releases.dwaar.dev"
+GITHUB_REPO="permanu/Dwaar"
 INSTALL_DIR="${DWAAR_INSTALL_DIR:-/usr/local/bin}"
 
 # --- Detect platform ---
@@ -22,13 +22,25 @@ case "$ARCH" in
   *)              printf "Error: unsupported architecture: %s\n" "$ARCH" >&2; exit 1 ;;
 esac
 
+# x86_64 macOS is not a supported release target (Apple ended Intel Mac
+# support). Users on Intel Macs should build from source or use Rosetta 2.
+if [ "$os" = "darwin" ] && [ "$arch" = "amd64" ]; then
+  printf "Error: Intel Mac (x86_64) binaries are not published.\n" >&2
+  printf "Build from source: cargo build --release\n" >&2
+  printf "Or run the ARM binary via Rosetta: arch -arm64 dwaar\n" >&2
+  exit 1
+fi
+
 ARTIFACT="dwaar-${os}-${arch}"
 
 # --- Resolve version ---
 if [ -n "${DWAAR_VERSION:-}" ]; then
   VERSION="$DWAAR_VERSION"
 else
-  VERSION="$(curl -fsSL "${BASE_URL}/latest")"
+  # Follow the GitHub Releases /latest redirect to extract the tag.
+  VERSION="$(curl -fsSL -o /dev/null -w '%{url_effective}' \
+    "https://github.com/${GITHUB_REPO}/releases/latest" | \
+    rev | cut -d/ -f1 | rev)"
 fi
 
 if [ -z "$VERSION" ]; then
@@ -36,7 +48,7 @@ if [ -z "$VERSION" ]; then
   exit 1
 fi
 
-DOWNLOAD_URL="${BASE_URL}/${VERSION}/${ARTIFACT}"
+DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/${ARTIFACT}"
 CHECKSUM_URL="${DOWNLOAD_URL}.sha256"
 
 printf "Installing dwaar %s (%s/%s)\n" "$VERSION" "$os" "$arch"

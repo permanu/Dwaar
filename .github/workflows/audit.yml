@@ -15,6 +15,9 @@ on:
     # Run daily at 06:00 UTC to catch new advisories
     - cron: '0 6 * * *'
 
+permissions:
+  contents: read
+
 jobs:
   audit:
     name: Dependency Audit

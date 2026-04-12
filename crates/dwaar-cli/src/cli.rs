@@ -168,7 +168,7 @@ pub(crate) enum Commands {
         pid_file: PathBuf,
     },
     /// Check for a newer version and update the Dwaar binary in-place.
-    /// Downloads from releases.dwaar.dev, verifies the SHA-256 checksum,
+    /// Downloads from GitHub Releases, verifies the SHA-256 checksum,
     /// and atomically replaces the current binary. Restart the server
     /// afterward (`dwaar upgrade` or `systemctl restart dwaar`).
     #[command(name = "self-update")]

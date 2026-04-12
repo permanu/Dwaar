@@ -93,11 +93,11 @@ tdigest = "0.2.3"
 
 # Crypto (visitor cookies, HMAC challenge signing, password hashing)
 aes-gcm = "0.10.3"
-bcrypt = "0.17"
-hmac = "0.12"
-sha2 = "0.10"
+bcrypt = "0.19"
+hmac = "0.13"
+sha2 = "0.11"
 hex = "0.4"
-rand = "0.10.0"
+rand = "0.10.1"
 base64 = "0.22.1"
 zeroize = "1"
 
@@ -116,10 +116,10 @@ tokio-openssl = "0.6.5"
 tikv-jemallocator = "0.6"
 
 # Inline strings (≤24 bytes stored on stack, no heap allocation)
-compact_str = { version = "0.8", features = ["serde"] }
+compact_str = { version = "0.9", features = ["serde"] }
 
 # Fast JSON serialization (SIMD-accelerated)
-sonic-rs = "0.3"
+sonic-rs = "0.5"
 
 # Fast random number generation (no_std-compatible, used for Random LB policy)
 fastrand = "2"
@@ -130,7 +130,7 @@ quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 rustls-pemfile = "2"
-webpki-roots = "0.26"
+webpki-roots = "1"
 
 # HTTP/3 request parsing (ISSUE-104) — h3 0.0.8 is latest stable, h3-quinn 0.0.10 is the quinn 0.11 adapter
 h3 = "0.0.8"
@@ -139,7 +139,7 @@ h3-quinn = "0.0.10"
 # WASM plugin runtime (optional — only pulled in when `wasm` feature is enabled).
 # `runtime` and `cranelift` required for wasmtime::component. `std` for basic functionality.
 # `pooling-allocator` for bounded instance pools, `addr2line` for trap backtraces.
-wasmtime = { version = "30", default-features = false, features = [
+wasmtime = { version = "43", default-features = false, features = [
     "component-model", "runtime", "cranelift", "std",
     "pooling-allocator", "addr2line", "wat",
 ] }
@@ -148,8 +148,8 @@ futures-util = "0.3"
 rcgen = "0.14"
 
 # K8s ingress controller (ISSUE-084)
-kube = { version = "0.98", default-features = false, features = ["runtime", "derive", "client", "rustls-tls"] }
-k8s-openapi = { version = "0.24", features = ["v1_32"] }
+kube = { version = "3.1", default-features = false, features = ["runtime", "derive", "client", "rustls-tls"] }
+k8s-openapi = { version = "0.27", features = ["v1_32"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 
 # Compression

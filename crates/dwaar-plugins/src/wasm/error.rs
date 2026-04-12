@@ -16,6 +16,6 @@ pub enum WasmError {
     Compile {
         path: String,
         #[source]
-        source: anyhow::Error,
+        source: wasmtime::Error,
     },
 }

@@ -8,7 +8,7 @@
 //!
 //! When `auto_update {}` is present in the Dwaarfile, this service runs
 //! as a Pingora [`BackgroundService`] alongside the proxy. It periodically
-//! checks `releases.dwaar.dev/latest` for a newer version, downloads and
+//! checks GitHub Releases for a newer version, downloads and
 //! verifies the binary, and either triggers a zero-downtime reload or
 //! just replaces the binary on disk (depending on `on_new_version`).
 
@@ -155,17 +155,33 @@ impl AutoUpdateService {
     }
 }
 
-/// Fetch latest version tag (blocking).
+/// Fetch latest version tag from GitHub Releases (blocking).
+///
+/// Uses the GitHub redirect `releases/latest` → `releases/tag/vX.Y.Z`
+/// and extracts the tag from the final URL. Lightweight — no JSON parsing,
+/// no API token needed.
 fn fetch_latest_version() -> anyhow::Result<String> {
     let output = Command::new("curl")
-        .args(["-fsSL", "https://releases.dwaar.dev/latest"])
+        .args([
+            "-fsSL",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{url_effective}",
+            "https://github.com/permanu/Dwaar/releases/latest",
+        ])
         .output()?;
 
     if !output.status.success() {
         anyhow::bail!("curl failed: {}", String::from_utf8_lossy(&output.stderr));
     }
 
-    Ok(String::from_utf8(output.stdout)?.trim().to_string())
+    let url = String::from_utf8(output.stdout)?;
+    url.rsplit('/')
+        .next()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("could not extract tag from GitHub redirect URL"))
 }
 
 /// Check if current UTC time is within the maintenance window.

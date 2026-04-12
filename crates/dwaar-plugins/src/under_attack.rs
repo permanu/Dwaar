@@ -44,7 +44,7 @@ use std::net::IpAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use pingora_http::RequestHeader;
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
@@ -599,6 +599,7 @@ mod tests {
     #[test]
     fn valid_pow_accepted() {
         // Brute-force a valid nonce for a known challenge
+        // lgtm[rs/hardcoded-credentials] — test-only fixture, not a production secret
         let challenge = "test-challenge-value";
         let mut nonce = 0u64;
         loop {
@@ -615,6 +616,7 @@ mod tests {
 
     #[test]
     fn invalid_pow_rejected() {
+        // lgtm[rs/hardcoded-credentials] — test-only fixtures, not production secrets
         assert!(!UnderAttackPlugin::verify_pow("challenge", "0"));
         assert!(!UnderAttackPlugin::verify_pow("challenge", "1"));
     }

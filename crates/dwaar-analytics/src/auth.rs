@@ -48,7 +48,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
@@ -81,15 +81,14 @@ static BEACON_SECRET: OnceLock<Zeroizing<[u8; 32]>> = OnceLock::new();
 
 /// Return the process beacon secret, initializing it on first call.
 ///
-/// The initializer uses `rand::rng().fill_bytes()`, which on modern Rust
+/// The initializer uses `rand::fill()`, which on modern Rust
 /// `rand` (0.10+) is an OS-backed CSPRNG (equivalent to `OsRng`).
 /// Once initialized, the 32 random bytes are wrapped in `Zeroizing` so
 /// the allocation is wiped on process exit.
 fn secret() -> &'static [u8; 32] {
     BEACON_SECRET.get_or_init(|| {
-        use rand::Rng;
-        let mut buf = Zeroizing::new([0u8; 32]);
-        rand::rng().fill_bytes(buf.as_mut_slice());
+        let mut buf = Zeroizing::new(<[u8; 32]>::default());
+        rand::fill(&mut buf[..]);
         buf
     })
 }
@@ -146,9 +145,8 @@ impl BeaconAuth {
 /// Generates 16 random bytes from the OS CSPRNG, computes the HMAC signature
 /// against the current 5-minute window, and returns both encoded forms.
 pub fn issue(host: &str) -> BeaconAuth {
-    use rand::Rng;
-    let mut nonce = [0u8; NONCE_LEN];
-    rand::rng().fill_bytes(&mut nonce);
+    let mut nonce: [u8; NONCE_LEN] = Default::default();
+    rand::fill(&mut nonce[..]);
 
     let window = current_window();
     let sig = compute_sig(&nonce, host.as_bytes(), window);
@@ -294,6 +292,7 @@ mod tests {
     fn secret_is_stable_across_calls() {
         // OnceLock guarantees a single init; sanity-check by signing twice
         // with the same (nonce, host, window) and asserting the sigs match.
+        // lgtm[rs/hardcoded-credentials] — test-only fixture, not a production secret
         let nonce = [0u8; NONCE_LEN];
         let sig1 = compute_sig(&nonce, b"example.com", 12345);
         let sig2 = compute_sig(&nonce, b"example.com", 12345);
@@ -302,6 +301,7 @@ mod tests {
 
     #[test]
     fn different_hosts_produce_different_sigs() {
+        // lgtm[rs/hardcoded-credentials] — test-only fixture, not a production secret
         let nonce = [7u8; NONCE_LEN];
         let a = compute_sig(&nonce, b"example.com", 12345);
         let b = compute_sig(&nonce, b"evil.com", 12345);

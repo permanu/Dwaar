@@ -40,7 +40,7 @@ pub struct GlobalOptions {
     /// on HTTP/2 responses so browsers can upgrade (ISSUE-079).
     pub h3_enabled: bool,
     /// Automatic binary update configuration.
-    /// When set, a background service periodically checks releases.dwaar.dev
+    /// When set, a background service periodically checks GitHub Releases
     /// for newer versions and applies them within the configured window.
     pub auto_update: Option<AutoUpdateConfig>,
     /// Top-level `layer4 { ... }` app block — raw L4 TCP proxy servers.

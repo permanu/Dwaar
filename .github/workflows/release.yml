@@ -25,9 +25,8 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             artifact: dwaar-linux-arm64
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            artifact: dwaar-darwin-amd64
+          # x86_64-apple-darwin dropped — Apple ended support for Intel Macs
+          # and macos-latest runners are ARM-only since macOS 14.
           - target: aarch64-apple-darwin
             os: macos-latest
             artifact: dwaar-darwin-arm64
@@ -38,6 +37,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      # Explicit target add — belt-and-braces for cross-compile targets
+      # where dtolnay/rust-toolchain may not install the std library.
+      - name: Ensure Rust target is installed
+        run: rustup target add ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
 
@@ -110,45 +114,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  publish-r2:
-    name: Publish to R2
-    needs: release
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          path: artifacts/
-          merge-multiple: true
-
-      - name: Upload artifacts and version manifest to R2
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: auto
-          R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
-          R2_BUCKET: ${{ secrets.R2_BUCKET_NAME }}
-        run: |
-          TAG="${GITHUB_REF#refs/tags/}"
-          VERSION="${TAG#v}"
-
-          # Upload versioned artifacts (binary + sha256 for each target)
-          for file in artifacts/dwaar-*; do
-            filename="$(basename "$file")"
-            aws s3 cp "$file" "s3://${R2_BUCKET}/${TAG}/${filename}" \
-              --endpoint-url "$R2_ENDPOINT" \
-              --cache-control "public, max-age=31536000, immutable"
-          done
-
-          # Update the `latest` pointer — plain text, short cache so updates
-          # propagate within minutes. The installer reads this to resolve
-          # which version to download.
-          echo -n "$TAG" > /tmp/latest
-          aws s3 cp /tmp/latest "s3://${R2_BUCKET}/latest" \
-            --endpoint-url "$R2_ENDPOINT" \
-            --content-type "text/plain" \
-            --cache-control "public, max-age=300"
-
-          echo "Published ${TAG} to R2 and updated latest pointer"
+  # publish-r2 job removed — assets are served from GitHub Releases.
+  # The R2 bucket (dwaar-releases) has been decommissioned. Self-update,
+  # auto-update, and install.sh all point to github.com/permanu/Dwaar/
+  # releases/download/{tag}/{artifact} now.
 
   docker:
     name: Docker Image

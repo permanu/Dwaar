@@ -315,7 +315,7 @@ fn max_fds_impl() -> u64 {
     unsafe {
         let mut rlim: libc::rlimit = std::mem::zeroed();
         if libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut rlim) == 0 {
-            rlim.rlim_cur as u64
+            rlim.rlim_cur
         } else {
             0
         }

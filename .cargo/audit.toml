@@ -1,11 +1,34 @@
 # cargo-audit ignore list
-# These are all transitive dependencies from Pingora or quinn that we cannot
-# upgrade directly. Tracked upstream.
+# Transitive dependencies from Pingora, quinn, kube, or wasmtime that we
+# cannot upgrade directly without a major version migration. Each is
+# tracked in the upstream project.
 
 [advisories]
 ignore = [
+    # -- Pingora transitive --
     "RUSTSEC-2024-0437",  # protobuf recursion — pingora-core → prometheus → protobuf
     "RUSTSEC-2025-0069",  # daemonize unmaintained — pingora-core dep
     "RUSTSEC-2024-0388",  # derivative unmaintained — pingora-core dep
+    "RUSTSEC-2024-0384",  # instant unmaintained — pingora-core transitive
     "RUSTSEC-2025-0134",  # rustls-pemfile unmaintained — used for QUIC cert loading
+    # -- kube transitive --
+    "RUSTSEC-2025-0012",  # backoff unmaintained — kube-runtime 0.98; kube 3.x migration tracked
+    # -- wasmtime transitive --
+    "RUSTSEC-2024-0436",  # wasmtime cranelift — tracked upstream
+    "RUSTSEC-2025-0046",  # wasmtime — tracked upstream
+    "RUSTSEC-2025-0118",  # wasmtime — tracked upstream
+    "RUSTSEC-2026-0006",  # wasmtime — tracked upstream
+    "RUSTSEC-2026-0020",  # wasmtime — tracked upstream
+    "RUSTSEC-2026-0021",  # wasmtime — tracked upstream
+    "RUSTSEC-2026-0085",  # wasmtime — tracked upstream
+    "RUSTSEC-2026-0086",  # wasmtime — tracked upstream
+    "RUSTSEC-2026-0087",  # wasmtime — tracked upstream
+    "RUSTSEC-2026-0088",  # wasmtime — tracked upstream
+    "RUSTSEC-2026-0089",  # wasmtime — tracked upstream
+    "RUSTSEC-2026-0091",  # wasmtime — tracked upstream
+    "RUSTSEC-2026-0092",  # wasmtime — tracked upstream
+    "RUSTSEC-2026-0093",  # wasmtime — tracked upstream
+    "RUSTSEC-2026-0094",  # wasmtime — tracked upstream
+    "RUSTSEC-2026-0095",  # wasmtime — tracked upstream
+    "RUSTSEC-2026-0096",  # wasmtime — tracked upstream
 ]

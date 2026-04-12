@@ -48,3 +48,4 @@ bench/profiles/
 .claude/
 .fallow
 libauth.rlib
+rand_test
