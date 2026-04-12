@@ -146,9 +146,8 @@ impl BeaconAuth {
 /// Generates 16 random bytes from the OS CSPRNG, computes the HMAC signature
 /// against the current 5-minute window, and returns both encoded forms.
 pub fn issue(host: &str) -> BeaconAuth {
-    use rand::Rng;
-    let mut nonce = [0u8; NONCE_LEN]; // lgtm[rs/hardcoded-credentials] — zero-init overwritten by CSPRNG below
-    rand::rng().fill_bytes(&mut nonce);
+    let mut nonce: [u8; NONCE_LEN] = Default::default();
+    rand::fill(&mut nonce[..]);
 
     let window = current_window();
     let sig = compute_sig(&nonce, host.as_bytes(), window);
