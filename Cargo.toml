@@ -139,7 +139,7 @@ h3-quinn = "0.0.10"
 # WASM plugin runtime (optional — only pulled in when `wasm` feature is enabled).
 # `runtime` and `cranelift` required for wasmtime::component. `std` for basic functionality.
 # `pooling-allocator` for bounded instance pools, `addr2line` for trap backtraces.
-wasmtime = { version = "30", default-features = false, features = [
+wasmtime = { version = "36", default-features = false, features = [
     "component-model", "runtime", "cranelift", "std",
     "pooling-allocator", "addr2line", "wat",
 ] }
