@@ -800,6 +800,9 @@ fn run_server(
     server.add_service(admin_listening);
 
     // Layer 4 TCP proxy — bind separate listeners for non-HTTP protocols.
+    // Shared via ArcSwap so ConfigWatcher can hot-reload L4 config.
+    let l4_shared: dwaar_core::l4::SharedL4Servers;
+    let l4_reload_notify = Arc::new(tokio::sync::Notify::new());
     {
         use dwaar_config::compile::{compile_l4_servers, compile_l4_wrappers};
 
@@ -816,23 +819,27 @@ fn run_server(
         {
             l4_servers.extend(compile_l4_wrappers(&opts.layer4_listener_wrappers));
         }
-        if !l4_servers.is_empty() {
-            // Inject the shared cert store into any L4 TLS handlers so they
-            // can look up certs by SNI at accept time.
-            for server_cfg in &mut l4_servers {
-                for route in &mut server_cfg.routes {
-                    for handler in &mut route.handlers {
-                        if let dwaar_core::l4::CompiledL4Handler::Tls { cert_store: cs } = handler {
-                            *cs = Some(Arc::clone(&cert_store));
-                        }
+        // Inject the shared cert store into any L4 TLS handlers so they
+        // can look up certs by SNI at accept time.
+        for server_cfg in &mut l4_servers {
+            for route in &mut server_cfg.routes {
+                for handler in &mut route.handlers {
+                    if let dwaar_core::l4::CompiledL4Handler::Tls { cert_store: cs } = handler {
+                        *cs = Some(Arc::clone(&cert_store));
                     }
                 }
             }
-            let count = l4_servers.len();
-            let l4_service = dwaar_core::l4::Layer4Service::new(l4_servers);
-            let l4_bg =
-                pingora_core::services::background::background_service("layer4", l4_service);
-            server.add_service(l4_bg);
+        }
+
+        let count = l4_servers.len();
+        l4_shared = Arc::new(arc_swap::ArcSwap::from_pointee(l4_servers));
+        let l4_service = dwaar_core::l4::Layer4Service::new(
+            Arc::clone(&l4_shared),
+            Arc::clone(&l4_reload_notify),
+        );
+        let l4_bg = pingora_core::services::background::background_service("layer4", l4_service);
+        server.add_service(l4_bg);
+        if count > 0 {
             info!(listeners = count, "layer4 TCP proxy service registered");
         }
     }
@@ -858,6 +865,8 @@ fn run_server(
         sni_domain_map,
         cache_backend_for_watcher,
         dwaar_config,
+        l4_shared,
+        l4_reload_notify,
     );
 
     info!("entering run loop, waiting for connections or signals");
@@ -887,6 +896,8 @@ fn register_background_services(
     sni_domain_map: DomainConfigMap,
     cache_backend: Option<dwaar_core::cache::SharedCacheBackend>,
     config: &dwaar_config::model::DwaarConfig,
+    l4_servers: dwaar_core::l4::SharedL4Servers,
+    l4_reload_notify: Arc<tokio::sync::Notify>,
 ) {
     // Upstream health checker — runs as a BackgroundService (Guardrail #20).
     // Always registered; it will sleep if the pool list is empty and wake up
@@ -949,7 +960,8 @@ fn register_background_services(
     .with_sni_domain_map(sni_domain_map)
     .with_health_pools(health_pools)
     .with_acme_domains(acme_domains)
-    .with_cert_store(Arc::clone(cert_store));
+    .with_cert_store(Arc::clone(cert_store))
+    .with_l4_servers(l4_servers, l4_reload_notify);
     let config_watcher = if let Some(cb) = cache_backend {
         config_watcher.with_cache_backend(cb)
     } else {
