@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-04-13
+
+### Fixed
+
+- **Layer 4 parser was dead code** — `parse_layer4_config` (490+ lines) was
+  fully implemented but never wired into the global options dispatch.
+  Configs with `layer4 {}` blocks were silently ignored. Now parsed into
+  `GlobalOptions.layer4` and available at runtime.
+- Wire `listener_wrappers { layer4 {} }` parsing inside `servers` blocks
+  for shared-listener L4 protocol detection.
+- Remove `#![allow(dead_code)]` suppression from `parser/layer4.rs`.
+
 ## [0.2.3] - 2026-04-12
 
 Security and performance hardening patch. Addresses 51 findings from an
