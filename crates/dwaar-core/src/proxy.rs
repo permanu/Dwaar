@@ -239,9 +239,11 @@ impl DwaarProxy {
         if let Some(ref sender) = self.beacon_sender {
             let mut body = Vec::with_capacity(1024);
             while let Ok(Some(chunk)) = session.downstream_session.read_request_body().await {
-                // Check before extending so we never allocate beyond the limit.
+                // Reject oversized beacons with 413 — never parse truncated data.
                 if body.len().saturating_add(chunk.len()) > beacon::MAX_BEACON_SIZE {
-                    break;
+                    let resp = ResponseHeader::build(413, Some(0))?;
+                    session.write_response_header(Box::new(resp), true).await?;
+                    return Ok(true);
                 }
                 body.extend_from_slice(&chunk);
             }
@@ -1383,21 +1385,29 @@ impl ProxyHttp for DwaarProxy {
             let ip_str = {
                 use std::io::Write;
                 let mut cursor = std::io::Cursor::new(&mut ip_buf[..]);
-                write!(cursor, "{ip}").expect("IP fits in 45 bytes");
+                write!(cursor, "{ip}").map_err(|e| {
+                    pingora_error::Error::because(
+                        pingora_error::ErrorType::InternalError,
+                        "IP format failed",
+                        e,
+                    )
+                })?;
                 let len = cursor.position() as usize;
                 // SAFETY: IpAddr Display only emits ASCII digits, colons, and dots.
-                std::str::from_utf8(&ip_buf[..len]).expect("IP is valid UTF-8")
+                std::str::from_utf8(&ip_buf[..len]).map_err(|e| {
+                    pingora_error::Error::because(
+                        pingora_error::ErrorType::InternalError,
+                        "IP UTF-8 failed",
+                        e,
+                    )
+                })?
             };
-            upstream_request
-                .insert_header("X-Real-IP", ip_str)
-                .expect("IP string is valid header value");
+            upstream_request.insert_header("X-Real-IP", ip_str)?;
 
             // Replace (not append) — client-supplied XFF is stripped to prevent
             // IP spoofing. Only the direct connection IP is trusted.
             upstream_request.remove_header("X-Forwarded-For");
-            upstream_request
-                .insert_header("X-Forwarded-For", ip_str)
-                .expect("IP string is valid header value");
+            upstream_request.insert_header("X-Forwarded-For", ip_str)?;
         }
 
         let proto = if Self::is_tls_connection(session) {
@@ -1405,13 +1415,9 @@ impl ProxyHttp for DwaarProxy {
         } else {
             "http"
         };
-        upstream_request
-            .insert_header("X-Forwarded-Proto", proto)
-            .expect("static header value is valid");
+        upstream_request.insert_header("X-Forwarded-Proto", proto)?;
 
-        upstream_request
-            .insert_header("X-Request-Id", ctx.request_id())
-            .expect("UUID is valid header value");
+        upstream_request.insert_header("X-Request-Id", ctx.request_id())?;
 
         // W3C Trace Context propagation (ISSUE-112): if the client sent a valid
         // traceparent, propagate it unchanged; otherwise generate a fresh one so
@@ -1424,17 +1430,13 @@ impl ProxyHttp for DwaarProxy {
             .and_then(crate::trace::parse_traceparent)
             .unwrap_or_else(crate::trace::generate_traceparent);
 
-        upstream_request
-            .insert_header("traceparent", trace_ctx.traceparent())
-            .expect("traceparent is valid header value");
+        upstream_request.insert_header("traceparent", trace_ctx.traceparent())?;
 
         // Pass through tracestate if present — we don't parse it, just relay.
         if let Some(ts) = session.req_header().headers.get("tracestate")
             && let Ok(v) = ts.to_str()
         {
-            upstream_request
-                .insert_header("tracestate", v)
-                .expect("tracestate is valid header value");
+            upstream_request.insert_header("tracestate", v)?;
         }
 
         ctx.trace_ctx = Some(trace_ctx);
@@ -1518,9 +1520,7 @@ impl ProxyHttp for DwaarProxy {
         Self::CTX: Send + Sync,
     {
         // --- Request tracing (ISSUE-006) ---
-        upstream_response
-            .insert_header("X-Request-Id", ctx.request_id())
-            .expect("UUID is valid header value");
+        upstream_response.insert_header("X-Request-Id", ctx.request_id())?;
 
         // Advertise HTTP/3 only for routes the QUIC bridge can serve
         // (ReverseProxy and ReverseProxyPool). FileServer, StaticResponse,
@@ -1528,16 +1528,12 @@ impl ProxyHttp for DwaarProxy {
         // advertising Alt-Svc for those routes would cause clients to
         // attempt QUIC and get a 502.
         if self.h3_enabled && ctx.quic_capable {
-            upstream_response
-                .insert_header("Alt-Svc", r#"h3=":443"; ma=86400"#)
-                .expect("static str is valid header value");
+            upstream_response.insert_header("Alt-Svc", r#"h3=":443"; ma=86400"#)?;
         }
 
         // --- Cache status header (ISSUE-073f) ---
         if let Some(status) = ctx.cache_status {
-            upstream_response
-                .insert_header("X-Cache", status)
-                .expect("static str is valid header value");
+            upstream_response.insert_header("X-Cache", status)?;
         }
 
         // --- Intercept check (ISSUE-067) ---
@@ -1566,18 +1562,13 @@ impl ProxyHttp for DwaarProxy {
                 }
             });
             if let Some((new_status, set_headers, replace_body)) = matched {
-                if let Some(code) = new_status {
-                    upstream_response
-                        .set_status(
-                            pingora_http::StatusCode::from_u16(code)
-                                .expect("intercept status must be a valid HTTP code"),
-                        )
-                        .expect("failed to set intercept status");
+                if let Some(code) = new_status
+                    && let Ok(status) = pingora_http::StatusCode::from_u16(code)
+                {
+                    upstream_response.set_status(status)?;
                 }
                 for (name, value) in set_headers {
-                    upstream_response
-                        .insert_header(name.into_string(), value.into_string())
-                        .expect("intercept header name/value must be valid");
+                    upstream_response.insert_header(name.into_string(), value.into_string())?;
                 }
                 if let Some(body) = replace_body {
                     // Signal body replacement to response_body_filter().
@@ -1630,9 +1621,7 @@ impl ProxyHttp for DwaarProxy {
                 limit = ctx.response_body_max_size,
                 "upstream response body exceeds limit — replacing with 502"
             );
-            upstream_response
-                .set_status(pingora_http::StatusCode::from_u16(502).expect("502 is valid"))
-                .expect("failed to set 502 status");
+            upstream_response.set_status(http::StatusCode::BAD_GATEWAY)?;
             upstream_response.remove_header("Content-Length");
             ctx.intercept_body = Some(bytes::Bytes::from_static(b"upstream response too large"));
         }

@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-04-13
+
+Hardening patch: 5 fixes for audit findings and a deploy-blocking startup bug.
+
+### Security
+
+- **Float-to-int truncation in compress negotiation** — `Accept-Encoding`
+  quality values now clamped with `.round().clamp(0.0, 1000.0)` before cast,
+  preventing incorrect encoding selection on `NaN`/`Infinity`/negative `q`.
+  (fixes #144)
+- **Beacon body overflow parsed truncated data** — oversized beacon bodies
+  now return 413 Payload Too Large instead of silently parsing the truncated
+  prefix. (fixes #151)
+
+### Fixed
+
+- **L4-only configs no longer rejected at startup** — `route_table.is_empty()`
+  guard now also checks for layer4 config, allowing Dwaar to start with only
+  TCP/UDP proxy routes and no HTTP sites.
+- **`.expect()` removed from hot proxy path** — 13 `.expect()` calls in
+  `upstream_request_filter` and `upstream_response_filter` replaced with `?`
+  propagation, preventing worker crashes on unexpected header values. (fixes #145)
+- **Docker watcher dual-map race condition** — `docker_routes` and
+  `container_domains` consolidated into a single `DockerState` struct under
+  one lock, ensuring atomic map updates. (fixes #148)
+
 ## [0.2.5] - 2026-04-13
 
 Critical security fix, parser hardening, and CLI improvements.

@@ -468,7 +468,11 @@ fn run_server(
 
     // Compile routes
     let route_table = compile_routes(dwaar_config);
-    if route_table.is_empty() {
+    let has_l4 = dwaar_config
+        .global_options
+        .as_ref()
+        .is_some_and(|g| g.layer4.is_some() || !g.layer4_listener_wrappers.is_empty());
+    if route_table.is_empty() && !has_l4 {
         bail!("no valid routes found in config — nothing to proxy");
     }
     info!(routes = route_table.len(), "route table compiled");

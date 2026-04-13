@@ -127,10 +127,10 @@ pub fn negotiate_encoding(accept_encoding: &str) -> Option<CompressEncoding> {
         // Compare quality as fixed-point to avoid float comparison lint.
         // Multiply by 1000 and compare as integers (q values have at most 3 decimal places).
         #[allow(clippy::cast_possible_truncation)]
-        let q_int = (quality * 1000.0) as i32;
+        let q_int = (quality * 1000.0).round().clamp(0.0, 1000.0) as i32;
         let dominated = best.as_ref().is_none_or(|(_, bq, bp)| {
             #[allow(clippy::cast_possible_truncation)]
-            let bq_int = (*bq * 1000.0) as i32;
+            let bq_int = (*bq * 1000.0).round().clamp(0.0, 1000.0) as i32;
             q_int > bq_int || (q_int == bq_int && priority > *bp)
         });
         if dominated {
