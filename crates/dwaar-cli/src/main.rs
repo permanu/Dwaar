@@ -824,7 +824,7 @@ fn run_server(
         for server_cfg in &mut l4_servers {
             for route in &mut server_cfg.routes {
                 for handler in &mut route.handlers {
-                    if let dwaar_core::l4::CompiledL4Handler::Tls { cert_store: cs } = handler {
+                    if let dwaar_core::l4::CompiledL4Handler::Tls { cert_store: cs, .. } = handler {
                         *cs = Some(Arc::clone(&cert_store));
                     }
                 }
