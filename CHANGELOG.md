@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-04-13
+
+Deploy agent compatibility patch.
+
+### Fixed
+
+- **Empty config no longer prevents startup** — Dwaar now starts with zero
+  routes and logs a warning, allowing the config watcher to pick up routes
+  on reload. Previously it would bail with "no valid routes found."
+- **`dwaar reload` admin endpoint discovery** — the server now writes the
+  active admin endpoint to `/tmp/dwaar-admin.addr` on startup. `dwaar reload`
+  reads this file to discover the correct address, eliminating hardcoded UDS
+  paths. Works with any `--admin-socket` value.
+
+### Tests
+
+- Added `imported_layer4_block_parsed` test confirming that `layer4 {}`
+  blocks imported via `import` directives are correctly parsed.
+
 ## [0.2.6] - 2026-04-13
 
 Hardening patch: 5 fixes for audit findings and a deploy-blocking startup bug.
