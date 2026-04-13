@@ -153,7 +153,7 @@ pub(crate) enum Commands {
     /// Trigger config reload on the running Dwaar instance
     Reload {
         /// Admin API address. Use a TCP address (127.0.0.1:6190) or a
-        /// Unix socket path (/var/run/dwaar-admin.sock or unix:///path).
+        /// Unix socket path (`/var/run/dwaar-admin.sock` or `unix:///path`).
         #[arg(long, default_value = "127.0.0.1:6190")]
         admin: String,
     },

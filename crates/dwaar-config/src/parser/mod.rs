@@ -110,7 +110,9 @@ fn parse_config(t: &mut Tokenizer<'_>) -> Result<DwaarConfig, ParseError> {
 
     // Merge top-level layer4 into global options (creating the struct if needed).
     if let Some(l4) = top_level_layer4 {
-        global_options.get_or_insert_with(GlobalOptions::default).layer4 = Some(l4);
+        global_options
+            .get_or_insert_with(GlobalOptions::default)
+            .layer4 = Some(l4);
     }
 
     Ok(DwaarConfig {
