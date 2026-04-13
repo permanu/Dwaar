@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.11] - 2026-04-13
+
+### Fixed
+
+- **L4 listeners now dual-stack (IPv4 + IPv6)** — bare `:port` in layer4
+  config now binds to `[::]` instead of `0.0.0.0`, enabling both IPv4 and
+  IPv6 connections on the same listener. Linux dual-stack sockets accept
+  both address families by default.
+
 ## [0.2.10] - 2026-04-13
 
 Layer 4 TLS termination with explicit cert/key — enables encrypted database
