@@ -16,10 +16,10 @@ Deploy agent compatibility patch.
 - **Empty config no longer prevents startup** — Dwaar now starts with zero
   routes and logs a warning, allowing the config watcher to pick up routes
   on reload. Previously it would bail with "no valid routes found."
-- **`dwaar reload` checks both UDS paths** — the CLI now probes
-  `/var/run/dwaar-admin.sock` and `/run/dwaar/admin.sock` before falling
-  back to TCP, fixing 401 errors when the deploy agent uses a non-default
-  socket path.
+- **`dwaar reload` admin endpoint discovery** — the server now writes the
+  active admin endpoint to `/tmp/dwaar-admin.addr` on startup. `dwaar reload`
+  reads this file to discover the correct address, eliminating hardcoded UDS
+  paths. Works with any `--admin-socket` value.
 
 ### Tests
 
