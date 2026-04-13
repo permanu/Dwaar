@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-04-13
+
+Hotfix: imported config files now work with hot-reload.
+
+### Fixed
+
+- **Import resolution used CWD instead of config directory** — `parser::parse()`
+  resolved `import` paths relative to the working directory, not the Dwaarfile's
+  parent. On servers where CWD is `/`, imported files were never found.
+- **Imported file changes didn't trigger reload** — the content hash was computed
+  from the raw Dwaarfile only. Now hashes the expanded content (after import
+  expansion) so changes to any imported file trigger a reload.
+- **Config watcher now watches recursively** — `RecursiveMode::Recursive` ensures
+  changes to imported files in subdirectories (e.g. `apps/*.dwaar`) are detected.
+- Added `parse_expanded()` entry point for pre-expanded config text, avoiding
+  double import expansion in the watcher.
+
 ## [0.2.8] - 2026-04-13
 
 Layer 4 hot-reload — the last major gap for zero-touch deploy automation.

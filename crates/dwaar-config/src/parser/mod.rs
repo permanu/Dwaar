@@ -62,7 +62,15 @@ pub fn parse_with_base_dir(
     base_dir: &std::path::Path,
 ) -> Result<DwaarConfig, ParseError> {
     let expanded = crate::import::expand_imports(input, base_dir)?;
-    let mut tokenizer = Tokenizer::new(&expanded);
+    parse_expanded(&expanded)
+}
+
+/// Parse pre-expanded config text (imports already resolved).
+///
+/// Used by [`ConfigWatcher`] which expands imports separately to hash the
+/// expanded content before parsing.
+pub fn parse_expanded(input: &str) -> Result<DwaarConfig, ParseError> {
+    let mut tokenizer = Tokenizer::new(input);
     parse_config(&mut tokenizer)
 }
 

@@ -283,8 +283,23 @@ impl ConfigWatcher {
             }
         };
 
-        // Content hash comparison
-        let new_hash = match openssl::hash::hash(MessageDigest::sha256(), content.as_bytes()) {
+        // Expand imports first so the hash covers imported file contents too.
+        // When an agent writes to an imported file (e.g. tcp.dwaar), the main
+        // Dwaarfile doesn't change — but the expanded text does.
+        let base_dir = self
+            .config_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
+        let expanded = match crate::import::expand_imports(&content, base_dir) {
+            Ok(e) => e,
+            Err(e) => {
+                error!(error = %e, "import expansion failed — keeping current config");
+                return;
+            }
+        };
+
+        // Hash the expanded content (includes all imported files)
+        let new_hash = match openssl::hash::hash(MessageDigest::sha256(), expanded.as_bytes()) {
             Ok(h) => {
                 let mut arr = [0u8; 32];
                 arr.copy_from_slice(&h);
@@ -304,8 +319,8 @@ impl ConfigWatcher {
             }
         }
 
-        // Parse
-        let config = match parser::parse(&content) {
+        // Parse the already-expanded content (no double-expansion).
+        let config = match parser::parse_expanded(&expanded) {
             Ok(c) => c,
             Err(e) => {
                 error!(error = %e, "config parse failed — keeping current config");
@@ -480,9 +495,10 @@ fn setup_watcher(
         notify::Config::default(),
     )?;
 
-    // Watch the parent directory (handles atomic rename patterns)
+    // Watch the parent directory recursively so changes to imported files
+    // (e.g. apps/*.dwaar) also trigger a reload check.
     let parent = config_path.parent().unwrap_or(std::path::Path::new("."));
-    watcher.watch(parent, RecursiveMode::NonRecursive)?;
+    watcher.watch(parent, RecursiveMode::Recursive)?;
 
     Ok(watcher)
 }
