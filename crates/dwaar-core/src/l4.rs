@@ -278,65 +278,153 @@ impl CompiledL4Handler {
 
 // ── Service ─────────────────────────────────────────────────────────────
 
-/// Background service that runs one or more Layer 4 TCP listeners.
+/// Shared L4 server config behind `ArcSwap`, used by both `Layer4Service`
+/// and `ConfigWatcher` for hot-reload.
+pub type SharedL4Servers = Arc<arc_swap::ArcSwap<Vec<CompiledL4Server>>>;
+
+/// Background service that runs Layer 4 TCP listeners with hot-reload support.
+///
+/// On startup, binds all configured listeners. When notified via `reload_notify`,
+/// diffs the new config against running listeners: binds new ports, drops removed
+/// ports, and swaps routes on existing ports — no restart needed.
 pub struct Layer4Service {
-    servers: Vec<CompiledL4Server>,
+    servers: SharedL4Servers,
+    reload_notify: Arc<tokio::sync::Notify>,
 }
 
 impl std::fmt::Debug for Layer4Service {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Layer4Service")
-            .field("servers", &self.servers.len())
+            .field("servers", &self.servers.load().len())
+            .field("reload_notify", &"Notify")
             .finish()
     }
 }
 
 impl Layer4Service {
-    pub fn new(servers: Vec<CompiledL4Server>) -> Self {
-        Self { servers }
+    pub fn new(servers: SharedL4Servers, reload_notify: Arc<tokio::sync::Notify>) -> Self {
+        Self {
+            servers,
+            reload_notify,
+        }
     }
+}
+
+/// State for a single running listener — tracks the cancel token so we can
+/// stop it on reload when its listen address is removed.
+struct LiveListener {
+    cancel: tokio_util::sync::CancellationToken,
+    /// The server config driving this listener, swappable for route updates.
+    server: Arc<arc_swap::ArcSwap<CompiledL4Server>>,
 }
 
 #[async_trait]
 impl BackgroundService for Layer4Service {
     async fn start(&self, shutdown: ShutdownWatch) {
-        let mut listeners = Vec::new();
+        let mut live: std::collections::HashMap<SocketAddr, LiveListener> =
+            std::collections::HashMap::new();
+        let mut tasks = tokio::task::JoinSet::new();
 
-        for server in &self.servers {
-            match TcpListener::bind(server.listen).await {
-                Ok(listener) => {
-                    info!(addr = %server.listen, routes = server.routes.len(), "L4 listener bound");
-                    listeners.push((listener, server.clone()));
+        // Initial bind
+        bind_new_listeners(&self.servers.load(), &mut live, &mut tasks, &shutdown);
+
+        if live.is_empty() {
+            info!("layer4 service started — no initial listeners, waiting for reload");
+        }
+
+        loop {
+            tokio::select! {
+                () = self.reload_notify.notified() => {
+                    let new_servers = self.servers.load();
+                    let new_addrs: std::collections::HashSet<SocketAddr> =
+                        new_servers.iter().map(|s| s.listen).collect();
+
+                    // Remove listeners for addresses no longer in config
+                    live.retain(|addr, ll| {
+                        if new_addrs.contains(addr) {
+                            true
+                        } else {
+                            info!(addr = %addr, "L4 listener removed by reload");
+                            ll.cancel.cancel();
+                            false
+                        }
+                    });
+
+                    // Update routes on existing listeners, bind new ones
+                    for server in new_servers.iter() {
+                        if let Some(ll) = live.get(&server.listen) {
+                            // Existing listener — swap routes
+                            ll.server.store(Arc::new(server.clone()));
+                            debug!(addr = %server.listen, "L4 listener routes updated");
+                        }
+                        // else: new address — bind below
+                    }
+                    bind_new_listeners(&new_servers, &mut live, &mut tasks, &shutdown);
                 }
-                Err(e) => {
-                    error!(addr = %server.listen, error = %e, "failed to bind L4 listener");
+                _ = tasks.join_next(), if !tasks.is_empty() => {
+                    // A listener task completed (cancelled or errored) — no action needed,
+                    // it was already removed from `live` by the reload branch.
+                }
+                () = shutdown_signal(&shutdown) => {
+                    info!("L4 service shutting down");
+                    // Cancel all listeners
+                    for ll in live.values() {
+                        ll.cancel.cancel();
+                    }
+                    // Drain remaining tasks
+                    while tasks.join_next().await.is_some() {}
+                    return;
                 }
             }
         }
+    }
+}
 
-        if listeners.is_empty() {
-            warn!("no L4 listeners bound — layer4 service idle");
-            return;
+/// Bind listeners for addresses not already in `live` and spawn accept loops.
+fn bind_new_listeners(
+    servers: &[CompiledL4Server],
+    live: &mut std::collections::HashMap<SocketAddr, LiveListener>,
+    tasks: &mut tokio::task::JoinSet<()>,
+    shutdown: &ShutdownWatch,
+) {
+    for server in servers {
+        if live.contains_key(&server.listen) {
+            continue;
         }
+        let addr = server.listen;
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let server_swap = Arc::new(arc_swap::ArcSwap::from_pointee(server.clone()));
 
-        let mut tasks = tokio::task::JoinSet::new();
+        let cancel_clone = cancel.clone();
+        let server_clone = Arc::clone(&server_swap);
+        let shutdown = shutdown.clone();
 
-        for (listener, server) in listeners {
-            let shutdown = shutdown.clone();
-            let server = Arc::new(server);
-            tasks.spawn(async move {
-                run_listener(listener, server, shutdown).await;
-            });
-        }
+        tasks.spawn(async move {
+            match TcpListener::bind(addr).await {
+                Ok(listener) => {
+                    info!(addr = %addr, "L4 listener bound");
+                    run_listener(listener, server_clone, cancel_clone, shutdown).await;
+                }
+                Err(e) => {
+                    error!(addr = %addr, error = %e, "failed to bind L4 listener");
+                }
+            }
+        });
 
-        // Wait for all listener tasks to complete (on shutdown).
-        while tasks.join_next().await.is_some() {}
+        live.insert(
+            addr,
+            LiveListener {
+                cancel,
+                server: server_swap,
+            },
+        );
     }
 }
 
 async fn run_listener(
     listener: TcpListener,
-    server: Arc<CompiledL4Server>,
+    server: Arc<arc_swap::ArcSwap<CompiledL4Server>>,
+    cancel: tokio_util::sync::CancellationToken,
     shutdown: ShutdownWatch,
 ) {
     loop {
@@ -344,7 +432,7 @@ async fn run_listener(
             result = listener.accept() => {
                 match result {
                     Ok((stream, peer)) => {
-                        let server = Arc::clone(&server);
+                        let server = Arc::clone(&server.load());
                         tokio::spawn(async move {
                             if let Err(e) = handle_connection(stream, peer, &server).await {
                                 debug!(peer = %peer, error = %e, "L4 connection error");
@@ -356,6 +444,10 @@ async fn run_listener(
                         tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }
+            }
+            () = cancel.cancelled() => {
+                info!("L4 listener cancelled by reload");
+                return;
             }
             () = shutdown_signal(&shutdown) => {
                 info!("L4 listener shutting down");

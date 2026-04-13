@@ -30,8 +30,13 @@ use dwaar_core::upstream::UpstreamPool;
 use dwaar_tls::cert_store::CertStore;
 
 use crate::MAX_CONFIG_SIZE;
-use crate::compile::{collect_pools, compile_acme_domains, compile_routes, compile_tls_configs};
+use crate::compile::{
+    collect_pools, compile_acme_domains, compile_l4_servers, compile_l4_wrappers, compile_routes,
+    compile_tls_configs,
+};
 use crate::parser;
+
+use dwaar_core::l4::SharedL4Servers;
 
 const DEBOUNCE_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -79,6 +84,11 @@ pub struct ConfigWatcher {
     /// Shared cert store. On reload, domains removed from the SNI domain map
     /// are invalidated in the LRU cache so stale certs are never served.
     cert_store: Option<Arc<CertStore>>,
+    /// Shared L4 server list. On reload, recompiled and swapped so the
+    /// `Layer4Service` can bind new ports / drop removed ones / update routes.
+    l4_servers: Option<SharedL4Servers>,
+    /// Notify the `Layer4Service` that `l4_servers` was updated.
+    l4_notify: Option<Arc<tokio::sync::Notify>>,
     /// WASM module invalidation callback (ISSUE-120). Called for every path
     /// that was removed from the config or whose on-disk mtime changed since
     /// the previous reload. `None` leaves the cache untouched.
@@ -120,6 +130,8 @@ impl ConfigWatcher {
             acme_domains: None,
             cache_backend: None,
             cert_store: None,
+            l4_servers: None,
+            l4_notify: None,
             wasm_invalidator: None,
             wasm_mtimes: Mutex::new(HashMap::new()),
         }
@@ -180,6 +192,20 @@ impl ConfigWatcher {
     #[must_use]
     pub fn with_cert_store(mut self, store: Arc<CertStore>) -> Self {
         self.cert_store = Some(store);
+        self
+    }
+
+    /// Attach the shared L4 server list and reload notify for hot-reload.
+    /// When the config changes, the watcher recompiles L4 servers, stores
+    /// them via `ArcSwap`, and notifies the `Layer4Service` to rebind.
+    #[must_use]
+    pub fn with_l4_servers(
+        mut self,
+        servers: SharedL4Servers,
+        notify: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.l4_servers = Some(servers);
+        self.l4_notify = Some(notify);
         self
     }
 
@@ -335,6 +361,29 @@ impl ConfigWatcher {
         // ISSUE-120: diff WASM module references against the previous reload
         // and invalidate anything that was removed or whose file changed.
         refresh_wasm_cache(self.wasm_invalidator.as_ref(), &self.wasm_mtimes, &config);
+
+        // Refresh L4 servers — recompile and notify the Layer4Service to
+        // diff listeners (bind new, drop removed, swap routes on existing).
+        if let Some(ref l4) = self.l4_servers {
+            let mut new_l4 = Vec::new();
+            if let Some(l4_cfg) = config
+                .global_options
+                .as_ref()
+                .and_then(|g| g.layer4.as_ref())
+            {
+                new_l4.extend(compile_l4_servers(l4_cfg));
+            }
+            if let Some(ref opts) = config.global_options
+                && !opts.layer4_listener_wrappers.is_empty()
+            {
+                new_l4.extend(compile_l4_wrappers(&opts.layer4_listener_wrappers));
+            }
+            l4.store(Arc::new(new_l4));
+            if let Some(ref notify) = self.l4_notify {
+                notify.notify_one();
+            }
+            debug!("layer4 servers refreshed");
+        }
 
         if let Some(ref snapshot) = self.dwaarfile_snapshot {
             // Docker mode: update snapshot, notify DockerWatcher to re-merge

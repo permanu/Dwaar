@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-04-13
+
+Layer 4 hot-reload — the last major gap for zero-touch deploy automation.
+
+### Added
+
+- **Layer 4 hot-reload** — `Layer4Service` now uses `ArcSwap` + `Notify` for
+  dynamic listener management. On config reload: new L4 ports are bound, removed
+  ports are cancelled, and routes on existing ports are swapped — no restart
+  needed. Follows the same proven pattern as health pools and ACME domains.
+- Added `tokio-util` dependency to `dwaar-core` for `CancellationToken` in
+  L4 listener lifecycle management.
+
 ## [0.2.7] - 2026-04-13
 
 Deploy agent compatibility patch.

@@ -37,6 +37,7 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util", "time"] }
+tokio-util = "0.7"
 fastrand = { workspace = true }
 quinn = { workspace = true }
 rustls = { workspace = true }
