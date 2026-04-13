@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-04-13
+
+Critical security fix, parser hardening, and CLI improvements.
+
+### Security
+
+- **Integer overflow in size parsing** — `parse_size` used wrapping multiplication
+  for GB/MB/KB suffixes, allowing a malicious config to produce silently incorrect
+  size limits (e.g., cache `max_size` wrapping to near-zero). Now uses `checked_mul`,
+  returning a parse error on overflow. (fixes #146)
+
+### Fixed
+
+- **Top-level `layer4 {}` blocks now parsed** — caddy-l4 syntax places `layer4`
+  at the top level alongside site blocks, not inside global options. The parser
+  now handles both placements correctly.
+- **`dwaar reload` supports Unix sockets** — the CLI admin client now connects
+  via Unix domain sockets (`/var/run/dwaar-admin.sock` or `unix:///path`).
+  When the default TCP address is used, the CLI auto-detects the well-known
+  UDS path and tries it first.
+
+### Dependencies
+
+- Bump `rustls` 0.23.37 → 0.23.38
+- Bump `openssl` 0.10.76 → 0.10.77
+- Bump `openssl-sys` 0.9.112 → 0.9.113
+- Bump `daachorse` 1.0.1 → 2.0.0
+- Bump `softprops/action-gh-release` v2 → v3
+- Bump `actions/setup-node` v4 → v6
+- Bump `actions/upload-pages-artifact` v3 → v4
+- Bump `actions/deploy-pages` v4 → v5
+
 ## [0.2.4] - 2026-04-13
 
 ### Fixed

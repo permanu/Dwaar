@@ -19,21 +19,30 @@ pub(super) fn parse_size(s: &str) -> Option<u64> {
         .or_else(|| s.strip_suffix("G"))
         .or_else(|| s.strip_suffix("g"))
     {
-        n.trim().parse::<u64>().ok().map(|n| n * 1024 * 1024 * 1024)
+        n.trim()
+            .parse::<u64>()
+            .ok()
+            .and_then(|n| n.checked_mul(1024 * 1024 * 1024))
     } else if let Some(n) = s
         .strip_suffix("MB")
         .or_else(|| s.strip_suffix("mb"))
         .or_else(|| s.strip_suffix("M"))
         .or_else(|| s.strip_suffix("m"))
     {
-        n.trim().parse::<u64>().ok().map(|n| n * 1024 * 1024)
+        n.trim()
+            .parse::<u64>()
+            .ok()
+            .and_then(|n| n.checked_mul(1024 * 1024))
     } else if let Some(n) = s
         .strip_suffix("KB")
         .or_else(|| s.strip_suffix("kb"))
         .or_else(|| s.strip_suffix("K"))
         .or_else(|| s.strip_suffix("k"))
     {
-        n.trim().parse::<u64>().ok().map(|n| n * 1024)
+        n.trim()
+            .parse::<u64>()
+            .ok()
+            .and_then(|n| n.checked_mul(1024))
     } else {
         s.parse().ok()
     }

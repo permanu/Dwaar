@@ -74,16 +74,24 @@ fn parse_config(t: &mut Tokenizer<'_>) -> Result<DwaarConfig, ParseError> {
     let mut sites = Vec::new();
 
     // A leading bare `{` is the global options block.
-    let global_options = if t.peek().kind == TokenKind::OpenBrace {
+    let mut global_options = if t.peek().kind == TokenKind::OpenBrace {
         Some(parse_global_options(t)?)
     } else {
         None
     };
 
+    // Top-level `layer4 { ... }` block (caddy-l4 app syntax).
+    // Can appear alongside site blocks and is stored in global options.
+    let mut top_level_layer4 = None;
+
     loop {
         let tok = t.peek();
-        match tok.kind {
+        match &tok.kind {
             TokenKind::Eof => break,
+            TokenKind::Word(w) if w == "layer4" => {
+                let l4_tok = t.next_token();
+                top_level_layer4 = Some(layer4::parse_layer4_config(t, &l4_tok)?);
+            }
             TokenKind::Word(_) => {
                 sites.push(parse_site_block(t)?);
             }
@@ -98,6 +106,13 @@ fn parse_config(t: &mut Tokenizer<'_>) -> Result<DwaarConfig, ParseError> {
                 });
             }
         }
+    }
+
+    // Merge top-level layer4 into global options (creating the struct if needed).
+    if let Some(l4) = top_level_layer4 {
+        global_options
+            .get_or_insert_with(GlobalOptions::default)
+            .layer4 = Some(l4);
     }
 
     Ok(DwaarConfig {
