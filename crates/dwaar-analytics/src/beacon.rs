@@ -165,6 +165,20 @@ pub fn sanitize_url_to_path(url: &str) -> Option<String> {
     Some(truncated.to_string())
 }
 
+fn is_private_host(host: &str) -> bool {
+    if matches!(host, "localhost" | "0.0.0.0") {
+        return true;
+    }
+    let stripped = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = stripped.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+            std::net::IpAddr::V6(v6) => v6.is_loopback(),
+        };
+    }
+    false
+}
+
 /// Sanitize a client-supplied referrer into the host we store in
 /// aggregation.
 ///
@@ -194,6 +208,9 @@ pub fn sanitize_referrer_host(referrer: &str) -> Option<String> {
         // Truncating a hostname changes its semantic meaning entirely —
         // better to drop it than to record a half-domain that could
         // misattribute the referral.
+        return None;
+    }
+    if is_private_host(&lower) {
         return None;
     }
     Some(lower)
@@ -463,5 +480,18 @@ mod tests {
     fn sanitize_referrer_drops_oversized_host() {
         let huge = format!("https://{}/", "a".repeat(MAX_REFERRER_HOST_LEN + 1));
         assert!(sanitize_referrer_host(&huge).is_none());
+    }
+
+    #[test]
+    fn sanitize_referrer_rejects_private_ips() {
+        assert!(sanitize_referrer_host("http://127.0.0.1/admin").is_none());
+        assert!(sanitize_referrer_host("http://192.168.1.1/").is_none());
+        assert!(sanitize_referrer_host("http://10.0.0.1/").is_none());
+        assert!(sanitize_referrer_host("http://172.16.0.1/").is_none());
+        assert!(sanitize_referrer_host("http://localhost/").is_none());
+        assert!(sanitize_referrer_host("http://::1/").is_none());
+        // Public IPs should still be allowed
+        assert!(sanitize_referrer_host("http://8.8.8.8/").is_some());
+        assert!(sanitize_referrer_host("https://example.com/").is_some());
     }
 }
