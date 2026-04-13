@@ -6,7 +6,7 @@
 
 //! Minimal HTTP/1.1 client for querying the Dwaar Admin API.
 //!
-//! Uses raw `TcpStream` — no external HTTP library needed.
+//! Uses raw `TcpStream` or `UnixStream` — no external HTTP library needed.
 //! Only supports simple GET/POST to localhost, which is all CLI
 //! commands need for talking to the co-located admin API.
 
@@ -18,6 +18,18 @@ use std::time::Duration;
 pub(crate) struct AdminResponse {
     pub status: u16,
     pub body: String,
+}
+
+/// Returns `true` if `addr` looks like a Unix socket path rather than a TCP
+/// `host:port`. We accept both bare paths (`/var/run/dwaar-admin.sock`) and
+/// the explicit `unix://` scheme.
+fn is_unix_addr(addr: &str) -> bool {
+    addr.starts_with('/') || addr.starts_with("unix://")
+}
+
+/// Strip the `unix://` prefix if present, returning the bare filesystem path.
+fn unix_path(addr: &str) -> &str {
+    addr.strip_prefix("unix://").unwrap_or(addr)
 }
 
 /// Build an actionable error message for a failed connect to the admin API.
@@ -68,10 +80,58 @@ fn request(
     path: &str,
     body: Option<&str>,
 ) -> anyhow::Result<AdminResponse> {
+    if is_unix_addr(addr) {
+        request_unix(addr, method, path, body)
+    } else {
+        request_tcp(addr, method, path, body)
+    }
+}
+
+fn request_tcp(
+    addr: &str,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> anyhow::Result<AdminResponse> {
     let mut stream = TcpStream::connect(addr).map_err(|e| friendly_connect_error(addr, &e))?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    send_and_parse(&mut stream, method, path, body)
+}
 
+#[cfg(unix)]
+fn request_unix(
+    addr: &str,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> anyhow::Result<AdminResponse> {
+    use std::os::unix::net::UnixStream;
+
+    let socket_path = unix_path(addr);
+    let mut stream =
+        UnixStream::connect(socket_path).map_err(|e| friendly_connect_error(addr, &e))?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    send_and_parse(&mut stream, method, path, body)
+}
+
+#[cfg(not(unix))]
+fn request_unix(
+    addr: &str,
+    _method: &str,
+    _path: &str,
+    _body: Option<&str>,
+) -> anyhow::Result<AdminResponse> {
+    anyhow::bail!("Unix socket admin connections are not supported on this platform: {addr}")
+}
+
+fn send_and_parse(
+    stream: &mut (impl Read + Write),
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> anyhow::Result<AdminResponse> {
     // Add auth token if set
     let auth_header = std::env::var("DWAAR_ADMIN_TOKEN")
         .ok()
@@ -96,10 +156,10 @@ fn request(
     }
     stream.flush()?;
 
-    parse_response(&mut stream)
+    parse_response(stream)
 }
 
-fn parse_response(stream: &mut TcpStream) -> anyhow::Result<AdminResponse> {
+fn parse_response(stream: &mut impl Read) -> anyhow::Result<AdminResponse> {
     let mut reader = BufReader::new(stream);
 
     // Parse status line

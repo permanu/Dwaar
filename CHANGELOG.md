@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.5] - 2026-04-13
 
-Dependency updates and a critical security fix for config size parsing.
+Critical security fix, parser hardening, and CLI improvements.
 
 ### Security
 
@@ -17,6 +17,16 @@ Dependency updates and a critical security fix for config size parsing.
   for GB/MB/KB suffixes, allowing a malicious config to produce silently incorrect
   size limits (e.g., cache `max_size` wrapping to near-zero). Now uses `checked_mul`,
   returning a parse error on overflow. (fixes #146)
+
+### Fixed
+
+- **Top-level `layer4 {}` blocks now parsed** — caddy-l4 syntax places `layer4`
+  at the top level alongside site blocks, not inside global options. The parser
+  now handles both placements correctly.
+- **`dwaar reload` supports Unix sockets** — the CLI admin client now connects
+  via Unix domain sockets (`/var/run/dwaar-admin.sock` or `unix:///path`).
+  When the default TCP address is used, the CLI auto-detects the well-known
+  UDS path and tries it first.
 
 ### Dependencies
 

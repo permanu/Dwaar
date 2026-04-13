@@ -1383,10 +1383,28 @@ fn parse_cert_info(pem_data: &[u8], path: &std::path::Path) -> anyhow::Result<Ce
 }
 
 /// `dwaar reload` — trigger config reload on the running instance.
+///
+/// If the user-supplied `admin_addr` is the default TCP address, also try the
+/// well-known Unix socket path first — deploy agents typically start Dwaar with
+/// `--admin-socket` and the TCP listener may not be reachable.
 fn cmd_reload(admin_addr: &str) -> anyhow::Result<()> {
     use std::io::Write;
 
-    let resp = admin_client::post(admin_addr, "/reload", "")?;
+    let resp = if admin_addr == "127.0.0.1:6190" {
+        // Try the conventional UDS path first — it's more reliable when Dwaar
+        // is managed by a deploy agent that passes --admin-socket.
+        const DEFAULT_UDS: &str = "/var/run/dwaar-admin.sock";
+        if std::path::Path::new(DEFAULT_UDS).exists() {
+            match admin_client::post(DEFAULT_UDS, "/reload", "") {
+                Ok(r) => r,
+                Err(_) => admin_client::post(admin_addr, "/reload", "")?,
+            }
+        } else {
+            admin_client::post(admin_addr, "/reload", "")?
+        }
+    } else {
+        admin_client::post(admin_addr, "/reload", "")?
+    };
 
     match resp.status {
         200 => {
