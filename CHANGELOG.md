@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-04-13
+
+Dependency updates and a critical security fix for config size parsing.
+
+### Security
+
+- **Integer overflow in size parsing** — `parse_size` used wrapping multiplication
+  for GB/MB/KB suffixes, allowing a malicious config to produce silently incorrect
+  size limits (e.g., cache `max_size` wrapping to near-zero). Now uses `checked_mul`,
+  returning a parse error on overflow. (fixes #146)
+
+### Dependencies
+
+- Bump `rustls` 0.23.37 → 0.23.38
+- Bump `openssl` 0.10.76 → 0.10.77
+- Bump `openssl-sys` 0.9.112 → 0.9.113
+- Bump `daachorse` 1.0.1 → 2.0.0
+- Bump `softprops/action-gh-release` v2 → v3
+- Bump `actions/setup-node` v4 → v6
+- Bump `actions/upload-pages-artifact` v3 → v4
+- Bump `actions/deploy-pages` v4 → v5
+
 ## [0.2.4] - 2026-04-13
 
 ### Fixed
