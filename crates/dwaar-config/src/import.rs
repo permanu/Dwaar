@@ -807,12 +807,12 @@ example.com {
 
     #[test]
     fn imported_layer4_block_parsed() {
-        let dir = tempfile::TempDir::new().unwrap();
+        let dir = tempfile::TempDir::new().expect("tempdir");
         fs::write(
             dir.path().join("tcp.dwaar"),
             "layer4 {\n    :5432 {\n        route {\n            proxy 127.0.0.1:5432\n        }\n    }\n}\n",
         )
-        .unwrap();
+        .expect("write file");
 
         let input = "{\n    email admin@example.com\n}\n\nimport tcp.dwaar\n";
         let config = crate::parser::parse_with_base_dir(input, dir.path())
