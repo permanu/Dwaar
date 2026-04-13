@@ -196,14 +196,19 @@ pub enum CompiledL4Handler {
     },
     /// TLS termination — decrypt then pass to the next handler in the chain.
     ///
-    /// Carries the cert store so the acceptor can look up the right cert for
-    /// the SNI hostname parsed from the `ClientHello` peek. We avoid baking in
-    /// an `SslAcceptor` because certs are hot-reloadable; the store handles
-    /// its own LRU cache.
+    /// Two modes:
+    /// 1. **Explicit cert/key** — loaded from paths in the `tls { cert ... key ... }`
+    ///    config block. Used for L4-only services (databases, TCP) that have no
+    ///    corresponding HTTP site block.
+    /// 2. **`CertStore` SNI lookup** — falls back to the shared HTTP cert store
+    ///    when no explicit paths are given.
     Tls {
+        /// Explicit cert file path from config (e.g. `/etc/dwaar/certs/db.crt`).
+        cert_path: Option<String>,
+        /// Explicit key file path from config (e.g. `/etc/dwaar/certs/db.key`).
+        key_path: Option<String>,
         /// Injected at runtime in main.rs after compilation. `None` during
-        /// the compile phase; the service refuses TLS if still `None` at
-        /// accept time.
+        /// the compile phase; used as fallback when no explicit cert/key paths.
         cert_store: Option<Arc<CertStore>>,
     },
     /// Nested routing after decryption.
@@ -234,7 +239,13 @@ impl Clone for CompiledL4Handler {
                 fail_duration: *fail_duration,
                 connect_timeout: *connect_timeout,
             },
-            Self::Tls { cert_store } => Self::Tls {
+            Self::Tls {
+                cert_path,
+                key_path,
+                cert_store,
+            } => Self::Tls {
+                cert_path: cert_path.clone(),
+                key_path: key_path.clone(),
                 cert_store: cert_store.clone(),
             },
             Self::Subroute {
@@ -667,19 +678,23 @@ async fn execute_handlers(
                 }
             }
         }
-        CompiledL4Handler::Tls { cert_store } => {
-            let Some(cert_store) = cert_store else {
-                warn!(peer = %peer, "L4 TLS handler: no cert store injected — dropping connection");
-                return Ok(());
-            };
-
-            // Build an acceptor using the cert for the SNI we already parsed
-            // from the peeked `ClientHello`. The acceptor is built per-connection
-            // because each connection may carry a different SNI. CertStore
-            // handles its own LRU caching of the parsed cert+key.
+        CompiledL4Handler::Tls {
+            cert_path,
+            key_path,
+            cert_store,
+        } => {
+            // Build an acceptor using explicit cert/key or CertStore fallback.
+            // The acceptor is built per-connection because each connection may
+            // carry a different SNI. CertStore handles its own LRU caching.
             let sni = parse_tls_client_hello(peeked).and_then(|h| h.sni);
 
-            let acceptor = build_ssl_acceptor(cert_store, sni.as_deref(), peer)?;
+            let acceptor = build_ssl_acceptor(
+                cert_path.as_deref(),
+                key_path.as_deref(),
+                cert_store.as_ref(),
+                sni.as_deref(),
+                peer,
+            )?;
 
             // Drive the TLS handshake asynchronously.
             // The `ClientHello` bytes are still in the kernel socket buffer
@@ -1256,8 +1271,15 @@ async fn execute_handlers_on_decrypted(
 /// anyway. The `CertStore` handles LRU caching of parsed cert+key, so the
 /// only cost here is `SslAcceptor` construction (~microseconds vs handshake
 /// latency at ~milliseconds).
+/// Build an `SslAcceptor` for L4 TLS termination.
+///
+/// Two modes:
+/// - **Explicit paths**: load cert/key directly from disk (L4-only services)
+/// - **`CertStore` fallback**: look up cert by SNI from the shared store (HTTP sites)
 fn build_ssl_acceptor(
-    cert_store: &Arc<CertStore>,
+    cert_path: Option<&str>,
+    key_path: Option<&str>,
+    cert_store: Option<&Arc<CertStore>>,
     sni: Option<&str>,
     peer: SocketAddr,
 ) -> Result<SslAcceptor, L4Error> {
@@ -1267,17 +1289,31 @@ fn build_ssl_acceptor(
     // No client cert verification at L4 — mTLS is the HTTP layer's concern.
     builder.set_verify(SslVerifyMode::NONE);
 
-    let cached = sni.and_then(|name| cert_store.get(name)).ok_or_else(|| {
-        warn!(peer = %peer, sni = ?sni, "L4 TLS: no cert for SNI — dropping");
-        L4Error::TlsNoCert(sni.map(str::to_owned))
-    })?;
+    if let (Some(cert), Some(key)) = (cert_path, key_path) {
+        // Explicit cert/key from config — load from disk.
+        builder
+            .set_certificate_chain_file(cert)
+            .map_err(|e| L4Error::TlsConfig(format!("failed to load cert {cert}: {e}")))?;
+        builder
+            .set_private_key_file(key, openssl::ssl::SslFiletype::PEM)
+            .map_err(|e| L4Error::TlsConfig(format!("failed to load key {key}: {e}")))?;
+    } else if let Some(cert_store) = cert_store {
+        // CertStore SNI lookup — shared with HTTP layer.
+        let cached = sni.and_then(|name| cert_store.get(name)).ok_or_else(|| {
+            warn!(peer = %peer, sni = ?sni, "L4 TLS: no cert for SNI — dropping");
+            L4Error::TlsNoCert(sni.map(str::to_owned))
+        })?;
+        builder
+            .set_certificate(&cached.cert)
+            .map_err(|e| L4Error::TlsConfig(e.to_string()))?;
+        builder
+            .set_private_key(&cached.key)
+            .map_err(|e| L4Error::TlsConfig(e.to_string()))?;
+    } else {
+        warn!(peer = %peer, "L4 TLS: no cert source configured — dropping");
+        return Err(L4Error::TlsNoCert(sni.map(str::to_owned)));
+    }
 
-    builder
-        .set_certificate(&cached.cert)
-        .map_err(|e| L4Error::TlsConfig(e.to_string()))?;
-    builder
-        .set_private_key(&cached.key)
-        .map_err(|e| L4Error::TlsConfig(e.to_string()))?;
     // Verify key matches cert — gives a clean error before the handshake
     // rather than a cryptic SSL alert mid-connection.
     builder

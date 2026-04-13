@@ -455,7 +455,23 @@ fn compile_l4_handler(handler: &Layer4Handler) -> Option<CompiledL4Handler> {
                 connect_timeout,
             ))
         }
-        Layer4Handler::Tls(_) => Some(CompiledL4Handler::Tls { cert_store: None }),
+        Layer4Handler::Tls(tls) => {
+            let cert_path = tls
+                .options
+                .iter()
+                .find(|o| o.name == "cert")
+                .and_then(|o| o.args.first().cloned());
+            let key_path = tls
+                .options
+                .iter()
+                .find(|o| o.name == "key")
+                .and_then(|o| o.args.first().cloned());
+            Some(CompiledL4Handler::Tls {
+                cert_path,
+                key_path,
+                cert_store: None,
+            })
+        }
         Layer4Handler::Subroute(sub) => {
             let routes = compile_l4_routes(&sub.matchers, &sub.routes);
             let timeout = sub

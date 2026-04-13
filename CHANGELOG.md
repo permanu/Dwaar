@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.10] - 2026-04-13
+
+Layer 4 TLS termination with explicit cert/key — enables encrypted database
+and TCP proxy connections without an HTTP site block.
+
+### Added
+
+- **L4 TLS with explicit cert/key paths** — the `tls { cert ... key ... }`
+  config block in layer4 handlers now loads certs directly from disk instead
+  of requiring a shared HTTP `CertStore` entry. This enables TLS termination
+  for L4-only services like PostgreSQL, MySQL, and Redis proxies where no
+  corresponding HTTP site block exists.
+- Two-mode TLS resolution: explicit cert/key paths take priority; falls back
+  to `CertStore` SNI lookup for domains that share certs with HTTP sites.
+
+### Example
+
+```
+layer4 {
+    :5432 {
+        route {
+            tls {
+                cert /etc/dwaar/certs/db.crt
+                key  /etc/dwaar/certs/db.key
+            }
+            proxy 172.18.0.2:5432
+        }
+    }
+}
+```
+
+External clients connect with `sslmode=require` and Dwaar terminates TLS
+before forwarding plaintext to the container on the same host.
+
 ## [0.2.9] - 2026-04-13
 
 Hotfix: imported config files now work with hot-reload.
