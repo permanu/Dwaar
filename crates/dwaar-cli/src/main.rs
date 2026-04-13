@@ -31,7 +31,7 @@ use pingora_core::listeners::TcpSocketOptions;
 use pingora_core::listeners::tls::TlsSettings;
 use pingora_core::server::Server;
 use pingora_core::server::configuration::{Opt as PingoraOpt, ServerConf};
-use tracing::info;
+use tracing::{info, warn};
 
 use cli::{Cli, Commands, WorkerCount};
 use dashmap::DashMap;
@@ -473,7 +473,7 @@ fn run_server(
         .as_ref()
         .is_some_and(|g| g.layer4.is_some() || !g.layer4_listener_wrappers.is_empty());
     if route_table.is_empty() && !has_l4 {
-        bail!("no valid routes found in config — nothing to proxy");
+        warn!("no routes configured — proxy is idle, waiting for config reload");
     }
     info!(routes = route_table.len(), "route table compiled");
 
@@ -1395,11 +1395,12 @@ fn cmd_reload(admin_addr: &str) -> anyhow::Result<()> {
     use std::io::Write;
 
     let resp = if admin_addr == "127.0.0.1:6190" {
-        // Try the conventional UDS path first — it's more reliable when Dwaar
-        // is managed by a deploy agent that passes --admin-socket.
-        const DEFAULT_UDS: &str = "/var/run/dwaar-admin.sock";
-        if std::path::Path::new(DEFAULT_UDS).exists() {
-            match admin_client::post(DEFAULT_UDS, "/reload", "") {
+        // Try well-known UDS paths first — deploy agents typically start Dwaar
+        // with --admin-socket and the TCP listener may not be reachable.
+        const UDS_PATHS: &[&str] = &["/var/run/dwaar-admin.sock", "/run/dwaar/admin.sock"];
+        let uds = UDS_PATHS.iter().find(|p| std::path::Path::new(p).exists());
+        if let Some(path) = uds {
+            match admin_client::post(path, "/reload", "") {
                 Ok(r) => r,
                 Err(_) => admin_client::post(admin_addr, "/reload", "")?,
             }

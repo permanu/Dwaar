@@ -804,4 +804,26 @@ example.com {
             "expected PathTraversal, got {err:?}"
         );
     }
+
+    #[test]
+    fn imported_layer4_block_parsed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("tcp.dwaar"),
+            "layer4 {\n    :5432 {\n        route {\n            proxy 127.0.0.1:5432\n        }\n    }\n}\n",
+        )
+        .unwrap();
+
+        let input = "{\n    email admin@example.com\n}\n\nimport tcp.dwaar\n";
+        let config = crate::parser::parse_with_base_dir(input, dir.path())
+            .expect("should parse imported layer4");
+        assert!(
+            config
+                .global_options
+                .as_ref()
+                .and_then(|g| g.layer4.as_ref())
+                .is_some(),
+            "layer4 config should be present after import expansion"
+        );
+    }
 }
