@@ -492,8 +492,10 @@ fn compile_l4_handler(handler: &Layer4Handler) -> Option<CompiledL4Handler> {
 }
 
 fn parse_l4_listen_addr(s: &str) -> Option<std::net::SocketAddr> {
+    // Bare `:port` binds to [::] (IPv6 any) which is dual-stack on Linux —
+    // accepts both IPv4 and IPv6 connections on the same listener.
     let normalized = if s.starts_with(':') {
-        format!("0.0.0.0{s}")
+        format!("[::]{s}")
     } else {
         s.to_string()
     };
