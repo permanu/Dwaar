@@ -42,7 +42,9 @@ mod transforms;
 mod tests;
 
 use crate::error::{ParseError, ParseErrorKind, suggest_directive};
-use crate::model::{Directive, DwaarConfig, GlobalOptions, SiteBlock, TimeoutsConfig};
+use crate::model::{
+    Directive, DwaarConfig, GlobalOptions, Layer4ListenerWrapper, SiteBlock, TimeoutsConfig,
+};
 use crate::token::{Token, TokenKind, Tokenizer};
 
 use helpers::skip_brace_block;
@@ -208,6 +210,9 @@ fn parse_global_option_line(
         "auto_update" => {
             opts.auto_update = Some(parse_auto_update_block(t, &key_tok)?);
         }
+        "layer4" => {
+            opts.layer4 = Some(layer4::parse_layer4_config(t, &key_tok)?);
+        }
         // Unknown option — collect args, consume sub-blocks
         _ => {
             let args = collect_global_passthrough_args(t);
@@ -309,6 +314,7 @@ fn is_global_option_key(w: &str) -> bool {
             | "drain_timeout"
             | "timeouts"
             | "auto_update"
+            | "layer4"
     )
 }
 
@@ -622,12 +628,74 @@ fn parse_servers_block(
                         let val = peek_consume_word_or_quoted(t);
                         opts.h3_enabled = val.eq_ignore_ascii_case("on");
                     }
-                    // Future server-level options go here.
+                    "listener_wrappers" => {
+                        parse_listener_wrappers_block(t, opts, &sub_tok)?;
+                    }
                     _ => {
                         // Skip unknown keys inside servers block
                         let _ = collect_global_passthrough_args(t);
                     }
                 }
+            }
+            _ => {
+                t.next_token();
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Parse `listener_wrappers { layer4 { ... } tls }` inside a `servers` block.
+///
+/// Each `layer4 { ... }` sub-block is parsed as an L4 route set and attached
+/// to a synthetic `"*"` listen address (the real address is resolved at compile
+/// time from the site block that owns this server).
+fn parse_listener_wrappers_block(
+    t: &mut Tokenizer<'_>,
+    opts: &mut GlobalOptions,
+    key_tok: &Token,
+) -> Result<(), ParseError> {
+    let brace = t.peek();
+    if brace.kind != TokenKind::OpenBrace {
+        return Err(ParseError {
+            line: key_tok.line,
+            col: key_tok.col,
+            kind: ParseErrorKind::Expected {
+                expected: "'{' to open listener_wrappers block".to_string(),
+                got: format!("{}", brace.kind),
+            },
+        });
+    }
+    t.next_token(); // consume `{`
+
+    loop {
+        let tok = t.peek();
+        match &tok.kind {
+            TokenKind::CloseBrace => {
+                t.next_token();
+                break;
+            }
+            TokenKind::Eof => {
+                return Err(ParseError {
+                    line: key_tok.line,
+                    col: key_tok.col,
+                    kind: ParseErrorKind::UnexpectedEof {
+                        expected: "'}' to close listener_wrappers block".to_string(),
+                    },
+                });
+            }
+            TokenKind::Word(w) if w == "layer4" => {
+                let l4_tok = t.next_token();
+                let route_set = layer4::parse_layer4_route_set(t, &l4_tok)?;
+                opts.layer4_listener_wrappers.push(Layer4ListenerWrapper {
+                    listen: "*".to_string(),
+                    layer4: route_set,
+                });
+            }
+            TokenKind::Word(_) => {
+                // Other wrappers (e.g. `tls`) — consume and skip
+                t.next_token();
             }
             _ => {
                 t.next_token();

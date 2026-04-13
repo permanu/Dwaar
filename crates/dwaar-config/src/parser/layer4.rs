@@ -9,9 +9,8 @@
 //! This is deliberately separate from the HTTP directive parser because words
 //! like `route`, `tls`, and `proxy` have different meanings in layer4 blocks.
 //!
-//! The top-level dispatch hasn't been wired yet — allow `dead_code` until
-//! the `layer4` directive is plumbed through in a follow-up change.
-#![allow(dead_code)]
+//! Wired from `parse_global_option_line` (top-level `layer4 { }` block)
+//! and from `parse_listener_wrappers_block` (server-level `listener_wrappers { layer4 { } }`).
 
 use crate::error::{ParseError, ParseErrorKind};
 use crate::model::{
