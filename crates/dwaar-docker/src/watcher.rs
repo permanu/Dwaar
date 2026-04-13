@@ -31,6 +31,17 @@ use tracing::{debug, error, info, warn};
 use crate::client::{DockerClient, DockerError};
 use crate::labels;
 
+/// Mutable state for Docker-discovered routes, protected by a single lock
+/// so both maps are always consistent (no window where one is updated but
+/// the other is stale).
+#[derive(Debug, Default)]
+struct DockerState {
+    /// Docker routes keyed by domain.
+    routes: HashMap<String, Route>,
+    /// Reverse map: container ID -> domain, for efficient cleanup on `die` events.
+    domains: HashMap<String, String>,
+}
+
 /// Watches the Docker daemon for containers with `dwaar.*` labels and
 /// maintains a merged route table combining Dwaarfile and Docker routes.
 #[derive(Debug)]
@@ -39,11 +50,9 @@ pub struct DockerWatcher {
     route_table: Arc<ArcSwap<RouteTable>>,
     dwaarfile_routes: Arc<ArcSwap<Vec<Route>>>,
     config_notify: Arc<Notify>,
-    /// Docker routes keyed by domain. Single-writer (event loop), so the
-    /// mutex never contends — it exists only for interior mutability from `&self`.
-    docker_routes: parking_lot::Mutex<HashMap<String, Route>>,
-    /// Reverse map: container ID -> domain, for efficient cleanup on `die` events.
-    container_domains: parking_lot::Mutex<HashMap<String, String>>,
+    /// Single lock protecting both route and domain maps — mutations are
+    /// always atomic with respect to both maps.
+    state: parking_lot::Mutex<DockerState>,
 }
 
 impl DockerWatcher {
@@ -58,8 +67,7 @@ impl DockerWatcher {
             route_table,
             dwaarfile_routes,
             config_notify,
-            docker_routes: parking_lot::Mutex::new(HashMap::new()),
-            container_domains: parking_lot::Mutex::new(HashMap::new()),
+            state: parking_lot::Mutex::new(DockerState::default()),
         }
     }
 
@@ -69,9 +77,13 @@ impl DockerWatcher {
         let containers = self.client.list_containers("dwaar.domain").await?;
         info!(count = containers.len(), "bootstrapping Docker containers");
 
-        // Clear stale state from any previous connection
-        self.docker_routes.lock().clear();
-        self.container_domains.lock().clear();
+        // Clear stale state from any previous connection — single lock
+        // ensures both maps are cleared atomically.
+        {
+            let mut st = self.state.lock();
+            st.routes.clear();
+            st.domains.clear();
+        }
 
         for container in &containers {
             let Some(id) = container.get("Id").and_then(|v| v.as_str()) else {
@@ -88,17 +100,17 @@ impl DockerWatcher {
                             upstream = ?cr.route.upstream(),
                             "discovered Docker route"
                         );
-                        let mut docker = self.docker_routes.lock();
-                        let mut domains = self.container_domains.lock();
-                        if docker.contains_key(&cr.route.domain) {
+                        let mut st = self.state.lock();
+                        if st.routes.contains_key(&cr.route.domain) {
                             warn!(
                                 domain = %cr.route.domain,
                                 container_id = %cr.container_id,
                                 "duplicate Docker domain — keeping first container"
                             );
                         } else {
-                            domains.insert(cr.container_id.clone(), cr.route.domain.clone());
-                            docker.insert(cr.route.domain.clone(), cr.route);
+                            st.domains
+                                .insert(cr.container_id.clone(), cr.route.domain.clone());
+                            st.routes.insert(cr.route.domain.clone(), cr.route);
                         }
                     }
                 }
@@ -136,24 +148,22 @@ impl DockerWatcher {
             "adding Docker route"
         );
 
-        let mut docker = self.docker_routes.lock();
-        let mut domains = self.container_domains.lock();
+        {
+            let mut st = self.state.lock();
 
-        if docker.contains_key(&cr.route.domain) {
-            warn!(
-                domain = %cr.route.domain,
-                container_id = %cr.container_id,
-                "duplicate Docker domain — keeping existing container"
-            );
-            return;
+            if st.routes.contains_key(&cr.route.domain) {
+                warn!(
+                    domain = %cr.route.domain,
+                    container_id = %cr.container_id,
+                    "duplicate Docker domain — keeping existing container"
+                );
+                return;
+            }
+
+            st.domains
+                .insert(cr.container_id.clone(), cr.route.domain.clone());
+            st.routes.insert(cr.route.domain.clone(), cr.route);
         }
-
-        domains.insert(cr.container_id.clone(), cr.route.domain.clone());
-        docker.insert(cr.route.domain.clone(), cr.route);
-
-        // Drop locks before merge (merge acquires docker_routes lock)
-        drop(docker);
-        drop(domains);
 
         self.merge_and_store();
     }
@@ -163,8 +173,12 @@ impl DockerWatcher {
         debug!(container_id, "container die event");
 
         let domain = {
-            let mut domains = self.container_domains.lock();
-            domains.remove(container_id)
+            let mut st = self.state.lock();
+            let domain = st.domains.remove(container_id);
+            if let Some(ref d) = domain {
+                st.routes.remove(d);
+            }
+            domain
         };
 
         let Some(domain) = domain else {
@@ -173,21 +187,20 @@ impl DockerWatcher {
         };
 
         info!(container_id, domain = %domain, "removing Docker route");
-        self.docker_routes.lock().remove(&domain);
         self.merge_and_store();
     }
 
     /// Merge Dwaarfile routes with Docker routes. Dwaarfile wins on conflict.
     fn merge_and_store(&self) {
         let dwaarfile = self.dwaarfile_routes.load();
-        let docker = self.docker_routes.lock();
+        let st = self.state.lock();
 
         let dwaarfile_routes: &[Route] = dwaarfile.as_ref();
         let dwaarfile_domains: std::collections::HashSet<&str> =
             dwaarfile_routes.iter().map(|r| r.domain.as_str()).collect();
 
         let mut merged: Vec<Route> = dwaarfile_routes.to_vec();
-        for (domain, route) in docker.iter() {
+        for (domain, route) in &st.routes {
             if dwaarfile_domains.contains(domain.as_str()) {
                 warn!(domain, "Docker route shadowed by Dwaarfile");
             } else {
@@ -349,8 +362,8 @@ mod tests {
     fn merge_adds_docker_route() {
         let watcher = make_watcher();
         {
-            let mut docker = watcher.docker_routes.lock();
-            docker.insert(
+            let mut st = watcher.state.lock();
+            st.routes.insert(
                 "docker.example.com".to_string(),
                 Route::new("docker.example.com", addr(8080), false, None),
             );
@@ -370,8 +383,8 @@ mod tests {
             None,
         )]));
         {
-            let mut docker = watcher.docker_routes.lock();
-            docker.insert(
+            let mut st = watcher.state.lock();
+            st.routes.insert(
                 "example.com".to_string(),
                 Route::new("example.com", addr(9000), false, None),
             );
@@ -387,13 +400,14 @@ mod tests {
     fn handle_die_removes_route() {
         let watcher = make_watcher();
         {
-            let mut docker = watcher.docker_routes.lock();
-            docker.insert(
+            let mut st = watcher.state.lock();
+            st.routes.insert(
                 "app.example.com".to_string(),
                 Route::new("app.example.com", addr(8080), false, None),
             );
-            let mut domains = watcher.container_domains.lock();
-            domains.insert("container123".to_string(), "app.example.com".to_string());
+            // domains inserted through the same lock
+            st.domains
+                .insert("container123".to_string(), "app.example.com".to_string());
         }
         watcher.merge_and_store();
         assert!(
@@ -418,8 +432,8 @@ mod tests {
     fn handle_die_unknown_container_is_noop() {
         let watcher = make_watcher();
         {
-            let mut docker = watcher.docker_routes.lock();
-            docker.insert(
+            let mut st = watcher.state.lock();
+            st.routes.insert(
                 "app.example.com".to_string(),
                 Route::new("app.example.com", addr(8080), false, None),
             );
@@ -441,13 +455,14 @@ mod tests {
     fn duplicate_domain_first_wins() {
         let watcher = make_watcher();
         {
-            let mut docker = watcher.docker_routes.lock();
-            docker.insert(
+            let mut st = watcher.state.lock();
+            st.routes.insert(
                 "app.com".to_string(),
                 Route::new("app.com", addr(8080), false, None),
             );
-            let mut domains = watcher.container_domains.lock();
-            domains.insert("container1".to_string(), "app.com".to_string());
+            // domains inserted through the same lock
+            st.domains
+                .insert("container1".to_string(), "app.com".to_string());
         }
         // HashMap ensures one entry per domain — inserting again overwrites,
         // but handle_start checks for duplicates before inserting
@@ -469,12 +484,12 @@ mod tests {
     fn merge_preserves_multiple_docker_routes() {
         let watcher = make_watcher();
         {
-            let mut docker = watcher.docker_routes.lock();
-            docker.insert(
+            let mut st = watcher.state.lock();
+            st.routes.insert(
                 "a.example.com".to_string(),
                 Route::new("a.example.com", addr(8001), false, None),
             );
-            docker.insert(
+            st.routes.insert(
                 "b.example.com".to_string(),
                 Route::new("b.example.com", addr(8002), true, Some(50)),
             );
@@ -503,8 +518,8 @@ mod tests {
             None,
         )]));
         {
-            let mut docker = watcher.docker_routes.lock();
-            docker.insert(
+            let mut st = watcher.state.lock();
+            st.routes.insert(
                 "api.example.com".to_string(),
                 Route::new("api.example.com", addr(8080), false, None),
             );
