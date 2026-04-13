@@ -784,6 +784,17 @@ fn run_server(
         }
 
         info!(listen = "127.0.0.1:6190", "admin API registered");
+
+        // Write the active admin endpoint to a runtime file so `dwaar reload`
+        // can discover it without hardcoded paths. UDS is preferred over TCP.
+        let preferred_addr = cli
+            .admin_socket
+            .as_ref()
+            .and_then(|p| p.to_str())
+            .unwrap_or("127.0.0.1:6190");
+        if let Err(e) = write_admin_addr(preferred_addr) {
+            warn!(error = %e, "failed to write admin address file — dwaar reload may need --admin flag");
+        }
     }
 
     server.add_service(admin_listening);
@@ -1386,30 +1397,40 @@ fn parse_cert_info(pem_data: &[u8], path: &std::path::Path) -> anyhow::Result<Ce
     })
 }
 
+/// Runtime file where the server writes the active admin endpoint on startup.
+/// `dwaar reload` reads this to discover the correct address without hardcoding.
+const ADMIN_ADDR_FILE: &str = "/tmp/dwaar-admin.addr";
+
+/// Write the active admin endpoint so `dwaar reload` can discover it.
+fn write_admin_addr(addr: &str) -> std::io::Result<()> {
+    std::fs::write(ADMIN_ADDR_FILE, addr)
+}
+
+/// Read the admin endpoint written by the running server.
+fn read_admin_addr() -> Option<String> {
+    std::fs::read_to_string(ADMIN_ADDR_FILE)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// `dwaar reload` — trigger config reload on the running instance.
 ///
-/// If the user-supplied `admin_addr` is the default TCP address, also try the
-/// well-known Unix socket path first — deploy agents typically start Dwaar with
-/// `--admin-socket` and the TCP listener may not be reachable.
+/// Discovers the admin endpoint in order:
+/// 1. If the user passed an explicit `--admin` value, use it directly.
+/// 2. Otherwise, read the runtime file written by the server on startup.
+/// 3. Fall back to the default TCP address `127.0.0.1:6190`.
 fn cmd_reload(admin_addr: &str) -> anyhow::Result<()> {
     use std::io::Write;
 
-    let resp = if admin_addr == "127.0.0.1:6190" {
-        // Try well-known UDS paths first — deploy agents typically start Dwaar
-        // with --admin-socket and the TCP listener may not be reachable.
-        const UDS_PATHS: &[&str] = &["/var/run/dwaar-admin.sock", "/run/dwaar/admin.sock"];
-        let uds = UDS_PATHS.iter().find(|p| std::path::Path::new(p).exists());
-        if let Some(path) = uds {
-            match admin_client::post(path, "/reload", "") {
-                Ok(r) => r,
-                Err(_) => admin_client::post(admin_addr, "/reload", "")?,
-            }
-        } else {
-            admin_client::post(admin_addr, "/reload", "")?
-        }
+    // If the user passed an explicit --admin, use it. Otherwise try discovery.
+    let effective_addr = if admin_addr == "127.0.0.1:6190" {
+        read_admin_addr().unwrap_or_else(|| admin_addr.to_string())
     } else {
-        admin_client::post(admin_addr, "/reload", "")?
+        admin_addr.to_string()
     };
+
+    let resp = admin_client::post(&effective_addr, "/reload", "")?;
 
     match resp.status {
         200 => {
