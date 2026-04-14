@@ -222,6 +222,10 @@ write_dwaarfile_system() {
     CONTENT='{
     admin unix//run/dwaar/admin.sock
 
+    auto_update {
+        on_new_version reload
+    }
+
     log default {
         output file /var/log/dwaar/access.log {
             roll_size_mb 50
