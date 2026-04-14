@@ -15,6 +15,19 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// Tune jemalloc to prevent Linux THP (Transparent Huge Pages) from inflating
+// RSS. Without this, THP promotes jemalloc arenas to 2 MB pages — even a
+// 50 KB arena becomes 2 MB of RSS. On a VPS with few routes this alone
+// caused 128 MB RSS for a 3 MB heap.
+//
+// - thp:never        → opt out of THP (biggest win)
+// - narenas:2        → 2 arenas instead of 4×cores (work-stealing makes more unnecessary)
+// - muzzy_decay_ms   → return freed-but-held pages to OS after 1 s
+// - dirty_decay_ms   → return dirty pages after 0.5 s
+#[allow(non_upper_case_globals, unsafe_code)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static malloc_conf: &[u8] = b"thp:never,narenas:2,muzzy_decay_ms:1000,dirty_decay_ms:500\0";
+
 mod admin_client;
 mod auto_update;
 mod cli;
@@ -443,12 +456,32 @@ fn run_server(
     let cpu_count = std::thread::available_parallelism()
         .map(std::num::NonZero::get)
         .unwrap_or(1);
-    let threads = (cpu_count / worker_count).max(1);
+
+    // Count configured routes to right-size threads and connection pools.
+    // A single L4 proxy doesn't need 8 threads and 512 keepalive slots.
+    let has_l4 = dwaar_config
+        .global_options
+        .as_ref()
+        .is_some_and(|g| g.layer4.is_some() || !g.layer4_listener_wrappers.is_empty());
+    let route_hint = dwaar_config.sites.len() + usize::from(has_l4);
+
+    let max_useful_threads = match route_hint {
+        0..=2 => 2,
+        3..=10 => 4,
+        _ => cpu_count,
+    };
+    let threads = (cpu_count / worker_count).max(1).min(max_useful_threads);
+
+    let upstream_keepalive_pool_size = match route_hint {
+        0..=5 => 64,
+        6..=50 => 256,
+        _ => 512,
+    };
 
     let conf = ServerConf {
         threads,
         work_stealing: true,
-        upstream_keepalive_pool_size: 512,
+        upstream_keepalive_pool_size,
         grace_period_seconds: Some(5),
         graceful_shutdown_timeout_seconds: Some(5),
         ..ServerConf::default()
@@ -466,12 +499,8 @@ fn run_server(
         "server bootstrapped"
     );
 
-    // Compile routes
+    // Compile routes (has_l4 already computed above for thread sizing)
     let route_table = compile_routes(dwaar_config);
-    let has_l4 = dwaar_config
-        .global_options
-        .as_ref()
-        .is_some_and(|g| g.layer4.is_some() || !g.layer4_listener_wrappers.is_empty());
     if route_table.is_empty() && !has_l4 {
         warn!("no routes configured — proxy is idle, waiting for config reload");
     }
