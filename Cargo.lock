@@ -1292,7 +1292,7 @@ dependencies = [
 
 [[package]]
 name = "dwaar-cli"
-version = "0.2.11"
+version = "0.2.13"
 dependencies = [
  "anyhow",
  "arc-swap",
