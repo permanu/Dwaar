@@ -169,6 +169,31 @@ pub fn issue(host: &str) -> BeaconAuth {
 /// expected tags per Guardrail #30. Both windows are compared without
 /// short-circuiting so timing does not leak which window succeeded.
 ///
+/// Reason a beacon authentication was rejected.
+///
+/// Used by [`crate::beacon_auth_metrics::BeaconAuthMetrics`] for counters
+/// and rate-limited debug logging. Security: never includes the actual
+/// signature values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthRejectReason {
+    /// The `X-Dwaar-Sig` header (or body field) was missing entirely.
+    MissingSignatureHeader,
+    /// The payload could not be parsed (bad base64, wrong lengths, etc.).
+    MalformedPayload,
+    /// Signature was well-formed but did not match (wrong secret or host).
+    SignatureMismatch,
+}
+
+impl std::fmt::Display for AuthRejectReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingSignatureHeader => f.write_str("missing_signature_header"),
+            Self::MalformedPayload => f.write_str("malformed_payload"),
+            Self::SignatureMismatch => f.write_str("signature_mismatch"),
+        }
+    }
+}
+
 /// All failure paths return `false`. Callers should translate this into
 /// a 401 response at `trace!` level so repeated failures under attack
 /// don't flood logs.
