@@ -20,6 +20,7 @@ use crate::token::{TokenKind, Tokenizer};
 
 use super::helpers::{
     expect_word_or_quoted, is_directive_name, parse_optional_pattern, parse_upstream_addr,
+    parse_upstream_with_scheme,
 };
 
 /// `reverse_proxy localhost:8080` or block form:
@@ -52,6 +53,8 @@ pub(super) fn parse_reverse_proxy(
 /// Parse inline form: `reverse_proxy host1:port [host2:port ...]`
 fn parse_reverse_proxy_inline(t: &mut Tokenizer<'_>) -> Result<ReverseProxyDirective, ParseError> {
     let mut upstreams = Vec::new();
+    let mut transport_h2 = false;
+    let mut transport_tls = false;
 
     loop {
         let tok = t.peek();
@@ -62,7 +65,14 @@ fn parse_reverse_proxy_inline(t: &mut Tokenizer<'_>) -> Result<ReverseProxyDirec
                     break;
                 }
                 t.next_token();
-                upstreams.push(parse_upstream_addr(w));
+                let parsed = parse_upstream_with_scheme(w);
+                upstreams.push(parsed.addr);
+                if parsed.h2c {
+                    transport_h2 = true;
+                }
+                if parsed.tls {
+                    transport_tls = true;
+                }
             }
             _ => break,
         }
@@ -88,8 +98,8 @@ fn parse_reverse_proxy_inline(t: &mut Tokenizer<'_>) -> Result<ReverseProxyDirec
         health_interval: None,
         fail_duration: None,
         max_conns: None,
-        transport_tls: false,
-        transport_h2: false,
+        transport_tls,
+        transport_h2,
         tls_server_name: None,
         tls_client_auth: None,
         tls_trusted_ca_certs: None,
@@ -147,7 +157,14 @@ fn parse_reverse_proxy_block(t: &mut Tokenizer<'_>) -> Result<ReverseProxyDirect
                             TokenKind::Word(ref w) if !is_reverse_proxy_subdirective(w) => {
                                 let addr_tok = t.next_token();
                                 if let TokenKind::Word(w) = addr_tok.kind {
-                                    upstreams.push(parse_upstream_addr(&w));
+                                    let parsed = parse_upstream_with_scheme(&w);
+                                    upstreams.push(parsed.addr);
+                                    if parsed.h2c {
+                                        transport_h2 = true;
+                                    }
+                                    if parsed.tls {
+                                        transport_tls = true;
+                                    }
                                 }
                             }
                             _ => break,

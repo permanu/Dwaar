@@ -137,6 +137,38 @@ pub(super) fn expect_word_or_quoted(
     }
 }
 
+/// Parsed upstream address with optional transport hints from the URL scheme.
+pub(super) struct ParsedUpstream {
+    pub addr: UpstreamAddr,
+    pub h2c: bool, // h2c:// scheme detected
+    pub tls: bool, // https:// scheme detected
+}
+
+/// Parse an upstream address with optional scheme prefix (h2c://, https://).
+pub(super) fn parse_upstream_with_scheme(s: &str) -> ParsedUpstream {
+    if let Some(rest) = s.strip_prefix("h2c://") {
+        return ParsedUpstream {
+            addr: parse_upstream_addr(rest),
+            h2c: true,
+            tls: false,
+        };
+    }
+    if let Some(rest) = s.strip_prefix("https://") {
+        return ParsedUpstream {
+            addr: parse_upstream_addr(rest),
+            h2c: false,
+            tls: true,
+        };
+    }
+    // Also handle http:// (just strip it, no special transport)
+    let clean = s.strip_prefix("http://").unwrap_or(s);
+    ParsedUpstream {
+        addr: parse_upstream_addr(clean),
+        h2c: false,
+        tls: false,
+    }
+}
+
 /// Parse an upstream address — try socket addr first, fall back to host:port string.
 pub(super) fn parse_upstream_addr(s: &str) -> UpstreamAddr {
     // Handle Caddyfile shorthand: ":8080" means "localhost:8080"

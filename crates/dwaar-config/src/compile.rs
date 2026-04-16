@@ -97,9 +97,13 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
         // Try reverse_proxy first (most common)
         if let Some(rp) = find_reverse_proxy(&site.directives) {
             let handler_result = compile_reverse_proxy_handler(rp, &site.address);
-            let Some(proxy_handler) = handler_result else {
+            let Some(mut proxy_handler) = handler_result else {
                 continue;
             };
+            // gRPC requires HTTP/2 upstream — force h2 when the grpc directive is present.
+            if is_grpc_route {
+                force_upstream_h2(&mut proxy_handler);
+            }
             let handler = HandlerBlock {
                 kind: BlockKind::Handle,
                 matcher: PathMatcher::Any,
@@ -783,7 +787,7 @@ fn compile_single_block(
     }
 
     // Find the handler directive inside the block
-    let handler = if let Some(rp) = find_reverse_proxy(inner_directives) {
+    let mut handler = if let Some(rp) = find_reverse_proxy(inner_directives) {
         compile_reverse_proxy_handler(rp, "handle block")?
     } else if let Some(resp) = find_respond(inner_directives) {
         Handler::StaticResponse {
@@ -809,6 +813,11 @@ fn compile_single_block(
         warn!("handle block has no handler directive, skipping");
         return None;
     };
+
+    // gRPC requires HTTP/2 upstream — force h2 when the grpc directive is present.
+    if is_grpc_route {
+        force_upstream_h2(&mut handler);
+    }
 
     Some(HandlerBlock {
         kind,
@@ -1092,6 +1101,19 @@ fn resolve_all_upstreams(upstreams: &[UpstreamAddr]) -> Vec<SocketAddr> {
 }
 
 /// Map a config `LbPolicy` to the runtime `CoreLbPolicy`.
+/// Force `upstream_h2 = true` on a reverse proxy handler.
+///
+/// Used when the `grpc` directive is present — gRPC requires HTTP/2 to the upstream
+/// even if the user didn't explicitly set `transport { h2 }`.
+fn force_upstream_h2(handler: &mut Handler) {
+    match handler {
+        Handler::ReverseProxy { upstream_h2, .. } | Handler::ReverseProxyPool { upstream_h2, .. } => {
+            *upstream_h2 = true;
+        }
+        _ => {}
+    }
+}
+
 fn map_lb_policy(policy: Option<LbPolicy>) -> CoreLbPolicy {
     match policy {
         None | Some(LbPolicy::RoundRobin) => CoreLbPolicy::RoundRobin,
