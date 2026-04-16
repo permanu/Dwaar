@@ -27,6 +27,7 @@ pub const MAX_TRACKED_DOMAINS: usize = 10_000;
 pub mod aggregation;
 pub mod auth;
 pub mod beacon;
+pub mod beacon_auth_metrics;
 pub mod decompress;
 pub mod injector;
 pub mod otel;
