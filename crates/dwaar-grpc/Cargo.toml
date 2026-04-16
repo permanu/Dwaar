@@ -1,0 +1,29 @@
+[package]
+name = "dwaar-grpc"
+version = "0.1.0"
+description = "Bidirectional gRPC control fabric — DwaarControl service (Permanu ↔ Dwaar)"
+edition.workspace = true
+publish = false
+rust-version.workspace = true
+license-file = "../../LICENSE"
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+tonic = "0.12"
+prost = "0.13"
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
+tokio-stream = "0.1"
+futures-core = "0.3"
+async-trait = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+
+[lints]
+workspace = true

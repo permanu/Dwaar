@@ -21,6 +21,7 @@ dwaar-admin = { path = "crates/dwaar-admin" }
 dwaar-docker = { path = "crates/dwaar-docker" }
 dwaar-geo = { path = "crates/dwaar-geo" }
 dwaar-log = { path = "crates/dwaar-log" }
+dwaar-grpc = { path = "crates/dwaar-grpc" }
 
 # Pingora
 pingora = { version = "0.8.0", features = ["proxy", "lb", "openssl"] }
