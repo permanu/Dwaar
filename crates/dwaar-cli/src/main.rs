@@ -55,7 +55,7 @@ use dwaar_analytics::beacon;
 use dwaar_config::MAX_CONFIG_SIZE;
 use dwaar_config::compile::{
     BindAddress, collect_pools, compile_acme_domains, compile_routes, compile_tls_configs,
-    extract_bind_addresses, has_tls_sites,
+    extract_bind_addresses, extract_tls_bind_addresses, has_tls_sites,
 };
 use dwaar_config::watcher::{ConfigWatcher, hash_content};
 use dwaar_core::proxy::DwaarProxy;
@@ -714,12 +714,14 @@ fn run_server(
     // sni_domain_map is shared between SniResolver (which reads it on every
     // TLS handshake) and ConfigWatcher (which swaps in a new map on reload).
     // When TLS is disabled the map stays empty and is never written to.
+    let tls_bind_addrs = extract_tls_bind_addresses(dwaar_config);
     let sni_domain_map: DomainConfigMap = if has_tls_sites(dwaar_config) {
         setup_tls_listener(
             dwaar_config,
             &mut proxy_service,
             &cert_store,
             worker_count > 1,
+            &tls_bind_addrs,
         )?
     } else {
         domain_config_map_empty()
@@ -1156,6 +1158,7 @@ fn setup_tls_listener(
     >,
     cert_store: &Arc<CertStore>,
     use_reuseport: bool,
+    tls_bind_addrs: &[BindAddress],
 ) -> anyhow::Result<DomainConfigMap> {
     let tls_configs = compile_tls_configs(config);
 
@@ -1205,9 +1208,13 @@ fn setup_tls_listener(
         None
     };
 
-    proxy_service.add_tls_with_settings("0.0.0.0:6189", tcp_opt, tls_settings);
+    let tls_listen_addr = match tls_bind_addrs.first() {
+        Some(BindAddress::Tcp(a)) => a.as_str(),
+        _ => "0.0.0.0:6189",
+    };
+    proxy_service.add_tls_with_settings(tls_listen_addr, tcp_opt, tls_settings);
     info!(
-        listen = "0.0.0.0:6189",
+        listen = tls_listen_addr,
         protocol = "https",
         "TLS listener registered"
     );
