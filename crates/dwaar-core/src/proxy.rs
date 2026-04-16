@@ -1502,6 +1502,26 @@ impl ProxyHttp for DwaarProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // gRPC-Web text mode: base64-decode request body before forwarding upstream
+        if let Some(crate::grpc_web::GrpcWebMode::Text) = ctx.grpc_web_mode
+            && let Some(chunk) = body.take()
+        {
+            match crate::grpc_web::decode_text_body(&chunk) {
+                Ok(decoded) => *body = Some(decoded),
+                Err(e) => {
+                    warn!(
+                        request_id = %ctx.request_id(),
+                        error = %e,
+                        "grpc-web-text base64 decode failed"
+                    );
+                    return Err(Error::explain(
+                        HTTPStatus(400),
+                        "invalid grpc-web-text body",
+                    ));
+                }
+            }
+        }
+
         // Track accumulated request body bytes for chunked requests (ISSUE-069).
         // Content-Length requests are already rejected in request_filter(); this
         // catches chunked transfer encoding where the total size isn't known upfront.
@@ -1872,6 +1892,13 @@ impl ProxyHttp for DwaarProxy {
         // Cap for captured 5xx error body — enough to identify the error type
         // without risking large allocations on fat error pages.
         const ERROR_BODY_CAP: usize = 256;
+
+        // gRPC-Web text mode: base64-encode response body before sending to client
+        if let Some(crate::grpc_web::GrpcWebMode::Text) = ctx.grpc_web_mode
+            && let Some(chunk) = body.take()
+        {
+            *body = Some(crate::grpc_web::encode_text_body(&chunk));
+        }
 
         // --- Response body size check (ISSUE-070) ---
         // Track accumulated response bytes. If the upstream sends more than the

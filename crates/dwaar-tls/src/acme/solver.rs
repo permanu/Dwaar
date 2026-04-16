@@ -290,8 +290,9 @@ impl ChallengeSolver {
             reason: format!("failed to create cert directory: {e}"),
         })?;
 
-        let cert_path = cert_dir.join(format!("{domain}.pem"));
-        let key_path = cert_dir.join(format!("{domain}.key"));
+        // Distinct filenames so a crash during challenge never overwrites production certs
+        let cert_path = cert_dir.join(format!("{domain}.alpn-challenge.pem"));
+        let key_path = cert_dir.join(format!("{domain}.alpn-challenge.key"));
 
         std::fs::write(&cert_path, &cert_pem).map_err(|e| AcmeError::AlpnCertGeneration {
             domain: domain.to_string(),
@@ -326,10 +327,10 @@ impl ChallengeSolver {
         cert_store.invalidate(domain);
 
         let cert_dir = cert_store.cert_dir();
-        let cert_path = cert_dir.join(format!("{domain}.pem"));
-        let key_path = cert_dir.join(format!("{domain}.key"));
+        let cert_path = cert_dir.join(format!("{domain}.alpn-challenge.pem"));
+        let key_path = cert_dir.join(format!("{domain}.alpn-challenge.key"));
 
-        // Best-effort deletion — the real cert will overwrite these anyway
+        // Best-effort deletion — challenge certs use distinct filenames to protect prod certs
         let _ = std::fs::remove_file(&cert_path);
         let _ = std::fs::remove_file(&key_path);
 
@@ -789,8 +790,8 @@ mod tests {
         let (cert_pem, key_pem) =
             generate_alpn_cert_from_digest(domain, &digest).expect("cert gen");
 
-        let cert_path = dir.path().join(format!("{domain}.pem"));
-        let key_path = dir.path().join(format!("{domain}.key"));
+        let cert_path = dir.path().join(format!("{domain}.alpn-challenge.pem"));
+        let key_path = dir.path().join(format!("{domain}.alpn-challenge.key"));
         std::fs::write(&cert_path, &cert_pem).expect("write cert");
         std::fs::write(&key_path, &key_pem).expect("write key");
 
@@ -834,8 +835,16 @@ mod tests {
         let digest = openssl::sha::sha256(b"stale-auth");
         let (cert_pem, key_pem) =
             generate_alpn_cert_from_digest(domain, &digest).expect("cert gen");
-        std::fs::write(dir.path().join(format!("{domain}.pem")), &cert_pem).expect("write");
-        std::fs::write(dir.path().join(format!("{domain}.key")), &key_pem).expect("write");
+        std::fs::write(
+            dir.path().join(format!("{domain}.alpn-challenge.pem")),
+            &cert_pem,
+        )
+        .expect("write");
+        std::fs::write(
+            dir.path().join(format!("{domain}.alpn-challenge.key")),
+            &key_pem,
+        )
+        .expect("write");
 
         // Install with a backdated timestamp that exceeds the TTL
         let old_instant = Instant::now()
