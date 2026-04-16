@@ -97,9 +97,13 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
         // Try reverse_proxy first (most common)
         if let Some(rp) = find_reverse_proxy(&site.directives) {
             let handler_result = compile_reverse_proxy_handler(rp, &site.address);
-            let Some(proxy_handler) = handler_result else {
+            let Some(mut proxy_handler) = handler_result else {
                 continue;
             };
+            // gRPC requires HTTP/2 upstream — force h2 when the grpc directive is present.
+            if is_grpc_route {
+                force_upstream_h2(&mut proxy_handler);
+            }
             let handler = HandlerBlock {
                 kind: BlockKind::Handle,
                 matcher: PathMatcher::Any,
@@ -587,6 +591,9 @@ pub fn compile_acme_domains(config: &DwaarConfig) -> Vec<String> {
 /// The fallback HTTP listen address when no `bind` directive is present.
 const DEFAULT_HTTP_BIND: &str = "0.0.0.0:6188";
 
+/// The fallback TLS listen address when no TLS site has a `bind` directive.
+const DEFAULT_TLS_BIND: &str = "0.0.0.0:6189";
+
 /// The fallback port appended when a `bind` address has no port.
 const DEFAULT_BIND_PORT: u16 = 6188;
 
@@ -620,6 +627,11 @@ pub fn extract_bind_addresses(config: &DwaarConfig) -> Vec<BindAddress> {
     let mut addrs: Vec<BindAddress> = Vec::new();
 
     for site in &config.sites {
+        // Sites with TLS get their own listener via extract_tls_bind_addresses.
+        // Only non-TLS sites contribute to the plaintext HTTP listener here.
+        if site_has_tls(&site.directives) {
+            continue;
+        }
         if let Some(bind) = find_bind(&site.directives) {
             for raw in &bind.addresses {
                 let addr = parse_bind_address(raw);
@@ -636,9 +648,43 @@ pub fn extract_bind_addresses(config: &DwaarConfig) -> Vec<BindAddress> {
         }
     }
 
-    // Fall back to the built-in default when no site specifies bind.
+    // Fall back to the built-in default when no non-TLS site specifies bind.
     if addrs.is_empty() {
         addrs.push(BindAddress::Tcp(DEFAULT_HTTP_BIND.to_owned()));
+    }
+
+    addrs
+}
+
+/// Extract TLS listener addresses from a parsed config.
+///
+/// Similar to [`extract_bind_addresses`] but only considers sites that have
+/// TLS directives (i.e. `site_has_tls` returns true). Falls back to
+/// `"0.0.0.0:6189"` when no TLS site specifies a `bind` directive.
+pub fn extract_tls_bind_addresses(config: &DwaarConfig) -> Vec<BindAddress> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut addrs: Vec<BindAddress> = Vec::new();
+
+    for site in &config.sites {
+        if site_has_tls(&site.directives)
+            && let Some(bind) = find_bind(&site.directives)
+        {
+            for raw in &bind.addresses {
+                let addr = parse_bind_address(raw);
+                let key = match &addr {
+                    BindAddress::Tcp(s) => s.clone(),
+                    BindAddress::Unix(p) => p.to_string_lossy().into_owned(),
+                };
+                if seen.insert(key) {
+                    addrs.push(addr);
+                }
+            }
+        }
+    }
+
+    // Fall back to the built-in default when no TLS site specifies bind.
+    if addrs.is_empty() {
+        addrs.push(BindAddress::Tcp(DEFAULT_TLS_BIND.to_owned()));
     }
 
     addrs
@@ -783,7 +829,7 @@ fn compile_single_block(
     }
 
     // Find the handler directive inside the block
-    let handler = if let Some(rp) = find_reverse_proxy(inner_directives) {
+    let mut handler = if let Some(rp) = find_reverse_proxy(inner_directives) {
         compile_reverse_proxy_handler(rp, "handle block")?
     } else if let Some(resp) = find_respond(inner_directives) {
         Handler::StaticResponse {
@@ -809,6 +855,11 @@ fn compile_single_block(
         warn!("handle block has no handler directive, skipping");
         return None;
     };
+
+    // gRPC requires HTTP/2 upstream — force h2 when the grpc directive is present.
+    if is_grpc_route {
+        force_upstream_h2(&mut handler);
+    }
 
     Some(HandlerBlock {
         kind,
@@ -1092,6 +1143,20 @@ fn resolve_all_upstreams(upstreams: &[UpstreamAddr]) -> Vec<SocketAddr> {
 }
 
 /// Map a config `LbPolicy` to the runtime `CoreLbPolicy`.
+/// Force `upstream_h2 = true` on a reverse proxy handler.
+///
+/// Used when the `grpc` directive is present — gRPC requires HTTP/2 to the upstream
+/// even if the user didn't explicitly set `transport { h2 }`.
+fn force_upstream_h2(handler: &mut Handler) {
+    match handler {
+        Handler::ReverseProxy { upstream_h2, .. }
+        | Handler::ReverseProxyPool { upstream_h2, .. } => {
+            *upstream_h2 = true;
+        }
+        _ => {}
+    }
+}
+
 fn map_lb_policy(policy: Option<LbPolicy>) -> CoreLbPolicy {
     match policy {
         None | Some(LbPolicy::RoundRobin) => CoreLbPolicy::RoundRobin,
