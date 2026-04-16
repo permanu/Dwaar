@@ -234,10 +234,10 @@ impl TlsAccept for SniResolver {
         // Send the intermediate certificate so clients can verify the full
         // chain. Without this, clients that don't have the intermediate
         // cached locally get "unable to get local issuer certificate".
-        if let Some(ref issuer) = cached.issuer {
-            if let Err(e) = ext::ssl_add_chain_cert(ssl, issuer) {
-                warn!(sni = %sni, error = %e, "failed to add intermediate chain cert");
-            }
+        if let Some(ref issuer) = cached.issuer
+            && let Err(e) = ext::ssl_add_chain_cert(ssl, issuer)
+        {
+            warn!(sni = %sni, error = %e, "failed to add intermediate chain cert");
         }
 
         // Staple OCSP response only if it was refreshed within MAX_OCSP_AGE
