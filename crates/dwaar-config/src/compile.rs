@@ -627,6 +627,11 @@ pub fn extract_bind_addresses(config: &DwaarConfig) -> Vec<BindAddress> {
     let mut addrs: Vec<BindAddress> = Vec::new();
 
     for site in &config.sites {
+        // Sites with TLS get their own listener via extract_tls_bind_addresses.
+        // Only non-TLS sites contribute to the plaintext HTTP listener here.
+        if site_has_tls(&site.directives) {
+            continue;
+        }
         if let Some(bind) = find_bind(&site.directives) {
             for raw in &bind.addresses {
                 let addr = parse_bind_address(raw);
@@ -643,7 +648,7 @@ pub fn extract_bind_addresses(config: &DwaarConfig) -> Vec<BindAddress> {
         }
     }
 
-    // Fall back to the built-in default when no site specifies bind.
+    // Fall back to the built-in default when no non-TLS site specifies bind.
     if addrs.is_empty() {
         addrs.push(BindAddress::Tcp(DEFAULT_HTTP_BIND.to_owned()));
     }
