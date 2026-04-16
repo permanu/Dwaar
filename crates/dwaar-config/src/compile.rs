@@ -661,17 +661,17 @@ pub fn extract_tls_bind_addresses(config: &DwaarConfig) -> Vec<BindAddress> {
     let mut addrs: Vec<BindAddress> = Vec::new();
 
     for site in &config.sites {
-        if site_has_tls(&site.directives) {
-            if let Some(bind) = find_bind(&site.directives) {
-                for raw in &bind.addresses {
-                    let addr = parse_bind_address(raw);
-                    let key = match &addr {
-                        BindAddress::Tcp(s) => s.clone(),
-                        BindAddress::Unix(p) => p.to_string_lossy().into_owned(),
-                    };
-                    if seen.insert(key) {
-                        addrs.push(addr);
-                    }
+        if site_has_tls(&site.directives)
+            && let Some(bind) = find_bind(&site.directives)
+        {
+            for raw in &bind.addresses {
+                let addr = parse_bind_address(raw);
+                let key = match &addr {
+                    BindAddress::Tcp(s) => s.clone(),
+                    BindAddress::Unix(p) => p.to_string_lossy().into_owned(),
+                };
+                if seen.insert(key) {
+                    addrs.push(addr);
                 }
             }
         }
