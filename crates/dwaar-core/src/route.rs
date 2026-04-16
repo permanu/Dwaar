@@ -1092,6 +1092,8 @@ mod tests {
             upstream_port: 0,
             tls_server_name: "",
             vars: None,
+            regex_captures: None,
+            regex_matcher_name: None,
         };
         assert_eq!(
             r.apply("/anything", Some(&ctx)).expect("matches"),

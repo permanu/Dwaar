@@ -7,8 +7,10 @@
 //! ACME client for automatic TLS certificate provisioning.
 //!
 //! Supports Let's Encrypt (primary) with Google Trust Services fallback.
-//! Implements HTTP-01 challenge solving via an in-memory token store
-//! shared with the proxy's request filter.
+//! Implements three challenge types:
+//! - **HTTP-01**: In-memory token store shared with the proxy request filter
+//! - **TLS-ALPN-01**: Self-signed challenge certs installed into the cert store
+//! - **DNS-01**: TXT records via pluggable DNS providers (for wildcards)
 
 pub mod account;
 pub mod error;

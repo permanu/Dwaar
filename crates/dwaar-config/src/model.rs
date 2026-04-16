@@ -46,12 +46,29 @@ pub struct GlobalOptions {
     /// Top-level `layer4 { ... }` app block — raw L4 TCP proxy servers.
     /// Compiled into runtime `CompiledL4Server`s by `compile_l4_servers`.
     pub layer4: Option<Layer4Config>,
+    /// UDP proxy servers parsed from `layer4 { udp :port { ... } }` blocks.
+    /// Only present when the Dwaarfile contains `udp` stanzas — zero overhead
+    /// otherwise (lazy loading).
+    pub udp_servers: Vec<UdpProxyConfig>,
     /// Listener-wrapper form: sites that share a listener with an L4 matcher
     /// front (caddy-l4 fall-through). Compiled by `compile_l4_wrappers`.
     pub layer4_listener_wrappers: Vec<Layer4ListenerWrapper>,
+    /// Distributed tracing configuration. When `otlp_endpoint` is set,
+    /// completed request spans are exported to an OTLP/HTTP collector.
+    pub tracing: Option<TracingConfig>,
     /// Options we recognized but don't act on — stored so we never error
     /// on valid Caddyfile syntax we haven't implemented yet.
     pub passthrough: Vec<(String, Vec<String>)>,
+}
+
+/// Distributed tracing export configuration.
+///
+/// Parsed from the `tracing { otlp_endpoint <url> }` block inside
+/// global options.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TracingConfig {
+    /// OTLP/HTTP endpoint URL, e.g. `http://localhost:4318/v1/traces`.
+    pub otlp_endpoint: String,
 }
 
 /// Connection-level timeouts for slow loris protection (ISSUE-076).
@@ -478,6 +495,8 @@ pub enum LbPolicy {
     Random,
     /// Hash the client IP to pick a backend — same client always hits same backend.
     IpHash,
+    /// Cookie-based sticky sessions — pin a visitor to a backend via `_dwaar_sticky`.
+    Cookie,
 }
 
 /// `reverse_proxy` — route requests to one or more upstream backends.
@@ -513,6 +532,10 @@ pub struct ReverseProxyDirective {
     pub tls_trusted_ca_certs: Option<String>,
     /// Scale-to-zero config — wake a sleeping backend on first request (ISSUE-082).
     pub scale_to_zero: Option<ScaleToZeroDirective>,
+    /// Max retry attempts on upstream failure (Caddy-compatible `lb_retries`).
+    pub lb_retries: Option<u32>,
+    /// Total time budget for all retry attempts (Caddy-compatible `lb_try_duration`).
+    pub lb_try_duration: Option<std::time::Duration>,
 }
 
 /// Scale-to-zero config inside a `reverse_proxy` block (ISSUE-082).
@@ -823,12 +846,32 @@ pub struct FileServerDirective {
 
 /// `rewrite` — replace the request URI sent to upstream.
 ///
-/// `rewrite /new-path` replaces the full URI.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `rewrite /new-path` replaces the full URI. When used with a `path_regexp`
+/// named matcher, the target can contain `{re.name.N}` capture placeholders
+/// that are resolved at request time against the regex match.
+#[derive(Debug, Clone)]
 pub struct RewriteDirective {
-    /// The new URI to send to upstream.
+    /// The new URI to send to upstream (may contain `{re.name.N}` placeholders).
     pub to: String,
+    /// Matcher name from the associated `path_regexp` (e.g., `"api"` from `@api`).
+    /// Populated when the rewrite is scoped under a named matcher that has a
+    /// `path_regexp` condition.
+    pub matcher_name: Option<compact_str::CompactString>,
+    /// Compiled regex from the `path_regexp` condition, if any. Pre-compiled at
+    /// parse time so the hot path only calls `captures()`.
+    pub pattern: Option<regex::Regex>,
 }
+
+impl PartialEq for RewriteDirective {
+    fn eq(&self, other: &Self) -> bool {
+        self.to == other.to
+            && self.matcher_name == other.matcher_name
+            && self.pattern.as_ref().map(regex::Regex::as_str)
+                == other.pattern.as_ref().map(regex::Regex::as_str)
+    }
+}
+
+impl Eq for RewriteDirective {}
 
 /// `uri` — partial URI transformation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1145,6 +1188,28 @@ pub struct Layer4ListenerWrapper {
     pub layer4: Layer4RouteSet,
 }
 
+// ── Layer 4 UDP proxy model types ─────────────────────────────────────────────
+
+/// Parsed `udp :port { proxy host:port ... }` block from the Dwaarfile.
+///
+/// One per listen address. Compiled into `CompiledUdpServer` at runtime by
+/// `compile_udp_servers`. The parser stores raw strings; address resolution
+/// happens at compile time so we get clear error messages with line/col context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UdpProxyConfig {
+    /// Raw listen address (e.g. `":5353"`, `"0.0.0.0:5353"`).
+    pub listen: String,
+    /// Upstream addresses (raw strings, resolved at compile time).
+    pub upstreams: Vec<String>,
+    /// Load balancing policy name (e.g. `"round_robin"`, `"ip_hash"`).
+    /// `None` defaults to `IpHash` — natural for UDP (same client → same upstream).
+    pub lb_policy: Option<String>,
+    /// Maximum concurrent sessions. `None` defaults to 10 000.
+    pub max_sessions: Option<usize>,
+    /// Idle timeout in seconds per session. `None` defaults to 30.
+    pub idle_timeout_secs: Option<u64>,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 impl DwaarConfig {
@@ -1194,6 +1259,8 @@ mod tests {
                     tls_client_auth: None,
                     tls_trusted_ca_certs: None,
                     scale_to_zero: None,
+                    lb_retries: None,
+                    lb_try_duration: None,
                 }),
                 Directive::Tls(TlsDirective::Auto),
             ],

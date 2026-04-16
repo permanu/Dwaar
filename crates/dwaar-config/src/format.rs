@@ -10,6 +10,8 @@
 //! Dwaarfile text — tabs for indentation, one directive per line,
 //! blank line between site blocks.
 
+use std::fmt::Write as _;
+
 use crate::model::{
     BasicAuthDirective, BindDirective, CacheDirective, CopyResponseHeadersDirective, Directive,
     DwaarConfig, EncodeDirective, ErrorDirective, FileServerDirective, ForwardAuthDirective,
@@ -156,6 +158,8 @@ fn format_reverse_proxy(out: &mut String, rp: &ReverseProxyDirective, depth: usi
         || rp.tls_server_name.is_some()
         || rp.tls_client_auth.is_some()
         || rp.tls_trusted_ca_certs.is_some()
+        || rp.lb_retries.is_some()
+        || rp.lb_try_duration.is_some()
         || rp.upstreams.len() > 1;
 
     if has_block_options {
@@ -183,6 +187,7 @@ fn format_reverse_proxy(out: &mut String, rp: &ReverseProxyDirective, depth: usi
                 LbPolicy::LeastConn => "least_conn",
                 LbPolicy::Random => "random",
                 LbPolicy::IpHash => "ip_hash",
+                LbPolicy::Cookie => "cookie",
             });
             out.push('\n');
         }
@@ -208,6 +213,18 @@ fn format_reverse_proxy(out: &mut String, rp: &ReverseProxyDirective, depth: usi
             out.push_str(&inner);
             out.push_str("max_conns ");
             out.push_str(&max.to_string());
+            out.push('\n');
+        }
+        if let Some(retries) = rp.lb_retries {
+            out.push_str(&inner);
+            out.push_str("lb_retries ");
+            out.push_str(&retries.to_string());
+            out.push('\n');
+        }
+        if let Some(dur) = rp.lb_try_duration {
+            out.push_str(&inner);
+            out.push_str("lb_try_duration ");
+            let _ = write!(out, "{}s", dur.as_secs());
             out.push('\n');
         }
 

@@ -91,6 +91,7 @@ fn parse_config(t: &mut Tokenizer<'_>) -> Result<DwaarConfig, ParseError> {
     // Top-level `layer4 { ... }` block (caddy-l4 app syntax).
     // Can appear alongside site blocks and is stored in global options.
     let mut top_level_layer4 = None;
+    let mut top_level_udp = Vec::new();
 
     loop {
         let tok = t.peek();
@@ -98,7 +99,9 @@ fn parse_config(t: &mut Tokenizer<'_>) -> Result<DwaarConfig, ParseError> {
             TokenKind::Eof => break,
             TokenKind::Word(w) if w == "layer4" => {
                 let l4_tok = t.next_token();
-                top_level_layer4 = Some(layer4::parse_layer4_config(t, &l4_tok)?);
+                let result = layer4::parse_layer4_config(t, &l4_tok)?;
+                top_level_layer4 = Some(result.tcp);
+                top_level_udp.extend(result.udp);
             }
             TokenKind::Word(_) => {
                 sites.push(parse_site_block(t)?);
@@ -121,6 +124,11 @@ fn parse_config(t: &mut Tokenizer<'_>) -> Result<DwaarConfig, ParseError> {
         global_options
             .get_or_insert_with(GlobalOptions::default)
             .layer4 = Some(l4);
+    }
+    if !top_level_udp.is_empty() {
+        global_options
+            .get_or_insert_with(GlobalOptions::default)
+            .udp_servers = top_level_udp;
     }
 
     Ok(DwaarConfig {
@@ -233,8 +241,13 @@ fn parse_global_option_line(
         "auto_update" => {
             opts.auto_update = Some(parse_auto_update_block(t, &key_tok)?);
         }
+        "tracing" => {
+            opts.tracing = Some(parse_tracing_block(t, &key_tok)?);
+        }
         "layer4" => {
-            opts.layer4 = Some(layer4::parse_layer4_config(t, &key_tok)?);
+            let result = layer4::parse_layer4_config(t, &key_tok)?;
+            opts.layer4 = Some(result.tcp);
+            opts.udp_servers.extend(result.udp);
         }
         // Unknown option — collect args, consume sub-blocks
         _ => {
@@ -498,6 +511,75 @@ fn parse_auto_update_block(
     }
 
     Ok(cfg)
+}
+
+/// Parse `tracing { otlp_endpoint <url> }` inside the global options block.
+fn parse_tracing_block(
+    t: &mut Tokenizer<'_>,
+    key_tok: &Token,
+) -> Result<super::model::TracingConfig, ParseError> {
+    let brace = t.peek();
+    if !matches!(brace.kind, TokenKind::OpenBrace) {
+        return Err(ParseError {
+            line: key_tok.line,
+            col: key_tok.col,
+            kind: ParseErrorKind::Expected {
+                expected: "'{' to open tracing block".to_string(),
+                got: format!("{}", brace.kind),
+            },
+        });
+    }
+    t.next_token(); // consume `{`
+
+    let mut endpoint: Option<String> = None;
+
+    loop {
+        let tok = t.peek();
+        match &tok.kind {
+            TokenKind::CloseBrace => {
+                t.next_token();
+                break;
+            }
+            TokenKind::Eof => {
+                return Err(ParseError {
+                    line: key_tok.line,
+                    col: key_tok.col,
+                    kind: ParseErrorKind::Expected {
+                        expected: "'}' to close tracing block".to_string(),
+                        got: "end of file".to_string(),
+                    },
+                });
+            }
+            TokenKind::Word(_) => {
+                let sub_tok = t.next_token();
+                let sub_key = match &sub_tok.kind {
+                    TokenKind::Word(w) => w.clone(),
+                    _ => unreachable!(),
+                };
+                let val = peek_consume_word_or_quoted(t);
+
+                if sub_key.as_str() == "otlp_endpoint" {
+                    endpoint = Some(val);
+                }
+                // Ignore unknown tracing sub-directives for forward compat.
+            }
+            _ => {
+                t.next_token();
+            }
+        }
+    }
+
+    let otlp_endpoint = endpoint.ok_or(ParseError {
+        line: key_tok.line,
+        col: key_tok.col,
+        kind: ParseErrorKind::InvalidValue {
+            directive: "tracing".to_string(),
+            message: "missing required 'otlp_endpoint' directive".to_string(),
+            accepted_format: Some("tracing { otlp_endpoint http://host:port/v1/traces }"),
+        },
+    })?;
+
+    Ok(super::model::TracingConfig { otlp_endpoint })
 }
 
 /// Parse "HH:MM-HH:MM" into (`start_minutes_from_midnight`, `end_minutes_from_midnight`).

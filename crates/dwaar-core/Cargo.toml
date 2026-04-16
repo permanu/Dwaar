@@ -28,6 +28,7 @@ arc-swap = { workspace = true }
 parking_lot = { workspace = true }
 itoa = "1"
 regex = "1"
+base64 = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 uuid = { workspace = true }
@@ -38,6 +39,7 @@ async-trait = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util", "time"] }
 tokio-util = "0.7"
+dashmap = { workspace = true }
 fastrand = { workspace = true }
 quinn = { workspace = true }
 rustls = { workspace = true }

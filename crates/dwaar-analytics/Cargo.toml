@@ -32,7 +32,9 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 libc = { workspace = true }
 parking_lot = { workspace = true }
-tokio = { workspace = true, features = ["sync", "time"] }
+pingora-core = { workspace = true }
+sonic-rs = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "net", "io-util"] }
 
 [dev-dependencies]
 chrono = { workspace = true }

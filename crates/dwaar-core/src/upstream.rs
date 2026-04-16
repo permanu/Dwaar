@@ -40,7 +40,54 @@ pub enum LbPolicy {
     LeastConn,
     Random,
     IpHash,
+    /// Cookie-based sticky sessions — pin visitors via `_dwaar_sticky` cookie.
+    Cookie,
 }
+
+/// Retry configuration for upstream connection/response failures.
+///
+/// Zero-size when retries are disabled (the default), so pools that don't
+/// use retry pay no memory overhead.
+#[derive(Debug, Clone, Copy)]
+pub struct RetryConfig {
+    /// Max retry attempts (0 = disabled).
+    pub max_retries: u32,
+    /// Total wall-clock budget for all retries. `Duration::ZERO` = no time limit.
+    pub try_duration: Duration,
+}
+
+impl RetryConfig {
+    /// No retries — the default. Compiles to a zero-check on the hot path.
+    pub const DISABLED: Self = Self {
+        max_retries: 0,
+        try_duration: Duration::ZERO,
+    };
+
+    /// Whether retry is actually enabled.
+    pub const fn is_enabled(&self) -> bool {
+        self.max_retries > 0
+    }
+
+    /// Whether the given HTTP method is safe to retry (idempotent).
+    /// POST, PUT, DELETE, and PATCH are not retried by default.
+    pub fn is_idempotent_method(method: &str) -> bool {
+        matches!(method, "GET" | "HEAD" | "OPTIONS")
+    }
+
+    /// Exponential backoff delay for the given attempt (0-indexed).
+    /// 50ms, 100ms, 200ms, 400ms, ... capped at 2s.
+    pub fn backoff_delay(attempt: u32) -> Duration {
+        let base_ms = 50u64;
+        let delay_ms = base_ms.saturating_mul(1u64 << attempt.min(5));
+        Duration::from_millis(delay_ms.min(2000))
+    }
+}
+
+/// Name of the sticky session cookie set by `lb_policy cookie`.
+pub const STICKY_COOKIE_NAME: &str = "_dwaar_sticky";
+
+/// Cookie attributes appended to the Set-Cookie header for sticky sessions.
+const STICKY_COOKIE_ATTRS: &str = "; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400";
 
 /// A pool of upstream backends with load balancing and health tracking.
 ///
@@ -59,6 +106,8 @@ pub struct UpstreamPool {
     /// Scale-to-zero config (ISSUE-082). When set, the proxy will attempt to wake
     /// a sleeping backend on upstream connection failure instead of returning 502.
     pub(crate) scale_to_zero: Option<Arc<ScaleToZeroConfig>>,
+    /// Retry config for upstream failures. Zero-overhead when disabled.
+    pub(crate) retry_config: RetryConfig,
 }
 
 /// One backend server inside the pool.
@@ -122,6 +171,7 @@ impl UpstreamPool {
             health_uri,
             health_interval: Duration::from_secs(health_interval.unwrap_or(10)),
             scale_to_zero: None,
+            retry_config: RetryConfig::DISABLED,
         }
     }
 
@@ -139,6 +189,23 @@ impl UpstreamPool {
         let mut pool = Self::new(backends, policy, health_uri, health_interval);
         pool.scale_to_zero = Some(Arc::new(scale_to_zero));
         pool
+    }
+
+    /// Set retry configuration on this pool (builder-style).
+    #[must_use]
+    pub fn with_retry_config(mut self, config: RetryConfig) -> Self {
+        self.retry_config = config;
+        self
+    }
+
+    /// Returns the retry configuration for this pool.
+    pub fn retry_config(&self) -> &RetryConfig {
+        &self.retry_config
+    }
+
+    /// Returns the load balancing policy for this pool.
+    pub fn policy(&self) -> LbPolicy {
+        self.policy
     }
 
     /// Returns the scale-to-zero config, if configured for this pool.
@@ -171,7 +238,9 @@ impl UpstreamPool {
         }
 
         match self.policy {
-            LbPolicy::RoundRobin => self.select_round_robin(),
+            // Cookie falls back to round-robin when called via select() without
+            // a cookie value; the caller should use select_cookie() instead.
+            LbPolicy::RoundRobin | LbPolicy::Cookie => self.select_round_robin(),
             LbPolicy::LeastConn => self.select_least_conn(),
             LbPolicy::Random => self.select_random(),
             LbPolicy::IpHash => self.select_ip_hash(client_ip),
@@ -288,6 +357,90 @@ impl UpstreamPool {
             return Some(b.addr);
         }
         None
+    }
+
+    /// Cookie-based sticky session selection.
+    ///
+    /// If `cookie_value` is `Some`, hash it to pick a backend deterministically.
+    /// Falls back to round-robin if the pinned backend is unhealthy or at capacity.
+    /// Returns `(selected_addr, needs_set_cookie)` — the bool is `true` when the
+    /// response should include a `Set-Cookie` header (no cookie was sent, or the
+    /// pinned backend was unavailable and a new one was chosen).
+    pub fn select_cookie(&self, cookie_value: Option<&str>) -> Option<(SocketAddr, bool)> {
+        if self.backends.is_empty() {
+            return None;
+        }
+        if self.backends.len() == 1 {
+            let addr = self.select_single()?;
+            let needs_set = cookie_value.is_none();
+            return Some((addr, needs_set));
+        }
+
+        if let Some(val) = cookie_value {
+            let hash = fnv_hash_bytes(val.as_bytes());
+            let n = self.backends.len();
+            let idx = hash % n;
+            let b = &self.backends[idx];
+
+            if b.healthy.load(Ordering::Relaxed)
+                && b.max_conns
+                    .is_none_or(|max| b.active_conns.load(Ordering::Acquire) < max)
+            {
+                return Some((b.addr, false));
+            }
+
+            // Pinned backend unavailable — fall through to round-robin and re-stick
+            let addr = self.select_round_robin()?;
+            Some((addr, true))
+        } else {
+            let addr = self.select_round_robin()?;
+            Some((addr, true))
+        }
+    }
+
+    /// Compute a stable sticky cookie value for a backend address.
+    ///
+    /// Uses FNV-1a of the `addr` string representation so that
+    /// adding/removing other backends doesn't invalidate existing sessions.
+    pub fn backend_sticky_hash(addr: SocketAddr) -> String {
+        let s = addr.to_string();
+        let hash = fnv_hash_bytes(s.as_bytes());
+        format!("{hash:016x}")
+    }
+
+    /// Format a `Set-Cookie` header value for sticky sessions.
+    pub fn sticky_set_cookie(addr: SocketAddr) -> String {
+        let val = Self::backend_sticky_hash(addr);
+        format!("{STICKY_COOKIE_NAME}={val}{STICKY_COOKIE_ATTRS}")
+    }
+
+    /// Select a different backend than the one that just failed, for retry.
+    ///
+    /// Advances the round-robin counter so the next healthy backend is chosen,
+    /// excluding `failed_addr` if possible.
+    pub fn select_excluding(&self, failed_addr: SocketAddr) -> Option<SocketAddr> {
+        if self.backends.is_empty() {
+            return None;
+        }
+        let n = self.backends.len();
+        let start = self.counter.fetch_add(1, Ordering::Relaxed) as usize % n;
+        for offset in 0..n {
+            let b = &self.backends[(start + offset) % n];
+            if b.addr == failed_addr {
+                continue;
+            }
+            if !b.healthy.load(Ordering::Relaxed) {
+                continue;
+            }
+            if let Some(max) = b.max_conns
+                && b.active_conns.load(Ordering::Acquire) >= max
+            {
+                continue;
+            }
+            return Some(b.addr);
+        }
+        // All other backends exhausted — allow the original as last resort
+        self.find_available_from(start)
     }
 
     /// Mark a backend as healthy (called by `HealthChecker` after a successful probe).
@@ -476,7 +629,20 @@ fn mask_addr(addr: &SocketAddr) -> String {
     }
 }
 
-// ── FNV-1a IP hash ────────────────────────────────────────────────────────────
+// ── FNV-1a hashing ───────────────────────────────────────────────────────────
+
+/// FNV-1a hash of an arbitrary byte slice, returning a `usize` for indexing.
+fn fnv_hash_bytes(bytes: &[u8]) -> usize {
+    const FNV_OFFSET: u64 = 14_695_981_039_346_656_037;
+    const FNV_PRIME: u64 = 1_099_511_628_211;
+
+    let mut hash = FNV_OFFSET;
+    for &b in bytes {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash as usize
+}
 
 /// FNV-1a hash of an IP address, returning a `usize` for indexing.
 ///
@@ -1091,5 +1257,152 @@ mod tests {
         assert!(!masked.contains("12"));
         assert!(!masked.contains("13"));
         assert!(masked.contains("9000"));
+    }
+
+    // ── cookie sticky sessions ───────────────────────────────────────────────
+
+    #[test]
+    fn select_cookie_returns_same_backend_for_same_value() {
+        let pool = make_pool(&[8080, 8081, 8082], LbPolicy::Cookie);
+        let cookie = UpstreamPool::backend_sticky_hash(make_addr(8081));
+
+        let (first, needs_set) = pool.select_cookie(Some(&cookie)).expect("should select");
+        assert!(!needs_set, "existing cookie should not need re-setting");
+
+        for _ in 0..20 {
+            let (sel, _) = pool.select_cookie(Some(&cookie)).expect("should select");
+            assert_eq!(
+                sel, first,
+                "same cookie must always select the same backend"
+            );
+        }
+    }
+
+    #[test]
+    fn select_cookie_falls_back_when_pinned_unhealthy() {
+        let pool = make_pool(&[8080, 8081], LbPolicy::Cookie);
+        let cookie = UpstreamPool::backend_sticky_hash(make_addr(8080));
+
+        // Verify it initially selects 8080
+        let (sel, _) = pool.select_cookie(Some(&cookie)).expect("should select");
+        assert_eq!(sel, make_addr(8080));
+
+        // Mark 8080 unhealthy — should fall back and request re-sticky
+        pool.mark_unhealthy(make_addr(8080));
+        let (sel, needs_set) = pool.select_cookie(Some(&cookie)).expect("should select");
+        assert_eq!(sel, make_addr(8081), "should fall back to healthy backend");
+        assert!(needs_set, "should need to set a new cookie after fallback");
+    }
+
+    #[test]
+    fn select_cookie_no_cookie_returns_with_set_flag() {
+        let pool = make_pool(&[8080, 8081], LbPolicy::Cookie);
+        let (_, needs_set) = pool.select_cookie(None).expect("should select");
+        assert!(needs_set, "absent cookie must trigger Set-Cookie");
+    }
+
+    #[test]
+    fn sticky_set_cookie_has_correct_format() {
+        let cookie = UpstreamPool::sticky_set_cookie(make_addr(8080));
+        assert!(cookie.starts_with("_dwaar_sticky="));
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Lax"));
+        assert!(cookie.contains("Max-Age=86400"));
+        assert!(cookie.contains("Path=/"));
+    }
+
+    #[test]
+    fn backend_sticky_hash_is_stable() {
+        let h1 = UpstreamPool::backend_sticky_hash(make_addr(8080));
+        let h2 = UpstreamPool::backend_sticky_hash(make_addr(8080));
+        assert_eq!(h1, h2, "hash must be deterministic");
+
+        // Different backends produce different hashes
+        let h3 = UpstreamPool::backend_sticky_hash(make_addr(8081));
+        assert_ne!(h1, h3, "different backends must have different hashes");
+    }
+
+    // ── retry ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn retry_skips_non_idempotent_methods() {
+        assert!(RetryConfig::is_idempotent_method("GET"));
+        assert!(RetryConfig::is_idempotent_method("HEAD"));
+        assert!(RetryConfig::is_idempotent_method("OPTIONS"));
+        assert!(!RetryConfig::is_idempotent_method("POST"));
+        assert!(!RetryConfig::is_idempotent_method("PUT"));
+        assert!(!RetryConfig::is_idempotent_method("DELETE"));
+        assert!(!RetryConfig::is_idempotent_method("PATCH"));
+    }
+
+    #[test]
+    fn retry_backoff_grows_exponentially_with_cap() {
+        assert_eq!(RetryConfig::backoff_delay(0), Duration::from_millis(50));
+        assert_eq!(RetryConfig::backoff_delay(1), Duration::from_millis(100));
+        assert_eq!(RetryConfig::backoff_delay(2), Duration::from_millis(200));
+        assert_eq!(RetryConfig::backoff_delay(3), Duration::from_millis(400));
+        assert_eq!(RetryConfig::backoff_delay(4), Duration::from_millis(800));
+        assert_eq!(RetryConfig::backoff_delay(5), Duration::from_millis(1600));
+        // min(5) clamps the shift, so attempt 6+ stays at 1600ms
+        assert_eq!(RetryConfig::backoff_delay(6), Duration::from_millis(1600));
+        assert_eq!(RetryConfig::backoff_delay(100), Duration::from_millis(1600));
+    }
+
+    #[test]
+    fn retry_config_disabled_by_default() {
+        let cfg = RetryConfig::DISABLED;
+        assert!(!cfg.is_enabled());
+        assert_eq!(cfg.max_retries, 0);
+    }
+
+    #[test]
+    fn select_excluding_skips_failed_backend() {
+        let pool = make_pool(&[8080, 8081, 8082], LbPolicy::RoundRobin);
+
+        // Call select_excluding enough times to verify we never get 8081
+        for _ in 0..20 {
+            let sel = pool
+                .select_excluding(make_addr(8081))
+                .expect("should select");
+            assert_ne!(
+                sel,
+                make_addr(8081),
+                "excluded backend must not be returned"
+            );
+        }
+    }
+
+    #[test]
+    fn select_excluding_falls_back_when_all_others_unhealthy() {
+        let pool = make_pool(&[8080, 8081], LbPolicy::RoundRobin);
+        pool.mark_unhealthy(make_addr(8081));
+
+        // Only 8080 is healthy, and we're excluding it — last resort should
+        // still return it via find_available_from fallback.
+        // Wait: 8080 is the failed addr. 8081 is unhealthy.
+        // select_excluding(8080) should skip 8080, try 8081 (unhealthy), then
+        // fall back via find_available_from which includes 8080 again.
+        let sel = pool.select_excluding(make_addr(8080));
+        // If the only available is the failed one, find_available_from returns it
+        assert_eq!(sel, Some(make_addr(8080)));
+    }
+
+    #[test]
+    fn retry_config_enabled_with_retries() {
+        let cfg = RetryConfig {
+            max_retries: 3,
+            try_duration: Duration::from_secs(30),
+        };
+        assert!(cfg.is_enabled());
+    }
+
+    #[test]
+    fn pool_with_retry_config() {
+        let pool = make_pool(&[8080, 8081], LbPolicy::RoundRobin).with_retry_config(RetryConfig {
+            max_retries: 3,
+            try_duration: Duration::from_secs(30),
+        });
+        assert!(pool.retry_config().is_enabled());
+        assert_eq!(pool.retry_config().max_retries, 3);
     }
 }

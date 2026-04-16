@@ -19,6 +19,7 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "time", "net", "io-util", "process"] }
 instant-acme = { workspace = true }
+rcgen = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
 zeroize = { workspace = true }

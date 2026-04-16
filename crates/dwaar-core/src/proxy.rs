@@ -72,6 +72,20 @@ fn sanitize_redirect_path(path: &str) -> String {
     }
 }
 
+/// Extract a named cookie's value from a `Cookie` header string.
+///
+/// Parses `key1=val1; key2=val2` format. Returns `None` if the cookie isn't present.
+fn extract_cookie_value<'a>(cookie_header: &'a str, name: &str) -> Option<&'a str> {
+    cookie_header.split(';').map(str::trim).find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        if k.trim() == name {
+            Some(v.trim())
+        } else {
+            None
+        }
+    })
+}
+
 /// The Dwaar proxy engine.
 ///
 /// Routes requests to upstreams based on the `Host` header, using a lock-free
@@ -529,13 +543,19 @@ impl ProxyHttp for DwaarProxy {
                 });
 
         // gRPC detection (ISSUE-074): Content-Type starting with "application/grpc"
-        // covers application/grpc, application/grpc+proto, application/grpc-web
+        // covers application/grpc, application/grpc+proto, application/grpc-web.
+        // gRPC-Web is detected first so grpc_web_mode is set before is_grpc —
+        // both flavors need HTTP/2 upstream and disabled body limits.
         if !ctx.is_websocket {
-            ctx.is_grpc = header
+            let ct_value = header
                 .headers
                 .get(http::header::CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .is_some_and(|ct| ct.starts_with("application/grpc"));
+                .and_then(|v| v.to_str().ok());
+
+            if let Some(ct) = ct_value {
+                ctx.grpc_web_mode = crate::grpc_web::detect_mode(ct);
+            }
+            ctx.is_grpc = ct_value.is_some_and(|ct| ct.starts_with("application/grpc"));
         }
 
         debug!(
@@ -625,13 +645,37 @@ impl ProxyHttp for DwaarProxy {
                         }
                         crate::route::Handler::ReverseProxyPool { pool, .. } => {
                             ctx.quic_capable = true;
-                            // Resolve the upstream now using the LB policy.
-                            // Cache the selected address in `route_upstream` so
-                            // `upstream_peer()` doesn't need to call `select()` again
-                            // for single-backend pools.
-                            ctx.route_upstream = pool.select(ctx.plugin_ctx.client_ip);
-                            // Always cache the pool so `upstream_peer()` can use the
-                            // correct TLS settings even in the single-backend case.
+
+                            // Cookie sticky sessions: read _dwaar_sticky cookie and
+                            // use it to pin the visitor to a specific backend.
+                            if pool.policy() == crate::upstream::LbPolicy::Cookie {
+                                let cookie_val = session
+                                    .req_header()
+                                    .headers
+                                    .get("cookie")
+                                    .and_then(|v| v.to_str().ok())
+                                    .and_then(|cookies| {
+                                        extract_cookie_value(
+                                            cookies,
+                                            crate::upstream::STICKY_COOKIE_NAME,
+                                        )
+                                    })
+                                    .map(String::from);
+
+                                if let Some((addr, needs_set)) =
+                                    pool.select_cookie(cookie_val.as_deref())
+                                {
+                                    ctx.route_upstream = Some(addr);
+                                    if needs_set {
+                                        ctx.sticky_set_cookie = Some(
+                                            crate::upstream::UpstreamPool::sticky_set_cookie(addr),
+                                        );
+                                    }
+                                }
+                            } else {
+                                ctx.route_upstream = pool.select(ctx.plugin_ctx.client_ip);
+                            }
+
                             ctx.upstream_pool = Some(pool.clone());
 
                             // Atomically claim the connection slot. `select()` is a
@@ -749,6 +793,8 @@ impl ProxyHttp for DwaarProxy {
                             upstream_port: 0,
                             tls_server_name: "",
                             vars: None,
+                            regex_captures: None,
+                            regex_matcher_name: None,
                         };
                         for map in &block.maps {
                             if let Some(val) = map.evaluate(&map_tmpl_ctx) {
@@ -787,6 +833,8 @@ impl ProxyHttp for DwaarProxy {
                                 // any `map` rules (#126). `route.var_defaults` is always
                                 // present (possibly empty) so the reference is always valid.
                                 vars: ctx.var_slots.as_ref().or(Some(&route.var_defaults)),
+                                regex_captures: None,
+                                regex_matcher_name: None,
                             };
                             if let Some(rewritten) = rule.apply(&path, Some(&tmpl_ctx)) {
                                 path = rewritten;
@@ -1206,6 +1254,18 @@ impl ProxyHttp for DwaarProxy {
         _session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
+        // Exponential backoff between retry attempts — sleep before re-selecting.
+        if ctx.retry_count > 0 {
+            let delay = crate::upstream::RetryConfig::backoff_delay(ctx.retry_count - 1);
+            debug!(
+                request_id = %ctx.request_id(),
+                attempt = ctx.retry_count,
+                delay = ?delay,
+                "backoff before retry"
+            );
+            tokio::time::sleep(delay).await;
+        }
+
         // Use the route resolved in request_filter() to avoid a second ArcSwap load
         let upstream = if let Some(addr) = ctx.route_upstream {
             addr
@@ -1341,6 +1401,97 @@ impl ProxyHttp for DwaarProxy {
         Ok(Box::new(peer))
     }
 
+    fn fail_to_connect(
+        &self,
+        _session: &mut Session,
+        _peer: &HttpPeer,
+        ctx: &mut Self::CTX,
+        mut e: Box<Error>,
+    ) -> Box<Error> {
+        let pool = match ctx.upstream_pool {
+            Some(ref p) if p.retry_config().is_enabled() => p,
+            _ => return e,
+        };
+
+        if !crate::upstream::RetryConfig::is_idempotent_method(&ctx.plugin_ctx.method) {
+            debug!(
+                request_id = %ctx.request_id(),
+                method = %ctx.plugin_ctx.method,
+                "skipping retry for non-idempotent method"
+            );
+            return e;
+        }
+
+        let retry_cfg = pool.retry_config();
+        if ctx.retry_count >= retry_cfg.max_retries {
+            return e;
+        }
+
+        if !retry_cfg.try_duration.is_zero() && ctx.start_time.elapsed() >= retry_cfg.try_duration {
+            return e;
+        }
+
+        // Pick a different backend for the next attempt
+        if let Some(failed_addr) = ctx.route_upstream
+            && let Some(next) = pool.select_excluding(failed_addr)
+        {
+            ctx.route_upstream = Some(next);
+        }
+
+        ctx.retry_count += 1;
+        debug!(
+            request_id = %ctx.request_id(),
+            attempt = ctx.retry_count,
+            "marking upstream connect failure as retryable"
+        );
+        e.set_retry(true);
+        e
+    }
+
+    fn error_while_proxy(
+        &self,
+        peer: &HttpPeer,
+        session: &mut Session,
+        mut e: Box<Error>,
+        ctx: &mut Self::CTX,
+        client_reused: bool,
+    ) -> Box<Error> {
+        e = e.more_context(format!("Peer: {peer}"));
+
+        let can_retry = ctx.upstream_pool.as_ref().is_some_and(|p| {
+            p.retry_config().is_enabled()
+                && crate::upstream::RetryConfig::is_idempotent_method(&ctx.plugin_ctx.method)
+                && ctx.retry_count < p.retry_config().max_retries
+                && (p.retry_config().try_duration.is_zero()
+                    || ctx.start_time.elapsed() < p.retry_config().try_duration)
+        });
+
+        if can_retry {
+            let buffer_ok = !session.as_ref().retry_buffer_truncated();
+            e.retry.decide_reuse(client_reused && buffer_ok);
+
+            if matches!(e.retry, pingora_error::RetryType::Decided(true)) {
+                if let Some(ref pool) = ctx.upstream_pool
+                    && let Some(failed_addr) = ctx.route_upstream
+                    && let Some(next) = pool.select_excluding(failed_addr)
+                {
+                    ctx.route_upstream = Some(next);
+                }
+                ctx.retry_count += 1;
+                debug!(
+                    request_id = %ctx.request_id(),
+                    attempt = ctx.retry_count,
+                    "retrying after upstream proxy error"
+                );
+            }
+        } else {
+            e.retry
+                .decide_reuse(client_reused && !session.as_ref().retry_buffer_truncated());
+        }
+
+        e
+    }
+
     async fn request_body_filter(
         &self,
         _session: &mut Session,
@@ -1351,6 +1502,26 @@ impl ProxyHttp for DwaarProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // gRPC-Web text mode: base64-decode request body before forwarding upstream
+        if let Some(crate::grpc_web::GrpcWebMode::Text) = ctx.grpc_web_mode
+            && let Some(chunk) = body.take()
+        {
+            match crate::grpc_web::decode_text_body(&chunk) {
+                Ok(decoded) => *body = Some(decoded),
+                Err(e) => {
+                    warn!(
+                        request_id = %ctx.request_id(),
+                        error = %e,
+                        "grpc-web-text base64 decode failed"
+                    );
+                    return Err(Error::explain(
+                        HTTPStatus(400),
+                        "invalid grpc-web-text body",
+                    ));
+                }
+            }
+        }
+
         // Track accumulated request body bytes for chunked requests (ISSUE-069).
         // Content-Length requests are already rejected in request_filter(); this
         // catches chunked transfer encoding where the total size isn't known upfront.
@@ -1501,6 +1672,16 @@ impl ProxyHttp for DwaarProxy {
             );
         }
 
+        // gRPC-Web → gRPC header translation: rewrite Content-Type so the
+        // upstream sees standard application/grpc instead of grpc-web.
+        if ctx.grpc_web_mode.is_some() {
+            crate::grpc_web::translate_request_headers(upstream_request)?;
+            debug!(
+                request_id = %ctx.request_id(),
+                "gRPC-Web request headers translated to application/grpc"
+            );
+        }
+
         debug!(
             request_id = %ctx.request_id(),
             client_ip = ?ctx.plugin_ctx.client_ip,
@@ -1521,6 +1702,22 @@ impl ProxyHttp for DwaarProxy {
     {
         // --- Request tracing (ISSUE-006) ---
         upstream_response.insert_header("X-Request-Id", ctx.request_id())?;
+
+        // --- Cookie sticky sessions ---
+        if let Some(ref cookie_hdr) = ctx.sticky_set_cookie {
+            upstream_response.append_header("Set-Cookie", cookie_hdr)?;
+        }
+
+        // gRPC-Web response translation: rewrite Content-Type back and add
+        // CORS headers so browser clients can read grpc-status/grpc-message.
+        if let Some(mode) = ctx.grpc_web_mode {
+            crate::grpc_web::translate_response_headers(upstream_response, mode)?;
+            debug!(
+                request_id = %ctx.request_id(),
+                mode = ?mode,
+                "gRPC response headers translated back to gRPC-Web"
+            );
+        }
 
         // Advertise HTTP/3 only for routes the QUIC bridge can serve
         // (ReverseProxy and ReverseProxyPool). FileServer, StaticResponse,
@@ -1695,6 +1892,13 @@ impl ProxyHttp for DwaarProxy {
         // Cap for captured 5xx error body — enough to identify the error type
         // without risking large allocations on fat error pages.
         const ERROR_BODY_CAP: usize = 256;
+
+        // gRPC-Web text mode: base64-encode response body before sending to client
+        if let Some(crate::grpc_web::GrpcWebMode::Text) = ctx.grpc_web_mode
+            && let Some(chunk) = body.take()
+        {
+            *body = Some(crate::grpc_web::encode_text_body(&chunk));
+        }
 
         // --- Response body size check (ISSUE-070) ---
         // Track accumulated response bytes. If the upstream sends more than the
@@ -2013,5 +2217,30 @@ mod tests {
 
         assert!(proxy.route_table.load().resolve("v1.example.com").is_none());
         assert!(proxy.route_table.load().resolve("v2.example.com").is_some());
+    }
+
+    #[test]
+    fn extract_cookie_value_finds_named_cookie() {
+        assert_eq!(
+            extract_cookie_value("_dwaar_sticky=abc123; session=xyz", "_dwaar_sticky"),
+            Some("abc123")
+        );
+        assert_eq!(
+            extract_cookie_value("session=xyz; _dwaar_sticky=abc123", "_dwaar_sticky"),
+            Some("abc123")
+        );
+    }
+
+    #[test]
+    fn extract_cookie_value_returns_none_when_absent() {
+        assert_eq!(
+            extract_cookie_value("session=xyz; other=foo", "_dwaar_sticky"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_cookie_value_handles_empty_header() {
+        assert_eq!(extract_cookie_value("", "_dwaar_sticky"), None);
     }
 }

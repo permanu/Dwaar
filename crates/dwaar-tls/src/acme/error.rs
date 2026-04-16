@@ -44,4 +44,7 @@ pub enum AcmeError {
 
     #[error("DNS-01 challenge failed for {domain}: {reason}")]
     Dns01Failed { domain: String, reason: String },
+
+    #[error("TLS-ALPN-01 challenge cert generation failed for {domain}: {reason}")]
+    AlpnCertGeneration { domain: String, reason: String },
 }
