@@ -14,7 +14,7 @@ use crate::model::{
     Directive, FileServerDirective, ForwardAuthDirective, HandleDirective, HandleErrorsDirective,
     HandlePathDirective, LbPolicy, PhpFastcgiDirective, RedirDirective, RespondDirective,
     ReverseProxyDirective, RewriteDirective, RootDirective, RouteDirective, ScaleToZeroDirective,
-    TryFilesDirective, UriDirective, UriOperation, WasmPluginDirective,
+    TryFilesDirective, UdpProxyConfig, UriDirective, UriOperation, WasmPluginDirective,
 };
 use crate::token::{TokenKind, Tokenizer};
 
@@ -104,6 +104,8 @@ fn parse_reverse_proxy_inline(t: &mut Tokenizer<'_>) -> Result<ReverseProxyDirec
         tls_client_auth: None,
         tls_trusted_ca_certs: None,
         scale_to_zero: None,
+        lb_retries: None,
+        lb_try_duration: None,
     })
 }
 
@@ -121,6 +123,8 @@ fn is_reverse_proxy_subdirective(w: &str) -> bool {
             | "max_conns"
             | "transport"
             | "scale_to_zero"
+            | "lb_retries"
+            | "lb_try_duration"
     )
 }
 
@@ -142,6 +146,8 @@ fn parse_reverse_proxy_block(t: &mut Tokenizer<'_>) -> Result<ReverseProxyDirect
     let mut tls_client_auth: Option<(String, String)> = None;
     let mut tls_trusted_ca_certs: Option<String> = None;
     let mut scale_to_zero: Option<ScaleToZeroDirective> = None;
+    let mut lb_retries: Option<u32> = None;
+    let mut lb_try_duration: Option<std::time::Duration> = None;
 
     loop {
         let tok = t.next_token();
@@ -180,6 +186,7 @@ fn parse_reverse_proxy_block(t: &mut Tokenizer<'_>) -> Result<ReverseProxyDirect
                             "least_conn" => LbPolicy::LeastConn,
                             "random" => LbPolicy::Random,
                             "ip_hash" => LbPolicy::IpHash,
+                            "cookie" => LbPolicy::Cookie,
                             other => {
                                 return Err(ParseError {
                                     line,
@@ -187,8 +194,8 @@ fn parse_reverse_proxy_block(t: &mut Tokenizer<'_>) -> Result<ReverseProxyDirect
                                     kind: ParseErrorKind::InvalidValue {
                                         directive: "reverse_proxy".to_string(),
                                         message: format!(
-                                            "unknown lb_policy '{other}'; \
-                                             expected round_robin, least_conn, random, ip_hash"
+                                            "unknown lb_policy '{other}'; expected \
+                                             round_robin, least_conn, random, ip_hash, cookie"
                                         ),
                                         accepted_format: None,
                                     },
@@ -322,6 +329,41 @@ fn parse_reverse_proxy_block(t: &mut Tokenizer<'_>) -> Result<ReverseProxyDirect
                 "scale_to_zero" => {
                     scale_to_zero = Some(parse_scale_to_zero_block(t)?);
                 }
+                "lb_retries" => {
+                    let val_tok = t.next_token();
+                    let (line, col) = (val_tok.line, val_tok.col);
+                    if let TokenKind::Word(v) = val_tok.kind {
+                        lb_retries = Some(v.parse().map_err(|_| ParseError {
+                            line,
+                            col,
+                            kind: ParseErrorKind::InvalidValue {
+                                directive: "reverse_proxy".to_string(),
+                                message: format!(
+                                    "lb_retries must be a non-negative integer, got '{v}'"
+                                ),
+                                accepted_format: None,
+                            },
+                        })?);
+                    }
+                }
+                "lb_try_duration" => {
+                    let val_tok = t.next_token();
+                    let (line, col) = (val_tok.line, val_tok.col);
+                    if let TokenKind::Word(v) = val_tok.kind {
+                        lb_try_duration =
+                            Some(parse_duration_string(&v).ok_or_else(|| ParseError {
+                                line,
+                                col,
+                                kind: ParseErrorKind::InvalidValue {
+                                    directive: "reverse_proxy".to_string(),
+                                    message: format!(
+                                        "lb_try_duration must be a duration like '30s' or '5m', got '{v}'"
+                                    ),
+                                    accepted_format: Some("30s, 1m, 500ms"),
+                                },
+                            })?);
+                    }
+                }
                 // Unknown sub-directive — skip tokens until the next known
                 // subdirective keyword or the closing brace. This keeps the parser
                 // forward-compatible with future `reverse_proxy` block options.
@@ -366,6 +408,8 @@ fn parse_reverse_proxy_block(t: &mut Tokenizer<'_>) -> Result<ReverseProxyDirect
         tls_client_auth,
         tls_trusted_ca_certs,
         scale_to_zero,
+        lb_retries,
+        lb_try_duration,
     })
 }
 
@@ -445,7 +489,11 @@ pub(super) fn parse_rewrite(t: &mut Tokenizer<'_>) -> Result<RewriteDirective, P
             });
         }
     };
-    Ok(RewriteDirective { to })
+    Ok(RewriteDirective {
+        to,
+        matcher_name: None,
+        pattern: None,
+    })
 }
 
 /// `uri strip_prefix /api` / `uri strip_suffix .html` / `uri replace /old /new`
@@ -1299,4 +1347,186 @@ pub(super) fn parse_directive_block(t: &mut Tokenizer<'_>) -> Result<Vec<Directi
     }
 
     Ok(directives)
+}
+
+/// Parse a human-friendly duration like `30s`, `5m`, `500ms` into `std::time::Duration`.
+///
+/// Bare integers are treated as seconds for Caddyfile compatibility.
+fn parse_duration_string(s: &str) -> Option<std::time::Duration> {
+    if let Some(rest) = s.strip_suffix("ms") {
+        rest.parse::<u64>()
+            .ok()
+            .map(std::time::Duration::from_millis)
+    } else if let Some(rest) = s.strip_suffix('s') {
+        rest.parse::<u64>().ok().map(std::time::Duration::from_secs)
+    } else if let Some(rest) = s.strip_suffix('m') {
+        rest.parse::<u64>()
+            .ok()
+            .map(|m| std::time::Duration::from_secs(m * 60))
+    } else if let Some(rest) = s.strip_suffix('h') {
+        rest.parse::<u64>()
+            .ok()
+            .map(|h| std::time::Duration::from_secs(h * 3600))
+    } else {
+        s.parse::<u64>().ok().map(std::time::Duration::from_secs)
+    }
+}
+
+// ── UDP proxy parser ──────────────────────────────────────────────────────────
+
+/// Parse `udp :5353 { proxy dns1:53 dns2:53 { lb_policy round_robin } }`.
+///
+/// Called from `layer4.rs` when the `udp` keyword is encountered inside
+/// a `layer4 { }` block. The `udp` token has already been consumed.
+pub(super) fn parse_udp_proxy(t: &mut Tokenizer<'_>) -> Result<UdpProxyConfig, ParseError> {
+    let listen = match t.peek().kind {
+        TokenKind::Word(_) | TokenKind::QuotedString(_) => {
+            expect_word_or_quoted(t, "udp", "listen address")?
+        }
+        _ => {
+            let tok = t.peek();
+            return Err(ParseError {
+                line: tok.line,
+                col: tok.col,
+                kind: ParseErrorKind::InvalidValue {
+                    directive: "udp".to_string(),
+                    message: "expected listen address after 'udp'".to_string(),
+                    accepted_format: Some("udp :5353 { ... }"),
+                },
+            });
+        }
+    };
+
+    let brace_tok = t.peek();
+    if brace_tok.kind != TokenKind::OpenBrace {
+        return Err(ParseError {
+            line: brace_tok.line,
+            col: brace_tok.col,
+            kind: ParseErrorKind::Expected {
+                expected: "'{' to open udp block".to_string(),
+                got: format!("{}", brace_tok.kind),
+            },
+        });
+    }
+    t.next_token();
+
+    let mut upstreams = Vec::new();
+    let mut lb_policy: Option<String> = None;
+    let mut max_sessions: Option<usize> = None;
+    let mut idle_timeout_secs: Option<u64> = None;
+
+    loop {
+        let tok = t.next_token();
+        match tok.kind {
+            TokenKind::CloseBrace | TokenKind::Eof => break,
+            TokenKind::Word(ref sub) => match sub.as_str() {
+                "proxy" => {
+                    loop {
+                        match t.peek().kind {
+                            TokenKind::Word(ref w) if !is_udp_subdirective(w) => {
+                                let addr_tok = t.next_token();
+                                if let TokenKind::Word(w) = addr_tok.kind {
+                                    upstreams.push(w);
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                    // Optional sub-block for proxy options.
+                    if t.peek().kind == TokenKind::OpenBrace {
+                        t.next_token();
+                        parse_udp_proxy_opts(
+                            t,
+                            &mut lb_policy,
+                            &mut max_sessions,
+                            &mut idle_timeout_secs,
+                        )?;
+                    }
+                }
+                _ => {
+                    udp_skip_unknown(t);
+                }
+            },
+            _ => {}
+        }
+    }
+
+    if upstreams.is_empty() {
+        return Err(ParseError {
+            line: brace_tok.line,
+            col: brace_tok.col,
+            kind: ParseErrorKind::InvalidValue {
+                directive: "udp".to_string(),
+                message: "expected at least one upstream in 'proxy' sub-directive".to_string(),
+                accepted_format: Some("udp :5353 { proxy dns1:53 dns2:53 }"),
+            },
+        });
+    }
+
+    Ok(UdpProxyConfig {
+        listen,
+        upstreams,
+        lb_policy,
+        max_sessions,
+        idle_timeout_secs,
+    })
+}
+
+fn is_udp_subdirective(w: &str) -> bool {
+    matches!(w, "lb_policy" | "max_sessions" | "idle_timeout")
+}
+
+fn parse_udp_proxy_opts(
+    t: &mut Tokenizer<'_>,
+    lb_policy: &mut Option<String>,
+    max_sessions: &mut Option<usize>,
+    idle_timeout_secs: &mut Option<u64>,
+) -> Result<(), ParseError> {
+    loop {
+        let tok = t.next_token();
+        match tok.kind {
+            TokenKind::CloseBrace | TokenKind::Eof => break,
+            TokenKind::Word(ref sub) => match sub.as_str() {
+                "lb_policy" => {
+                    *lb_policy = Some(expect_word_or_quoted(t, "udp proxy", "lb_policy")?);
+                }
+                "max_sessions" => {
+                    let val = expect_word_or_quoted(t, "udp proxy", "max_sessions")?;
+                    *max_sessions = val.parse().ok();
+                }
+                "idle_timeout" => {
+                    let val = expect_word_or_quoted(t, "udp proxy", "idle_timeout")?;
+                    *idle_timeout_secs = parse_duration_string(&val).map(|d| d.as_secs());
+                }
+                _ => {
+                    udp_skip_unknown(t);
+                }
+            },
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Skip an unknown subdirective and its arguments or nested block.
+fn udp_skip_unknown(t: &mut Tokenizer<'_>) {
+    if t.peek().kind == TokenKind::OpenBrace {
+        t.next_token();
+        let mut depth: u32 = 1;
+        while depth > 0 {
+            match t.next_token().kind {
+                TokenKind::OpenBrace => depth += 1,
+                TokenKind::CloseBrace => depth -= 1,
+                TokenKind::Eof => return,
+                _ => {}
+            }
+        }
+    } else {
+        while matches!(
+            t.peek().kind,
+            TokenKind::Word(_) | TokenKind::QuotedString(_)
+        ) {
+            t.next_token();
+        }
+    }
 }

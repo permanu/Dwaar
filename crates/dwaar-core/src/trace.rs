@@ -130,6 +130,58 @@ pub fn generate_traceparent() -> TraceContext {
     ctx
 }
 
+/// Build a completed OTLP span from a finished request. Called at the end
+/// of the request lifecycle when both timing and status are known.
+///
+/// Returns a `dwaar_analytics::otel::Span` ready for `OtlpExporter::record()`.
+/// The trace/span IDs come from the propagated or generated `TraceContext`;
+/// everything else is request metadata captured during proxying.
+pub fn create_request_span(
+    trace_ctx: &TraceContext,
+    method: &str,
+    path: &str,
+    status: u16,
+    upstream: &str,
+    start_ns: u64,
+    end_ns: u64,
+) -> dwaar_analytics::otel::Span {
+    use compact_str::CompactString;
+    use dwaar_analytics::otel::{SpanAttribute, SpanKind, SpanValue};
+
+    let name = CompactString::from(format!("HTTP {method} {path}"));
+
+    let attributes = vec![
+        SpanAttribute {
+            key: CompactString::from("http.method"),
+            value: SpanValue::String(CompactString::from(method)),
+        },
+        SpanAttribute {
+            key: CompactString::from("http.url"),
+            value: SpanValue::String(CompactString::from(path)),
+        },
+        SpanAttribute {
+            key: CompactString::from("http.status_code"),
+            value: SpanValue::Int(i64::from(status)),
+        },
+        SpanAttribute {
+            key: CompactString::from("net.peer.name"),
+            value: SpanValue::String(CompactString::from(upstream)),
+        },
+    ];
+
+    dwaar_analytics::otel::Span {
+        trace_id: trace_ctx.trace_id,
+        span_id: trace_ctx.span_id,
+        parent_span_id: None,
+        name,
+        kind: SpanKind::Server,
+        start_ns,
+        end_ns,
+        status_code: status,
+        attributes,
+    }
+}
+
 /// Encode bytes as lowercase hex directly into a fixed buffer.
 fn hex_encode_lower_into(src: &[u8], dst: &mut [u8]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -244,5 +296,35 @@ mod tests {
         let tp = "00-4BF92F3577B34DA6A3CE929D0E0E4736-00F067AA0BA902B7-01";
         let ctx = parse_traceparent(tp).expect("should accept uppercase hex");
         assert_eq!(ctx.trace_id(), "4BF92F3577B34DA6A3CE929D0E0E4736");
+    }
+
+    #[test]
+    fn create_request_span_populates_fields() {
+        let tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let ctx = parse_traceparent(tp).expect("valid");
+        let span = create_request_span(&ctx, "GET", "/api/users", 200, "backend:8080", 1000, 2000);
+
+        assert_eq!(
+            std::str::from_utf8(&span.trace_id).expect("ascii"),
+            "4bf92f3577b34da6a3ce929d0e0e4736"
+        );
+        assert_eq!(
+            std::str::from_utf8(&span.span_id).expect("ascii"),
+            "00f067aa0ba902b7"
+        );
+        assert_eq!(span.name.as_str(), "HTTP GET /api/users");
+        assert_eq!(span.kind, dwaar_analytics::otel::SpanKind::Server);
+        assert_eq!(span.start_ns, 1000);
+        assert_eq!(span.end_ns, 2000);
+        assert_eq!(span.status_code, 200);
+        assert_eq!(span.attributes.len(), 4);
+    }
+
+    #[test]
+    fn create_request_span_from_generated_context() {
+        let ctx = generate_traceparent();
+        let span = create_request_span(&ctx, "POST", "/upload", 201, "store:9090", 5000, 6000);
+        assert_eq!(span.status_code, 201);
+        assert_eq!(span.name.as_str(), "HTTP POST /upload");
     }
 }

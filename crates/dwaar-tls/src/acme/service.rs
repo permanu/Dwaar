@@ -119,6 +119,23 @@ impl TlsBackgroundService {
     async fn try_issue(&self, domain: &str) -> Result<(), AcmeError> {
         let le_url = le_directory_url();
 
+        // For non-wildcard domains, prefer TLS-ALPN-01 (needs only port 443)
+        // over HTTP-01 (needs port 80). Fall back to HTTP-01 if ALPN fails.
+        let is_wildcard = domain.starts_with("*.");
+
+        if !is_wildcard {
+            match self.issuer.issue_tls_alpn01(domain, le_url, "le").await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    debug!(
+                        domain,
+                        error = %e,
+                        "TLS-ALPN-01 failed, falling back to HTTP-01"
+                    );
+                }
+            }
+        }
+
         match self.issuer.issue(domain, le_url, "le").await {
             Ok(()) => Ok(()),
             Err(le_err) => {

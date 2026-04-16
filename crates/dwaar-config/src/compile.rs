@@ -23,7 +23,7 @@ use dwaar_core::route::{
     is_valid_domain,
 };
 use dwaar_core::template::{CompiledTemplate, VarRegistry, VarSlots};
-use dwaar_core::upstream::{BackendConfig, LbPolicy as CoreLbPolicy, UpstreamPool};
+use dwaar_core::upstream::{BackendConfig, LbPolicy as CoreLbPolicy, RetryConfig, UpstreamPool};
 use tracing::warn;
 
 use crate::model::{
@@ -524,6 +524,61 @@ fn parse_l4_duration(s: &str) -> Option<std::time::Duration> {
     } else {
         s.parse().ok().map(std::time::Duration::from_secs)
     }
+}
+
+// ── Layer 4 UDP compilation ────────────────────────────────────────────
+
+use crate::model::UdpProxyConfig;
+use dwaar_core::l4_udp::CompiledUdpServer;
+
+/// Compile parsed UDP proxy configs into runtime-ready servers.
+///
+/// Address resolution happens here so errors surface early with context.
+pub fn compile_udp_servers(configs: &[UdpProxyConfig]) -> Vec<CompiledUdpServer> {
+    configs
+        .iter()
+        .filter_map(|cfg| {
+            let listen = parse_l4_listen_addr(&cfg.listen)?;
+            let upstreams: Vec<SocketAddr> = cfg
+                .upstreams
+                .iter()
+                .filter_map(|raw| {
+                    raw.parse::<SocketAddr>()
+                        .ok()
+                        .or_else(|| {
+                            raw.to_socket_addrs()
+                                .ok()
+                                .and_then(|mut addrs| addrs.next())
+                        })
+                        .or_else(|| {
+                            warn!(addr = %raw, "UDP: unresolvable upstream address");
+                            None
+                        })
+                })
+                .collect();
+            if upstreams.is_empty() {
+                warn!(listen = %cfg.listen, "UDP: no valid upstreams — skipping");
+                return None;
+            }
+            let policy = match cfg.lb_policy.as_deref() {
+                Some("round_robin" | "roundrobin") => L4LoadBalancePolicy::RoundRobin,
+                Some("least_conn" | "leastconn") => L4LoadBalancePolicy::LeastConn,
+                Some("random") => L4LoadBalancePolicy::Random,
+                Some("ip_hash" | "iphash") | None => L4LoadBalancePolicy::IpHash,
+                Some(other) => {
+                    warn!(policy = %other, "UDP: unknown lb_policy — defaulting to ip_hash");
+                    L4LoadBalancePolicy::IpHash
+                }
+            };
+            Some(CompiledUdpServer {
+                listen,
+                upstreams,
+                policy,
+                max_sessions: cfg.max_sessions.unwrap_or(10_000),
+                idle_timeout: std::time::Duration::from_secs(cfg.idle_timeout_secs.unwrap_or(30)),
+            })
+        })
+        .collect()
 }
 
 // ── HTTP route compilation (continued) ──────────────────────────────────
@@ -1163,7 +1218,53 @@ fn map_lb_policy(policy: Option<LbPolicy>) -> CoreLbPolicy {
         Some(LbPolicy::LeastConn) => CoreLbPolicy::LeastConn,
         Some(LbPolicy::Random) => CoreLbPolicy::Random,
         Some(LbPolicy::IpHash) => CoreLbPolicy::IpHash,
+        Some(LbPolicy::Cookie) => CoreLbPolicy::Cookie,
     }
+}
+
+type MtlsPair = (
+    Option<Arc<pingora_core::utils::tls::CertKey>>,
+    Option<Arc<pingora_core::protocols::tls::CaType>>,
+);
+
+/// Load mTLS client cert and trusted CA from config, or `None` if absent.
+/// Returns `None` (outer) on load failure — caller should skip this site.
+fn load_mtls_config(rp: &ReverseProxyDirective, location: &str) -> Option<MtlsPair> {
+    let client_cert_key = if let Some((ref cert_path, ref key_path)) = rp.tls_client_auth {
+        match dwaar_tls::mtls::load_client_cert_key(cert_path.as_ref(), key_path.as_ref()) {
+            Ok(ck) => Some(Arc::new(ck)),
+            Err(e) => {
+                warn!(
+                    location,
+                    cert = %cert_path,
+                    error = %e,
+                    "failed to load mTLS client cert, skipping site"
+                );
+                return None;
+            }
+        }
+    } else {
+        None
+    };
+
+    let trusted_ca = if let Some(ref ca_path) = rp.tls_trusted_ca_certs {
+        match dwaar_tls::mtls::load_ca_certs(ca_path.as_ref()) {
+            Ok(cas) => Some(cas),
+            Err(e) => {
+                warn!(
+                    location,
+                    ca_path = %ca_path,
+                    error = %e,
+                    "failed to load trusted CA certs, skipping site"
+                );
+                return None;
+            }
+        }
+    } else {
+        None
+    };
+
+    Some((client_cert_key, trusted_ca))
 }
 
 /// Decide whether `rp` needs a pool (multi-upstream or has block-form options).
@@ -1181,7 +1282,9 @@ fn compile_reverse_proxy_handler(rp: &ReverseProxyDirective, location: &str) -> 
         || rp.tls_server_name.is_some()
         || rp.tls_client_auth.is_some()
         || rp.tls_trusted_ca_certs.is_some()
-        || rp.scale_to_zero.is_some();
+        || rp.scale_to_zero.is_some()
+        || rp.lb_retries.is_some()
+        || rp.lb_try_duration.is_some();
 
     if rp.upstreams.len() <= 1 && !is_block_form {
         // Common single-upstream case — zero overhead path.
@@ -1203,41 +1306,7 @@ fn compile_reverse_proxy_handler(rp: &ReverseProxyDirective, location: &str) -> 
     let tls = rp.transport_tls;
     let sni = rp.tls_server_name.clone().unwrap_or_default();
 
-    // Load and validate mTLS client cert+key at config time (Guardrail #18).
-    let client_cert_key = if let Some((ref cert_path, ref key_path)) = rp.tls_client_auth {
-        match dwaar_tls::mtls::load_client_cert_key(cert_path.as_ref(), key_path.as_ref()) {
-            Ok(ck) => Some(Arc::new(ck)),
-            Err(e) => {
-                warn!(
-                    location,
-                    cert = %cert_path,
-                    error = %e,
-                    "failed to load mTLS client cert, skipping site"
-                );
-                return None;
-            }
-        }
-    } else {
-        None
-    };
-
-    // Load custom CA bundle for upstream cert verification.
-    let trusted_ca = if let Some(ref ca_path) = rp.tls_trusted_ca_certs {
-        match dwaar_tls::mtls::load_ca_certs(ca_path.as_ref()) {
-            Ok(cas) => Some(cas),
-            Err(e) => {
-                warn!(
-                    location,
-                    ca_path = %ca_path,
-                    error = %e,
-                    "failed to load trusted CA certs, skipping site"
-                );
-                return None;
-            }
-        }
-    } else {
-        None
-    };
+    let (client_cert_key, trusted_ca) = load_mtls_config(rp, location)?;
 
     let backends = addrs
         .into_iter()
@@ -1251,6 +1320,16 @@ fn compile_reverse_proxy_handler(rp: &ReverseProxyDirective, location: &str) -> 
         })
         .collect();
 
+    let retry = match (rp.lb_retries, rp.lb_try_duration) {
+        (Some(n), _) if n > 0 => RetryConfig {
+            max_retries: n,
+            try_duration: rp
+                .lb_try_duration
+                .unwrap_or(std::time::Duration::from_secs(30)),
+        },
+        _ => RetryConfig::DISABLED,
+    };
+
     let pool = if let Some(ref s2z) = rp.scale_to_zero {
         let s2z_config = dwaar_core::wake::ScaleToZeroConfig::new(
             std::time::Duration::from_secs(s2z.wake_timeout_secs),
@@ -1263,8 +1342,10 @@ fn compile_reverse_proxy_handler(rp: &ReverseProxyDirective, location: &str) -> 
             rp.health_interval,
             s2z_config,
         )
+        .with_retry_config(retry)
     } else {
         UpstreamPool::new(backends, policy, rp.health_uri.clone(), rp.health_interval)
+            .with_retry_config(retry)
     };
 
     Some(Handler::ReverseProxyPool {
@@ -1633,6 +1714,8 @@ mod tests {
             tls_client_auth: None,
             tls_trusted_ca_certs: None,
             scale_to_zero: None,
+            lb_retries: None,
+            lb_try_duration: None,
         })
     }
 
@@ -1653,6 +1736,8 @@ mod tests {
             tls_client_auth: None,
             tls_trusted_ca_certs: None,
             scale_to_zero: None,
+            lb_retries: None,
+            lb_try_duration: None,
         })
     }
 
@@ -1670,6 +1755,8 @@ mod tests {
             tls_client_auth: None,
             tls_trusted_ca_certs: None,
             scale_to_zero: None,
+            lb_retries: None,
+            lb_try_duration: None,
         })
     }
 
@@ -1758,6 +1845,8 @@ mod tests {
                     tls_client_auth: None,
                     tls_trusted_ca_certs: None,
                     scale_to_zero: None,
+                    lb_retries: None,
+                    lb_try_duration: None,
                 })],
             }],
         };
@@ -2230,6 +2319,8 @@ mod tests {
                     }),
                     Directive::Rewrite(RewriteDirective {
                         to: "{backend_path}".to_string(),
+                        matcher_name: None,
+                        pattern: None,
                     }),
                 ],
             }],
@@ -2254,6 +2345,8 @@ mod tests {
             upstream_port: 0,
             tls_server_name: "",
             vars: Some(&route.var_defaults),
+            regex_captures: None,
+            regex_matcher_name: None,
         };
         let result = block.rewrites[0]
             .apply("/anything", Some(&ctx))
@@ -2274,6 +2367,8 @@ mod tests {
                     rp("127.0.0.1:8080"),
                     Directive::Rewrite(RewriteDirective {
                         to: "{nonexistent_var}".to_string(),
+                        matcher_name: None,
+                        pattern: None,
                     }),
                 ],
             }],

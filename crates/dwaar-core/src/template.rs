@@ -308,6 +308,31 @@ enum Segment {
     Placeholder(Placeholder),
     /// A user variable like `{my_var}` — resolved from `VarSlots` by slot index.
     UserVar(u16),
+    /// Regex capture group: `{re.name.N}` — resolved from `path_regexp` match captures.
+    RegexCapture {
+        matcher_name: CompactString,
+        group: usize,
+    },
+}
+
+/// Parse a `re.name.N` token into a `RegexCapture` segment.
+///
+/// Caddy format: `{re.matcher_name.group_index}` where group 0 is the full
+/// match and 1+ are capture groups. Returns `None` if the token doesn't
+/// match the `re.` prefix or has invalid structure.
+fn parse_regex_capture(name: &str) -> Option<Segment> {
+    let rest = name.strip_prefix("re.")?;
+    let dot = rest.rfind('.')?;
+    if dot == 0 {
+        return None;
+    }
+    let matcher_name = &rest[..dot];
+    let group_str = &rest[dot + 1..];
+    let group: usize = group_str.parse().ok()?;
+    Some(Segment::RegexCapture {
+        matcher_name: CompactString::from(matcher_name),
+        group,
+    })
 }
 
 // ── CompiledTemplate ─────────────────────────────────────────
@@ -387,9 +412,11 @@ impl CompiledTemplate {
                                 input: input.to_owned(),
                             });
                         }
-                        // Resolution order: built-in first, then user vars
+                        // Resolution order: built-in first, regex captures, then user vars
                         if let Some(ph) = Placeholder::from_name(name) {
                             segments.push(Segment::Placeholder(ph));
+                        } else if let Some(cap) = parse_regex_capture(name) {
+                            segments.push(cap);
                         } else if let Some(reg) = registry {
                             if let Some(slot) = reg.get(name) {
                                 segments.push(Segment::UserVar(slot));
@@ -447,9 +474,12 @@ impl CompiledTemplate {
 
     /// Whether this template has any placeholders (i.e., needs request context).
     pub fn has_placeholders(&self) -> bool {
-        self.segments
-            .iter()
-            .any(|s| matches!(s, Segment::Placeholder(_) | Segment::UserVar(_)))
+        self.segments.iter().any(|s| {
+            matches!(
+                s,
+                Segment::Placeholder(_) | Segment::UserVar(_) | Segment::RegexCapture { .. }
+            )
+        })
     }
 
     /// Number of segments in the compiled template.
@@ -479,6 +509,19 @@ impl CompiledTemplate {
                     {
                         out.push_str(val);
                     }
+                }
+                Segment::RegexCapture {
+                    matcher_name,
+                    group,
+                } => {
+                    if let Some(name) = ctx.regex_matcher_name
+                        && name == matcher_name.as_str()
+                        && let Some(caps) = ctx.regex_captures
+                        && let Some(m) = caps.get(*group)
+                    {
+                        out.push_str(m.as_str());
+                    }
+                    // Missing capture or name mismatch → empty string (Caddy behavior)
                 }
             }
         }
@@ -533,6 +576,10 @@ impl fmt::Display for CompiledTemplate {
                 Segment::Placeholder(ph) => write!(f, "{{{}}}", ph.canonical_name())?,
                 // User vars display as {var:N} to distinguish from built-ins in debug
                 Segment::UserVar(slot) => write!(f, "{{var:{slot}}}")?,
+                Segment::RegexCapture {
+                    matcher_name,
+                    group,
+                } => write!(f, "{{re.{matcher_name}.{group}}}")?,
             }
         }
         Ok(())
@@ -545,7 +592,7 @@ impl fmt::Display for CompiledTemplate {
 ///
 /// Created from `RequestContext` per-request. All fields are borrowed —
 /// no allocation to build this struct.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct TemplateContext<'a> {
     pub host: &'a str,
     pub method: &'a str,
@@ -565,6 +612,11 @@ pub struct TemplateContext<'a> {
     /// User-declared variables from `vars` / `map` directives.
     /// `None` when no variables are declared for this route.
     pub vars: Option<&'a VarSlots>,
+    /// Regex captures from a `path_regexp` matcher, if any.
+    /// Used by `{re.name.N}` placeholders.
+    pub regex_captures: Option<&'a regex::Captures<'a>>,
+    /// The matcher name that produced `regex_captures` (e.g., `"api"`).
+    pub regex_matcher_name: Option<&'a str>,
 }
 
 /// Resolve a single placeholder from the request context.
@@ -700,6 +752,8 @@ mod tests {
             upstream_port: 8080,
             tls_server_name: "example.com",
             vars: None,
+            regex_captures: None,
+            regex_matcher_name: None,
         }
     }
 
@@ -1163,5 +1217,136 @@ mod tests {
         // One past the cap is rejected; len stays capped.
         slots.set(MAX_VAR_SLOTS as u16, CompactString::from("reject"));
         assert_eq!(slots.len(), MAX_VAR_SLOTS);
+    }
+
+    // ── Regex capture tests ──────────────────────────────────
+
+    #[test]
+    fn compile_regex_capture_placeholder() {
+        let t = CompiledTemplate::compile("/internal/v{re.api.1}/{re.api.2}").unwrap();
+        assert!(t.has_placeholders());
+        assert_eq!(t.segment_count(), 4); // "/internal/v", capture 1, "/", capture 2
+    }
+
+    #[test]
+    fn evaluate_regex_capture_with_captures() {
+        let t = CompiledTemplate::compile("/internal/v{re.api.1}/{re.api.2}").unwrap();
+        let re = regex::Regex::new(r"/api/v([0-9]+)/(.*)").unwrap();
+        let caps = re.captures("/api/v3/users/list").unwrap();
+        let ctx = TemplateContext {
+            regex_captures: Some(&caps),
+            regex_matcher_name: Some("api"),
+            ..test_ctx()
+        };
+        assert_eq!(t.evaluate(&ctx), "/internal/v3/users/list");
+    }
+
+    #[test]
+    fn regex_capture_missing_captures_returns_empty() {
+        let t = CompiledTemplate::compile("/prefix{re.api.1}/suffix").unwrap();
+        let ctx = test_ctx();
+        assert_eq!(t.evaluate(&ctx), "/prefix/suffix");
+    }
+
+    #[test]
+    fn regex_capture_name_mismatch_returns_empty() {
+        let t = CompiledTemplate::compile("{re.other.1}").unwrap();
+        let re = regex::Regex::new(r"(hello)").unwrap();
+        let caps = re.captures("hello world").unwrap();
+        let ctx = TemplateContext {
+            regex_captures: Some(&caps),
+            regex_matcher_name: Some("api"),
+            ..test_ctx()
+        };
+        assert_eq!(t.evaluate(&ctx), "");
+    }
+
+    #[test]
+    fn regex_capture_group_out_of_range_returns_empty() {
+        let t = CompiledTemplate::compile("{re.api.99}").unwrap();
+        let re = regex::Regex::new(r"(hello)").unwrap();
+        let caps = re.captures("hello").unwrap();
+        let ctx = TemplateContext {
+            regex_captures: Some(&caps),
+            regex_matcher_name: Some("api"),
+            ..test_ctx()
+        };
+        assert_eq!(t.evaluate(&ctx), "");
+    }
+
+    #[test]
+    fn regex_capture_group_zero_is_full_match() {
+        let t = CompiledTemplate::compile("{re.m.0}").unwrap();
+        let re = regex::Regex::new(r"/api/v([0-9]+)").unwrap();
+        let caps = re.captures("/api/v42").unwrap();
+        let ctx = TemplateContext {
+            regex_captures: Some(&caps),
+            regex_matcher_name: Some("m"),
+            ..test_ctx()
+        };
+        assert_eq!(t.evaluate(&ctx), "/api/v42");
+    }
+
+    #[test]
+    fn regex_capture_display_roundtrip() {
+        let input = "/v{re.api.1}/{re.api.2}";
+        let t = CompiledTemplate::compile(input).unwrap();
+        assert_eq!(t.to_string(), input);
+    }
+
+    #[test]
+    fn regex_capture_mixed_with_builtins() {
+        let t = CompiledTemplate::compile("{scheme}://{host}/v{re.api.1}").unwrap();
+        let re = regex::Regex::new(r"/api/v([0-9]+)").unwrap();
+        let caps = re.captures("/api/v2").unwrap();
+        let ctx = TemplateContext {
+            regex_captures: Some(&caps),
+            regex_matcher_name: Some("api"),
+            ..test_ctx()
+        };
+        assert_eq!(t.evaluate(&ctx), "https://example.com/v2");
+    }
+
+    #[test]
+    fn parse_regex_capture_valid_formats() {
+        let seg = parse_regex_capture("re.api.1").unwrap();
+        assert!(
+            matches!(seg, Segment::RegexCapture { ref matcher_name, group } if matcher_name == "api" && group == 1)
+        );
+
+        let seg = parse_regex_capture("re.match.0").unwrap();
+        assert!(
+            matches!(seg, Segment::RegexCapture { ref matcher_name, group } if matcher_name == "match" && group == 0)
+        );
+
+        let seg = parse_regex_capture("re.test.12").unwrap();
+        assert!(
+            matches!(seg, Segment::RegexCapture { ref matcher_name, group } if matcher_name == "test" && group == 12)
+        );
+    }
+
+    #[test]
+    fn parse_regex_capture_invalid_formats() {
+        assert!(parse_regex_capture("api.1").is_none());
+        assert!(parse_regex_capture("re.api").is_none());
+        assert!(parse_regex_capture("re..1").is_none());
+        assert!(parse_regex_capture("re.api.abc").is_none());
+        assert!(parse_regex_capture("re.").is_none());
+    }
+
+    #[test]
+    fn regex_capture_sanitized_strips_crlf() {
+        let t = CompiledTemplate::compile("{re.m.1}").unwrap();
+        let re = regex::Regex::new(r"(.+)").unwrap();
+        let input = "evil\r\nheader";
+        let caps = re.captures(input).unwrap();
+        let ctx = TemplateContext {
+            regex_captures: Some(&caps),
+            regex_matcher_name: Some("m"),
+            ..test_ctx()
+        };
+        let result = t.evaluate_sanitized(&ctx);
+        assert!(!result.contains('\r'));
+        assert!(!result.contains('\n'));
     }
 }

@@ -141,6 +141,11 @@ pub struct RequestContext {
     /// skips analytics injection. gRPC has its own compression and framing.
     pub is_grpc: bool,
 
+    /// gRPC-Web mode detected in `request_filter()`. When `Some`, the response
+    /// path translates headers and optionally base64-encodes the body back to
+    /// the client's expected gRPC-Web format.
+    pub grpc_web_mode: Option<crate::grpc_web::GrpcWebMode>,
+
     /// Max request body size in bytes (ISSUE-069). Enforced in `request_filter()`
     /// (Content-Length) and `request_body_filter()` (chunked streaming).
     /// Default: 10 MB. Set to `u64::MAX` for unlimited.
@@ -199,6 +204,13 @@ pub struct RequestContext {
     /// IP filter, under-attack challenge), surfaced in the access log as
     /// `blocked_by`. `&'static str` so no per-request allocation (#128).
     pub blocked_by: Option<&'static str>,
+
+    /// Number of upstream retries performed for this request.
+    pub retry_count: u32,
+
+    /// When `lb_policy cookie` selects a backend, this holds the `Set-Cookie`
+    /// header value to pin the visitor. Applied in `response_filter()`.
+    pub sticky_set_cookie: Option<String>,
 }
 
 impl RequestContext {
@@ -250,6 +262,7 @@ impl RequestContext {
             upstream_pool: None,
             is_websocket: false,
             is_grpc: false,
+            grpc_web_mode: None,
             request_body_max_size: 10 * 1024 * 1024, // 10 MB default
             request_body_received: 0,
             response_body_max_size: 100 * 1024 * 1024, // 100 MB default
@@ -264,6 +277,8 @@ impl RequestContext {
             upstream_error_body: None,
             rejected_by: None,
             blocked_by: None,
+            retry_count: 0,
+            sticky_set_cookie: None,
         }
     }
 

@@ -16,26 +16,39 @@ use crate::error::{ParseError, ParseErrorKind};
 use crate::model::{
     Layer4Config, Layer4Handler, Layer4Matcher, Layer4MatcherDef, Layer4Option, Layer4ProxyHandler,
     Layer4Route, Layer4RouteSet, Layer4Server, Layer4SubrouteHandler, Layer4TlsHandler,
+    UdpProxyConfig,
 };
 use crate::token::{Token, TokenKind, Tokenizer};
 
+use super::directives::parse_udp_proxy;
 use super::helpers::next_word_or_quoted;
+
+/// Parse result from a `layer4 { }` block — TCP servers and any `udp` stanzas.
+pub(super) struct Layer4ParseResult {
+    pub tcp: Layer4Config,
+    pub udp: Vec<UdpProxyConfig>,
+}
 
 pub(super) fn parse_layer4_config(
     t: &mut Tokenizer<'_>,
     key_tok: &Token,
-) -> Result<Layer4Config, ParseError> {
+) -> Result<Layer4ParseResult, ParseError> {
     expect_open_brace(t, key_tok, "layer4")?;
 
     let mut servers = Vec::new();
+    let mut udp_servers = Vec::new();
     loop {
         let tok = t.peek();
-        match tok.kind {
+        match &tok.kind {
             TokenKind::CloseBrace => {
                 t.next_token();
                 break;
             }
             TokenKind::Eof => return unexpected_eof(&tok, "'}' to close layer4 block"),
+            TokenKind::Word(w) if w == "udp" => {
+                t.next_token();
+                udp_servers.push(parse_udp_proxy(t)?);
+            }
             TokenKind::Word(_) | TokenKind::QuotedString(_) => {
                 servers.push(parse_layer4_server(t, &tok)?);
             }
@@ -44,7 +57,7 @@ pub(super) fn parse_layer4_config(
                     line: tok.line,
                     col: tok.col,
                     kind: ParseErrorKind::Expected {
-                        expected: "layer4 listen address or '}'".to_string(),
+                        expected: "layer4 listen address, 'udp', or '}'".to_string(),
                         got: format!("{}", tok.kind),
                     },
                 });
@@ -52,7 +65,10 @@ pub(super) fn parse_layer4_config(
         }
     }
 
-    Ok(Layer4Config { servers })
+    Ok(Layer4ParseResult {
+        tcp: Layer4Config { servers },
+        udp: udp_servers,
+    })
 }
 
 pub(super) fn parse_layer4_route_set(

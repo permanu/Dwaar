@@ -29,6 +29,7 @@ pub mod auth;
 pub mod beacon;
 pub mod decompress;
 pub mod injector;
+pub mod otel;
 pub mod process_metrics;
 pub mod prometheus;
 pub mod rate_cache_metrics;

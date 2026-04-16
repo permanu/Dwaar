@@ -114,6 +114,11 @@ impl CertStore {
         self.cache.lock()
     }
 
+    /// Base directory where cert files are stored.
+    pub fn cert_dir(&self) -> &Path {
+        &self.cert_dir
+    }
+
     /// Create a new cert store loading from `cert_dir` with the given cache capacity.
     pub fn new(cert_dir: impl Into<PathBuf>, capacity: usize) -> Self {
         let cap = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::new(1000).expect("nonzero"));

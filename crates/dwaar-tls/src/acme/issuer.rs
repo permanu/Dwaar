@@ -254,6 +254,131 @@ impl CertIssuer {
         Ok(record_ids)
     }
 
+    /// Issue a certificate using TLS-ALPN-01 challenge validation.
+    ///
+    /// Preferred over HTTP-01 for non-wildcard domains when port 443 is
+    /// already serving (no port 80 needed). Falls back to the normal
+    /// `issue()` path if the CA doesn't offer TLS-ALPN-01.
+    pub async fn issue_tls_alpn01(
+        &self,
+        domain: &str,
+        directory_url: &str,
+        ca_id: &str,
+    ) -> Result<(), AcmeError> {
+        ensure_acme_dir(&self.acme_dir).await?;
+
+        let account = self.get_or_create_account(directory_url, ca_id).await?;
+
+        info!(domain, ca = ca_id, "starting ACME TLS-ALPN-01 order");
+
+        let identifier = Identifier::Dns(domain.to_string());
+        let mut order = account
+            .new_order(&NewOrder {
+                identifiers: &[identifier],
+            })
+            .await
+            .map_err(|e| AcmeError::OrderCreation(e.to_string()))?;
+
+        self.solve_tls_alpn01_challenges(domain, &mut order).await?;
+        Self::poll_order_ready(domain, &mut order).await?;
+
+        let (private_key_pem, csr_der) =
+            generate_key_and_csr(domain).map_err(|e| AcmeError::Finalization(e.to_string()))?;
+
+        order
+            .finalize(&csr_der)
+            .await
+            .map_err(|e| AcmeError::Finalization(e.to_string()))?;
+
+        let cert_chain_pem = Self::poll_certificate(domain, &mut order).await?;
+
+        self.write_cert_files(domain, &cert_chain_pem, &private_key_pem)
+            .await?;
+
+        self.cert_store.invalidate(domain);
+
+        info!(
+            domain,
+            ca = ca_id,
+            "TLS-ALPN-01 certificate issued and stored"
+        );
+        Ok(())
+    }
+
+    /// Process all authorizations using TLS-ALPN-01 challenges.
+    ///
+    /// Installs a self-signed challenge cert into the cert store for each
+    /// authorization, signals readiness, then cleans up regardless of outcome.
+    async fn solve_tls_alpn01_challenges(
+        &self,
+        domain: &str,
+        order: &mut Order,
+    ) -> Result<(), AcmeError> {
+        let authorizations =
+            order
+                .authorizations()
+                .await
+                .map_err(|e| AcmeError::ChallengeValidation {
+                    domain: domain.to_string(),
+                    reason: e.to_string(),
+                })?;
+
+        for authz in &authorizations {
+            match authz.status {
+                AuthorizationStatus::Valid => continue,
+                AuthorizationStatus::Pending => {}
+                other => {
+                    return Err(AcmeError::ChallengeValidation {
+                        domain: domain.to_string(),
+                        reason: format!("unexpected authorization status: {other:?}"),
+                    });
+                }
+            }
+
+            let challenge = authz
+                .challenges
+                .iter()
+                .find(|c| c.r#type == ChallengeType::TlsAlpn01)
+                .ok_or_else(|| AcmeError::ChallengeValidation {
+                    domain: domain.to_string(),
+                    reason: "no TLS-ALPN-01 challenge offered by CA".to_string(),
+                })?;
+
+            let key_auth = order.key_authorization(challenge);
+
+            debug!(domain, "installing TLS-ALPN-01 challenge cert");
+            self.solver
+                .install_alpn_challenge(domain, &key_auth, &self.cert_store)
+                .map_err(|e| AcmeError::ChallengeValidation {
+                    domain: domain.to_string(),
+                    reason: e.to_string(),
+                })?;
+
+            let result = order.set_challenge_ready(&challenge.url).await;
+
+            // Always clean up the challenge cert, even if signaling failed
+            if result.is_err() {
+                self.solver.remove_alpn_challenge(domain, &self.cert_store);
+            } else {
+                // Schedule delayed cleanup so the CA has time to validate
+                let solver = Arc::clone(&self.solver);
+                let cert_store = Arc::clone(&self.cert_store);
+                let cleanup_domain = domain.to_string();
+                tokio::spawn(async move {
+                    tokio::time::sleep(CHALLENGE_CLEANUP_DELAY).await;
+                    solver.remove_alpn_challenge(&cleanup_domain, &cert_store);
+                });
+            }
+
+            result.map_err(|e| AcmeError::ChallengeValidation {
+                domain: domain.to_string(),
+                reason: e.to_string(),
+            })?;
+        }
+
+        Ok(())
+    }
+
     /// Process all authorizations for the order, setting up HTTP-01 challenges.
     async fn solve_challenges(&self, domain: &str, order: &mut Order) -> Result<(), AcmeError> {
         let authorizations =

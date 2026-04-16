@@ -1053,6 +1053,48 @@ fn register_background_services(
         server.add_service(agg_bg);
         info!("analytics aggregation service registered");
     }
+
+    // OTLP span exporter — only registered when the Dwaarfile sets `tracing { otlp_endpoint }`.
+    if let Some(tracing_cfg) = config
+        .global_options
+        .as_ref()
+        .and_then(|g| g.tracing.as_ref())
+    {
+        match dwaar_analytics::otel::OtlpExporter::new(
+            &tracing_cfg.otlp_endpoint,
+            env!("CARGO_PKG_VERSION"),
+        ) {
+            Ok(exporter) => {
+                let exporter = Arc::new(exporter);
+                let otel_bg = pingora_core::services::background::background_service(
+                    "OTLP exporter",
+                    OtlpExporterService {
+                        exporter: Arc::clone(&exporter),
+                    },
+                );
+                server.add_service(otel_bg);
+                info!(
+                    endpoint = %tracing_cfg.otlp_endpoint,
+                    "OTLP span exporter registered"
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to initialize OTLP exporter — tracing disabled");
+            }
+        }
+    }
+}
+
+/// Wraps `OtlpExporter` as a Pingora `BackgroundService`.
+struct OtlpExporterService {
+    exporter: Arc<dwaar_analytics::otel::OtlpExporter>,
+}
+
+#[async_trait::async_trait]
+impl pingora_core::services::background::BackgroundService for OtlpExporterService {
+    async fn start(&self, shutdown: pingora_core::server::ShutdownWatch) {
+        self.exporter.run(shutdown).await;
+    }
 }
 
 /// Resolve a user-supplied config path to an absolute display form, even

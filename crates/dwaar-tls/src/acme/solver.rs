@@ -4,16 +4,26 @@
 // This file is part of Dwaar — https://dwaar.dev
 // Licensed under the Business Source License 1.1
 
-//! In-memory ACME HTTP-01 challenge token store.
+//! In-memory ACME challenge stores for HTTP-01 and TLS-ALPN-01.
 //!
-//! Shared between the ACME service (writes tokens) and the proxy's
-//! request filter (reads tokens to respond to validation requests).
+//! HTTP-01 tokens are shared between the ACME service (writes tokens)
+//! and the proxy's request filter (reads tokens to respond to
+//! validation requests).
+//!
+//! TLS-ALPN-01 challenge certs are installed into the `CertStore` so
+//! the TLS handshake callback can serve them for ALPN `acme-tls/1`
+//! connections. Cleaned up after validation completes.
 
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
+use instant_acme::KeyAuthorization;
+use tracing::debug;
+
+use super::AcmeError;
+use crate::cert_store::CertStore;
 
 /// Upper bound on the number of pending ACME challenge tokens kept in memory.
 ///
@@ -42,6 +52,27 @@ pub const PROBE_MAX_PER_WINDOW: u32 = 120;
 /// addresses. At 10k entries × (16-byte `IpAddr` + 16-byte `ProbeWindow`)
 /// the map tops out around 320 KB.
 pub const PROBES_MAX_TRACKED_IPS: usize = 10_000;
+
+/// Maximum number of concurrent TLS-ALPN-01 challenges. Mirrors the
+/// HTTP-01 cap for the same memory-exhaustion defence.
+pub const MAX_PENDING_ALPN_CHALLENGES: usize = 1024;
+
+/// TLS-ALPN-01 challenge certs older than this are stale and can be
+/// garbage-collected. One hour is far longer than any ACME validation
+/// round-trip, so hitting this means the challenge failed silently.
+pub const ALPN_CHALLENGE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// OID for the `acmeIdentifier` extension (1.3.6.1.5.5.7.1.31).
+/// RFC 8737 mandates this exact OID for the challenge validation value
+/// in the self-signed certificate.
+const ACME_IDENTIFIER_OID: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 1, 31];
+
+/// Tracks an in-flight TLS-ALPN-01 challenge so cleanup can remove
+/// the temporary cert from the `CertStore` after validation.
+#[derive(Debug)]
+struct AlpnChallenge {
+    installed_at: Instant,
+}
 
 /// Per-source-IP probe counter used by [`ChallengeSolver::get`] to throttle
 /// the ACME challenge lookup path during active issuance.
@@ -79,12 +110,9 @@ pub enum SolverError {
     TooManyPendingTokens { cap: usize },
 }
 
-/// Stores pending ACME HTTP-01 challenge tokens and throttles per-IP
-/// challenge probes.
-///
-/// The ACME service inserts `token → key_authorization` entries when
-/// setting up challenges. The proxy checks incoming requests against
-/// this map and responds directly for `/.well-known/acme-challenge/{token}`.
+/// Stores pending ACME challenge state for both HTTP-01 (token map) and
+/// TLS-ALPN-01 (domain-keyed challenge tracker) flows. Throttles per-IP
+/// challenge probes on the HTTP-01 path.
 ///
 /// Thread-safe via `DashMap` — lock-free concurrent reads and writes.
 #[derive(Debug)]
@@ -93,6 +121,10 @@ pub struct ChallengeSolver {
     /// Per-source-IP sliding-window counter used to throttle the challenge
     /// lookup path while `pending` is non-empty (audit finding L-05).
     probes: DashMap<IpAddr, ProbeWindow>,
+    /// Tracks in-flight TLS-ALPN-01 challenges keyed by domain. The actual
+    /// cert is written to disk for the `CertStore`; this map exists purely
+    /// for cleanup bookkeeping and capacity enforcement.
+    alpn_challenges: DashMap<String, AlpnChallenge>,
 }
 
 impl ChallengeSolver {
@@ -100,6 +132,7 @@ impl ChallengeSolver {
         Self {
             pending: DashMap::new(),
             probes: DashMap::new(),
+            alpn_challenges: DashMap::new(),
         }
     }
 
@@ -220,6 +253,111 @@ impl ChallengeSolver {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     }
+
+    /// Generate and install a TLS-ALPN-01 challenge cert for `domain`.
+    ///
+    /// Writes the self-signed cert (with the `acmeIdentifier` extension
+    /// containing the SHA-256 of `key_authorization`) to the cert store's
+    /// disk directory, then invalidates the cache so the next SNI lookup
+    /// picks it up.
+    ///
+    /// The actual ALPN protocol negotiation (`acme-tls/1`) must be handled
+    /// by the TLS accept callback — this method only provisions the cert.
+    pub fn install_alpn_challenge(
+        &self,
+        domain: &str,
+        key_authorization: &KeyAuthorization,
+        cert_store: &CertStore,
+    ) -> Result<(), AcmeError> {
+        if self.alpn_challenges.len() >= MAX_PENDING_ALPN_CHALLENGES
+            && !self.alpn_challenges.contains_key(domain)
+        {
+            return Err(AcmeError::AlpnCertGeneration {
+                domain: domain.to_string(),
+                reason: format!(
+                    "too many pending ALPN challenges (cap {MAX_PENDING_ALPN_CHALLENGES})"
+                ),
+            });
+        }
+
+        let (cert_pem, key_pem) = generate_alpn_challenge_cert(domain, key_authorization)?;
+
+        // Write to disk so CertStore can load it through its normal path.
+        // Uses the same naming convention as the ACME issuer.
+        let cert_dir = cert_store.cert_dir();
+        std::fs::create_dir_all(cert_dir).map_err(|e| AcmeError::AlpnCertGeneration {
+            domain: domain.to_string(),
+            reason: format!("failed to create cert directory: {e}"),
+        })?;
+
+        let cert_path = cert_dir.join(format!("{domain}.pem"));
+        let key_path = cert_dir.join(format!("{domain}.key"));
+
+        std::fs::write(&cert_path, &cert_pem).map_err(|e| AcmeError::AlpnCertGeneration {
+            domain: domain.to_string(),
+            reason: format!("failed to write ALPN challenge cert: {e}"),
+        })?;
+        std::fs::write(&key_path, &key_pem).map_err(|e| AcmeError::AlpnCertGeneration {
+            domain: domain.to_string(),
+            reason: format!("failed to write ALPN challenge key: {e}"),
+        })?;
+
+        // Force the cert store to reload from disk on next lookup
+        cert_store.invalidate(domain);
+
+        self.alpn_challenges.insert(
+            domain.to_string(),
+            AlpnChallenge {
+                installed_at: Instant::now(),
+            },
+        );
+
+        debug!(domain, "TLS-ALPN-01 challenge cert installed");
+        Ok(())
+    }
+
+    /// Remove a TLS-ALPN-01 challenge cert after validation completes.
+    ///
+    /// Deletes the temporary cert files from disk and evicts the cached
+    /// entry. The next issuance cycle will write the real cert. Safe to
+    /// call even if no ALPN challenge was installed (idempotent).
+    pub fn remove_alpn_challenge(&self, domain: &str, cert_store: &CertStore) {
+        self.alpn_challenges.remove(domain);
+        cert_store.invalidate(domain);
+
+        let cert_dir = cert_store.cert_dir();
+        let cert_path = cert_dir.join(format!("{domain}.pem"));
+        let key_path = cert_dir.join(format!("{domain}.key"));
+
+        // Best-effort deletion — the real cert will overwrite these anyway
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+
+        debug!(domain, "TLS-ALPN-01 challenge cert removed");
+    }
+
+    /// Evict ALPN challenges older than [`ALPN_CHALLENGE_TTL`]. Called
+    /// periodically to prevent leaked entries from accumulating if a
+    /// challenge flow crashes without cleanup.
+    pub fn cleanup_stale_alpn_challenges(&self, cert_store: &CertStore) {
+        let now = Instant::now();
+        let stale: Vec<String> = self
+            .alpn_challenges
+            .iter()
+            .filter(|entry| now.duration_since(entry.value().installed_at) >= ALPN_CHALLENGE_TTL)
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        for domain in &stale {
+            self.remove_alpn_challenge(domain, cert_store);
+            debug!(domain, "cleaned up stale ALPN challenge");
+        }
+    }
+
+    /// Number of pending ALPN challenges (for diagnostics).
+    pub fn alpn_challenge_count(&self) -> usize {
+        self.alpn_challenges.len()
+    }
 }
 
 impl Default for ChallengeSolver {
@@ -238,6 +376,136 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_default()
+}
+
+/// Build the ASN.1 DER encoding of the `acmeIdentifier` extension value.
+///
+/// RFC 8737 s3 requires the extension value to be an ASN.1 OCTET STRING
+/// wrapping the raw 32-byte SHA-256 digest:
+///   `04 20 <32 bytes of SHA-256 digest>`
+fn encode_acme_identifier_der(key_auth_hash: &[u8; 32]) -> Vec<u8> {
+    let mut der = Vec::with_capacity(34);
+    der.push(0x04); // ASN.1 OCTET STRING tag
+    der.push(0x20); // length 32
+    der.extend_from_slice(key_auth_hash);
+    der
+}
+
+/// Generate a self-signed TLS-ALPN-01 challenge certificate.
+///
+/// Uses `rcgen` to create an EC P-256 cert with:
+/// - SAN: the challenged domain
+/// - Critical `acmeIdentifier` extension (OID 1.3.6.1.5.5.7.1.31)
+///   containing the SHA-256 of the key authorization string
+///
+/// Returns `(cert_pem, key_pem)` as byte vectors.
+fn generate_alpn_challenge_cert(
+    domain: &str,
+    key_authorization: &KeyAuthorization,
+) -> Result<(Vec<u8>, Vec<u8>), AcmeError> {
+    use rcgen::{
+        CertificateParams, CustomExtension, DistinguishedName, DnType, KeyPair,
+        PKCS_ECDSA_P256_SHA256, SanType,
+    };
+
+    // instant_acme provides the pre-computed SHA-256 digest via `digest()`
+    let digest_ref = key_authorization.digest();
+    let digest_bytes: &[u8] = digest_ref.as_ref();
+    let mut digest = [0u8; 32];
+    digest.copy_from_slice(digest_bytes);
+    let acme_id_der = encode_acme_identifier_der(&digest);
+
+    let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(|e| {
+        AcmeError::AlpnCertGeneration {
+            domain: domain.to_string(),
+            reason: format!("EC key generation failed: {e}"),
+        }
+    })?;
+
+    // Default validity spans are fine for a challenge cert — the ACME server
+    // only checks the extension and SAN, not the dates. Cleanup is driven by
+    // the solver's ALPN_CHALLENGE_TTL, not the cert's notAfter.
+    let mut params = CertificateParams::default();
+
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, domain);
+    params.distinguished_name = dn;
+
+    params.subject_alt_names = vec![SanType::DnsName(domain.try_into().map_err(
+        |e: rcgen::Error| AcmeError::AlpnCertGeneration {
+            domain: domain.to_string(),
+            reason: format!("invalid SAN domain: {e}"),
+        },
+    )?)];
+
+    // The acmeIdentifier extension MUST be critical per RFC 8737
+    let mut ext = CustomExtension::from_oid_content(ACME_IDENTIFIER_OID, acme_id_der);
+    ext.set_criticality(true);
+    params.custom_extensions = vec![ext];
+
+    let cert = params
+        .self_signed(&key_pair)
+        .map_err(|e| AcmeError::AlpnCertGeneration {
+            domain: domain.to_string(),
+            reason: format!("self-signed cert generation failed: {e}"),
+        })?;
+
+    Ok((
+        cert.pem().into_bytes(),
+        key_pair.serialize_pem().into_bytes(),
+    ))
+}
+
+/// Generate an ALPN challenge cert from a raw SHA-256 digest, bypassing
+/// the `KeyAuthorization` type. Test-only — production code goes through
+/// `install_alpn_challenge` which holds a real `KeyAuthorization`.
+#[cfg(test)]
+fn generate_alpn_cert_from_digest(
+    domain: &str,
+    digest: &[u8; 32],
+) -> Result<(Vec<u8>, Vec<u8>), AcmeError> {
+    use rcgen::{
+        CertificateParams, CustomExtension, DistinguishedName, DnType, KeyPair,
+        PKCS_ECDSA_P256_SHA256, SanType,
+    };
+
+    let acme_id_der = encode_acme_identifier_der(digest);
+
+    let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).map_err(|e| {
+        AcmeError::AlpnCertGeneration {
+            domain: domain.to_string(),
+            reason: format!("EC key generation failed: {e}"),
+        }
+    })?;
+
+    let mut params = CertificateParams::default();
+
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, domain);
+    params.distinguished_name = dn;
+
+    params.subject_alt_names = vec![SanType::DnsName(domain.try_into().map_err(
+        |e: rcgen::Error| AcmeError::AlpnCertGeneration {
+            domain: domain.to_string(),
+            reason: format!("invalid SAN domain: {e}"),
+        },
+    )?)];
+
+    let mut ext = CustomExtension::from_oid_content(ACME_IDENTIFIER_OID, acme_id_der);
+    ext.set_criticality(true);
+    params.custom_extensions = vec![ext];
+
+    let cert = params
+        .self_signed(&key_pair)
+        .map_err(|e| AcmeError::AlpnCertGeneration {
+            domain: domain.to_string(),
+            reason: format!("self-signed cert generation failed: {e}"),
+        })?;
+
+    Ok((
+        cert.pem().into_bytes(),
+        key_pair.serialize_pem().into_bytes(),
+    ))
 }
 
 #[cfg(test)]
@@ -433,5 +701,184 @@ mod tests {
         solver
             .set("fresh-token", "auth")
             .expect("after eviction there is room");
+    }
+
+    // ---- TLS-ALPN-01 tests ----
+
+    #[test]
+    fn acme_identifier_der_encoding() {
+        let digest = [0xAB; 32];
+        let der = encode_acme_identifier_der(&digest);
+
+        // ASN.1 OCTET STRING: tag 0x04, length 0x20 (32), then 32 bytes
+        assert_eq!(der.len(), 34);
+        assert_eq!(der[0], 0x04, "ASN.1 OCTET STRING tag");
+        assert_eq!(der[1], 0x20, "length 32");
+        assert_eq!(&der[2..], &[0xAB; 32]);
+    }
+
+    #[test]
+    fn acme_identifier_der_encodes_sha256_correctly() {
+        let key_auth = b"test-key-auth";
+        let digest = openssl::sha::sha256(key_auth);
+        let der = encode_acme_identifier_der(&digest);
+
+        assert_eq!(der.len(), 34);
+        assert_eq!(&der[2..], &digest);
+    }
+
+    #[test]
+    fn generate_alpn_cert_produces_valid_x509() {
+        let digest = openssl::sha::sha256(b"fake-key-authorization");
+        let (cert_pem, key_pem) = generate_alpn_cert_from_digest("alpn.example.com", &digest)
+            .expect("cert generation should succeed");
+
+        let cert = openssl::x509::X509::from_pem(&cert_pem).expect("cert PEM should parse");
+        let key =
+            openssl::pkey::PKey::private_key_from_pem(&key_pem).expect("key PEM should parse");
+
+        assert!(
+            cert.public_key().expect("public key").public_eq(&key),
+            "cert and key must match"
+        );
+
+        let sans = cert.subject_alt_names().expect("cert should have SANs");
+        let san_names: Vec<&str> = sans.iter().filter_map(|n| n.dnsname()).collect();
+        assert!(
+            san_names.contains(&"alpn.example.com"),
+            "SAN must contain the challenged domain"
+        );
+    }
+
+    #[test]
+    fn generate_alpn_cert_has_acme_identifier_extension() {
+        let digest = openssl::sha::sha256(b"key-auth-for-extension-test");
+        let (cert_pem, _key_pem) = generate_alpn_cert_from_digest("ext.example.com", &digest)
+            .expect("cert generation should succeed");
+
+        let cert = openssl::x509::X509::from_pem(&cert_pem).expect("cert PEM should parse");
+
+        // Verify the acmeIdentifier OID (1.3.6.1.5.5.7.1.31) is present
+        // in the cert's DER encoding. The OID body is 8 bytes:
+        //   2B.06.01.05.05.07.01.1F
+        // Wrapped in OBJECT IDENTIFIER tag: 06 08 <body>
+        let cert_der = cert.to_der().expect("cert to DER");
+        let oid_der: &[u8] = &[0x06, 0x08, 0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x1F];
+
+        assert!(
+            cert_der.windows(oid_der.len()).any(|w| w == oid_der),
+            "cert DER must contain the acmeIdentifier OID (1.3.6.1.5.5.7.1.31)"
+        );
+
+        // Verify the SHA-256 digest is embedded in the cert
+        assert!(
+            cert_der.windows(digest.len()).any(|w| w == digest),
+            "cert DER must contain the SHA-256 digest of the key authorization"
+        );
+    }
+
+    #[test]
+    fn install_and_remove_alpn_challenge() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert_store = Arc::new(CertStore::new(dir.path(), 100));
+        let solver = ChallengeSolver::new();
+
+        let domain = "alpn-test.example.com";
+        let digest = openssl::sha::sha256(b"test-key-auth");
+
+        let (cert_pem, key_pem) =
+            generate_alpn_cert_from_digest(domain, &digest).expect("cert gen");
+
+        let cert_path = dir.path().join(format!("{domain}.pem"));
+        let key_path = dir.path().join(format!("{domain}.key"));
+        std::fs::write(&cert_path, &cert_pem).expect("write cert");
+        std::fs::write(&key_path, &key_pem).expect("write key");
+
+        // Track it in the solver
+        solver.alpn_challenges.insert(
+            domain.to_string(),
+            AlpnChallenge {
+                installed_at: Instant::now(),
+            },
+        );
+
+        assert_eq!(solver.alpn_challenge_count(), 1);
+        assert!(cert_store.get(domain).is_some(), "cert should be loadable");
+
+        // Remove the challenge
+        solver.remove_alpn_challenge(domain, &cert_store);
+
+        assert_eq!(solver.alpn_challenge_count(), 0);
+        assert!(!cert_path.exists(), "cert file should be deleted");
+        assert!(!key_path.exists(), "key file should be deleted");
+    }
+
+    #[test]
+    fn remove_alpn_challenge_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert_store = Arc::new(CertStore::new(dir.path(), 100));
+        let solver = ChallengeSolver::new();
+
+        solver.remove_alpn_challenge("nonexistent.example.com", &cert_store);
+        assert_eq!(solver.alpn_challenge_count(), 0);
+    }
+
+    #[test]
+    fn cleanup_stale_alpn_challenges() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert_store = Arc::new(CertStore::new(dir.path(), 100));
+        let solver = ChallengeSolver::new();
+
+        let domain = "stale.example.com";
+
+        let digest = openssl::sha::sha256(b"stale-auth");
+        let (cert_pem, key_pem) =
+            generate_alpn_cert_from_digest(domain, &digest).expect("cert gen");
+        std::fs::write(dir.path().join(format!("{domain}.pem")), &cert_pem).expect("write");
+        std::fs::write(dir.path().join(format!("{domain}.key")), &key_pem).expect("write");
+
+        // Install with a backdated timestamp that exceeds the TTL
+        let old_instant = Instant::now()
+            .checked_sub(ALPN_CHALLENGE_TTL + std::time::Duration::from_secs(1))
+            .expect("subtraction should not underflow in tests");
+
+        solver.alpn_challenges.insert(
+            domain.to_string(),
+            AlpnChallenge {
+                installed_at: old_instant,
+            },
+        );
+
+        assert_eq!(solver.alpn_challenge_count(), 1);
+
+        solver.cleanup_stale_alpn_challenges(&cert_store);
+
+        assert_eq!(
+            solver.alpn_challenge_count(),
+            0,
+            "stale challenge should be cleaned up"
+        );
+    }
+
+    #[test]
+    fn cleanup_preserves_fresh_alpn_challenges() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert_store = Arc::new(CertStore::new(dir.path(), 100));
+        let solver = ChallengeSolver::new();
+
+        solver.alpn_challenges.insert(
+            "fresh.example.com".to_string(),
+            AlpnChallenge {
+                installed_at: Instant::now(),
+            },
+        );
+
+        solver.cleanup_stale_alpn_challenges(&cert_store);
+
+        assert_eq!(
+            solver.alpn_challenge_count(),
+            1,
+            "fresh challenge must not be cleaned up"
+        );
     }
 }
