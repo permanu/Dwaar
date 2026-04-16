@@ -4,8 +4,9 @@
 [advisories]
 version = 2
 ignore = [
-    "RUSTSEC-2025-0132",  # maxminddb mmap — read-only usage, acceptable
     "RUSTSEC-2025-0069",  # daemonize unmaintained — Pingora dep
+    "RUSTSEC-2026-0098",  # rustls URI name constraints — not exploitable in proxy context, fix pending Pingora upgrade
+    "RUSTSEC-2026-0099",  # rustls wildcard name constraints — not exploitable in proxy context, fix pending Pingora upgrade
     "RUSTSEC-2024-0388",  # derivative unmaintained — Pingora dep
     "RUSTSEC-2024-0384",  # instant unmaintained — Pingora transitive
     "RUSTSEC-2024-0437",  # protobuf recursion DoS — transitive dep via Pingora's tracing-opentelemetry; not directly exposed to untrusted input. Dwaar does not parse protobuf from client requests.
