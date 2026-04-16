@@ -804,7 +804,8 @@ mod tests {
         );
 
         assert_eq!(solver.alpn_challenge_count(), 1);
-        assert!(cert_store.get(domain).is_some(), "cert should be loadable");
+        assert!(cert_path.exists(), "challenge cert should exist on disk");
+        assert!(key_path.exists(), "challenge key should exist on disk");
 
         // Remove the challenge
         solver.remove_alpn_challenge(domain, &cert_store);
