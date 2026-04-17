@@ -1,0 +1,168 @@
+// Copyright (C) 2026 Permanu
+// SPDX-License-Identifier: BSL-1.1
+//
+// Dwaar control-plane protocol. Source of truth:
+// permanu/docs/substrate-contract.md (Wheel #2).
+// Any change to this file MUST be mirrored in the substrate contract.
+
+syntax = "proto3";
+package permanu.dwaar.v1;
+
+// DwaarControl is the bidirectional control channel between Permanu
+// (the orchestrator) and a Dwaar proxy instance.
+//
+// Upstream   (Permanu -> Dwaar): route mutations, traffic splits, mirrors.
+// Downstream (Dwaar   -> Permanu): lifecycle events, anomalies, live logs.
+service DwaarControl {
+  // Permanu opens a long-lived bidirectional stream.
+  rpc Channel(stream ClientMessage) returns (stream ServerMessage);
+}
+
+// -----------------------------------------------------------------------------
+// Envelope messages
+// -----------------------------------------------------------------------------
+
+message ClientMessage {
+  oneof kind {
+    Hello hello = 1;
+    Heartbeat heartbeat = 2;
+    AddRoute add_route = 10;
+    RemoveRoute remove_route = 11;
+    SplitTraffic split_traffic = 12;
+    MirrorRequest mirror_request = 13;
+    SetHeaderRule set_header_rule = 14;
+  }
+}
+
+message ServerMessage {
+  oneof kind {
+    HelloAck hello_ack = 1;
+    HeartbeatAck heartbeat_ack = 2;
+    CommandAck command_ack = 3;       // ack_id matches ClientMessage id
+    RouteEvent route_event = 10;
+    AnomalyEvent anomaly_event = 11;
+    TrafficSpikeEvent spike_event = 12;
+    LiveLogChunk log_chunk = 13;
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Handshake & liveness
+// -----------------------------------------------------------------------------
+
+message Hello {
+  string permanu_instance_id = 1;
+  string permanu_version = 2;
+}
+
+message HelloAck {
+  string dwaar_instance_id = 1;
+  string dwaar_version = 2;
+}
+
+message Heartbeat {
+  uint64 sequence = 1;
+  int64 sent_at_unix_ms = 2;
+}
+
+message HeartbeatAck {
+  uint64 sequence = 1;
+  int64 received_at_unix_ms = 2;
+}
+
+// CommandAck is returned for any stateful ClientMessage (AddRoute, RemoveRoute,
+// SplitTraffic, MirrorRequest, SetHeaderRule). The ack_id correlates to a
+// caller-supplied identifier on the originating message.
+message CommandAck {
+  string ack_id = 1;
+  string status = 2;                 // "ok" | "error" | "not_implemented"
+  string error_message = 3;          // populated when status == "error"
+}
+
+// -----------------------------------------------------------------------------
+// Route primitives
+// -----------------------------------------------------------------------------
+
+message Route {
+  string deploy_id = 1;                // links to BuildManifest.id (Wheel #1)
+  string release_name = 2;             // Wheel #6
+  string domain = 3;
+  string upstream_addr = 4;            // "1.2.3.4:8080"
+  bool tls = 5;
+  map<string, string> header_match = 6; // feature-flag routing
+}
+
+message WeightedUpstream {
+  Route route = 1;
+  uint32 weight = 2;                   // 0-100
+}
+
+// -----------------------------------------------------------------------------
+// Client-initiated commands
+// -----------------------------------------------------------------------------
+
+message AddRoute {
+  string ack_id = 1;
+  Route route = 2;
+}
+
+message RemoveRoute {
+  string ack_id = 1;
+  string domain = 2;
+  string deploy_id = 3;                // optional — remove a specific revision
+}
+
+message SplitTraffic {
+  string ack_id = 1;
+  string domain = 2;
+  repeated WeightedUpstream upstreams = 3;  // weights sum to 100
+  string strategy = 4;                      // "canary" | "blue_green" | "shadow"
+}
+
+message MirrorRequest {
+  string ack_id = 1;
+  string source_domain = 2;
+  string mirror_to = 3;                // upstream address
+  uint32 sample_rate_bps = 4;          // basis points, 10000 = 100%
+}
+
+message SetHeaderRule {
+  string ack_id = 1;
+  string domain = 2;
+  string header_name = 3;
+  string header_value = 4;
+  string action = 5;                   // "set" | "append" | "remove"
+}
+
+// -----------------------------------------------------------------------------
+// Server-initiated events
+// -----------------------------------------------------------------------------
+
+message RouteEvent {
+  string domain = 1;
+  string deploy_id = 2;
+  string event_type = 3;               // "added" | "removed" | "updated" | "promoted"
+  int64 observed_at_unix_ms = 4;
+}
+
+message AnomalyEvent {
+  string domain = 1;
+  string anomaly_type = 2;             // "latency_spike" | "error_rate" | "upstream_down"
+  double severity = 3;                 // 0.0-1.0
+  string detail = 4;
+  int64 observed_at_unix_ms = 5;
+}
+
+message TrafficSpikeEvent {
+  string domain = 1;
+  double rps_current = 2;
+  double rps_baseline = 3;
+  int64 observed_at_unix_ms = 4;
+}
+
+message LiveLogChunk {
+  string domain = 1;
+  string deploy_id = 2;
+  bytes payload = 3;
+  int64 observed_at_unix_ms = 4;
+}
