@@ -12,7 +12,7 @@
 //! `Heartbeat` envelopes, and stubs every stateful command with a
 //! `CommandAck { status: "not_implemented" }`.
 //!
-//! Route / SplitTraffic / MirrorRequest handlers land in Week 3.
+//! Route / `SplitTraffic` / `MirrorRequest` handlers land in Week 3.
 
 pub mod pb {
     //! Protobuf types generated from `proto/dwaar.proto`.

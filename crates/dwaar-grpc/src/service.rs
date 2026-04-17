@@ -92,11 +92,11 @@ impl DwaarControl for DwaarControlService {
             loop {
                 match inbound.message().await {
                     Ok(Some(msg)) => {
-                        if let Some(reply) = svc.handle_client_message(msg) {
-                            if tx.send(Ok(reply)).await.is_err() {
-                                debug!("dwaar-grpc: downstream dropped, terminating channel");
-                                break;
-                            }
+                        if let Some(reply) = svc.handle_client_message(msg)
+                            && tx.send(Ok(reply)).await.is_err()
+                        {
+                            debug!("dwaar-grpc: downstream dropped, terminating channel");
+                            break;
                         }
                     }
                     Ok(None) => {
@@ -256,7 +256,7 @@ mod tests {
                         domain: "example.test".into(),
                         upstream_addr: "127.0.0.1:8080".into(),
                         tls: false,
-                        header_match: Default::default(),
+                        header_match: std::collections::HashMap::new(),
                     }),
                 })),
             })
