@@ -8,17 +8,17 @@
 //!
 //! This module wires a tonic service that accepts the bidirectional
 //! `Channel` RPC and dispatches each inbound `ClientMessage` to a
-//! dedicated handler. `Hello` and `Heartbeat` are stateless; the
-//! route-mutating commands (`AddRoute`, `RemoveRoute`) land in Week 3 as
-//! the first batch, with `SplitTraffic` and `MirrorRequest` following
-//! in the next commit.
+//! dedicated handler. `Hello` and `Heartbeat` are stateless; the stateful
+//! command variants (`AddRoute`, `RemoveRoute`, `SplitTraffic`,
+//! `MirrorRequest`) mutate the shared [`RouteTable`] or the split /
+//! mirror registries that live in [`crate::routing`].
 //!
 //! Each mutation produces two outbound messages:
 //!
 //! 1. A [`pb::CommandAck`] correlated to the original `ack_id` with
 //!    `status: "applied"` or `status: "rejected"`.
-//! 2. A follow-up [`pb::RouteEvent`] so Permanu can reconcile its mirror
-//!    of Dwaar state without polling.
+//! 2. For route-modifying commands, a follow-up [`pb::RouteEvent`] so
+//!    Permanu can reconcile its mirror of Dwaar state without polling.
 
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -36,6 +36,7 @@ use tracing::{debug, info, warn};
 
 use crate::pb;
 use crate::pb::dwaar_control_server::{DwaarControl, DwaarControlServer};
+use crate::routing::{MirrorConfig, MirrorRegistry, RouteRegistry, SplitConfig};
 use crate::tls::{TlsConfig, TlsError};
 
 /// Channel depth for the per-stream outbound queue. Small on purpose:
@@ -73,6 +74,8 @@ pub enum Error {
 pub struct DwaarControlService {
     dwaar_instance_id: String,
     route_table: Arc<ArcSwap<RouteTable>>,
+    splits: Arc<RouteRegistry>,
+    mirrors: Arc<MirrorRegistry>,
 }
 
 impl std::fmt::Debug for DwaarControlService {
@@ -80,12 +83,15 @@ impl std::fmt::Debug for DwaarControlService {
         f.debug_struct("DwaarControlService")
             .field("dwaar_instance_id", &self.dwaar_instance_id)
             .field("routes", &self.route_table.load().len())
+            .field("splits", &self.splits.len())
+            .field("mirrors", &self.mirrors.len())
             .finish()
     }
 }
 
 impl DwaarControlService {
-    /// Build a service sharing the main process's route table.
+    /// Build a service sharing the main process's route table plus new
+    /// split/mirror registries.
     pub fn new(
         dwaar_instance_id: impl Into<String>,
         route_table: Arc<ArcSwap<RouteTable>>,
@@ -93,7 +99,33 @@ impl DwaarControlService {
         Self {
             dwaar_instance_id: dwaar_instance_id.into(),
             route_table,
+            splits: Arc::new(RouteRegistry::new()),
+            mirrors: Arc::new(MirrorRegistry::new()),
         }
+    }
+
+    /// Expose the split registry so the proxy hot path (Week 4) can look
+    /// up splits without going through the service.
+    pub fn split_registry(&self) -> Arc<RouteRegistry> {
+        Arc::clone(&self.splits)
+    }
+
+    /// Expose the mirror registry for symmetry with `split_registry`.
+    pub fn mirror_registry(&self) -> Arc<MirrorRegistry> {
+        Arc::clone(&self.mirrors)
+    }
+
+    /// Inject pre-built registries — useful for tests that need to seed
+    /// state before the service starts serving.
+    #[must_use]
+    pub fn with_registries(
+        mut self,
+        splits: Arc<RouteRegistry>,
+        mirrors: Arc<MirrorRegistry>,
+    ) -> Self {
+        self.splits = splits;
+        self.mirrors = mirrors;
+        self
     }
 }
 
@@ -149,9 +181,10 @@ impl DwaarControl for DwaarControlService {
 impl DwaarControlService {
     /// Translate a single `ClientMessage` into zero-or-more `ServerMessage`s.
     ///
-    /// Mutation commands emit two messages on success: the `CommandAck` and
-    /// a trailing `RouteEvent`. Validation failures emit only the
-    /// `CommandAck` with `status: "rejected"`.
+    /// Mutation commands (`AddRoute`, `RemoveRoute`, `SplitTraffic`) emit
+    /// two messages on success: the `CommandAck` and a trailing
+    /// `RouteEvent`. Validation failures emit only the `CommandAck` with
+    /// `status: "rejected"`.
     pub(crate) fn handle_client_message(&self, msg: pb::ClientMessage) -> Vec<pb::ServerMessage> {
         use pb::client_message::Kind as In;
         use pb::server_message::Kind as Out;
@@ -181,8 +214,8 @@ impl DwaarControlService {
             }
             In::AddRoute(cmd) => self.handle_add_route(cmd),
             In::RemoveRoute(cmd) => self.handle_remove_route(cmd),
-            In::SplitTraffic(cmd) => vec![not_implemented(cmd.ack_id, "split_traffic")],
-            In::MirrorRequest(cmd) => vec![not_implemented(cmd.ack_id, "mirror_request")],
+            In::SplitTraffic(cmd) => self.handle_split_traffic(&cmd),
+            In::MirrorRequest(cmd) => self.handle_mirror_request(&cmd),
             In::SetHeaderRule(cmd) => vec![not_implemented(cmd.ack_id, "set_header_rule")],
         };
 
@@ -273,8 +306,17 @@ impl DwaarControlService {
             Arc::new(RouteTable::new(filtered))
         });
 
-        if !removed {
-            return vec![rejected(ack_id, format!("no route for domain: {domain}"))];
+        // Also drop any split / mirror state keyed on this domain — leaving
+        // orphan split configs pointing at a removed route would be a silent
+        // deploy-to-nowhere footgun.
+        let split_removed = self.splits.remove_split(&domain);
+        let mirror_removed = self.mirrors.remove(&domain);
+
+        if !removed && !split_removed && !mirror_removed {
+            return vec![rejected(
+                ack_id,
+                format!("no route, split, or mirror for domain: {domain}"),
+            )];
         }
 
         info!(
@@ -295,6 +337,66 @@ impl DwaarControlService {
                 observed_at_unix_ms: now_unix_ms(),
             }),
         ]
+    }
+
+    // ─── SplitTraffic ─────────────────────────────────────────────────
+
+    fn handle_split_traffic(&self, cmd: &pb::SplitTraffic) -> Vec<pb::server_message::Kind> {
+        let ack_id = cmd.ack_id.clone();
+        let cfg = match SplitConfig::from_pb(cmd) {
+            Ok(c) => c,
+            Err(reason) => return vec![rejected(ack_id, reason)],
+        };
+
+        let domain = cfg.domain.clone();
+        let strategy = cfg.strategy.clone();
+        self.splits.upsert_split(cfg);
+
+        info!(
+            target: "dwaar::grpc::audit",
+            action = "split_traffic_upsert",
+            principal = "grpc",
+            resource = %domain,
+            strategy = %strategy,
+            "grpc route mutation"
+        );
+
+        vec![
+            applied(ack_id),
+            pb::server_message::Kind::RouteEvent(pb::RouteEvent {
+                domain,
+                deploy_id: String::new(),
+                event_type: "updated".into(),
+                observed_at_unix_ms: now_unix_ms(),
+            }),
+        ]
+    }
+
+    // ─── MirrorRequest ────────────────────────────────────────────────
+
+    fn handle_mirror_request(&self, cmd: &pb::MirrorRequest) -> Vec<pb::server_message::Kind> {
+        let ack_id = cmd.ack_id.clone();
+        let cfg = match MirrorConfig::from_pb(cmd) {
+            Ok(c) => c,
+            Err(reason) => return vec![rejected(ack_id, reason)],
+        };
+
+        let source_domain = cfg.source_domain.clone();
+        let rate = cfg.sample_rate_bps;
+        self.mirrors.upsert(cfg);
+
+        info!(
+            target: "dwaar::grpc::audit",
+            action = "mirror_upsert",
+            principal = "grpc",
+            resource = %source_domain,
+            sample_rate_bps = rate,
+            "grpc route mutation"
+        );
+
+        // Mirrors don't emit a RouteEvent — the main domain's route is unchanged.
+        // Permanu tracks mirror installs via the CommandAck alone.
+        vec![applied(ack_id)]
     }
 }
 
@@ -333,10 +435,11 @@ fn now_unix_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Start the `DwaarControl` gRPC server on `addr`, ignoring shutdown.
+/// Start the `DwaarControl` gRPC server on `addr` with no shutdown signal.
 ///
-/// Prefer [`start_grpc_server_with_shutdown`] in production. This variant
-/// is kept for tests and short-lived processes.
+/// Prefer [`start_grpc_server_with_shutdown`] in production — this variant
+/// exists for tests and short-lived processes where an explicit shutdown
+/// future is overkill.
 pub fn start_grpc_server(
     addr: SocketAddr,
     service: DwaarControlService,
@@ -346,8 +449,12 @@ pub fn start_grpc_server(
 }
 
 /// Start the `DwaarControl` gRPC server on `addr`, terminating gracefully
-/// when `shutdown` resolves. Returns a `JoinHandle` that resolves once the
-/// server exits.
+/// when `shutdown` resolves. This is how `dwaar-cli` wires the server into
+/// the Pingora server: the shutdown future is a `ShutdownWatch` that fires
+/// on SIGTERM.
+///
+/// Logs a structured `addr / tls_enabled` startup line so operators can
+/// confirm the listening configuration from the journal.
 pub fn start_grpc_server_with_shutdown<F>(
     addr: SocketAddr,
     service: DwaarControlService,
@@ -465,6 +572,7 @@ mod tests {
         assert_ack(&replies[0], "cmd-1", STATUS_APPLIED);
         assert_route_event(&replies[1], "api.example.com", "added");
 
+        // Side effect: route table updated.
         let table = svc.route_table.load();
         let r = table.resolve("api.example.com").expect("route installed");
         assert_eq!(r.upstream().expect("upstream").port(), 8080);
@@ -545,19 +653,115 @@ mod tests {
     }
 
     #[test]
-    fn split_traffic_still_stubbed() {
+    fn split_traffic_applies_and_records() {
+        let svc = service();
+        let cmd = pb::SplitTraffic {
+            ack_id: "split-1".into(),
+            domain: "api.example.com".into(),
+            upstreams: vec![
+                pb::WeightedUpstream {
+                    route: Some(route("api.example.com", "127.0.0.1:1001", "stable")),
+                    weight: 90,
+                },
+                pb::WeightedUpstream {
+                    route: Some(route("api.example.com", "127.0.0.1:1002", "canary")),
+                    weight: 10,
+                },
+            ],
+            strategy: "canary".into(),
+        };
+        let replies = svc.handle_client_message(pb::ClientMessage {
+            kind: Some(pb::client_message::Kind::SplitTraffic(cmd)),
+        });
+        assert_eq!(replies.len(), 2);
+        assert_ack(&replies[0], "split-1", STATUS_APPLIED);
+        assert_route_event(&replies[1], "api.example.com", "updated");
+
+        let snap = svc
+            .splits
+            .snapshot_for("api.example.com")
+            .expect("split recorded");
+        assert_eq!(snap.entries.len(), 2);
+        assert_eq!(snap.strategy, "canary");
+
+        // Round-robin determinism: roll 0 must land on the 90% bucket.
+        assert_eq!(snap.choose_with_roll(0).expect("pick").deploy_id, "stable");
+        // Roll at 90 crosses into the canary bucket.
+        assert_eq!(snap.choose_with_roll(90).expect("pick").deploy_id, "canary");
+    }
+
+    #[test]
+    fn split_traffic_rejects_bad_sum() {
         let svc = service();
         let replies = svc.handle_client_message(pb::ClientMessage {
             kind: Some(pb::client_message::Kind::SplitTraffic(pb::SplitTraffic {
-                ack_id: "split-stub".into(),
+                ack_id: "split-bad".into(),
                 domain: "api.example.com".into(),
-                upstreams: vec![],
+                upstreams: vec![pb::WeightedUpstream {
+                    route: Some(route("api.example.com", "127.0.0.1:1001", "stable")),
+                    weight: 55,
+                }],
                 strategy: String::new(),
             })),
         });
+        assert_ack(&replies[0], "split-bad", STATUS_REJECTED);
+        assert!(svc.splits.is_empty());
+    }
+
+    #[test]
+    fn mirror_request_applies_and_records() {
+        let svc = service();
+        let replies = svc.handle_client_message(pb::ClientMessage {
+            kind: Some(pb::client_message::Kind::MirrorRequest(pb::MirrorRequest {
+                ack_id: "mir-1".into(),
+                source_domain: "api.example.com".into(),
+                mirror_to: "127.0.0.1:9099".into(),
+                sample_rate_bps: 5_000, // 50%
+            })),
+        });
+        // Mirror upserts emit only the CommandAck — no RouteEvent.
+        assert_eq!(replies.len(), 1);
+        assert_ack(&replies[0], "mir-1", STATUS_APPLIED);
+        let m = svc
+            .mirrors
+            .snapshot_for("api.example.com")
+            .expect("mirror recorded");
+        assert_eq!(m.mirror_to, "127.0.0.1:9099");
+        assert_eq!(m.sample_rate_bps, 5_000);
+    }
+
+    #[test]
+    fn mirror_request_rejects_overrate() {
+        let svc = service();
+        let replies = svc.handle_client_message(pb::ClientMessage {
+            kind: Some(pb::client_message::Kind::MirrorRequest(pb::MirrorRequest {
+                ack_id: "mir-bad".into(),
+                source_domain: "api.example.com".into(),
+                mirror_to: "127.0.0.1:9099".into(),
+                sample_rate_bps: 20_000, // > 10_000
+            })),
+        });
+        assert_ack(&replies[0], "mir-bad", STATUS_REJECTED);
+        assert!(svc.mirrors.is_empty());
+    }
+
+    #[test]
+    fn set_header_rule_still_stubbed() {
+        let svc = service();
+        let replies = svc.handle_client_message(pb::ClientMessage {
+            kind: Some(pb::client_message::Kind::SetHeaderRule(pb::SetHeaderRule {
+                ack_id: "hdr".into(),
+                domain: "api.example.com".into(),
+                header_name: "X-Foo".into(),
+                header_value: "bar".into(),
+                action: "set".into(),
+            })),
+        });
+        assert_eq!(replies.len(), 1);
         let Some(pb::server_message::Kind::CommandAck(ack)) = &replies[0].kind else {
             panic!("expected CommandAck");
         };
+        assert_eq!(ack.ack_id, "hdr");
         assert_eq!(ack.status, "not_implemented");
     }
 
@@ -567,16 +771,22 @@ mod tests {
         let table = Arc::new(ArcSwap::from_pointee(RouteTable::new(Vec::new())));
         let svc = DwaarControlService::new("dwaar-shutdown", table);
         let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid addr");
+        // NB: :0 would yield an ephemeral port, but tonic's Server::serve
+        // binds to what we pass — pick 0 and accept the OS-assigned port.
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let handle = start_grpc_server_with_shutdown(addr, svc, TlsConfig::Plaintext, async move {
             let _ = rx.await;
         });
 
+        // Give the server a beat, then fire the shutdown.
         tokio::time::sleep(Duration::from_millis(20)).await;
         let _ = tx.send(());
         let result = tokio::time::timeout(Duration::from_secs(2), handle)
             .await
             .expect("shutdown within 2s");
+        // The join result is Ok, and the inner Result is fine — tonic may
+        // return Ok or a benign transport error on a rapid shutdown depending
+        // on whether bind succeeded first. Either way the future resolved.
         assert!(result.is_ok(), "task must complete cleanly on shutdown");
     }
 }

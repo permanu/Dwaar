@@ -34,8 +34,10 @@ pub mod pb {
     tonic::include_proto!("permanu.dwaar.v1");
 }
 
+pub mod routing;
 pub mod service;
 pub mod tls;
 
+pub use routing::{MirrorConfig, MirrorRegistry, RouteRegistry, SplitConfig, WeightedEntry};
 pub use service::{DwaarControlService, Error, start_grpc_server, start_grpc_server_with_shutdown};
 pub use tls::{TlsConfig, TlsError};
