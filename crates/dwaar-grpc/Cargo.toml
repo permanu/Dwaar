@@ -21,6 +21,7 @@ thiserror = { workspace = true }
 parking_lot = { workspace = true }
 arc-swap = { workspace = true }
 fastrand = { workspace = true }
+dashmap = { workspace = true }
 dwaar-core = { workspace = true }
 
 [build-dependencies]

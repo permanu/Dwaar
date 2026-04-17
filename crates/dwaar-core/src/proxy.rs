@@ -12,6 +12,7 @@
 //! through the [`PluginChain`] — the proxy engine itself only handles routing,
 //! analytics, ACME challenges, and request logging.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -115,6 +116,61 @@ pub struct DwaarProxy {
     /// HTTP/3 (QUIC) enabled — when true, `response_filter` injects `Alt-Svc`
     /// to advertise HTTP/3 availability to browsers (ISSUE-079b).
     h3_enabled: bool,
+    /// Control-plane hooks populated by the `dwaar-grpc` channel (Wheel #2).
+    /// `None` when the gRPC control server isn't running, which keeps the
+    /// registry lookups off the hot path entirely for single-node installs.
+    control_plane: Option<ControlPlaneHooks>,
+    /// Request-outcome callback for anomaly detection (Wheel #2 Week 5).
+    /// Invoked in `logging()` with the completed request's status + latency.
+    /// `None` disables anomaly emission without touching the proxy hot path.
+    outcome_sink: Option<Arc<dyn RequestOutcomeSink>>,
+    /// Mirror dispatcher (Wheel #2 Week 4). When set, `request_filter`
+    /// consults the mirror registry for the current domain and spawns a
+    /// fire-and-forget clone of the request to the mirror target. Mirror
+    /// failures NEVER affect the primary response.
+    mirror_dispatcher: Option<Arc<dyn MirrorDispatcher>>,
+}
+
+/// Registries consulted by the proxy hot path, populated by the gRPC
+/// control plane in `dwaar-cli::main`.
+///
+/// The proxy holds `Arc`s — cloning is free. When no registry is needed
+/// (no split / no header rule), the fast path is a plain `RouteTable`
+/// lookup with no additional allocations or atomic loads.
+#[derive(Clone)]
+pub struct ControlPlaneHooks {
+    pub splits: Arc<crate::registries::SplitRegistry>,
+    pub header_rules: Arc<crate::registries::HeaderRuleRegistry>,
+}
+
+impl std::fmt::Debug for ControlPlaneHooks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlPlaneHooks")
+            .field("splits", &self.splits.len())
+            .field("header_rules", &self.header_rules.len())
+            .finish()
+    }
+}
+
+/// Trait objects for decoupling the proxy from the gRPC crate.
+///
+/// The proxy lives in `dwaar-core` and must not pull in `dwaar-grpc`
+/// (which itself depends on `dwaar-core`). The gRPC crate provides
+/// implementations of these traits that plug in at startup; unit tests can
+/// substitute no-op doubles without wiring gRPC at all.
+pub trait RequestOutcomeSink: std::fmt::Debug + Send + Sync {
+    /// Record a completed request. Called once per response from
+    /// `logging()`. Implementations must be fast enough to run on the hot
+    /// path — typically a per-domain detector wrapped in a parking-lot
+    /// mutex, which serialises one mutex per domain.
+    fn record(&self, domain: &str, status: u16, latency: std::time::Duration);
+}
+
+pub trait MirrorDispatcher: std::fmt::Debug + Send + Sync {
+    /// Fire a fire-and-forget mirror clone of a completed request. The
+    /// dispatcher MUST NOT await the mirror's response on the primary
+    /// request's critical path — it SHOULD spawn a detached tokio task.
+    fn mirror(&self, domain: &str, method: &str, path: &str, headers: &[(String, String)]);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -146,7 +202,35 @@ impl DwaarProxy {
             keepalive_secs,
             body_timeout: std::time::Duration::from_secs(body_timeout_secs),
             h3_enabled,
+            control_plane: None,
+            outcome_sink: None,
+            mirror_dispatcher: None,
         }
+    }
+
+    /// Install the gRPC control-plane registries so Wheel #2 Weeks 4-5
+    /// behaviours (traffic splits, header rules, mirror traffic, anomaly
+    /// events) run on every request. Safe to call once at startup after
+    /// `new()`.
+    #[must_use]
+    pub fn with_control_plane(mut self, hooks: ControlPlaneHooks) -> Self {
+        self.control_plane = Some(hooks);
+        self
+    }
+
+    /// Register an anomaly-detection sink. The proxy calls `record()` once
+    /// per completed request with the final status and wall-clock latency.
+    #[must_use]
+    pub fn with_outcome_sink(mut self, sink: Arc<dyn RequestOutcomeSink>) -> Self {
+        self.outcome_sink = Some(sink);
+        self
+    }
+
+    /// Register a mirror dispatcher.
+    #[must_use]
+    pub fn with_mirror_dispatcher(mut self, dispatcher: Arc<dyn MirrorDispatcher>) -> Self {
+        self.mirror_dispatcher = Some(dispatcher);
+        self
     }
 }
 
@@ -157,6 +241,76 @@ impl DwaarProxy {
             .digest()
             .and_then(|d| d.ssl_digest.as_ref())
             .is_some()
+    }
+
+    /// Look up the header-rule registry for `domain` and, if every
+    /// `(header_name, expected_value)` pair matches the incoming request
+    /// headers, return the override upstream address. Returns `None` when
+    /// no rule is installed or when the match fails.
+    ///
+    /// The lookup closure reads case-insensitively and consults
+    /// `session.req_header().headers`. A stored expected value of `""` is
+    /// interpreted as "accept any non-empty value" (presence match) — this
+    /// matches the pb→registry translation in `dwaar-grpc::routing`.
+    fn apply_header_rule_override(
+        rules: &crate::registries::HeaderRuleRegistry,
+        domain: &str,
+        session: &Session,
+    ) -> Option<SocketAddr> {
+        let cfg = rules.snapshot_for(domain)?;
+        let req = session.req_header();
+        let matched = cfg.matches(|name| {
+            req.headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        });
+        // "Presence-only" match: when any expected value is empty, require
+        // that header to be present with ANY non-empty value. We do that
+        // check here because `HeaderRuleConfig::matches` treats empty as an
+        // exact-equal on empty, which a real header never is.
+        let matched = matched
+            || cfg.header_match.iter().all(|(name, expected)| {
+                if expected.is_empty() {
+                    req.headers
+                        .get(name.as_str())
+                        .and_then(|v| v.to_str().ok())
+                        .is_some_and(|v| !v.is_empty())
+                } else {
+                    req.headers.get(name.as_str()).and_then(|v| v.to_str().ok())
+                        == Some(expected.as_str())
+                }
+            });
+        if !matched {
+            return None;
+        }
+        cfg.socket_addr()
+    }
+
+    /// Spawn a fire-and-forget mirror of the current request. The
+    /// dispatcher receives method, path, and headers (as a plain vec so it
+    /// is cheap to move across a task boundary) and decides internally
+    /// whether to mirror based on `sample_rate_bps`. Mirror failures
+    /// cannot influence the primary response.
+    fn spawn_mirror_request(dispatcher: &dyn MirrorDispatcher, domain: &str, session: &Session) {
+        let req = session.req_header();
+        let method = req.method.as_str().to_string();
+        let path = req
+            .uri
+            .path_and_query()
+            .map_or_else(|| "/".to_string(), std::string::ToString::to_string);
+        // Small, bounded vec — capped implicitly by the request header set
+        // the proxy already accepted.
+        let headers: Vec<(String, String)> = req
+            .headers
+            .iter()
+            .filter_map(|(n, v)| {
+                v.to_str()
+                    .ok()
+                    .map(|s| (n.as_str().to_string(), s.to_string()))
+            })
+            .collect();
+        dispatcher.mirror(domain, &method, &path, &headers);
     }
 
     fn https_redirect_domain(&self, session: &Session, ctx: &RequestContext) -> Option<String> {
@@ -614,6 +768,44 @@ impl ProxyHttp for DwaarProxy {
                 ctx.plugin_ctx.under_attack = route.under_attack();
                 ctx.route_upstream = route.upstream();
                 ctx.route_tls = route.tls;
+
+                // Wheel #2 control-plane hooks (Week 4). Consulted in order
+                // of specificity: header rules win over traffic splits. Both
+                // are no-ops when no matching config is installed — the
+                // happy path adds at most two `ArcSwap` loads on this hot
+                // line, and only when `control_plane` is wired at startup.
+                if let Some(ref cp) = self.control_plane {
+                    if let Some(override_addr) =
+                        Self::apply_header_rule_override(&cp.header_rules, &route.domain, session)
+                    {
+                        debug!(
+                            request_id = %ctx.request_id(),
+                            domain = %route.domain,
+                            override_upstream = %override_addr,
+                            "header-rule override applied"
+                        );
+                        ctx.route_upstream = Some(override_addr);
+                    } else if let Some(weighted) = cp.splits.choose(route.domain.as_str())
+                        && let Ok(addr) = weighted.upstream_addr.parse::<SocketAddr>()
+                    {
+                        debug!(
+                            request_id = %ctx.request_id(),
+                            domain = %route.domain,
+                            upstream = %addr,
+                            deploy_id = %weighted.deploy_id,
+                            "traffic split applied"
+                        );
+                        ctx.route_upstream = Some(addr);
+                    }
+                }
+
+                // Fire-and-forget mirror clone — Wheel #2 Week 4. The
+                // dispatcher itself handles sample_rate_bps + spawns a
+                // detached tokio task, so no work runs on the primary
+                // response path beyond a single atomic load.
+                if let Some(ref dispatcher) = self.mirror_dispatcher {
+                    Self::spawn_mirror_request(dispatcher.as_ref(), &route.domain, session);
+                }
 
                 // Path-based handler resolution (ISSUE-050).
                 // Iterate handler blocks, find the first matching one (handle/handle_path)
@@ -2014,6 +2206,20 @@ impl ProxyHttp for DwaarProxy {
         let status = session.response_written().map_or(0, |r| r.status.as_u16());
         let bytes_sent = session.body_bytes_sent() as u64;
         let bytes_received = session.body_bytes_read() as u64;
+
+        // Anomaly detection — Wheel #2 Week 5. The sink owns its own
+        // per-domain state; the proxy only records a single observation
+        // per completed request and never waits on emission. No sink
+        // registered → zero cost.
+        if let Some(ref sink) = self.outcome_sink
+            && let Some(ref domain) = ctx.plugin_ctx.route_domain
+        {
+            sink.record(
+                domain.as_str(),
+                status,
+                std::time::Duration::from_micros(response_time_us),
+            );
+        }
 
         // Prometheus metrics (ISSUE-072) — recorded before host.take() moves it
         if let Some(ref prom) = self.prometheus

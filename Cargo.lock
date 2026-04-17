@@ -1482,6 +1482,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "async-trait",
+ "dashmap",
  "dwaar-core",
  "fastrand",
  "futures-core",
