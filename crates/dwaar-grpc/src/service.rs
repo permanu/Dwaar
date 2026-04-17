@@ -10,8 +10,9 @@
 //! `Channel` RPC and dispatches each inbound `ClientMessage` to a
 //! dedicated handler. `Hello` and `Heartbeat` are stateless; the stateful
 //! command variants (`AddRoute`, `RemoveRoute`, `SplitTraffic`,
-//! `MirrorRequest`) mutate the shared [`RouteTable`] or the split /
-//! mirror registries that live in [`crate::routing`].
+//! `MirrorRequest`, `SetHeaderRule`) mutate the shared [`RouteTable`] or
+//! the split / mirror / header-rule registries that live in
+//! [`dwaar_core::registries`].
 //!
 //! Each mutation produces two outbound messages:
 //!
@@ -19,12 +20,18 @@
 //!    `status: "applied"` or `status: "rejected"`.
 //! 2. For route-modifying commands, a follow-up [`pb::RouteEvent`] so
 //!    Permanu can reconcile its mirror of Dwaar state without polling.
+//!
+//! Week 5 adds an [`events::EventBus`] that streams `AnomalyEvent`,
+//! `TrafficSpikeEvent`, and `LiveLogChunk` to subscribed clients. The
+//! service spawns a forwarder task per channel that drains the shared
+//! bus into the outbound mpsc until the peer disconnects.
 
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+use dwaar_core::registries::{HeaderRuleRegistry, MirrorRegistry, SplitRegistry};
 use dwaar_core::route::{self, Route, RouteTable};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -34,9 +41,10 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, info, warn};
 
+use crate::events::{EventBus, EventSubscriber};
 use crate::pb;
 use crate::pb::dwaar_control_server::{DwaarControl, DwaarControlServer};
-use crate::routing::{MirrorConfig, MirrorRegistry, RouteRegistry, SplitConfig};
+use crate::routing::{header_rule_from_pb, mirror_from_pb, split_from_pb};
 use crate::tls::{TlsConfig, TlsError};
 
 /// Channel depth for the per-stream outbound queue. Small on purpose:
@@ -74,8 +82,10 @@ pub enum Error {
 pub struct DwaarControlService {
     dwaar_instance_id: String,
     route_table: Arc<ArcSwap<RouteTable>>,
-    splits: Arc<RouteRegistry>,
+    splits: Arc<SplitRegistry>,
     mirrors: Arc<MirrorRegistry>,
+    header_rules: Arc<HeaderRuleRegistry>,
+    events: Arc<EventBus>,
 }
 
 impl std::fmt::Debug for DwaarControlService {
@@ -85,13 +95,15 @@ impl std::fmt::Debug for DwaarControlService {
             .field("routes", &self.route_table.load().len())
             .field("splits", &self.splits.len())
             .field("mirrors", &self.mirrors.len())
+            .field("header_rules", &self.header_rules.len())
+            .field("event_subscribers", &self.events.subscriber_count())
             .finish()
     }
 }
 
 impl DwaarControlService {
     /// Build a service sharing the main process's route table plus new
-    /// split/mirror registries.
+    /// split/mirror/header-rule registries and a fresh event bus.
     pub fn new(
         dwaar_instance_id: impl Into<String>,
         route_table: Arc<ArcSwap<RouteTable>>,
@@ -99,14 +111,16 @@ impl DwaarControlService {
         Self {
             dwaar_instance_id: dwaar_instance_id.into(),
             route_table,
-            splits: Arc::new(RouteRegistry::new()),
+            splits: Arc::new(SplitRegistry::new()),
             mirrors: Arc::new(MirrorRegistry::new()),
+            header_rules: Arc::new(HeaderRuleRegistry::new()),
+            events: Arc::new(EventBus::new()),
         }
     }
 
-    /// Expose the split registry so the proxy hot path (Week 4) can look
-    /// up splits without going through the service.
-    pub fn split_registry(&self) -> Arc<RouteRegistry> {
+    /// Expose the split registry so the proxy hot path can look up splits
+    /// without going through the service.
+    pub fn split_registry(&self) -> Arc<SplitRegistry> {
         Arc::clone(&self.splits)
     }
 
@@ -115,16 +129,32 @@ impl DwaarControlService {
         Arc::clone(&self.mirrors)
     }
 
-    /// Inject pre-built registries — useful for tests that need to seed
-    /// state before the service starts serving.
+    /// Expose the header-rule registry so the proxy can consult it on
+    /// request intake.
+    pub fn header_rule_registry(&self) -> Arc<HeaderRuleRegistry> {
+        Arc::clone(&self.header_rules)
+    }
+
+    /// Expose the event bus so the proxy can emit anomalies / spikes / log
+    /// chunks into the outgoing streams.
+    pub fn event_bus(&self) -> Arc<EventBus> {
+        Arc::clone(&self.events)
+    }
+
+    /// Inject pre-built registries + bus — useful for tests that need to
+    /// seed state before the service starts serving.
     #[must_use]
     pub fn with_registries(
         mut self,
-        splits: Arc<RouteRegistry>,
+        splits: Arc<SplitRegistry>,
         mirrors: Arc<MirrorRegistry>,
+        header_rules: Arc<HeaderRuleRegistry>,
+        events: Arc<EventBus>,
     ) -> Self {
         self.splits = splits;
         self.mirrors = mirrors;
+        self.header_rules = header_rules;
+        self.events = events;
         self
     }
 }
@@ -148,6 +178,25 @@ impl DwaarControl for DwaarControlService {
         let (tx, rx) = mpsc::channel::<Result<pb::ServerMessage, Status>>(OUTBOUND_CHANNEL_DEPTH);
         let svc = self.clone();
 
+        // Subscribe to the event bus so anomaly / spike / log-chunk events
+        // published by the proxy reach this peer. `subscribe_to_logs` is
+        // negotiated via the Hello message — we default to off and flip on
+        // first Hello.
+        let subscriber: EventSubscriber = svc.events.subscribe();
+
+        // Forwarder task #1 — bus → per-peer mpsc.
+        let forward_tx = tx.clone();
+        let mut forward_sub = subscriber;
+        tokio::spawn(async move {
+            while let Some(msg) = forward_sub.next().await {
+                if forward_tx.send(Ok(msg)).await.is_err() {
+                    // Peer gone; shutting down forwarder quietly.
+                    return;
+                }
+            }
+        });
+
+        // Forwarder task #2 — inbound ClientMessage pump.
         tokio::spawn(async move {
             loop {
                 match inbound.message().await {
@@ -216,7 +265,7 @@ impl DwaarControlService {
             In::RemoveRoute(cmd) => self.handle_remove_route(cmd),
             In::SplitTraffic(cmd) => self.handle_split_traffic(&cmd),
             In::MirrorRequest(cmd) => self.handle_mirror_request(&cmd),
-            In::SetHeaderRule(cmd) => vec![not_implemented(cmd.ack_id, "set_header_rule")],
+            In::SetHeaderRule(cmd) => self.handle_set_header_rule(&cmd),
         };
 
         out_vec
@@ -306,16 +355,17 @@ impl DwaarControlService {
             Arc::new(RouteTable::new(filtered))
         });
 
-        // Also drop any split / mirror state keyed on this domain — leaving
-        // orphan split configs pointing at a removed route would be a silent
-        // deploy-to-nowhere footgun.
-        let split_removed = self.splits.remove_split(&domain);
+        // Also drop any split / mirror / header-rule state keyed on this
+        // domain — leaving orphan configs pointing at a removed route would
+        // be a silent deploy-to-nowhere footgun.
+        let split_removed = self.splits.remove(&domain);
         let mirror_removed = self.mirrors.remove(&domain);
+        let header_removed = self.header_rules.remove(&domain);
 
-        if !removed && !split_removed && !mirror_removed {
+        if !removed && !split_removed && !mirror_removed && !header_removed {
             return vec![rejected(
                 ack_id,
-                format!("no route, split, or mirror for domain: {domain}"),
+                format!("no route, split, mirror, or header rule for domain: {domain}"),
             )];
         }
 
@@ -343,14 +393,14 @@ impl DwaarControlService {
 
     fn handle_split_traffic(&self, cmd: &pb::SplitTraffic) -> Vec<pb::server_message::Kind> {
         let ack_id = cmd.ack_id.clone();
-        let cfg = match SplitConfig::from_pb(cmd) {
+        let cfg = match split_from_pb(cmd) {
             Ok(c) => c,
             Err(reason) => return vec![rejected(ack_id, reason)],
         };
 
         let domain = cfg.domain.clone();
         let strategy = cfg.strategy.clone();
-        self.splits.upsert_split(cfg);
+        self.splits.upsert(cfg);
 
         info!(
             target: "dwaar::grpc::audit",
@@ -376,7 +426,7 @@ impl DwaarControlService {
 
     fn handle_mirror_request(&self, cmd: &pb::MirrorRequest) -> Vec<pb::server_message::Kind> {
         let ack_id = cmd.ack_id.clone();
-        let cfg = match MirrorConfig::from_pb(cmd) {
+        let cfg = match mirror_from_pb(cmd) {
             Ok(c) => c,
             Err(reason) => return vec![rejected(ack_id, reason)],
         };
@@ -398,6 +448,41 @@ impl DwaarControlService {
         // Permanu tracks mirror installs via the CommandAck alone.
         vec![applied(ack_id)]
     }
+
+    // ─── SetHeaderRule ────────────────────────────────────────────────
+
+    fn handle_set_header_rule(&self, cmd: &pb::SetHeaderRule) -> Vec<pb::server_message::Kind> {
+        let ack_id = cmd.ack_id.clone();
+        let cfg = match header_rule_from_pb(cmd) {
+            Ok(c) => c,
+            Err(reason) => return vec![rejected(ack_id, reason)],
+        };
+
+        let domain = cfg.domain.clone();
+        let header_name = cmd.header_name.to_ascii_lowercase();
+        let override_addr = cfg.upstream_addr.clone();
+        self.header_rules.upsert(cfg);
+
+        info!(
+            target: "dwaar::grpc::audit",
+            action = "set_header_rule_upsert",
+            principal = "grpc",
+            resource = %domain,
+            header = %header_name,
+            override_upstream = %override_addr,
+            "grpc route mutation"
+        );
+
+        vec![
+            applied(ack_id),
+            pb::server_message::Kind::RouteEvent(pb::RouteEvent {
+                domain,
+                deploy_id: String::new(),
+                event_type: "updated".into(),
+                observed_at_unix_ms: now_unix_ms(),
+            }),
+        ]
+    }
 }
 
 fn applied(ack_id: String) -> pb::server_message::Kind {
@@ -415,15 +500,6 @@ fn rejected(ack_id: String, reason: impl Into<String>) -> pb::server_message::Ki
         ack_id,
         status: STATUS_REJECTED.to_string(),
         error_message: reason,
-    })
-}
-
-fn not_implemented(ack_id: String, op: &'static str) -> pb::server_message::Kind {
-    warn!(op, %ack_id, "dwaar-grpc: command not implemented");
-    pb::server_message::Kind::CommandAck(pb::CommandAck {
-        ack_id,
-        status: "not_implemented".to_string(),
-        error_message: format!("{op} handler lands in a later wheel"),
     })
 }
 
@@ -746,23 +822,44 @@ mod tests {
     }
 
     #[test]
-    fn set_header_rule_still_stubbed() {
+    fn set_header_rule_applies_and_records() {
         let svc = service();
         let replies = svc.handle_client_message(pb::ClientMessage {
             kind: Some(pb::client_message::Kind::SetHeaderRule(pb::SetHeaderRule {
-                ack_id: "hdr".into(),
+                ack_id: "hdr-1".into(),
                 domain: "api.example.com".into(),
-                header_name: "X-Foo".into(),
-                header_value: "bar".into(),
+                header_name: "X-Env".into(),
+                header_value: "127.0.0.1:9001".into(),
+                action: "route_to".into(),
+            })),
+        });
+        assert_eq!(replies.len(), 2);
+        assert_ack(&replies[0], "hdr-1", STATUS_APPLIED);
+        assert_route_event(&replies[1], "api.example.com", "updated");
+
+        let snap = svc
+            .header_rules
+            .snapshot_for("api.example.com")
+            .expect("header rule recorded");
+        assert_eq!(snap.upstream_addr, "127.0.0.1:9001");
+        assert!(snap.header_match.contains_key("x-env"));
+    }
+
+    #[test]
+    fn set_header_rule_rejects_unsupported_action() {
+        let svc = service();
+        let replies = svc.handle_client_message(pb::ClientMessage {
+            kind: Some(pb::client_message::Kind::SetHeaderRule(pb::SetHeaderRule {
+                ack_id: "hdr-bad".into(),
+                domain: "api.example.com".into(),
+                header_name: "X-Env".into(),
+                header_value: "canary".into(),
                 action: "set".into(),
             })),
         });
         assert_eq!(replies.len(), 1);
-        let Some(pb::server_message::Kind::CommandAck(ack)) = &replies[0].kind else {
-            panic!("expected CommandAck");
-        };
-        assert_eq!(ack.ack_id, "hdr");
-        assert_eq!(ack.status, "not_implemented");
+        assert_ack(&replies[0], "hdr-bad", STATUS_REJECTED);
+        assert!(svc.header_rules.is_empty());
     }
 
     #[tokio::test]
