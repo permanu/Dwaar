@@ -79,6 +79,11 @@ pub(crate) struct Cli {
     #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "/var/run/dwaar-admin.sock")]
     pub admin_socket: Option<PathBuf>,
 
+    /// Listening address for the `DwaarControl` gRPC server (Wheel #2).
+    /// Defaults to 127.0.0.1:9091. Set to an empty string to disable.
+    #[arg(long, env = "DWAAR_GRPC_ADDR", default_value = "127.0.0.1:9091")]
+    pub grpc_addr: String,
+
     /// Bare mode — disable all optional features (logging, plugins, analytics, geoip).
     /// Use for maximum throughput in CDN edge nodes.
     #[arg(long)]

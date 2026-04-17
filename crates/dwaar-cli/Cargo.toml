@@ -32,6 +32,7 @@ dwaar-plugins = { workspace = true }
 dwaar-admin = { workspace = true }
 dwaar-docker = { workspace = true }
 dwaar-geo = { workspace = true }
+dwaar-grpc = { workspace = true }
 dwaar-log = { workspace = true }
 arc-swap = { workspace = true }
 dashmap = { workspace = true }

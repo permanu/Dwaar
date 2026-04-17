@@ -1345,6 +1345,7 @@ dependencies = [
  "dwaar-core",
  "dwaar-docker",
  "dwaar-geo",
+ "dwaar-grpc",
  "dwaar-log",
  "dwaar-plugins",
  "dwaar-tls",

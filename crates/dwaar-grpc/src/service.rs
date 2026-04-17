@@ -174,20 +174,44 @@ fn now_unix_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Start the `DwaarControl` gRPC server on `addr`. Returns a `JoinHandle`
-/// that resolves once the server exits. The caller owns lifecycle.
+/// Start the `DwaarControl` gRPC server on `addr`, ignoring shutdown.
 ///
-/// This scaffold does **not** yet apply mTLS. Auth lands alongside the
-/// Week 3 mutation handlers (see substrate contract, Wheel #2).
+/// Prefer [`start_grpc_server_with_shutdown`] in production. This variant
+/// is kept for tests and short-lived processes.
 pub fn start_grpc_server(
     addr: SocketAddr,
     service: DwaarControlService,
 ) -> JoinHandle<Result<(), Error>> {
+    start_grpc_server_with_shutdown(addr, service, std::future::pending::<()>())
+}
+
+/// Start the `DwaarControl` gRPC server on `addr`, terminating gracefully
+/// when `shutdown` resolves. Returns a `JoinHandle` that resolves once the
+/// server exits. The caller owns lifecycle — `dwaar-cli` pipes Pingora's
+/// `ShutdownWatch` through this so SIGTERM tears down the gRPC listener
+/// alongside the HTTP admin server.
+///
+/// Logs a structured `addr / tls_enabled` startup line so operators can
+/// confirm the listening configuration from the journal.
+///
+/// This scaffold does **not** yet apply mTLS. Auth lands in Week 2.
+pub fn start_grpc_server_with_shutdown<F>(
+    addr: SocketAddr,
+    service: DwaarControlService,
+    shutdown: F,
+) -> JoinHandle<Result<(), Error>>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     tokio::spawn(async move {
-        info!(%addr, "dwaar-grpc: starting DwaarControl server");
+        // tls_enabled is always false at this stage — the env loader lands
+        // in Week 2. Keep the structured field name stable so operators
+        // don't have to re-learn the log line across versions.
+        let tls_on = false;
+        info!(%addr, tls_enabled = %tls_on, "dwaar-grpc: listening");
         Server::builder()
             .add_service(DwaarControlServer::new(service))
-            .serve(addr)
+            .serve_with_shutdown(addr, shutdown)
             .await
             .map_err(Error::from)
     })

@@ -22,4 +22,4 @@ pub mod pb {
 
 pub mod service;
 
-pub use service::{DwaarControlService, Error, start_grpc_server};
+pub use service::{DwaarControlService, Error, start_grpc_server, start_grpc_server_with_shutdown};
