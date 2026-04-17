@@ -1480,7 +1480,9 @@ dependencies = [
 name = "dwaar-grpc"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
+ "dwaar-core",
  "futures-core",
  "prost",
  "rcgen",

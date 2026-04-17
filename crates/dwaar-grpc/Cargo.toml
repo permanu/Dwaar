@@ -18,6 +18,8 @@ futures-core = "0.3"
 async-trait = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+arc-swap = { workspace = true }
+dwaar-core = { workspace = true }
 
 [build-dependencies]
 tonic-build = "0.12"

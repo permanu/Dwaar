@@ -552,6 +552,7 @@ fn run_server(
     let route_table_for_watcher = Arc::clone(&route_table);
     let route_table_for_docker = Arc::clone(&route_table);
     let route_table_for_agg = Arc::clone(&route_table);
+    let route_table_for_grpc = Arc::clone(&route_table);
 
     // GeoIP — load the MaxMind database if present. Not a hard requirement;
     // country enrichment simply won't happen without it.
@@ -835,8 +836,10 @@ fn run_server(
     // a SIGTERM on the Pingora side tears down the gRPC listener alongside
     // the HTTP admin server and the proxy. See [`GrpcBackgroundService`].
     if worker_id == 0 && !cli.grpc_addr.trim().is_empty() {
-        let grpc_service =
-            dwaar_grpc::DwaarControlService::new(format!("dwaar-worker-{worker_id}"));
+        let grpc_service = dwaar_grpc::DwaarControlService::new(
+            format!("dwaar-worker-{worker_id}"),
+            route_table_for_grpc,
+        );
         let grpc_addr: std::net::SocketAddr = cli
             .grpc_addr
             .parse()
