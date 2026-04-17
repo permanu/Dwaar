@@ -34,10 +34,23 @@ pub mod pb {
     tonic::include_proto!("permanu.dwaar.v1");
 }
 
+pub mod dispatch;
+pub mod events;
 pub mod routing;
 pub mod service;
 pub mod tls;
 
-pub use routing::{MirrorConfig, MirrorRegistry, RouteRegistry, SplitConfig, WeightedEntry};
+pub use dispatch::{
+    AnomalyOutcomeSink, MIRROR_OUTCOME_ERROR, MIRROR_OUTCOME_SAMPLED_OUT, MIRROR_OUTCOME_SENT,
+    MirrorDispatcherImpl, MirrorMetrics,
+};
+pub use events::{
+    AnomalyDetector, AnomalyThresholds, DEFAULT_BUS_DEPTH, EventBus, EventSubscriber,
+    LogChunkBuffer, LogIngest, RequestOutcome,
+};
+pub use routing::{
+    HeaderRuleConfig, HeaderRuleRegistry, MirrorConfig, MirrorRegistry, RouteRegistry, SplitConfig,
+    SplitRegistry, WeightedEntry, header_rule_from_pb, mirror_from_pb, split_from_pb,
+};
 pub use service::{DwaarControlService, Error, start_grpc_server, start_grpc_server_with_shutdown};
 pub use tls::{TlsConfig, TlsError};

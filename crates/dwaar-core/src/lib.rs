@@ -23,6 +23,7 @@ pub mod l4;
 pub mod l4_udp;
 pub mod proxy;
 pub mod quic;
+pub mod registries;
 pub mod route;
 pub mod template;
 pub mod trace;
