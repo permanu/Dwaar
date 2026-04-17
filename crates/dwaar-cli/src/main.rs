@@ -552,6 +552,7 @@ fn run_server(
     let route_table_for_watcher = Arc::clone(&route_table);
     let route_table_for_docker = Arc::clone(&route_table);
     let route_table_for_agg = Arc::clone(&route_table);
+    let route_table_for_grpc = Arc::clone(&route_table);
 
     // GeoIP — load the MaxMind database if present. Not a hard requirement;
     // country enrichment simply won't happen without it.
@@ -830,6 +831,36 @@ fn run_server(
 
     server.add_service(admin_listening);
 
+    // DwaarControl gRPC server (Wheel #2) — only worker 0 binds. Runs as a
+    // Pingora BackgroundService so it shares the server's shutdown watch:
+    // a SIGTERM on the Pingora side tears down the gRPC listener alongside
+    // the HTTP admin server and the proxy. See [`GrpcBackgroundService`].
+    if worker_id == 0 && !cli.grpc_addr.trim().is_empty() {
+        let grpc_service = dwaar_grpc::DwaarControlService::new(
+            format!("dwaar-worker-{worker_id}"),
+            route_table_for_grpc,
+        );
+        let grpc_addr: std::net::SocketAddr = cli
+            .grpc_addr
+            .parse()
+            .with_context(|| format!("invalid --grpc-addr: {}", cli.grpc_addr))?;
+
+        let tls_config = dwaar_grpc::TlsConfig::from_env()
+            .context("failed to load gRPC TLS configuration from environment")?;
+
+        let grpc_wrapper = GrpcBackgroundService {
+            addr: grpc_addr,
+            service: grpc_service,
+            tls: tls_config,
+        };
+        let grpc_bg = pingora_core::services::background::background_service(
+            "dwaar-grpc control",
+            grpc_wrapper,
+        );
+        server.add_service(grpc_bg);
+        info!(listen = %grpc_addr, "dwaar-grpc control server registered");
+    }
+
     // Layer 4 TCP proxy — bind separate listeners for non-HTTP protocols.
     // Shared via ArcSwap so ConfigWatcher can hot-reload L4 config.
     let l4_shared: dwaar_core::l4::SharedL4Servers;
@@ -1094,6 +1125,45 @@ struct OtlpExporterService {
 impl pingora_core::services::background::BackgroundService for OtlpExporterService {
     async fn start(&self, shutdown: pingora_core::server::ShutdownWatch) {
         self.exporter.run(shutdown).await;
+    }
+}
+
+/// Wraps the `DwaarControl` gRPC server as a Pingora `BackgroundService`
+/// so its lifecycle matches the HTTP admin server's. When Pingora sends
+/// shutdown, we translate the watch signal into tonic's graceful-shutdown
+/// future so in-flight RPCs complete and the listener socket is released.
+struct GrpcBackgroundService {
+    addr: std::net::SocketAddr,
+    service: dwaar_grpc::DwaarControlService,
+    tls: dwaar_grpc::TlsConfig,
+}
+
+#[async_trait::async_trait]
+impl pingora_core::services::background::BackgroundService for GrpcBackgroundService {
+    async fn start(&self, mut shutdown: pingora_core::server::ShutdownWatch) {
+        // Adapt Pingora's `ShutdownWatch` (a tokio watch channel) into the
+        // single-fire future tonic expects. Fires on the first observable
+        // change — that's Pingora's "please drain" signal.
+        let shutdown_future = async move {
+            let _ = shutdown.changed().await;
+        };
+
+        let handle = dwaar_grpc::start_grpc_server_with_shutdown(
+            self.addr,
+            self.service.clone(),
+            self.tls.clone(),
+            shutdown_future,
+        );
+
+        match handle.await {
+            Ok(Ok(())) => info!(addr = %self.addr, "dwaar-grpc: server terminated cleanly"),
+            Ok(Err(e)) => {
+                warn!(addr = %self.addr, error = %e, "dwaar-grpc: server exited with error");
+            }
+            Err(e) => {
+                warn!(addr = %self.addr, error = %e, "dwaar-grpc: background task join failed");
+            }
+        }
     }
 }
 

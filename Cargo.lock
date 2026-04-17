@@ -1330,7 +1330,7 @@ dependencies = [
 
 [[package]]
 name = "dwaar-cli"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1345,6 +1345,7 @@ dependencies = [
  "dwaar-core",
  "dwaar-docker",
  "dwaar-geo",
+ "dwaar-grpc",
  "dwaar-log",
  "dwaar-plugins",
  "dwaar-tls",
@@ -1479,9 +1480,15 @@ dependencies = [
 name = "dwaar-grpc"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
+ "dwaar-core",
+ "fastrand",
  "futures-core",
+ "parking_lot",
  "prost",
+ "rcgen",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -5243,8 +5250,10 @@ dependencies = [
  "percent-encoding",
  "pin-project",
  "prost",
+ "rustls-pemfile",
  "socket2 0.5.10",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower 0.4.13",
  "tower-layer",
