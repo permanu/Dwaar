@@ -10,7 +10,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-tonic = "0.12"
+tonic = { version = "0.12", features = ["tls"] }
 prost = "0.13"
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
 tokio-stream = "0.1"
@@ -24,6 +24,8 @@ tonic-build = "0.12"
 
 [dev-dependencies]
 tokio-test = { workspace = true }
+tempfile = { workspace = true }
+rcgen = { workspace = true }
 
 [lints]
 workspace = true

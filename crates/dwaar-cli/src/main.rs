@@ -842,9 +842,13 @@ fn run_server(
             .parse()
             .with_context(|| format!("invalid --grpc-addr: {}", cli.grpc_addr))?;
 
+        let tls_config = dwaar_grpc::TlsConfig::from_env()
+            .context("failed to load gRPC TLS configuration from environment")?;
+
         let grpc_wrapper = GrpcBackgroundService {
             addr: grpc_addr,
             service: grpc_service,
+            tls: tls_config,
         };
         let grpc_bg = pingora_core::services::background::background_service(
             "dwaar-grpc control",
@@ -1128,6 +1132,7 @@ impl pingora_core::services::background::BackgroundService for OtlpExporterServi
 struct GrpcBackgroundService {
     addr: std::net::SocketAddr,
     service: dwaar_grpc::DwaarControlService,
+    tls: dwaar_grpc::TlsConfig,
 }
 
 #[async_trait::async_trait]
@@ -1143,6 +1148,7 @@ impl pingora_core::services::background::BackgroundService for GrpcBackgroundSer
         let handle = dwaar_grpc::start_grpc_server_with_shutdown(
             self.addr,
             self.service.clone(),
+            self.tls.clone(),
             shutdown_future,
         );
 

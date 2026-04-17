@@ -26,6 +26,7 @@ use tracing::{debug, info, warn};
 
 use crate::pb;
 use crate::pb::dwaar_control_server::{DwaarControl, DwaarControlServer};
+use crate::tls::{TlsConfig, TlsError};
 
 /// Channel depth for the per-stream outbound queue. Small on purpose:
 /// backpressure is preferable to unbounded memory if Permanu stalls.
@@ -45,6 +46,8 @@ pub enum Error {
     },
     #[error("gRPC server terminated: {0}")]
     Serve(#[from] tonic::transport::Error),
+    #[error("TLS configuration error: {0}")]
+    Tls(#[from] TlsError),
 }
 
 /// Stubbed `DwaarControl` service. Holds the Dwaar instance identity
@@ -181,8 +184,9 @@ fn now_unix_ms() -> i64 {
 pub fn start_grpc_server(
     addr: SocketAddr,
     service: DwaarControlService,
+    tls: TlsConfig,
 ) -> JoinHandle<Result<(), Error>> {
-    start_grpc_server_with_shutdown(addr, service, std::future::pending::<()>())
+    start_grpc_server_with_shutdown(addr, service, tls, std::future::pending::<()>())
 }
 
 /// Start the `DwaarControl` gRPC server on `addr`, terminating gracefully
@@ -192,24 +196,33 @@ pub fn start_grpc_server(
 /// alongside the HTTP admin server.
 ///
 /// Logs a structured `addr / tls_enabled` startup line so operators can
-/// confirm the listening configuration from the journal.
-///
-/// This scaffold does **not** yet apply mTLS. Auth lands in Week 2.
+/// confirm the listening configuration from the journal. When `tls` is
+/// [`TlsConfig::Enabled`] the server terminates TLS; when the config also
+/// carries a client CA, mutual TLS is enforced.
 pub fn start_grpc_server_with_shutdown<F>(
     addr: SocketAddr,
     service: DwaarControlService,
+    tls: TlsConfig,
     shutdown: F,
 ) -> JoinHandle<Result<(), Error>>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     tokio::spawn(async move {
-        // tls_enabled is always false at this stage — the env loader lands
-        // in Week 2. Keep the structured field name stable so operators
-        // don't have to re-learn the log line across versions.
-        let tls_on = false;
-        info!(%addr, tls_enabled = %tls_on, "dwaar-grpc: listening");
-        Server::builder()
+        let tls_enabled = tls.is_enabled();
+        let mtls_enabled = tls.is_mutual();
+        info!(
+            %addr,
+            tls_enabled = %tls_enabled,
+            mtls_enabled = %mtls_enabled,
+            "dwaar-grpc: listening"
+        );
+
+        let mut builder = Server::builder();
+        if let Some(tls_cfg) = tls.to_tonic() {
+            builder = builder.tls_config(tls_cfg).map_err(Error::Serve)?;
+        }
+        builder
             .add_service(DwaarControlServer::new(service))
             .serve_with_shutdown(addr, shutdown)
             .await
