@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-04-17
+
+Wheel #2 Weeks 4–5 — proxy hot-path integration and server-initiated event
+stream.
+
+### Added
+
+- **Proxy consults the split registry on every request** — a matched
+  `SplitTraffic` config for the current domain now steers the upstream pick
+  through a weighted choice. When no split is installed the dispatcher
+  bypasses the registry entirely, so single-upstream routes pay nothing.
+  Registries moved from `dwaar-grpc` into a new `dwaar_core::registries`
+  module so the hot path can consult them without the control-plane crate
+  taking a circular dependency on `dwaar-core`.
+- **Fire-and-forget mirror traffic** via `MirrorDispatcherImpl` —
+  `request_filter` spawns a detached tokio task per matching request that
+  replays the method + path + headers to `mirror_to`. Sample rate is
+  enforced with `sample_rate_bps`; mirror failures never influence the
+  primary response. A new Prometheus counter `dwaar_mirror_requests_total`
+  (labels: `source_domain`, `mirror_to`, `outcome={sent|sampled_out|error}`)
+  is exposed via `MirrorMetrics::render`.
+- **`SetHeaderRule` handler** + `HeaderRuleRegistry`. Header rules are
+  strictly more specific than traffic splits — when both are installed
+  for the same domain the header rule wins and overrides the default
+  upstream. The pb `action == "route_to"` repurposes `header_value` as the
+  override upstream address (single-pair matches, Week 4 scope).
+- **Server-initiated event stream** (Wheel #2 Week 5). New `EventBus`
+  multiplexes `AnomalyEvent`, `TrafficSpikeEvent`, and `LiveLogChunk`
+  messages to every connected gRPC peer. A per-domain `AnomalyDetector`
+  drives thresholds: 5xx rate > 1 % over a 60 s rolling window; P95
+  latency > 2× the 10-min baseline; traffic RPS > 2× the 5-min moving
+  average sustained ≥ 30 s. `LogChunkBuffer` batches structured log
+  chunks every 200 ms (caps: 100 lines / 64 KB / chunk).
+- Bounded mpsc subscriber queues (depth 256) with oldest-drop on
+  backpressure and a drop counter, so publishers never block primary
+  request flow.
+
+### Changed
+
+- `DwaarProxy::new` gains three optional wiring methods —
+  `with_control_plane`, `with_mirror_dispatcher`, `with_outcome_sink` —
+  that populate the new hot-path hooks. `None` keeps the pre-existing
+  single-upstream fast path unchanged.
+- `dwaar-cli` builds the `DwaarControlService` up-front and threads its
+  registries into `DwaarProxy` before the proxy service is registered,
+  so every worker observes the same shared state.
+
+### Tests
+
+- 10 proxy-level integration tests in
+  `crates/dwaar-grpc/tests/proxy_integration.rs` covering split
+  100→50/50→100 transitions, mirror dispatch against a real `TcpListener`,
+  mirror error / sampled-out counters, header-rule match semantics, the
+  event-bus drop-on-backpressure behaviour, anomaly emission, and log-chunk
+  batching.
+- Unit tests for `SplitRegistry`, `MirrorRegistry`, `HeaderRuleRegistry`,
+  `AnomalyDetector`, `LogChunkBuffer`, and `MirrorDispatcherImpl`.
+
 ## [0.2.11] - 2026-04-13
 
 ### Fixed
