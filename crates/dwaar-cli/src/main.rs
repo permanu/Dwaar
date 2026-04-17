@@ -656,6 +656,28 @@ fn run_server(
     let cache_backend_for_admin = cache_backend.clone();
     let cache_backend_for_watcher = cache_backend.clone();
 
+    // Build the DwaarControl service up-front so its registries can be
+    // shared with DwaarProxy's hot path (Wheel #2 Week 4) AND handed to the
+    // gRPC BackgroundService below. The service is cheap to clone — every
+    // internal handle is an `Arc` — so both consumers get independent clones.
+    let grpc_service = dwaar_grpc::DwaarControlService::new(
+        format!("dwaar-worker-{worker_id}"),
+        Arc::clone(&route_table_for_grpc),
+    );
+    let control_plane_hooks = dwaar_core::proxy::ControlPlaneHooks {
+        splits: grpc_service.split_registry(),
+        header_rules: grpc_service.header_rule_registry(),
+    };
+    let mirror_registry = grpc_service.mirror_registry();
+    let event_bus = grpc_service.event_bus();
+
+    let mirror_dispatcher = Arc::new(dwaar_grpc::MirrorDispatcherImpl::new(Arc::clone(
+        &mirror_registry,
+    )));
+    let mirror_metrics = mirror_dispatcher.metrics();
+    let outcome_sink = Arc::new(dwaar_grpc::AnomalyOutcomeSink::new(Arc::clone(&event_bus)));
+    let log_buffer = Arc::new(dwaar_grpc::LogChunkBuffer::new(Arc::clone(&event_bus)));
+
     let proxy = DwaarProxy::new(
         route_table,
         challenge_solver.clone(),
@@ -669,7 +691,17 @@ fn run_server(
         u64::from(timeouts.keepalive_secs),
         u64::from(timeouts.body_secs),
         h3_enabled,
-    );
+    )
+    .with_control_plane(control_plane_hooks)
+    .with_mirror_dispatcher(
+        Arc::clone(&mirror_dispatcher) as Arc<dyn dwaar_core::proxy::MirrorDispatcher>
+    )
+    .with_outcome_sink(Arc::clone(&outcome_sink) as Arc<dyn dwaar_core::proxy::RequestOutcomeSink>);
+    // Hand-off: the admin / metrics wiring consuming `mirror_metrics` and
+    // `log_buffer` lands in a follow-up wheel. Explicit drops keep both
+    // `Arc`s' ref counts honest for now — cheap atomic decrements.
+    drop(mirror_metrics);
+    drop(log_buffer);
 
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, proxy);
 
@@ -835,11 +867,10 @@ fn run_server(
     // Pingora BackgroundService so it shares the server's shutdown watch:
     // a SIGTERM on the Pingora side tears down the gRPC listener alongside
     // the HTTP admin server and the proxy. See [`GrpcBackgroundService`].
+    //
+    // The service itself was built earlier so its registries are already
+    // plumbed into the DwaarProxy hot path.
     if worker_id == 0 && !cli.grpc_addr.trim().is_empty() {
-        let grpc_service = dwaar_grpc::DwaarControlService::new(
-            format!("dwaar-worker-{worker_id}"),
-            route_table_for_grpc,
-        );
         let grpc_addr: std::net::SocketAddr = cli
             .grpc_addr
             .parse()
