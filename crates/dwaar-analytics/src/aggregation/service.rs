@@ -247,12 +247,16 @@ struct FlushSnapshot {
     /// [`crate::sink::DomainMetricsSnapshot::devices`] — same data,
     /// different wire format (stdout-legacy JSON vs socket sink).
     devices: Vec<DeviceCount>,
-    /// Top-N UTM source / medium / campaign counters. Mirrors the socket
+    /// Top-N UTM counters across all five dimensions. Mirrors the socket
     /// sink so consumers tailing the stdout legacy path see the same
-    /// attribution numbers as the agent does. Lowercased at ingest.
+    /// attribution numbers as the agent does. Lowercased at ingest;
+    /// term/content are bounded tighter than source/medium/campaign
+    /// (see `TOP_UTM_TERMS_N` / `TOP_UTM_CONTENTS_N`).
     utm_sources: Vec<UtmCount>,
     utm_mediums: Vec<UtmCount>,
     utm_campaigns: Vec<UtmCount>,
+    utm_terms: Vec<UtmCount>,
+    utm_contents: Vec<UtmCount>,
     /// HTTP status classes (1xx..5xx) emitted in order with zero counts
     /// included. Sibling of [`crate::sink::DomainMetricsSnapshot::status_classes`].
     status_classes: Vec<StatusClassCount>,
@@ -286,10 +290,10 @@ struct DeviceCount {
 }
 
 /// One UTM attribution entry for the stdout-legacy flush. Field name
-/// is deliberately generic (`value`) so a single struct handles
-/// `utm_source`, `utm_medium`, and `utm_campaign` without three
-/// near-identical types; the owning field on `FlushSnapshot` carries
-/// the dimension.
+/// is deliberately generic (`value`) so a single struct handles all
+/// five UTM dimensions (`utm_source`, `utm_medium`, `utm_campaign`,
+/// `utm_term`, `utm_content`) without five near-identical types; the
+/// owning field on `FlushSnapshot` carries the dimension.
 #[derive(Debug, Serialize)]
 struct UtmCount {
     value: String,
@@ -379,6 +383,18 @@ impl FlushSnapshot {
                 .collect(),
             utm_campaigns: m
                 .utm_campaigns
+                .top()
+                .into_iter()
+                .map(|(value, count)| UtmCount { value, count })
+                .collect(),
+            utm_terms: m
+                .utm_terms
+                .top()
+                .into_iter()
+                .map(|(value, count)| UtmCount { value, count })
+                .collect(),
+            utm_contents: m
+                .utm_contents
                 .top()
                 .into_iter()
                 .map(|(value, count)| UtmCount { value, count })

@@ -54,6 +54,13 @@ pub struct DomainMetricsSnapshot {
     pub utm_mediums: Vec<(String, u64)>,
     /// Top-N UTM campaign values (e.g. `spring-launch-2026`).
     pub utm_campaigns: Vec<(String, u64)>,
+    /// Top-N UTM term values (e.g. `running_shoes`). Capped tighter than
+    /// source/medium/campaign (25 vs 50) because term carries the most
+    /// ad-hoc cardinality of any UTM dimension.
+    pub utm_terms: Vec<(String, u64)>,
+    /// Top-N UTM content values (e.g. `hero_blue`, `variant_a`). Same
+    /// tighter cap as `utm_terms` for the same cardinality reason.
+    pub utm_contents: Vec<(String, u64)>,
     /// HTTP status-class counts across the fixed 1xx..5xx enum, emitted
     /// in order with zero counts included so downstream heatmaps do not
     /// have to synthesize missing buckets. Sourced from the first five
@@ -81,6 +88,8 @@ impl DomainMetricsSnapshot {
             utm_sources: m.utm_sources.top(),
             utm_mediums: m.utm_mediums.top(),
             utm_campaigns: m.utm_campaigns.top(),
+            utm_terms: m.utm_terms.top(),
+            utm_contents: m.utm_contents.top(),
             status_classes: crate::aggregation::status_class_snapshot(&m.status_codes),
             status_codes: m.status_codes,
             bytes_sent: m.bytes_sent,
@@ -333,7 +342,10 @@ mod tests {
         let events = [
             (
                 200,
-                Some("utm_source=Google&utm_medium=cpc&utm_campaign=Spring_2026"),
+                Some(
+                    "utm_source=Google&utm_medium=cpc&utm_campaign=Spring_2026\
+                     &utm_term=Running&utm_content=Hero_Blue",
+                ),
             ),
             (201, None),
             (404, None),
@@ -364,6 +376,10 @@ mod tests {
         let campaigns: std::collections::HashMap<_, _> =
             snap.utm_campaigns.iter().cloned().collect();
         assert_eq!(campaigns.get("spring_2026").copied(), Some(1));
+        let terms: std::collections::HashMap<_, _> = snap.utm_terms.iter().cloned().collect();
+        assert_eq!(terms.get("running").copied(), Some(1));
+        let contents: std::collections::HashMap<_, _> = snap.utm_contents.iter().cloned().collect();
+        assert_eq!(contents.get("hero_blue").copied(), Some(1));
 
         // Status classes: always all 5 labels present, in order.
         assert_eq!(snap.status_classes.len(), 5);
@@ -396,6 +412,8 @@ mod tests {
         assert!(snap.utm_sources.is_empty());
         assert!(snap.utm_mediums.is_empty());
         assert!(snap.utm_campaigns.is_empty());
+        assert!(snap.utm_terms.is_empty());
+        assert!(snap.utm_contents.is_empty());
     }
 
     #[test]

@@ -58,8 +58,9 @@ pub struct StatusClassEntry {
 }
 
 /// One UTM attribution entry for the Admin API. A single struct covers
-/// `utm_source`, `utm_medium`, and `utm_campaign` — the owning field
-/// on [`AnalyticsSnapshot`] carries the dimension.
+/// all five UTM dimensions (`utm_source`, `utm_medium`, `utm_campaign`,
+/// `utm_term`, `utm_content`) — the owning field on
+/// [`AnalyticsSnapshot`] carries the dimension.
 #[derive(Debug, Serialize)]
 pub struct UtmEntry {
     pub value: String,
@@ -109,11 +110,14 @@ pub struct AnalyticsSnapshot {
     /// stable label enumeration rather than a struct of fields.
     pub status_classes: Vec<StatusClassEntry>,
     /// Top-N UTM attribution counters. Lowercased and length-capped at
-    /// ingest; bounded at 50/20/50 respectively so the Admin API
-    /// response stays small regardless of traffic.
+    /// ingest; bounded at 50/20/50/25/25 respectively (term/content are
+    /// tighter because their value space is the most ad-hoc) so the
+    /// Admin API response stays small regardless of traffic.
     pub utm_sources: Vec<UtmEntry>,
     pub utm_mediums: Vec<UtmEntry>,
     pub utm_campaigns: Vec<UtmEntry>,
+    pub utm_terms: Vec<UtmEntry>,
+    pub utm_contents: Vec<UtmEntry>,
     pub bytes_sent: u64,
     pub web_vitals: VitalsSnapshot,
     /// Bot vs human pageview split. Cumulative since the last 60s
@@ -189,6 +193,18 @@ impl AnalyticsSnapshot {
             .into_iter()
             .map(|(value, count)| UtmEntry { value, count })
             .collect();
+        let utm_terms = m
+            .utm_terms
+            .top()
+            .into_iter()
+            .map(|(value, count)| UtmEntry { value, count })
+            .collect();
+        let utm_contents = m
+            .utm_contents
+            .top()
+            .into_iter()
+            .map(|(value, count)| UtmEntry { value, count })
+            .collect();
 
         let web_vitals = VitalsSnapshot {
             lcp: m.web_vitals.peek_lcp_percentiles(),
@@ -216,6 +232,8 @@ impl AnalyticsSnapshot {
             utm_sources,
             utm_mediums,
             utm_campaigns,
+            utm_terms,
+            utm_contents,
             bytes_sent: m.bytes_sent,
             web_vitals,
             bot_views: m.bot_views,

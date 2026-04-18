@@ -72,9 +72,18 @@ const DEVICE_BUCKETS: usize = 5;
 /// `cpc|email|social|organic`), so we size the bounded counters to
 /// match observed real-world attribution shapes while still preventing
 /// unbounded label growth under adversarial input.
+///
+/// Term and content are capped tighter (25 vs 50) because their value
+/// space is the most ad-hoc of the five UTM dimensions: term typically
+/// carries ad-network keyword bids (long tail — thousands of variants
+/// per campaign) and content typically carries A/B creative identifiers
+/// (dynamic across ad rotations). Keeping these two counters small is
+/// the primary cardinality-risk mitigation for shipping them at all.
 const TOP_UTM_SOURCES_N: usize = 50;
 const TOP_UTM_MEDIUMS_N: usize = 20;
 const TOP_UTM_CAMPAIGNS_N: usize = 50;
+const TOP_UTM_TERMS_N: usize = 25;
+const TOP_UTM_CONTENTS_N: usize = 25;
 /// Per-UTM-value length cap to defend against adversarial ballast values
 /// designed to blow up the bounded counter's memory footprint. Longer
 /// than any legitimate campaign slug but short enough that 150
@@ -120,6 +129,16 @@ pub struct DomainMetrics {
     /// controlled, but we bound anyway to defend against adversarial
     /// ballast traffic.
     pub utm_campaigns: BoundedCounter<String>,
+    /// UTM term counter (e.g. `running+shoes`, `crm_software`). Typically
+    /// carries ad-network keyword bids, which have the highest real-world
+    /// cardinality of any UTM dimension — hence the tighter cap (25 vs
+    /// 50 for source/campaign). Values are case-folded to lowercase and
+    /// length-capped at insertion time just like the other UTM fields.
+    pub utm_terms: BoundedCounter<String>,
+    /// UTM content counter (e.g. `hero-cta-blue`, `v2-banner`). Typically
+    /// carries A/B creative identifiers that rotate across ad variants,
+    /// so cardinality is similarly ad-hoc to term — same tighter cap.
+    pub utm_contents: BoundedCounter<String>,
     pub status_codes: [u64; 6],
     pub bytes_sent: u64,
     pub web_vitals: WebVitals,
@@ -143,6 +162,8 @@ impl DomainMetrics {
             utm_sources: BoundedCounter::new(TOP_UTM_SOURCES_N),
             utm_mediums: BoundedCounter::new(TOP_UTM_MEDIUMS_N),
             utm_campaigns: BoundedCounter::new(TOP_UTM_CAMPAIGNS_N),
+            utm_terms: BoundedCounter::new(TOP_UTM_TERMS_N),
+            utm_contents: BoundedCounter::new(TOP_UTM_CONTENTS_N),
             status_codes: [0; 6],
             bytes_sent: 0,
             web_vitals: WebVitals::new(),
@@ -187,22 +208,29 @@ impl DomainMetrics {
         };
         self.devices.insert(device.to_string());
 
-        // Marketing-attribution UTM parameters — `utm_source`,
-        // `utm_medium`, `utm_campaign` only. `utm_term` and `utm_content`
-        // are intentionally skipped: both are low-signal for aggregated
-        // dashboards and high-cardinality (ad-network term lists explode
-        // bounded-counter capacity). Each extracted value is lowercased
-        // at insertion so `Google` and `google` merge into one bucket.
+        // Marketing-attribution UTM parameters across the full
+        // source/medium/campaign/term/content set. term/content are
+        // capped tighter than the other three because their value
+        // space is the most ad-hoc (keyword bids, A/B creative IDs);
+        // see `TOP_UTM_TERMS_N` / `TOP_UTM_CONTENTS_N` for the cap
+        // rationale. Each extracted value is lowercased at insertion
+        // so `Google` and `google` merge into one bucket.
         if let Some(ref query) = event.query {
-            let (source, medium, campaign) = extract_utm_params(query);
-            if let Some(s) = source {
+            let utm = extract_utm_params(query);
+            if let Some(s) = utm.source {
                 self.utm_sources.insert(s);
             }
-            if let Some(m) = medium {
+            if let Some(m) = utm.medium {
                 self.utm_mediums.insert(m);
             }
-            if let Some(c) = campaign {
+            if let Some(c) = utm.campaign {
                 self.utm_campaigns.insert(c);
+            }
+            if let Some(t) = utm.term {
+                self.utm_terms.insert(t);
+            }
+            if let Some(ct) = utm.content {
+                self.utm_contents.insert(ct);
             }
         }
     }
@@ -312,17 +340,28 @@ pub fn classify_device(ua: &str) -> &'static str {
     "desktop"
 }
 
-/// Extract the three tracked UTM attribution parameters from a raw
+/// Parsed UTM attribution values from a raw query string. Any
+/// parameter absent or empty after trimming is returned as `None` so
+/// the caller can skip inserts into the bounded counters entirely.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct UtmParams {
+    pub source: Option<String>,
+    pub medium: Option<String>,
+    pub campaign: Option<String>,
+    pub term: Option<String>,
+    pub content: Option<String>,
+}
+
+/// Extract the five tracked UTM attribution parameters from a raw
 /// query string (without the leading `?`). Returns lowercased,
 /// length-capped values ready for insertion into the per-domain
-/// bounded counters. Any parameter absent or empty after trimming is
-/// returned as `None` so the caller can skip the insert entirely.
+/// bounded counters.
 ///
-/// Only `utm_source`, `utm_medium`, and `utm_campaign` are tracked —
-/// `utm_term` and `utm_content` are intentionally dropped because both
-/// are low-signal for aggregated dashboards and have unbounded
-/// real-world cardinality (ad-network term lists, dynamic content
-/// variants) that would defeat the bounded counter caps.
+/// Covers `utm_source`, `utm_medium`, `utm_campaign`, `utm_term`, and
+/// `utm_content`. term/content carry tighter downstream caps
+/// (`TOP_UTM_TERMS_N`, `TOP_UTM_CONTENTS_N`) because their value space
+/// is the most ad-hoc — this function merely extracts; cardinality
+/// containment happens at the bounded-counter layer.
 ///
 /// The parser is deliberately simple — no percent-decoding, no
 /// fragment handling, no repeated-key semantics — because:
@@ -336,10 +375,8 @@ pub fn classify_device(ua: &str) -> &'static str {
 /// Values longer than [`UTM_VALUE_MAX_LEN`] are dropped (not
 /// truncated) so adversarial inputs cannot grow the counter value
 /// keys beyond the defensive cap.
-pub fn extract_utm_params(query: &str) -> (Option<String>, Option<String>, Option<String>) {
-    let mut source: Option<String> = None;
-    let mut medium: Option<String> = None;
-    let mut campaign: Option<String> = None;
+pub fn extract_utm_params(query: &str) -> UtmParams {
+    let mut out = UtmParams::default();
 
     for pair in query.split('&') {
         if pair.is_empty() {
@@ -348,16 +385,20 @@ pub fn extract_utm_params(query: &str) -> (Option<String>, Option<String>, Optio
         let Some((raw_key, raw_val)) = pair.split_once('=') else {
             continue;
         };
-        // Only three keys matter; reject anything else without
+        // Only the five UTM keys matter; reject anything else without
         // allocating a new String. Case-insensitive key comparison
         // because campaign tools produce both `UTM_SOURCE` and
         // `utm_source` in the wild.
         let slot = if raw_key.eq_ignore_ascii_case("utm_source") {
-            &mut source
+            &mut out.source
         } else if raw_key.eq_ignore_ascii_case("utm_medium") {
-            &mut medium
+            &mut out.medium
         } else if raw_key.eq_ignore_ascii_case("utm_campaign") {
-            &mut campaign
+            &mut out.campaign
+        } else if raw_key.eq_ignore_ascii_case("utm_term") {
+            &mut out.term
+        } else if raw_key.eq_ignore_ascii_case("utm_content") {
+            &mut out.content
         } else {
             continue;
         };
@@ -370,7 +411,7 @@ pub fn extract_utm_params(query: &str) -> (Option<String>, Option<String>, Optio
         *slot = Some(trimmed.to_lowercase());
     }
 
-    (source, medium, campaign)
+    out
 }
 
 /// Extract domain from a URL (e.g., `https://google.com/search` → `google.com`).
@@ -596,10 +637,11 @@ mod tests {
 
     /// Table-driven UTM extraction coverage. Each row exercises one
     /// axis of the parser (happy path, case folding, missing params,
-    /// malformed syntax, length cap, repeated keys, low-signal keys we
-    /// deliberately drop) so a regression in any single branch fails
-    /// its own row loudly.
+    /// malformed syntax, length cap, repeated keys, term/content
+    /// coverage) so a regression in any single branch fails its own
+    /// row loudly.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn extract_utm_params_table_driven() {
         struct Case {
             name: &'static str,
@@ -607,28 +649,37 @@ mod tests {
             want_source: Option<&'static str>,
             want_medium: Option<&'static str>,
             want_campaign: Option<&'static str>,
+            want_term: Option<&'static str>,
+            want_content: Option<&'static str>,
         }
         let cases = [
             Case {
-                name: "all three present",
-                query: "utm_source=google&utm_medium=cpc&utm_campaign=spring_launch",
+                name: "all five present",
+                query: "utm_source=google&utm_medium=cpc&utm_campaign=spring_launch\
+                        &utm_term=running_shoes&utm_content=hero_blue",
                 want_source: Some("google"),
                 want_medium: Some("cpc"),
                 want_campaign: Some("spring_launch"),
+                want_term: Some("running_shoes"),
+                want_content: Some("hero_blue"),
             },
             Case {
                 name: "case folded values merge",
-                query: "utm_source=Google&utm_medium=EMAIL",
+                query: "utm_source=Google&utm_medium=EMAIL&utm_term=RUNNING&utm_content=HERO",
                 want_source: Some("google"),
                 want_medium: Some("email"),
                 want_campaign: None,
+                want_term: Some("running"),
+                want_content: Some("hero"),
             },
             Case {
-                name: "case insensitive keys",
-                query: "UTM_SOURCE=twitter&Utm_Medium=social",
-                want_source: Some("twitter"),
-                want_medium: Some("social"),
+                name: "case insensitive keys for term and content",
+                query: "UTM_TERM=shoes&Utm_Content=Variant_A",
+                want_source: None,
+                want_medium: None,
                 want_campaign: None,
+                want_term: Some("shoes"),
+                want_content: Some("variant_a"),
             },
             Case {
                 name: "missing utm entirely",
@@ -636,6 +687,8 @@ mod tests {
                 want_source: None,
                 want_medium: None,
                 want_campaign: None,
+                want_term: None,
+                want_content: None,
             },
             Case {
                 name: "empty query",
@@ -643,56 +696,80 @@ mod tests {
                 want_source: None,
                 want_medium: None,
                 want_campaign: None,
+                want_term: None,
+                want_content: None,
             },
             Case {
                 name: "malformed pairs ignored",
-                query: "utm_source=reddit&brokenpair&utm_campaign=winter",
+                query: "utm_source=reddit&brokenpair&utm_campaign=winter&utm_term=brand",
                 want_source: Some("reddit"),
                 want_medium: None,
                 want_campaign: Some("winter"),
+                want_term: Some("brand"),
+                want_content: None,
             },
             Case {
-                name: "empty value dropped",
-                query: "utm_source=&utm_campaign=  &utm_medium=email",
-                want_source: None,
-                want_medium: Some("email"),
+                name: "empty term and content dropped",
+                query: "utm_source=bing&utm_term=&utm_content=  &utm_medium=cpc",
+                want_source: Some("bing"),
+                want_medium: Some("cpc"),
                 want_campaign: None,
+                want_term: None,
+                want_content: None,
             },
             Case {
-                name: "utm_term and utm_content ignored",
+                name: "term and content captured alongside rest",
                 query: "utm_source=google&utm_term=shoes&utm_content=ad1",
                 want_source: Some("google"),
                 want_medium: None,
                 want_campaign: None,
+                want_term: Some("shoes"),
+                want_content: Some("ad1"),
             },
             Case {
-                name: "repeated key last wins",
-                query: "utm_source=a&utm_source=b",
-                want_source: Some("b"),
+                name: "repeated term last wins",
+                query: "utm_term=a&utm_term=b&utm_content=c&utm_content=d",
+                want_source: None,
                 want_medium: None,
                 want_campaign: None,
+                want_term: Some("b"),
+                want_content: Some("d"),
             },
         ];
         for c in cases {
-            let (s, m, cp) = extract_utm_params(c.query);
+            let got = extract_utm_params(c.query);
             assert_eq!(
-                s.as_deref(),
+                got.source.as_deref(),
                 c.want_source,
                 "{}: source mismatch for {:?}",
                 c.name,
                 c.query
             );
             assert_eq!(
-                m.as_deref(),
+                got.medium.as_deref(),
                 c.want_medium,
                 "{}: medium mismatch for {:?}",
                 c.name,
                 c.query
             );
             assert_eq!(
-                cp.as_deref(),
+                got.campaign.as_deref(),
                 c.want_campaign,
                 "{}: campaign mismatch for {:?}",
+                c.name,
+                c.query
+            );
+            assert_eq!(
+                got.term.as_deref(),
+                c.want_term,
+                "{}: term mismatch for {:?}",
+                c.name,
+                c.query
+            );
+            assert_eq!(
+                got.content.as_deref(),
+                c.want_content,
+                "{}: content mismatch for {:?}",
                 c.name,
                 c.query
             );
@@ -701,14 +778,16 @@ mod tests {
 
     #[test]
     fn extract_utm_params_drops_oversized_values() {
-        // Adversarial ballast: source value exceeds UTM_VALUE_MAX_LEN so
-        // the key survives the parse but the value is dropped to keep
-        // the bounded counter's key-space small.
+        // Adversarial ballast: term and content values exceed
+        // UTM_VALUE_MAX_LEN so the keys survive the parse but the
+        // values are dropped to keep the bounded counter's key-space
+        // small. Source stays populated as a control.
         let huge = "x".repeat(UTM_VALUE_MAX_LEN + 1);
-        let q = format!("utm_source={huge}&utm_medium=cpc");
-        let (source, medium, _) = extract_utm_params(&q);
-        assert!(source.is_none(), "oversized source must be dropped");
-        assert_eq!(medium.as_deref(), Some("cpc"));
+        let q = format!("utm_source=google&utm_term={huge}&utm_content={huge}");
+        let got = extract_utm_params(&q);
+        assert_eq!(got.source.as_deref(), Some("google"));
+        assert!(got.term.is_none(), "oversized term must be dropped");
+        assert!(got.content.is_none(), "oversized content must be dropped");
     }
 
     #[test]
@@ -717,7 +796,11 @@ mod tests {
         let event = AggEvent {
             host: "example.com".into(),
             path: "/landing".into(),
-            query: Some("utm_source=Google&utm_medium=cpc&utm_campaign=Spring_2026".into()),
+            query: Some(
+                "utm_source=Google&utm_medium=cpc&utm_campaign=Spring_2026\
+                 &utm_term=Running+Shoes&utm_content=Hero_Blue"
+                    .into(),
+            ),
             status: 200,
             bytes_sent: 512,
             client_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
@@ -730,6 +813,8 @@ mod tests {
         assert_eq!(dm.utm_sources.top()[0].0, "google");
         assert_eq!(dm.utm_mediums.top()[0].0, "cpc");
         assert_eq!(dm.utm_campaigns.top()[0].0, "spring_2026");
+        assert_eq!(dm.utm_terms.top()[0].0, "running+shoes");
+        assert_eq!(dm.utm_contents.top()[0].0, "hero_blue");
     }
 
     #[test]
@@ -751,5 +836,7 @@ mod tests {
         assert!(dm.utm_sources.is_empty());
         assert!(dm.utm_mediums.is_empty());
         assert!(dm.utm_campaigns.is_empty());
+        assert!(dm.utm_terms.is_empty());
+        assert!(dm.utm_contents.is_empty());
     }
 }
