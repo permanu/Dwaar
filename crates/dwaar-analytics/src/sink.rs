@@ -46,6 +46,19 @@ pub struct DomainMetricsSnapshot {
     /// in [`crate::aggregation::classify_device`]. Cardinality is
     /// bounded at the enum size so downstream emitters cannot explode.
     pub devices: Vec<(String, u64)>,
+    /// Top-N UTM source values (e.g. `google`, `newsletter`). Lowercased
+    /// at ingest; bounded at the counter cap so the agent cannot fan
+    /// out an unbounded label set to `VictoriaMetrics`.
+    pub utm_sources: Vec<(String, u64)>,
+    /// Top-N UTM medium values (e.g. `cpc`, `email`, `social`).
+    pub utm_mediums: Vec<(String, u64)>,
+    /// Top-N UTM campaign values (e.g. `spring-launch-2026`).
+    pub utm_campaigns: Vec<(String, u64)>,
+    /// HTTP status-class counts across the fixed 1xx..5xx enum, emitted
+    /// in order with zero counts included so downstream heatmaps do not
+    /// have to synthesize missing buckets. Sourced from the first five
+    /// indices of [`crate::aggregation::DomainMetrics::status_codes`].
+    pub status_classes: Vec<(String, u64)>,
     pub status_codes: [u64; 6],
     pub bytes_sent: u64,
     pub lcp: Percentiles,
@@ -65,6 +78,10 @@ impl DomainMetricsSnapshot {
             referrers: m.referrers.top(),
             countries: m.countries.top(),
             devices: m.devices.top(),
+            utm_sources: m.utm_sources.top(),
+            utm_mediums: m.utm_mediums.top(),
+            utm_campaigns: m.utm_campaigns.top(),
+            status_classes: crate::aggregation::status_class_snapshot(&m.status_codes),
             status_codes: m.status_codes,
             bytes_sent: m.bytes_sent,
             lcp: m.web_vitals.peek_lcp_percentiles(),
@@ -270,6 +287,7 @@ mod tests {
                 } else {
                     "/about".into()
                 },
+                query: None,
                 status: 200,
                 bytes_sent: 512,
                 client_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, i as u8 + 1)),
@@ -301,6 +319,83 @@ mod tests {
         let json = serde_json::to_string(&snap).expect("serialize");
         assert!(json.contains("\"domain\":\"test.example.com\""));
         assert!(json.contains("\"unique_visitors\":0"));
+    }
+
+    #[test]
+    fn snapshot_surfaces_utm_and_status_classes() {
+        use crate::aggregation::AggEvent;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        // Three requests so each status class is populated differently:
+        // 2xx x2, 4xx x1, 5xx x1. UTM comes in on the first event only so
+        // source/medium/campaign appear once each after ingest.
+        let mut dm = DomainMetrics::new();
+        let events = [
+            (
+                200,
+                Some("utm_source=Google&utm_medium=cpc&utm_campaign=Spring_2026"),
+            ),
+            (201, None),
+            (404, None),
+            (503, None),
+        ];
+        for (i, (status, query)) in events.into_iter().enumerate() {
+            dm.ingest_log(&AggEvent {
+                host: "test.example.com".into(),
+                path: "/".into(),
+                query: query.map(Into::into),
+                status,
+                bytes_sent: 100,
+                client_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, i as u8 + 1)),
+                country: None,
+                referer: None,
+                user_agent: None,
+                is_bot: false,
+            });
+        }
+
+        let snap = DomainMetricsSnapshot::from_metrics("test.example.com", &dm);
+
+        // UTM fan-out: case-folded values each counted once.
+        let sources: std::collections::HashMap<_, _> = snap.utm_sources.iter().cloned().collect();
+        assert_eq!(sources.get("google").copied(), Some(1));
+        let mediums: std::collections::HashMap<_, _> = snap.utm_mediums.iter().cloned().collect();
+        assert_eq!(mediums.get("cpc").copied(), Some(1));
+        let campaigns: std::collections::HashMap<_, _> =
+            snap.utm_campaigns.iter().cloned().collect();
+        assert_eq!(campaigns.get("spring_2026").copied(), Some(1));
+
+        // Status classes: always all 5 labels present, in order.
+        assert_eq!(snap.status_classes.len(), 5);
+        let classes: std::collections::HashMap<_, _> =
+            snap.status_classes.iter().cloned().collect();
+        assert_eq!(classes.get("1xx").copied(), Some(0));
+        assert_eq!(classes.get("2xx").copied(), Some(2));
+        assert_eq!(classes.get("3xx").copied(), Some(0));
+        assert_eq!(classes.get("4xx").copied(), Some(1));
+        assert_eq!(classes.get("5xx").copied(), Some(1));
+        // Order is stable 1xx..5xx so downstream heatmaps can rely on it.
+        let labels: Vec<_> = snap
+            .status_classes
+            .iter()
+            .map(|(l, _)| l.as_str())
+            .collect();
+        assert_eq!(labels, vec!["1xx", "2xx", "3xx", "4xx", "5xx"]);
+    }
+
+    #[test]
+    fn empty_metrics_emit_zero_status_classes() {
+        // Status classes must always surface, even when no requests
+        // landed yet, so the agent can propagate a zero baseline to
+        // VictoriaMetrics the moment a new domain appears.
+        let snap = test_snapshot();
+        assert_eq!(snap.status_classes.len(), 5);
+        for (_, count) in &snap.status_classes {
+            assert_eq!(*count, 0);
+        }
+        assert!(snap.utm_sources.is_empty());
+        assert!(snap.utm_mediums.is_empty());
+        assert!(snap.utm_campaigns.is_empty());
     }
 
     #[test]

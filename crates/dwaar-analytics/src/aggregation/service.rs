@@ -247,6 +247,15 @@ struct FlushSnapshot {
     /// [`crate::sink::DomainMetricsSnapshot::devices`] — same data,
     /// different wire format (stdout-legacy JSON vs socket sink).
     devices: Vec<DeviceCount>,
+    /// Top-N UTM source / medium / campaign counters. Mirrors the socket
+    /// sink so consumers tailing the stdout legacy path see the same
+    /// attribution numbers as the agent does. Lowercased at ingest.
+    utm_sources: Vec<UtmCount>,
+    utm_mediums: Vec<UtmCount>,
+    utm_campaigns: Vec<UtmCount>,
+    /// HTTP status classes (1xx..5xx) emitted in order with zero counts
+    /// included. Sibling of [`crate::sink::DomainMetricsSnapshot::status_classes`].
+    status_classes: Vec<StatusClassCount>,
     status_codes: StatusCodes,
     bytes_sent: u64,
     web_vitals: VitalsSnapshot,
@@ -273,6 +282,23 @@ struct CountryCount {
 #[derive(Debug, Serialize)]
 struct DeviceCount {
     device: String,
+    count: u64,
+}
+
+/// One UTM attribution entry for the stdout-legacy flush. Field name
+/// is deliberately generic (`value`) so a single struct handles
+/// `utm_source`, `utm_medium`, and `utm_campaign` without three
+/// near-identical types; the owning field on `FlushSnapshot` carries
+/// the dimension.
+#[derive(Debug, Serialize)]
+struct UtmCount {
+    value: String,
+    count: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct StatusClassCount {
+    class: String,
     count: u64,
 }
 
@@ -339,6 +365,28 @@ impl FlushSnapshot {
                 .into_iter()
                 .map(|(device, count)| DeviceCount { device, count })
                 .collect(),
+            utm_sources: m
+                .utm_sources
+                .top()
+                .into_iter()
+                .map(|(value, count)| UtmCount { value, count })
+                .collect(),
+            utm_mediums: m
+                .utm_mediums
+                .top()
+                .into_iter()
+                .map(|(value, count)| UtmCount { value, count })
+                .collect(),
+            utm_campaigns: m
+                .utm_campaigns
+                .top()
+                .into_iter()
+                .map(|(value, count)| UtmCount { value, count })
+                .collect(),
+            status_classes: super::status_class_snapshot(&m.status_codes)
+                .into_iter()
+                .map(|(class, count)| StatusClassCount { class, count })
+                .collect(),
             status_codes: StatusCodes {
                 s1xx: m.status_codes[0],
                 s2xx: m.status_codes[1],
@@ -378,6 +426,7 @@ mod tests {
         AggEvent {
             host: host.into(),
             path: path.into(),
+            query: None,
             status,
             bytes_sent: 1024,
             client_ip: std::net::IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),

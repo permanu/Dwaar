@@ -48,6 +48,24 @@ pub struct StatusCodeBreakdown {
     pub other: u64,
 }
 
+/// HTTP status-class count entry for the Admin API. Always emitted in
+/// order 1xx..5xx with zero counts included so frontend heatmaps can
+/// key on a stable label set.
+#[derive(Debug, Serialize)]
+pub struct StatusClassEntry {
+    pub class: String,
+    pub count: u64,
+}
+
+/// One UTM attribution entry for the Admin API. A single struct covers
+/// `utm_source`, `utm_medium`, and `utm_campaign` — the owning field
+/// on [`AnalyticsSnapshot`] carries the dimension.
+#[derive(Debug, Serialize)]
+pub struct UtmEntry {
+    pub value: String,
+    pub count: u64,
+}
+
 /// Percentile snapshot for LCP, CLS, and INP Web Vitals.
 ///
 /// Read via `peek_*_percentiles` — intentionally does not flush the
@@ -86,6 +104,16 @@ pub struct AnalyticsSnapshot {
     pub referrers: Vec<ReferrerEntry>,
     pub countries: Vec<CountryEntry>,
     pub status_codes: StatusCodeBreakdown,
+    /// HTTP status classes 1xx..5xx in order with zero counts included.
+    /// Sibling of `status_codes` but shaped for dashboards that want a
+    /// stable label enumeration rather than a struct of fields.
+    pub status_classes: Vec<StatusClassEntry>,
+    /// Top-N UTM attribution counters. Lowercased and length-capped at
+    /// ingest; bounded at 50/20/50 respectively so the Admin API
+    /// response stays small regardless of traffic.
+    pub utm_sources: Vec<UtmEntry>,
+    pub utm_mediums: Vec<UtmEntry>,
+    pub utm_campaigns: Vec<UtmEntry>,
     pub bytes_sent: u64,
     pub web_vitals: VitalsSnapshot,
     /// Bot vs human pageview split. Cumulative since the last 60s
@@ -139,6 +167,28 @@ impl AnalyticsSnapshot {
             s5xx: sc[4],
             other: sc[5],
         };
+        let status_classes = crate::aggregation::status_class_snapshot(sc)
+            .into_iter()
+            .map(|(class, count)| StatusClassEntry { class, count })
+            .collect();
+        let utm_sources = m
+            .utm_sources
+            .top()
+            .into_iter()
+            .map(|(value, count)| UtmEntry { value, count })
+            .collect();
+        let utm_mediums = m
+            .utm_mediums
+            .top()
+            .into_iter()
+            .map(|(value, count)| UtmEntry { value, count })
+            .collect();
+        let utm_campaigns = m
+            .utm_campaigns
+            .top()
+            .into_iter()
+            .map(|(value, count)| UtmEntry { value, count })
+            .collect();
 
         let web_vitals = VitalsSnapshot {
             lcp: m.web_vitals.peek_lcp_percentiles(),
@@ -162,6 +212,10 @@ impl AnalyticsSnapshot {
             referrers,
             countries,
             status_codes,
+            status_classes,
+            utm_sources,
+            utm_mediums,
+            utm_campaigns,
             bytes_sent: m.bytes_sent,
             web_vitals,
             bot_views: m.bot_views,
@@ -183,6 +237,7 @@ mod tests {
         AggEvent {
             host: "test.example.com".into(),
             path: path.into(),
+            query: None,
             status,
             bytes_sent: 1024,
             client_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),

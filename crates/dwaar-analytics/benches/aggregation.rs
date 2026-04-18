@@ -34,6 +34,21 @@ fn sample_event(i: u32) -> AggEvent {
     AggEvent {
         host: "example.com".into(),
         path: format!("/page/{}", i % 500).into(),
+        // Every 4th event carries a UTM query so the benchmark measures
+        // the cost of the UTM extraction path end-to-end, not just the
+        // no-query fast exit.
+        query: if i.is_multiple_of(4) {
+            Some(
+                format!(
+                    "utm_source=src{}&utm_medium=cpc&utm_campaign=campaign{}",
+                    i % 10,
+                    i % 7
+                )
+                .into(),
+            )
+        } else {
+            None
+        },
         status: if i.is_multiple_of(20) { 404 } else { 200 },
         bytes_sent: 1024 + u64::from(i % 10_000),
         client_ip: IpAddr::V4(Ipv4Addr::from(i)),

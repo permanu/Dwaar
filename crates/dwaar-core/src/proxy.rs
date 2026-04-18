@@ -2296,9 +2296,13 @@ impl ProxyHttp for DwaarProxy {
         if let Some(ref agg) = self.agg_sender {
             // AggEvent fields are Arc<str>: construction pays one Arc alloc per field,
             // but subsequent clones (at the batch boundary) are pointer bumps only.
+            // `query` is cloned (not moved) because `RequestLog` below still
+            // needs the original — the aggregator reads only the UTM
+            // parameters from it and never retains the raw string.
             let event = AggEvent {
                 host: Arc::from(host.as_str()),
                 path: Arc::from(path.as_str()),
+                query: query.as_deref().map(Arc::from),
                 status,
                 bytes_sent,
                 client_ip,

@@ -37,6 +37,12 @@ const CHANNEL_CAPACITY: usize = 8192;
 pub struct AggEvent {
     pub host: Arc<str>,
     pub path: Arc<str>,
+    /// Raw request query string (without the leading `?`), if present.
+    /// Used by [`DomainMetrics::ingest_log`] to extract marketing-attribution
+    /// UTM parameters via [`extract_utm_params`] and nothing else — the
+    /// raw query is never persisted to any aggregate. `None` when the
+    /// request carried no query string.
+    pub query: Option<Arc<str>>,
     pub status: u16,
     pub bytes_sent: u64,
     pub client_ip: IpAddr,
@@ -61,6 +67,26 @@ const TOP_COUNTRIES_N: usize = 250;
 /// cardinality can never exceed the number of buckets even if a new
 /// classifier branch is added.
 const DEVICE_BUCKETS: usize = 5;
+/// UTM top-N caps. Source/campaign cardinality is higher than medium
+/// (medium is typically one of a dozen conventional values like
+/// `cpc|email|social|organic`), so we size the bounded counters to
+/// match observed real-world attribution shapes while still preventing
+/// unbounded label growth under adversarial input.
+const TOP_UTM_SOURCES_N: usize = 50;
+const TOP_UTM_MEDIUMS_N: usize = 20;
+const TOP_UTM_CAMPAIGNS_N: usize = 50;
+/// Per-UTM-value length cap to defend against adversarial ballast values
+/// designed to blow up the bounded counter's memory footprint. Longer
+/// than any legitimate campaign slug but short enough that 150
+/// (sources+campaigns combined) * 128 bytes = 19 KiB worst case.
+const UTM_VALUE_MAX_LEN: usize = 128;
+/// Fixed HTTP status class enum (1xx, 2xx, 3xx, 4xx, 5xx) — always
+/// emitted in order with zero counts included so downstream dashboards
+/// can render heatmaps without having to synthesize missing buckets.
+/// Matches the first five indices of [`DomainMetrics::status_codes`]
+/// (the sixth `other` bucket is never surfaced as a class — it is a
+/// catch-all for out-of-range codes, reported via `status_codes`).
+const STATUS_CLASS_LABELS: [&str; 5] = ["1xx", "2xx", "3xx", "4xx", "5xx"];
 
 /// Per-domain analytics aggregates.
 ///
@@ -78,6 +104,22 @@ pub struct DomainMetrics {
     /// cover the classifier output so the bounded counter can never
     /// exceed its capacity regardless of traffic.
     pub devices: BoundedCounter<String>,
+    /// UTM source counter (e.g. `google`, `newsletter`, `twitter`).
+    /// Top-N sampled to prevent unbounded label growth from campaigns
+    /// in the wild; the cap is set so the typical long tail of organic
+    /// traffic sources is captured without becoming a `DoS` vector.
+    /// Values are case-folded to lowercase at insertion time so
+    /// `"Google"` and `"google"` merge.
+    pub utm_sources: BoundedCounter<String>,
+    /// UTM medium counter (e.g. `cpc`, `email`, `social`, `organic`).
+    /// Tighter bound than source/campaign because the value space is
+    /// conventionally small.
+    pub utm_mediums: BoundedCounter<String>,
+    /// UTM campaign counter (e.g. `spring-launch-2026`, `black-friday`).
+    /// Same cap as source; campaign values are typically marketing-team
+    /// controlled, but we bound anyway to defend against adversarial
+    /// ballast traffic.
+    pub utm_campaigns: BoundedCounter<String>,
     pub status_codes: [u64; 6],
     pub bytes_sent: u64,
     pub web_vitals: WebVitals,
@@ -98,6 +140,9 @@ impl DomainMetrics {
             referrers: BoundedCounter::new(TOP_REFERRERS_N),
             countries: BoundedCounter::new(TOP_COUNTRIES_N),
             devices: BoundedCounter::new(DEVICE_BUCKETS),
+            utm_sources: BoundedCounter::new(TOP_UTM_SOURCES_N),
+            utm_mediums: BoundedCounter::new(TOP_UTM_MEDIUMS_N),
+            utm_campaigns: BoundedCounter::new(TOP_UTM_CAMPAIGNS_N),
             status_codes: [0; 6],
             bytes_sent: 0,
             web_vitals: WebVitals::new(),
@@ -141,6 +186,25 @@ impl DomainMetrics {
             None => "unknown",
         };
         self.devices.insert(device.to_string());
+
+        // Marketing-attribution UTM parameters — `utm_source`,
+        // `utm_medium`, `utm_campaign` only. `utm_term` and `utm_content`
+        // are intentionally skipped: both are low-signal for aggregated
+        // dashboards and high-cardinality (ad-network term lists explode
+        // bounded-counter capacity). Each extracted value is lowercased
+        // at insertion so `Google` and `google` merge into one bucket.
+        if let Some(ref query) = event.query {
+            let (source, medium, campaign) = extract_utm_params(query);
+            if let Some(s) = source {
+                self.utm_sources.insert(s);
+            }
+            if let Some(m) = medium {
+                self.utm_mediums.insert(m);
+            }
+            if let Some(c) = campaign {
+                self.utm_campaigns.insert(c);
+            }
+        }
     }
 
     /// Update from a client-side beacon event.
@@ -190,6 +254,20 @@ impl Default for DomainMetrics {
     }
 }
 
+/// Emit the `[1xx, 2xx, 3xx, 4xx, 5xx]` status-class counts as a
+/// label-count pair vector, always in order, with zero counts included.
+/// Drops the sixth `other` bucket because downstream dashboards
+/// already treat out-of-range codes separately via the raw
+/// `status_codes` array — folding them into a class label would
+/// conflate RFC-valid status codes with malformed-response counts.
+pub fn status_class_snapshot(status_codes: &[u64; 6]) -> Vec<(String, u64)> {
+    STATUS_CLASS_LABELS
+        .iter()
+        .enumerate()
+        .map(|(i, label)| ((*label).to_string(), status_codes[i]))
+        .collect()
+}
+
 /// Map HTTP status code to bucket index: [1xx, 2xx, 3xx, 4xx, 5xx, other].
 pub fn status_bucket(status: u16) -> usize {
     match status {
@@ -232,6 +310,67 @@ pub fn classify_device(ua: &str) -> &'static str {
         return "mobile";
     }
     "desktop"
+}
+
+/// Extract the three tracked UTM attribution parameters from a raw
+/// query string (without the leading `?`). Returns lowercased,
+/// length-capped values ready for insertion into the per-domain
+/// bounded counters. Any parameter absent or empty after trimming is
+/// returned as `None` so the caller can skip the insert entirely.
+///
+/// Only `utm_source`, `utm_medium`, and `utm_campaign` are tracked —
+/// `utm_term` and `utm_content` are intentionally dropped because both
+/// are low-signal for aggregated dashboards and have unbounded
+/// real-world cardinality (ad-network term lists, dynamic content
+/// variants) that would defeat the bounded counter caps.
+///
+/// The parser is deliberately simple — no percent-decoding, no
+/// fragment handling, no repeated-key semantics — because:
+/// 1. UTM values in the wild are overwhelmingly ASCII slugs that
+///    need no decoding to stay unique.
+/// 2. Percent-decoding the raw query string would pull in the `url`
+///    crate, violating the no-new-deps constraint for this cut.
+/// 3. Repeated keys are handled last-wins, which matches the
+///    behavior of every major analytics platform.
+///
+/// Values longer than [`UTM_VALUE_MAX_LEN`] are dropped (not
+/// truncated) so adversarial inputs cannot grow the counter value
+/// keys beyond the defensive cap.
+pub fn extract_utm_params(query: &str) -> (Option<String>, Option<String>, Option<String>) {
+    let mut source: Option<String> = None;
+    let mut medium: Option<String> = None;
+    let mut campaign: Option<String> = None;
+
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let Some((raw_key, raw_val)) = pair.split_once('=') else {
+            continue;
+        };
+        // Only three keys matter; reject anything else without
+        // allocating a new String. Case-insensitive key comparison
+        // because campaign tools produce both `UTM_SOURCE` and
+        // `utm_source` in the wild.
+        let slot = if raw_key.eq_ignore_ascii_case("utm_source") {
+            &mut source
+        } else if raw_key.eq_ignore_ascii_case("utm_medium") {
+            &mut medium
+        } else if raw_key.eq_ignore_ascii_case("utm_campaign") {
+            &mut campaign
+        } else {
+            continue;
+        };
+
+        let trimmed = raw_val.trim();
+        if trimmed.is_empty() || trimmed.len() > UTM_VALUE_MAX_LEN {
+            continue;
+        }
+        // Last-wins semantics: `?utm_source=a&utm_source=b` → `b`.
+        *slot = Some(trimmed.to_lowercase());
+    }
+
+    (source, medium, campaign)
 }
 
 /// Extract domain from a URL (e.g., `https://google.com/search` → `google.com`).
@@ -310,6 +449,7 @@ mod tests {
         let dummy = AggEvent {
             host: "test.com".into(),
             path: "/".into(),
+            query: None,
             status: 200,
             bytes_sent: 0,
             client_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -363,6 +503,7 @@ mod tests {
         let event = AggEvent {
             host: "example.com".into(),
             path: "/home".into(),
+            query: None,
             status: 200,
             bytes_sent: 1024,
             client_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
@@ -440,6 +581,7 @@ mod tests {
         let event = AggEvent {
             host: "example.com".into(),
             path: "/".into(),
+            query: None,
             status: 200,
             bytes_sent: 128,
             client_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
@@ -450,5 +592,164 @@ mod tests {
         };
         dm.ingest_log(&event);
         assert_eq!(dm.devices.top()[0].0, "unknown");
+    }
+
+    /// Table-driven UTM extraction coverage. Each row exercises one
+    /// axis of the parser (happy path, case folding, missing params,
+    /// malformed syntax, length cap, repeated keys, low-signal keys we
+    /// deliberately drop) so a regression in any single branch fails
+    /// its own row loudly.
+    #[test]
+    fn extract_utm_params_table_driven() {
+        struct Case {
+            name: &'static str,
+            query: &'static str,
+            want_source: Option<&'static str>,
+            want_medium: Option<&'static str>,
+            want_campaign: Option<&'static str>,
+        }
+        let cases = [
+            Case {
+                name: "all three present",
+                query: "utm_source=google&utm_medium=cpc&utm_campaign=spring_launch",
+                want_source: Some("google"),
+                want_medium: Some("cpc"),
+                want_campaign: Some("spring_launch"),
+            },
+            Case {
+                name: "case folded values merge",
+                query: "utm_source=Google&utm_medium=EMAIL",
+                want_source: Some("google"),
+                want_medium: Some("email"),
+                want_campaign: None,
+            },
+            Case {
+                name: "case insensitive keys",
+                query: "UTM_SOURCE=twitter&Utm_Medium=social",
+                want_source: Some("twitter"),
+                want_medium: Some("social"),
+                want_campaign: None,
+            },
+            Case {
+                name: "missing utm entirely",
+                query: "q=foo&page=2",
+                want_source: None,
+                want_medium: None,
+                want_campaign: None,
+            },
+            Case {
+                name: "empty query",
+                query: "",
+                want_source: None,
+                want_medium: None,
+                want_campaign: None,
+            },
+            Case {
+                name: "malformed pairs ignored",
+                query: "utm_source=reddit&brokenpair&utm_campaign=winter",
+                want_source: Some("reddit"),
+                want_medium: None,
+                want_campaign: Some("winter"),
+            },
+            Case {
+                name: "empty value dropped",
+                query: "utm_source=&utm_campaign=  &utm_medium=email",
+                want_source: None,
+                want_medium: Some("email"),
+                want_campaign: None,
+            },
+            Case {
+                name: "utm_term and utm_content ignored",
+                query: "utm_source=google&utm_term=shoes&utm_content=ad1",
+                want_source: Some("google"),
+                want_medium: None,
+                want_campaign: None,
+            },
+            Case {
+                name: "repeated key last wins",
+                query: "utm_source=a&utm_source=b",
+                want_source: Some("b"),
+                want_medium: None,
+                want_campaign: None,
+            },
+        ];
+        for c in cases {
+            let (s, m, cp) = extract_utm_params(c.query);
+            assert_eq!(
+                s.as_deref(),
+                c.want_source,
+                "{}: source mismatch for {:?}",
+                c.name,
+                c.query
+            );
+            assert_eq!(
+                m.as_deref(),
+                c.want_medium,
+                "{}: medium mismatch for {:?}",
+                c.name,
+                c.query
+            );
+            assert_eq!(
+                cp.as_deref(),
+                c.want_campaign,
+                "{}: campaign mismatch for {:?}",
+                c.name,
+                c.query
+            );
+        }
+    }
+
+    #[test]
+    fn extract_utm_params_drops_oversized_values() {
+        // Adversarial ballast: source value exceeds UTM_VALUE_MAX_LEN so
+        // the key survives the parse but the value is dropped to keep
+        // the bounded counter's key-space small.
+        let huge = "x".repeat(UTM_VALUE_MAX_LEN + 1);
+        let q = format!("utm_source={huge}&utm_medium=cpc");
+        let (source, medium, _) = extract_utm_params(&q);
+        assert!(source.is_none(), "oversized source must be dropped");
+        assert_eq!(medium.as_deref(), Some("cpc"));
+    }
+
+    #[test]
+    fn ingest_log_extracts_utm_into_bounded_counters() {
+        let mut dm = DomainMetrics::new();
+        let event = AggEvent {
+            host: "example.com".into(),
+            path: "/landing".into(),
+            query: Some("utm_source=Google&utm_medium=cpc&utm_campaign=Spring_2026".into()),
+            status: 200,
+            bytes_sent: 512,
+            client_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            country: None,
+            referer: None,
+            user_agent: None,
+            is_bot: false,
+        };
+        dm.ingest_log(&event);
+        assert_eq!(dm.utm_sources.top()[0].0, "google");
+        assert_eq!(dm.utm_mediums.top()[0].0, "cpc");
+        assert_eq!(dm.utm_campaigns.top()[0].0, "spring_2026");
+    }
+
+    #[test]
+    fn ingest_log_without_query_leaves_utm_counters_empty() {
+        let mut dm = DomainMetrics::new();
+        let event = AggEvent {
+            host: "example.com".into(),
+            path: "/".into(),
+            query: None,
+            status: 200,
+            bytes_sent: 0,
+            client_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)),
+            country: None,
+            referer: None,
+            user_agent: None,
+            is_bot: false,
+        };
+        dm.ingest_log(&event);
+        assert!(dm.utm_sources.is_empty());
+        assert!(dm.utm_mediums.is_empty());
+        assert!(dm.utm_campaigns.is_empty());
     }
 }
