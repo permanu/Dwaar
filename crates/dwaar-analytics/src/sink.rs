@@ -463,12 +463,14 @@ mod tests {
             .collect();
         assert_eq!(
             labels,
-            vec!["10", "50", "100", "250", "500", "1000", "2500", "5000", "10000", "+Inf"]
+            vec![
+                "10", "50", "100", "250", "500", "1000", "2500", "5000", "10000", "+Inf"
+            ]
         );
         let counts: std::collections::HashMap<_, _> =
             snap.response_latency_buckets.iter().cloned().collect();
-        assert_eq!(counts.get("10").copied(), Some(1));   // 5 ms
-        assert_eq!(counts.get("100").copied(), Some(1));  // 80 ms
+        assert_eq!(counts.get("10").copied(), Some(1)); // 5 ms
+        assert_eq!(counts.get("100").copied(), Some(1)); // 80 ms
         assert_eq!(counts.get("5000").copied(), Some(1)); // 3 s
         assert_eq!(counts.get("+Inf").copied(), Some(0));
     }

@@ -9,15 +9,15 @@
 //! Each request's server-observed response time lands in one of ten
 //! cumulative buckets (edges in milliseconds). The bucket edges are
 //! deliberately static — the same ten labels emit across every flush
-//! so the downstream heatmap keys on a stable axis and VictoriaMetrics
+//! so the downstream heatmap keys on a stable axis and `VictoriaMetrics`
 //! cardinality is bounded at `10 × domains` regardless of traffic.
 //!
-//! # Why fixed edges, not a TDigest
+//! # Why fixed edges, not a `TDigest`
 //!
-//! [`crate::aggregation::web_vitals::WebVitals`] already uses TDigest
+//! [`crate::aggregation::web_vitals::WebVitals`] already uses `TDigest`
 //! for LCP/CLS/INP because those feeds only care about p75. Request
 //! latency additionally needs a heatmap-friendly shape (distribution
-//! over time), and TDigest percentiles don't serialise cleanly into
+//! over time), and `TDigest` percentiles don't serialise cleanly into
 //! heatmap-cell buckets. A fixed histogram keeps the wire format
 //! compact (ten `(le, count)` pairs) and lets the frontend render
 //! the heatmap with no additional bucketing work.
@@ -149,21 +149,66 @@ mod tests {
             expected_bucket: usize,
         }
         let cases = [
-            Case { latency_ms: 0, expected_bucket: 0 },     // sub-10ms
-            Case { latency_ms: 5, expected_bucket: 0 },     // sub-10ms
-            Case { latency_ms: 10, expected_bucket: 0 },    // = 10ms edge → first bucket
-            Case { latency_ms: 11, expected_bucket: 1 },    // 10–50ms
-            Case { latency_ms: 50, expected_bucket: 1 },    // = 50ms edge
-            Case { latency_ms: 99, expected_bucket: 2 },    // 50–100ms
-            Case { latency_ms: 200, expected_bucket: 3 },   // 100–250ms
-            Case { latency_ms: 400, expected_bucket: 4 },   // 250–500ms
-            Case { latency_ms: 999, expected_bucket: 5 },   // 500–1000ms
-            Case { latency_ms: 1500, expected_bucket: 6 },  // 1000–2500ms
-            Case { latency_ms: 4000, expected_bucket: 7 },  // 2500–5000ms
-            Case { latency_ms: 7500, expected_bucket: 8 },  // 5000–10000ms
-            Case { latency_ms: 10_000, expected_bucket: 8 }, // = 10 s edge
-            Case { latency_ms: 15_000, expected_bucket: 9 }, // +Inf
-            Case { latency_ms: u64::MAX, expected_bucket: 9 }, // +Inf
+            Case {
+                latency_ms: 0,
+                expected_bucket: 0,
+            }, // sub-10ms
+            Case {
+                latency_ms: 5,
+                expected_bucket: 0,
+            }, // sub-10ms
+            Case {
+                latency_ms: 10,
+                expected_bucket: 0,
+            }, // = 10ms edge → first bucket
+            Case {
+                latency_ms: 11,
+                expected_bucket: 1,
+            }, // 10–50ms
+            Case {
+                latency_ms: 50,
+                expected_bucket: 1,
+            }, // = 50ms edge
+            Case {
+                latency_ms: 99,
+                expected_bucket: 2,
+            }, // 50–100ms
+            Case {
+                latency_ms: 200,
+                expected_bucket: 3,
+            }, // 100–250ms
+            Case {
+                latency_ms: 400,
+                expected_bucket: 4,
+            }, // 250–500ms
+            Case {
+                latency_ms: 999,
+                expected_bucket: 5,
+            }, // 500–1000ms
+            Case {
+                latency_ms: 1500,
+                expected_bucket: 6,
+            }, // 1000–2500ms
+            Case {
+                latency_ms: 4000,
+                expected_bucket: 7,
+            }, // 2500–5000ms
+            Case {
+                latency_ms: 7500,
+                expected_bucket: 8,
+            }, // 5000–10000ms
+            Case {
+                latency_ms: 10_000,
+                expected_bucket: 8,
+            }, // = 10 s edge
+            Case {
+                latency_ms: 15_000,
+                expected_bucket: 9,
+            }, // +Inf
+            Case {
+                latency_ms: u64::MAX,
+                expected_bucket: 9,
+            }, // +Inf
         ];
         for c in cases {
             let mut h = BucketHistogram::new();
@@ -194,7 +239,9 @@ mod tests {
         let labels: Vec<_> = snap.iter().map(|(l, _)| l.as_str()).collect();
         assert_eq!(
             labels,
-            vec!["10", "50", "100", "250", "500", "1000", "2500", "5000", "10000", "+Inf"]
+            vec![
+                "10", "50", "100", "250", "500", "1000", "2500", "5000", "10000", "+Inf"
+            ]
         );
 
         // Counts follow the label order.

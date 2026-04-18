@@ -161,8 +161,7 @@ impl<RT: RouteValidator> AggregationService<RT> {
             // every flush would report a lifetime total while the status
             // counters next to it would show a window delta — operators
             // would read the two side-by-side and get conflicting stories.
-            metrics.response_latency_buckets =
-                super::latency_histogram::BucketHistogram::new();
+            metrics.response_latency_buckets = super::latency_histogram::BucketHistogram::new();
         }
         if let Err(e) = handle.flush() {
             warn!(error = %e, "failed to flush stdout");
