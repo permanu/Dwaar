@@ -66,6 +66,13 @@ pub struct DomainMetricsSnapshot {
     /// have to synthesize missing buckets. Sourced from the first five
     /// indices of [`crate::aggregation::DomainMetrics::status_codes`].
     pub status_classes: Vec<(String, u64)>,
+    /// Server-observed response-latency histogram across ten fixed
+    /// buckets (edges `[10, 50, 100, 250, 500, 1000, 2500, 5000, 10000,
+    /// +Inf]` milliseconds). Emitted as `(le_label, count)` pairs in
+    /// order with zero counts included so the downstream heatmap keys
+    /// on a stable axis. Cardinality is fixed at ten by construction —
+    /// see [`crate::aggregation::latency_histogram::BucketHistogram`].
+    pub response_latency_buckets: Vec<(String, u64)>,
     pub status_codes: [u64; 6],
     pub bytes_sent: u64,
     pub lcp: Percentiles,
@@ -91,6 +98,7 @@ impl DomainMetricsSnapshot {
             utm_terms: m.utm_terms.top(),
             utm_contents: m.utm_contents.top(),
             status_classes: crate::aggregation::status_class_snapshot(&m.status_codes),
+            response_latency_buckets: m.response_latency_buckets.snapshot(),
             status_codes: m.status_codes,
             bytes_sent: m.bytes_sent,
             lcp: m.web_vitals.peek_lcp_percentiles(),
@@ -304,6 +312,7 @@ mod tests {
                 referer: Some("https://news.ycombinator.com/".into()),
                 user_agent: Some((*ua).into()),
                 is_bot: false,
+                response_latency_us: 0,
             });
         }
 
@@ -363,6 +372,7 @@ mod tests {
                 referer: None,
                 user_agent: None,
                 is_bot: false,
+                response_latency_us: 0,
             });
         }
 
@@ -414,6 +424,62 @@ mod tests {
         assert!(snap.utm_campaigns.is_empty());
         assert!(snap.utm_terms.is_empty());
         assert!(snap.utm_contents.is_empty());
+    }
+
+    #[test]
+    fn snapshot_surfaces_response_latency_buckets() {
+        use crate::aggregation::AggEvent;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        // Ingest three observations spanning three buckets so the
+        // surfaced snapshot exposes the histogram shape end-to-end
+        // (not just that the field exists on the wire).
+        let mut dm = DomainMetrics::new();
+        let latencies_us = [5_000u64, 80_000, 3_000_000];
+        for (i, latency) in latencies_us.iter().enumerate() {
+            dm.ingest_log(&AggEvent {
+                host: "test.example.com".into(),
+                path: "/".into(),
+                query: None,
+                status: 200,
+                bytes_sent: 0,
+                client_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, i as u8 + 1)),
+                country: None,
+                referer: None,
+                user_agent: None,
+                is_bot: false,
+                response_latency_us: *latency,
+            });
+        }
+
+        let snap = DomainMetricsSnapshot::from_metrics("test.example.com", &dm);
+        // All ten buckets always present, in order, with zero counts
+        // included so the frontend heatmap renders a stable axis.
+        assert_eq!(snap.response_latency_buckets.len(), 10);
+        let labels: Vec<_> = snap
+            .response_latency_buckets
+            .iter()
+            .map(|(l, _)| l.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["10", "50", "100", "250", "500", "1000", "2500", "5000", "10000", "+Inf"]
+        );
+        let counts: std::collections::HashMap<_, _> =
+            snap.response_latency_buckets.iter().cloned().collect();
+        assert_eq!(counts.get("10").copied(), Some(1));   // 5 ms
+        assert_eq!(counts.get("100").copied(), Some(1));  // 80 ms
+        assert_eq!(counts.get("5000").copied(), Some(1)); // 3 s
+        assert_eq!(counts.get("+Inf").copied(), Some(0));
+    }
+
+    #[test]
+    fn empty_metrics_emit_zero_response_latency_buckets() {
+        let snap = test_snapshot();
+        assert_eq!(snap.response_latency_buckets.len(), 10);
+        for (_, count) in &snap.response_latency_buckets {
+            assert_eq!(*count, 0);
+        }
     }
 
     #[test]

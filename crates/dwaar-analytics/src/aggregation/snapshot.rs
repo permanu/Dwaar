@@ -67,6 +67,17 @@ pub struct UtmEntry {
     pub count: u64,
 }
 
+/// One response-latency histogram bucket entry for the Admin API. `le`
+/// is the bucket upper-bound label (`"10"` … `"10000"` or `"+Inf"`);
+/// `count` is the non-cumulative observation count that landed in
+/// `(previous_edge, le]`. Always emitted in order across all ten
+/// buckets so downstream heatmaps key on a stable axis.
+#[derive(Debug, Serialize)]
+pub struct LatencyBucketEntry {
+    pub le: String,
+    pub count: u64,
+}
+
 /// Percentile snapshot for LCP, CLS, and INP Web Vitals.
 ///
 /// Read via `peek_*_percentiles` — intentionally does not flush the
@@ -118,6 +129,14 @@ pub struct AnalyticsSnapshot {
     pub utm_campaigns: Vec<UtmEntry>,
     pub utm_terms: Vec<UtmEntry>,
     pub utm_contents: Vec<UtmEntry>,
+    /// Server-observed response-latency histogram across ten fixed
+    /// buckets (edges `[10, 50, 100, 250, 500, 1000, 2500, 5000, 10000,
+    /// +Inf]` milliseconds). Always emitted in order with zero counts
+    /// included so the Admin API heatmap renders a stable axis without
+    /// gap-filling. Cardinality is bounded at ten labels by
+    /// construction — see
+    /// [`crate::aggregation::latency_histogram::BucketHistogram`].
+    pub response_latency_buckets: Vec<LatencyBucketEntry>,
     pub bytes_sent: u64,
     pub web_vitals: VitalsSnapshot,
     /// Bot vs human pageview split. Cumulative since the last 60s
@@ -205,6 +224,12 @@ impl AnalyticsSnapshot {
             .into_iter()
             .map(|(value, count)| UtmEntry { value, count })
             .collect();
+        let response_latency_buckets = m
+            .response_latency_buckets
+            .snapshot()
+            .into_iter()
+            .map(|(le, count)| LatencyBucketEntry { le, count })
+            .collect();
 
         let web_vitals = VitalsSnapshot {
             lcp: m.web_vitals.peek_lcp_percentiles(),
@@ -234,6 +259,7 @@ impl AnalyticsSnapshot {
             utm_campaigns,
             utm_terms,
             utm_contents,
+            response_latency_buckets,
             bytes_sent: m.bytes_sent,
             web_vitals,
             bot_views: m.bot_views,
@@ -266,6 +292,7 @@ mod tests {
                     .into(),
             ),
             is_bot: false,
+            response_latency_us: 0,
         }
     }
 

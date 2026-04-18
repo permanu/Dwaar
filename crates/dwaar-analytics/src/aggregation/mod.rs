@@ -11,6 +11,7 @@
 //! consumes both channels and flushes snapshots every 60 seconds.
 
 pub mod bounded_counter;
+pub mod latency_histogram;
 pub mod minute_buckets;
 pub mod service;
 pub mod snapshot;
@@ -24,6 +25,7 @@ use tokio::sync::mpsc;
 use tracing::warn;
 
 use self::bounded_counter::BoundedCounter;
+use self::latency_histogram::BucketHistogram;
 use self::minute_buckets::MinuteBuckets;
 use self::top_k::TopK;
 use self::web_vitals::WebVitals;
@@ -58,6 +60,14 @@ pub struct AggEvent {
     /// propagated so the aggregation snapshot can surface bot-vs-human
     /// pageview ratios. Default `false` is treated as a human request.
     pub is_bot: bool,
+    /// Server-observed end-to-end response latency in microseconds,
+    /// measured from the start of request handling to the end of the
+    /// response body on the Pingora side. Used by
+    /// [`DomainMetrics::ingest_log`] to bucket the request into the
+    /// fixed [`latency_histogram::BucketHistogram`]. The microsecond
+    /// unit matches [`dwaar_log::RequestLog::response_time_us`] so the
+    /// proxy site can pass the same value into both without conversion.
+    pub response_latency_us: u64,
 }
 const TOP_PAGES_K: usize = 100;
 const TOP_REFERRERS_N: usize = 50;
@@ -148,6 +158,14 @@ pub struct DomainMetrics {
     /// separate time-windowed structure.
     pub bot_views: u64,
     pub human_views: u64,
+    /// Fixed ten-bucket histogram of server-observed response latency.
+    /// Edges: `[10, 50, 100, 250, 500, 1000, 2500, 5000, 10000, +Inf]`
+    /// (milliseconds). Cardinality is bounded at construction time so
+    /// the per-domain memory footprint is 80 B regardless of traffic.
+    /// Surfaced on every snapshot as `response_latency_buckets:
+    /// Vec<(le, count)>` — see [`latency_histogram::BucketHistogram`]
+    /// for the bucketing rationale.
+    pub response_latency_buckets: BucketHistogram,
 }
 
 impl DomainMetrics {
@@ -169,6 +187,7 @@ impl DomainMetrics {
             web_vitals: WebVitals::new(),
             bot_views: 0,
             human_views: 0,
+            response_latency_buckets: BucketHistogram::new(),
         }
     }
 
@@ -185,6 +204,13 @@ impl DomainMetrics {
         self.top_pages.insert(event.path.to_string());
         self.status_codes[status_bucket(event.status)] += 1;
         self.bytes_sent += event.bytes_sent;
+        // Convert microseconds (the unit carried on `AggEvent` and
+        // `RequestLog`) to milliseconds for the latency histogram.
+        // Integer division floors — sub-millisecond responses land in
+        // the `10` bucket alongside true sub-10ms observations, which
+        // matches the Prometheus convention for the smallest `le`.
+        self.response_latency_buckets
+            .record(event.response_latency_us / 1000);
         // Split bot vs human counters from the bot-detect classification.
         if event.is_bot {
             self.bot_views += 1;
@@ -498,6 +524,7 @@ mod tests {
             referer: None,
             user_agent: None,
             is_bot: false,
+            response_latency_us: 0,
         };
         // Should not panic — drops silently when full
         for _ in 0..10_000 {
@@ -554,6 +581,7 @@ mod tests {
                 "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Mobile/15E148".into(),
             ),
             is_bot: false,
+            response_latency_us: 0,
         };
         dm.ingest_log(&event);
 
@@ -630,6 +658,7 @@ mod tests {
             referer: None,
             user_agent: None,
             is_bot: false,
+            response_latency_us: 0,
         };
         dm.ingest_log(&event);
         assert_eq!(dm.devices.top()[0].0, "unknown");
@@ -808,6 +837,7 @@ mod tests {
             referer: None,
             user_agent: None,
             is_bot: false,
+            response_latency_us: 0,
         };
         dm.ingest_log(&event);
         assert_eq!(dm.utm_sources.top()[0].0, "google");
@@ -831,6 +861,7 @@ mod tests {
             referer: None,
             user_agent: None,
             is_bot: false,
+            response_latency_us: 0,
         };
         dm.ingest_log(&event);
         assert!(dm.utm_sources.is_empty());
@@ -838,5 +869,38 @@ mod tests {
         assert!(dm.utm_campaigns.is_empty());
         assert!(dm.utm_terms.is_empty());
         assert!(dm.utm_contents.is_empty());
+    }
+
+    #[test]
+    fn ingest_log_buckets_response_latency() {
+        // Three requests landing in three distinct latency buckets so
+        // we can assert the histogram surfaces the distribution end-to-end
+        // via `ingest_log` (the production path) rather than only via
+        // the unit tests on `BucketHistogram` in isolation.
+        let mut dm = DomainMetrics::new();
+        let latencies_us = [5_000u64, 80_000, 3_000_000]; // 5ms, 80ms, 3 s
+        for (i, latency) in latencies_us.iter().enumerate() {
+            dm.ingest_log(&AggEvent {
+                host: "example.com".into(),
+                path: "/api".into(),
+                query: None,
+                status: 200,
+                bytes_sent: 128,
+                client_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, i as u8 + 1)),
+                country: None,
+                referer: None,
+                user_agent: None,
+                is_bot: false,
+                response_latency_us: *latency,
+            });
+        }
+
+        // 5 ms → bucket 0 (le=10), 80 ms → bucket 2 (le=100),
+        // 3 s → bucket 7 (le=5000).
+        let counts = dm.response_latency_buckets.counts();
+        assert_eq!(counts[0], 1, "5ms observation in 10ms bucket");
+        assert_eq!(counts[2], 1, "80ms observation in 100ms bucket");
+        assert_eq!(counts[7], 1, "3s observation in 5000ms bucket");
+        assert_eq!(dm.response_latency_buckets.total(), 3);
     }
 }

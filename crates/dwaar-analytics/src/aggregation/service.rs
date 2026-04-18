@@ -155,6 +155,14 @@ impl<RT: RouteValidator> AggregationService<RT> {
             metrics.bytes_sent = 0;
             metrics.bot_views = 0;
             metrics.human_views = 0;
+            // Same per-window semantics as the other cumulative counters:
+            // the flush snapshot reports the delta for this window, so
+            // we zero the histogram after serialising it. Without this,
+            // every flush would report a lifetime total while the status
+            // counters next to it would show a window delta — operators
+            // would read the two side-by-side and get conflicting stories.
+            metrics.response_latency_buckets =
+                super::latency_histogram::BucketHistogram::new();
         }
         if let Err(e) = handle.flush() {
             warn!(error = %e, "failed to flush stdout");
@@ -260,6 +268,13 @@ struct FlushSnapshot {
     /// HTTP status classes (1xx..5xx) emitted in order with zero counts
     /// included. Sibling of [`crate::sink::DomainMetricsSnapshot::status_classes`].
     status_classes: Vec<StatusClassCount>,
+    /// Server-observed response-latency histogram across ten fixed
+    /// buckets (edges `[10, 50, 100, 250, 500, 1000, 2500, 5000, 10000,
+    /// +Inf]` milliseconds). Sibling of
+    /// [`crate::sink::DomainMetricsSnapshot::response_latency_buckets`]
+    /// — same data, different wire format (stdout-legacy JSON vs socket
+    /// sink). Always emitted in order with zero counts included.
+    response_latency_buckets: Vec<LatencyBucketCount>,
     status_codes: StatusCodes,
     bytes_sent: u64,
     web_vitals: VitalsSnapshot,
@@ -303,6 +318,16 @@ struct UtmCount {
 #[derive(Debug, Serialize)]
 struct StatusClassCount {
     class: String,
+    count: u64,
+}
+
+/// One response-latency histogram bucket entry for the stdout-legacy
+/// flush. `le` is the bucket upper-bound label (`"10"` … `"10000"` or
+/// `"+Inf"`). Structure mirrors the socket-sink wire format so
+/// consumers can parse both paths with the same shape.
+#[derive(Debug, Serialize)]
+struct LatencyBucketCount {
+    le: String,
     count: u64,
 }
 
@@ -403,6 +428,12 @@ impl FlushSnapshot {
                 .into_iter()
                 .map(|(class, count)| StatusClassCount { class, count })
                 .collect(),
+            response_latency_buckets: m
+                .response_latency_buckets
+                .snapshot()
+                .into_iter()
+                .map(|(le, count)| LatencyBucketCount { le, count })
+                .collect(),
             status_codes: StatusCodes {
                 s1xx: m.status_codes[0],
                 s2xx: m.status_codes[1],
@@ -453,6 +484,7 @@ mod tests {
                     .into(),
             ),
             is_bot: false,
+            response_latency_us: 0,
         }
     }
 
@@ -604,6 +636,51 @@ mod tests {
 
         shutdown_tx.send(true).expect("shutdown send");
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    #[test]
+    fn flush_resets_response_latency_buckets() {
+        // Per-window semantics: the flush snapshot reports the delta
+        // for this window, so the histogram must zero out after the
+        // flush just like status_codes and bytes_sent already do.
+        let domains: HashSet<String> = ["lat.test".into()].into();
+        let (_beacon_tx, beacon_rx) = mpsc::channel(1);
+        let (_log_tx, log_rx) = mpsc::channel(1);
+        let metrics = Arc::new(DashMap::new());
+        let svc = AggregationService::new(
+            Arc::clone(&metrics),
+            TestValidator(domains),
+            beacon_rx,
+            AggReceiver { rx: log_rx },
+        );
+
+        // Ingest two requests with distinct latencies so the histogram
+        // is populated before the flush.
+        let mut ev1 = test_event("lat.test", "/", 200);
+        ev1.response_latency_us = 25_000; // 25ms → bucket 1 (le=50)
+        svc.ingest_log(&ev1);
+        let mut ev2 = test_event("lat.test", "/", 200);
+        ev2.response_latency_us = 750_000; // 750ms → bucket 5 (le=1000)
+        svc.ingest_log(&ev2);
+
+        {
+            let entry = metrics.get("lat.test").expect("domain");
+            assert_eq!(entry.response_latency_buckets.total(), 2);
+        }
+
+        svc.flush();
+
+        {
+            let entry = metrics.get("lat.test").expect("domain");
+            assert_eq!(
+                entry.response_latency_buckets.total(),
+                0,
+                "flush must zero the histogram so next window reports a delta"
+            );
+            for count in entry.response_latency_buckets.counts() {
+                assert_eq!(*count, 0);
+            }
+        }
     }
 
     #[test]

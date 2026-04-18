@@ -303,6 +303,7 @@ mod tests {
             referer: None,
             user_agent: None,
             is_bot: false,
+            response_latency_us: 0,
         });
         map.insert("test.example.com".to_string(), dm);
         map
