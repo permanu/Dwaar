@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.6] - 2026-04-18
+
+### Added
+
+- **Response-latency bucket histogram** — on every request,
+  `DomainMetrics` now records the server-observed response latency in a
+  fixed ten-bucket histogram (`BucketHistogram`). Edges in milliseconds:
+  `[10, 50, 100, 250, 500, 1000, 2500, 5000, 10000, +Inf]`. Cardinality
+  is bounded at ten labels by construction, so downstream VictoriaMetrics
+  fan-out is capped at `10 × domains` regardless of traffic volume.
+- **`response_latency_buckets` on every analytics snapshot** — the
+  histogram surfaces on `DomainMetricsSnapshot` (socket sink),
+  `FlushSnapshot` (stdout-legacy), and `AnalyticsSnapshot` (Admin API)
+  in the same `(le_label, count)` shape so consumers can parse any of
+  the three paths with one decoder. Always emitted in order with zero
+  counts included — downstream heatmaps key on a stable label axis.
+- **Window-delta semantics** — the histogram is zeroed by `flush()`
+  after serialisation, matching the existing `status_codes` /
+  `bytes_sent` / bot-vs-human per-window reset discipline so operators
+  reading the flushed stream see deltas across windows rather than a
+  perpetually growing lifetime total.
+
+### Changed
+
+- `AggEvent` gains a `response_latency_us: u64` field so the proxy
+  hot-path can propagate the already-measured `response_time_us` into
+  the analytics aggregator without duplicating the clock read. The
+  microsecond unit matches `RequestLog::response_time_us` verbatim.
+
 ## [0.3.3] - 2026-04-17
 
 Wheel #2 Weeks 4–5 — proxy hot-path integration and server-initiated event

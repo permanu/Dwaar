@@ -67,6 +67,10 @@ fn sample_event(i: u32) -> AggEvent {
         },
         user_agent: Some(UAS[i as usize % UAS.len()].into()),
         is_bot: i.is_multiple_of(7),
+        // Vary latency across the full bucket range so the benchmark
+        // exercises the partition_point lookup across every bucket
+        // rather than pinning all observations to one slot.
+        response_latency_us: u64::from(i % 20_000) * 1_000,
     }
 }
 

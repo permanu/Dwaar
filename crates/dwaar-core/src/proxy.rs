@@ -2312,6 +2312,11 @@ impl ProxyHttp for DwaarProxy {
                 // bot-detect plugin classifies the request on PluginCtx;
                 // the aggregator splits bot vs human counters in DomainMetrics.
                 is_bot: ctx.plugin_ctx.is_bot,
+                // Same value stored on `RequestLog::response_time_us` below —
+                // read once above and propagated to both paths so the log
+                // stream and the analytics histogram can never disagree on
+                // the per-request latency.
+                response_latency_us: response_time_us,
             };
             agg.send(event);
         }
