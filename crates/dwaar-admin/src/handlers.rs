@@ -295,6 +295,7 @@ mod tests {
         dm.ingest_log(&dwaar_analytics::aggregation::AggEvent {
             host: "test.example.com".into(),
             path: "/home".into(),
+            query: None,
             status: 200,
             bytes_sent: 1024,
             client_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
