@@ -36,13 +36,18 @@ fn sample_event(i: u32) -> AggEvent {
         path: format!("/page/{}", i % 500).into(),
         // Every 4th event carries a UTM query so the benchmark measures
         // the cost of the UTM extraction path end-to-end, not just the
-        // no-query fast exit.
+        // no-query fast exit. Term and content are cycled on a finer
+        // spread than source/medium/campaign to stress the tighter
+        // bounded-counter caps (25 vs 50) on those dimensions.
         query: if i.is_multiple_of(4) {
             Some(
                 format!(
-                    "utm_source=src{}&utm_medium=cpc&utm_campaign=campaign{}",
+                    "utm_source=src{}&utm_medium=cpc&utm_campaign=campaign{}\
+                     &utm_term=term{}&utm_content=ad{}",
                     i % 10,
-                    i % 7
+                    i % 7,
+                    i % 12,
+                    i % 15
                 )
                 .into(),
             )
