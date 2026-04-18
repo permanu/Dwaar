@@ -2282,6 +2282,16 @@ impl ProxyHttp for DwaarProxy {
             .get("referer")
             .and_then(|v| v.to_str().ok())
             .map(CompactString::from);
+        // User-Agent is read once here so the analytics aggregator can
+        // classify the request into a fixed device bucket. The full UA
+        // is also stored on `RequestLog` below — read both from the
+        // same header value so the two paths cannot disagree.
+        let user_agent: Option<CompactString> = session
+            .req_header()
+            .headers
+            .get("user-agent")
+            .and_then(|v| v.to_str().ok())
+            .map(CompactString::from);
 
         if let Some(ref agg) = self.agg_sender {
             // AggEvent fields are Arc<str>: construction pays one Arc alloc per field,
@@ -2294,6 +2304,7 @@ impl ProxyHttp for DwaarProxy {
                 client_ip,
                 country: country.as_deref().map(Arc::from),
                 referer: referer.as_deref().map(Arc::from),
+                user_agent: user_agent.as_deref().map(Arc::from),
                 // bot-detect plugin classifies the request on PluginCtx;
                 // the aggregator splits bot vs human counters in DomainMetrics.
                 is_bot: ctx.plugin_ctx.is_bot,
@@ -2315,12 +2326,7 @@ impl ProxyHttp for DwaarProxy {
             status,
             response_time_us,
             client_ip,
-            user_agent: session
-                .req_header()
-                .headers
-                .get("user-agent")
-                .and_then(|v| v.to_str().ok())
-                .map(CompactString::from),
+            user_agent,
             referer,
             bytes_sent,
             bytes_received,

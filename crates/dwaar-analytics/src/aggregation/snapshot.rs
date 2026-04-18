@@ -188,6 +188,10 @@ mod tests {
             client_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             country: Some("US".into()),
             referer: Some("https://google.com/search".into()),
+            user_agent: Some(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit Chrome/120 Safari"
+                    .into(),
+            ),
             is_bot: false,
         }
     }

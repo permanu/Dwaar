@@ -21,6 +21,16 @@ use dwaar_analytics::aggregation::{AggEvent, DomainMetrics};
 use hyperloglog::HyperLogLog;
 
 fn sample_event(i: u32) -> AggEvent {
+    // Cycle through representative UAs so the device classifier branch
+    // is exercised in the hot path benchmark — otherwise the device
+    // BoundedCounter insert cost is not measured.
+    const UAS: &[&str] = &[
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit Chrome/120 Safari",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Mobile/15E148",
+        "Mozilla/5.0 (iPad; CPU OS 17_0) AppleWebKit Mobile/15E148",
+        "Googlebot/2.1 (+http://www.google.com/bot.html)",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Firefox/122.0",
+    ];
     AggEvent {
         host: "example.com".into(),
         path: format!("/page/{}", i % 500).into(),
@@ -35,6 +45,7 @@ fn sample_event(i: u32) -> AggEvent {
         } else {
             None
         },
+        user_agent: Some(UAS[i as usize % UAS.len()].into()),
         is_bot: i.is_multiple_of(7),
     }
 }

@@ -41,6 +41,11 @@ pub struct DomainMetricsSnapshot {
     pub top_pages: Vec<(String, u64)>,
     pub referrers: Vec<(String, u64)>,
     pub countries: Vec<(String, u64)>,
+    /// Per-device-class pageview counts across the fixed
+    /// `mobile|desktop|tablet|bot|unknown` enum. Classification lives
+    /// in [`crate::aggregation::classify_device`]. Cardinality is
+    /// bounded at the enum size so downstream emitters cannot explode.
+    pub devices: Vec<(String, u64)>,
     pub status_codes: [u64; 6],
     pub bytes_sent: u64,
     pub lcp: Percentiles,
@@ -59,6 +64,7 @@ impl DomainMetricsSnapshot {
             top_pages: m.top_pages.top(),
             referrers: m.referrers.top(),
             countries: m.countries.top(),
+            devices: m.devices.top(),
             status_codes: m.status_codes,
             bytes_sent: m.bytes_sent,
             lcp: m.web_vitals.peek_lcp_percentiles(),
@@ -241,6 +247,52 @@ mod tests {
         assert_eq!(snap.unique_visitors, 0);
         assert_eq!(snap.total_pageviews, 0);
         assert!(snap.top_pages.is_empty());
+        assert!(snap.referrers.is_empty());
+        assert!(snap.devices.is_empty());
+    }
+
+    #[test]
+    fn snapshot_surfaces_referrer_device_and_top_pages() {
+        use crate::aggregation::AggEvent;
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let mut dm = DomainMetrics::new();
+        let uas = [
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Mobile/15E148", // mobile
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/120 Safari",    // desktop
+            "Googlebot/2.1",                                                        // bot
+        ];
+        for (i, ua) in uas.iter().enumerate() {
+            dm.ingest_log(&AggEvent {
+                host: "test.example.com".into(),
+                path: if i == 0 {
+                    "/home".into()
+                } else {
+                    "/about".into()
+                },
+                status: 200,
+                bytes_sent: 512,
+                client_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, i as u8 + 1)),
+                country: None,
+                referer: Some("https://news.ycombinator.com/".into()),
+                user_agent: Some((*ua).into()),
+                is_bot: false,
+            });
+        }
+
+        let snap = DomainMetricsSnapshot::from_metrics("test.example.com", &dm);
+        // referrer emission — unblocks ReferrerBreakdown.svelte
+        assert_eq!(snap.referrers.len(), 1);
+        assert_eq!(snap.referrers[0].0, "news.ycombinator.com");
+        // device emission — unblocks DeviceBreakdown.svelte
+        let devices: std::collections::HashMap<_, _> = snap.devices.iter().cloned().collect();
+        assert_eq!(devices.get("mobile").copied(), Some(1));
+        assert_eq!(devices.get("desktop").copied(), Some(1));
+        assert_eq!(devices.get("bot").copied(), Some(1));
+        // top_pages emission — unblocks per-path drill-down
+        let paths: std::collections::HashMap<_, _> = snap.top_pages.iter().cloned().collect();
+        assert_eq!(paths.get("/home").copied(), Some(1));
+        assert_eq!(paths.get("/about").copied(), Some(2));
     }
 
     #[test]
