@@ -36,6 +36,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the analytics aggregator without duplicating the clock read. The
   microsecond unit matches `RequestLog::response_time_us` verbatim.
 
+## [0.3.5] - 2026-04-18
+
+### Added
+
+- **UTM term + content labels** — `extract_utm_params()` now returns all
+  five UTM fields. `utm_terms` + `utm_contents` aggregate into
+  `BoundedCounter<25>` (tighter cap than source/medium/campaign because
+  term/content are more ad-hoc). Surfaced on all three snapshot paths.
+  Completes Plausible-level attribution coverage.
+
+### Fixed
+
+- **Release workflow installs `protoc`** — `dwaar-grpc`'s build.rs
+  invokes `prost-build` which shells out to `protoc`. Ubuntu-latest and
+  macos-latest runners no longer ship it preinstalled, so the release
+  build silently failed for `v0.3.4`. Workflow now installs
+  `protobuf-compiler` on Linux and homebrew `protobuf` on macOS before
+  `cargo build`.
+
+## [0.3.4] - 2026-04-18
+
+### Added
+
+- **UTM source / medium / campaign labels** — when a request carries
+  `utm_*` query params, Dwaar aggregates them into per-domain
+  `BoundedCounter` (50 / 20 / 50). Case-folded and trimmed before
+  counting. Surfaced on `DomainMetricsSnapshot` / `FlushSnapshot` /
+  `AnalyticsSnapshot` via `utm_sources` / `utm_mediums` /
+  `utm_campaigns`. Powers marketing-attribution dashboards.
+- **Status-class counters** — the 1xx / 2xx / 3xx / 4xx / 5xx counters
+  already computed in `AggEvent` now surface on every snapshot as
+  `status_classes: Vec<(class, count)>`. Fixed cardinality (5 labels)
+  → safe for VictoriaMetrics fan-out at any scale.
+- **Referrer / device / top-path emission** — previously-bounded
+  counters (referrers top-50, top-pages top-100) and new device
+  classification (desktop / mobile / tablet / bot / unknown via UA
+  heuristic) are now included in every flushed snapshot. Unblocks the
+  Plausible-parity referrer and device panels in the Permanu UI.
+
 ## [0.3.3] - 2026-04-17
 
 Wheel #2 Weeks 4–5 — proxy hot-path integration and server-initiated event
