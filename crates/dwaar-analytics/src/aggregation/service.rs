@@ -242,6 +242,11 @@ struct FlushSnapshot {
     top_pages: Vec<PageCount>,
     referrers: Vec<ReferrerCount>,
     countries: Vec<CountryCount>,
+    /// Per-device-class pageview counts across the fixed
+    /// `mobile|desktop|tablet|bot|unknown` enum. Sibling of
+    /// [`crate::sink::DomainMetricsSnapshot::devices`] — same data,
+    /// different wire format (stdout-legacy JSON vs socket sink).
+    devices: Vec<DeviceCount>,
     status_codes: StatusCodes,
     bytes_sent: u64,
     web_vitals: VitalsSnapshot,
@@ -262,6 +267,12 @@ struct ReferrerCount {
 #[derive(Debug, Serialize)]
 struct CountryCount {
     code: String,
+    count: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct DeviceCount {
+    device: String,
     count: u64,
 }
 
@@ -322,6 +333,12 @@ impl FlushSnapshot {
                 .into_iter()
                 .map(|(code, count)| CountryCount { code, count })
                 .collect(),
+            devices: m
+                .devices
+                .top()
+                .into_iter()
+                .map(|(device, count)| DeviceCount { device, count })
+                .collect(),
             status_codes: StatusCodes {
                 s1xx: m.status_codes[0],
                 s2xx: m.status_codes[1],
@@ -366,6 +383,10 @@ mod tests {
             client_ip: std::net::IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             country: Some("US".into()),
             referer: Some("https://google.com/search".into()),
+            user_agent: Some(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit Chrome/120 Safari"
+                    .into(),
+            ),
             is_bot: false,
         }
     }

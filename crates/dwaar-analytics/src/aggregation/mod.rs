@@ -32,7 +32,7 @@ const CHANNEL_CAPACITY: usize = 8192;
 
 /// Slim event for analytics aggregation — only the fields the aggregation
 /// service actually reads. Avoids cloning the full `RequestLog` (20+ fields)
-/// on every request when only 7 are needed.
+/// on every request when only a handful are needed.
 #[derive(Debug, Clone)]
 pub struct AggEvent {
     pub host: Arc<str>,
@@ -42,6 +42,12 @@ pub struct AggEvent {
     pub client_ip: IpAddr,
     pub country: Option<Arc<str>>,
     pub referer: Option<Arc<str>>,
+    /// Raw `User-Agent` request header. Used by
+    /// [`DomainMetrics::ingest_log`] to classify the request into a
+    /// fixed `mobile|desktop|tablet|bot|unknown` bucket via
+    /// [`classify_device`]. Never retained beyond classification so
+    /// the raw string is not stored in any aggregate.
+    pub user_agent: Option<Arc<str>>,
     /// Bot classification from the bot-detect plugin (priority 10),
     /// propagated so the aggregation snapshot can surface bot-vs-human
     /// pageview ratios. Default `false` is treated as a human request.
@@ -50,6 +56,11 @@ pub struct AggEvent {
 const TOP_PAGES_K: usize = 100;
 const TOP_REFERRERS_N: usize = 50;
 const TOP_COUNTRIES_N: usize = 250;
+/// Fixed device enum (mobile, desktop, tablet, bot, unknown) — the
+/// `BoundedCounter` capacity is sized to exactly cover this enum so
+/// cardinality can never exceed the number of buckets even if a new
+/// classifier branch is added.
+const DEVICE_BUCKETS: usize = 5;
 
 /// Per-domain analytics aggregates.
 ///
@@ -62,6 +73,11 @@ pub struct DomainMetrics {
     pub top_pages: TopK<String>,
     pub referrers: BoundedCounter<String>,
     pub countries: BoundedCounter<String>,
+    /// Per-device-class pageview counter across the fixed
+    /// `mobile|desktop|tablet|bot|unknown` enum. Sized to exactly
+    /// cover the classifier output so the bounded counter can never
+    /// exceed its capacity regardless of traffic.
+    pub devices: BoundedCounter<String>,
     pub status_codes: [u64; 6],
     pub bytes_sent: u64,
     pub web_vitals: WebVitals,
@@ -81,6 +97,7 @@ impl DomainMetrics {
             top_pages: TopK::new(TOP_PAGES_K),
             referrers: BoundedCounter::new(TOP_REFERRERS_N),
             countries: BoundedCounter::new(TOP_COUNTRIES_N),
+            devices: BoundedCounter::new(DEVICE_BUCKETS),
             status_codes: [0; 6],
             bytes_sent: 0,
             web_vitals: WebVitals::new(),
@@ -115,6 +132,15 @@ impl DomainMetrics {
         if let Some(ref country) = event.country {
             self.countries.insert(country.to_string());
         }
+        // Classify the User-Agent into the fixed five-bucket device enum
+        // so `devices.top()` reports mobile vs desktop vs tablet vs bot vs
+        // unknown without ever persisting the raw header (PII-sensitive
+        // and unbounded in cardinality).
+        let device = match event.user_agent.as_deref() {
+            Some(ua) => classify_device(ua),
+            None => "unknown",
+        };
+        self.devices.insert(device.to_string());
     }
 
     /// Update from a client-side beacon event.
@@ -174,6 +200,38 @@ pub fn status_bucket(status: u16) -> usize {
         500..=599 => 4,
         _ => 5,
     }
+}
+
+/// Classify a `User-Agent` string into a fixed five-bucket enum:
+/// `mobile | desktop | tablet | bot | unknown`.
+///
+/// Intentionally coarse — headline numbers only. Precedence:
+/// 1. Bot / crawler / spider markers win over everything else so
+///    automated traffic never counts toward mobile/desktop share.
+/// 2. Tablet markers win over mobile because iPads advertise "Mobile"
+///    in their UA and would otherwise double-count.
+/// 3. Mobile markers (`mobile`, `android`, `iphone`).
+/// 4. Everything else is `desktop`.
+///
+/// An empty UA returns `unknown` so downstream dashboards can flag
+/// the gap instead of misattributing it to desktop. The raw UA is
+/// never retained — this function is the sole path from
+/// `User-Agent` to the bounded counter.
+pub fn classify_device(ua: &str) -> &'static str {
+    if ua.is_empty() {
+        return "unknown";
+    }
+    let ua_lower = ua.to_lowercase();
+    if ua_lower.contains("bot") || ua_lower.contains("crawler") || ua_lower.contains("spider") {
+        return "bot";
+    }
+    if ua_lower.contains("tablet") || ua_lower.contains("ipad") {
+        return "tablet";
+    }
+    if ua_lower.contains("mobile") || ua_lower.contains("android") || ua_lower.contains("iphone") {
+        return "mobile";
+    }
+    "desktop"
 }
 
 /// Extract domain from a URL (e.g., `https://google.com/search` → `google.com`).
@@ -257,6 +315,7 @@ mod tests {
             client_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             country: None,
             referer: None,
+            user_agent: None,
             is_bot: false,
         };
         // Should not panic — drops silently when full
@@ -309,6 +368,9 @@ mod tests {
             client_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
             country: Some("US".into()),
             referer: Some("https://google.com/search".into()),
+            user_agent: Some(
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Mobile/15E148".into(),
+            ),
             is_bot: false,
         };
         dm.ingest_log(&event);
@@ -318,5 +380,75 @@ mod tests {
         assert_eq!(dm.top_pages.top()[0].0, "/home");
         assert_eq!(dm.referrers.top()[0].0, "google.com");
         assert_eq!(dm.countries.top()[0].0, "US");
+        assert_eq!(dm.devices.top()[0].0, "mobile");
+    }
+
+    #[test]
+    fn classify_device_buckets() {
+        // Bots / crawlers / spiders win over any other match.
+        assert_eq!(
+            classify_device("Googlebot/2.1 (+http://www.google.com/bot.html)"),
+            "bot"
+        );
+        assert_eq!(classify_device("AhrefsBot/7.0"), "bot");
+        assert_eq!(classify_device("Bingbot"), "bot");
+        assert_eq!(classify_device("facebookexternalhit/1.1"), "desktop"); // no bot/crawler marker
+        assert_eq!(classify_device("Mozilla spider v1"), "bot");
+        assert_eq!(classify_device("Screaming Frog SEO Spider/19.5"), "bot");
+        assert_eq!(classify_device("web crawler edu"), "bot");
+
+        // Tablet markers win over mobile — iPads advertise "Mobile" too.
+        assert_eq!(
+            classify_device("Mozilla/5.0 (iPad; CPU OS 17_0) AppleWebKit Mobile/15E148"),
+            "tablet"
+        );
+        assert_eq!(
+            classify_device("Mozilla/5.0 (Linux; Android 11; SM-T870) AppleWebKit Tablet"),
+            "tablet"
+        );
+
+        // Mobile markers.
+        assert_eq!(
+            classify_device("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) Mobile/15E148"),
+            "mobile"
+        );
+        assert_eq!(
+            classify_device("Mozilla/5.0 (Linux; Android 13; Pixel 8) AppleWebKit Mobile Safari"),
+            "mobile"
+        );
+
+        // Desktop fallback — regular Chrome/Firefox on macOS/Linux/Windows.
+        assert_eq!(
+            classify_device(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit Chrome/120 Safari"
+            ),
+            "desktop"
+        );
+        assert_eq!(
+            classify_device("Mozilla/5.0 (Windows NT 10.0; Win64; x64) Firefox/122.0"),
+            "desktop"
+        );
+        assert_eq!(classify_device("curl/8.1.0"), "desktop");
+
+        // Empty / missing UA → unknown so the dashboard can surface the gap.
+        assert_eq!(classify_device(""), "unknown");
+    }
+
+    #[test]
+    fn ingest_log_classifies_missing_ua_as_unknown() {
+        let mut dm = DomainMetrics::new();
+        let event = AggEvent {
+            host: "example.com".into(),
+            path: "/".into(),
+            status: 200,
+            bytes_sent: 128,
+            client_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            country: None,
+            referer: None,
+            user_agent: None,
+            is_bot: false,
+        };
+        dm.ingest_log(&event);
+        assert_eq!(dm.devices.top()[0].0, "unknown");
     }
 }
