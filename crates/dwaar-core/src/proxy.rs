@@ -129,6 +129,11 @@ pub struct DwaarProxy {
     /// fire-and-forget clone of the request to the mirror target. Mirror
     /// failures NEVER affect the primary response.
     mirror_dispatcher: Option<Arc<dyn MirrorDispatcher>>,
+    /// OTLP span exporter — present when `tracing { otlp_endpoint }` is set.
+    /// One span is recorded per completed request in `logging()`.
+    otlp_exporter: Option<Arc<dwaar_analytics::otel::OtlpExporter>>,
+    /// Fraction of requests to sample for tracing `[0.0, 1.0]`. 0.0 = off.
+    trace_sample_ratio: f64,
 }
 
 /// Registries consulted by the proxy hot path, populated by the gRPC
@@ -205,6 +210,8 @@ impl DwaarProxy {
             control_plane: None,
             outcome_sink: None,
             mirror_dispatcher: None,
+            otlp_exporter: None,
+            trace_sample_ratio: 1.0,
         }
     }
 
@@ -230,6 +237,20 @@ impl DwaarProxy {
     #[must_use]
     pub fn with_mirror_dispatcher(mut self, dispatcher: Arc<dyn MirrorDispatcher>) -> Self {
         self.mirror_dispatcher = Some(dispatcher);
+        self
+    }
+
+    /// Install the OTLP exporter. When set, one ingress span is recorded per
+    /// completed request in `logging()`. The exporter's flush loop runs as a
+    /// separate Pingora `BackgroundService` — the proxy only calls `record()`.
+    #[must_use]
+    pub fn with_otlp_exporter(
+        mut self,
+        exporter: Arc<dwaar_analytics::otel::OtlpExporter>,
+        sample_ratio: f64,
+    ) -> Self {
+        self.otlp_exporter = Some(exporter);
+        self.trace_sample_ratio = sample_ratio.clamp(0.0, 1.0);
         self
     }
 }
@@ -1782,16 +1803,30 @@ impl ProxyHttp for DwaarProxy {
 
         upstream_request.insert_header("X-Request-Id", ctx.request_id())?;
 
-        // W3C Trace Context propagation (ISSUE-112): if the client sent a valid
-        // traceparent, propagate it unchanged; otherwise generate a fresh one so
-        // downstream tracing tools can correlate this edge span.
-        let trace_ctx = session
-            .req_header()
-            .headers
-            .get("traceparent")
-            .and_then(|v| v.to_str().ok())
-            .and_then(crate::trace::parse_traceparent)
-            .unwrap_or_else(crate::trace::generate_traceparent);
+        // W3C Trace Context propagation (ISSUE-112):
+        //
+        // When the client sends a valid traceparent, Dwaar emits its own ingress
+        // span as a child of the client's span (same trace_id, fresh span_id),
+        // then injects that as the upstream traceparent so downstream services
+        // are children of Dwaar, not of the original client call.
+        //
+        // When no traceparent is present, generate a fresh trace + span so the
+        // downstream service tree is still fully correlated.
+        let (trace_ctx, inbound_parent_span_id) =
+            if let Some(inbound) = session
+                .req_header()
+                .headers
+                .get("traceparent")
+                .and_then(|v| v.to_str().ok())
+                .and_then(crate::trace::parse_traceparent)
+            {
+                // Extract the client's span_id before generating the child context.
+                let parent_id = inbound.span_id_bytes();
+                let child = crate::trace::generate_child_traceparent(&inbound);
+                (child, Some(parent_id))
+            } else {
+                (crate::trace::generate_traceparent(), None)
+            };
 
         upstream_request.insert_header("traceparent", trace_ctx.traceparent())?;
 
@@ -1803,6 +1838,7 @@ impl ProxyHttp for DwaarProxy {
         }
 
         ctx.trace_ctx = Some(trace_ctx);
+        ctx.inbound_parent_span_id = inbound_parent_span_id;
 
         // Strip hop-by-hop headers (RFC 7230 §6.1)
         // IMPORTANT: Use remove_header(), not headers.remove() — Pingora
@@ -2241,6 +2277,54 @@ impl ProxyHttp for DwaarProxy {
                 Some("MISS") => prom.rate_cache.record_cache_miss(host),
                 _ => {}
             }
+        }
+
+        // OTLP ingress span — emitted before field moves below so we can
+        // borrow method/path/host from ctx without cloning. The None check is
+        // a single pointer compare; zero overhead when tracing is disabled.
+        if let Some(ref exporter) = self.otlp_exporter
+            && let Some(ref trace_ctx) = ctx.trace_ctx
+            && (self.trace_sample_ratio >= 1.0
+                || fastrand::f64() < self.trace_sample_ratio)
+        {
+            let scheme = if ctx.plugin_ctx.is_tls { "https" } else { "http" };
+            let span_client_ip = ctx
+                .plugin_ctx
+                .client_ip
+                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+            let client_addr = span_client_ip.to_string();
+            let upstream_str = ctx
+                .route_upstream
+                .map_or_else(String::default, |a| a.to_string());
+            let tls_version_str = session
+                .downstream_session
+                .digest()
+                .and_then(|d| d.ssl_digest.as_ref())
+                .map(|ssl| ssl.version.clone());
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            let start_ns = now_ns.saturating_sub(response_time_us * 1_000);
+            let host_str = ctx.plugin_ctx.host.as_deref().unwrap_or("");
+
+            let meta = crate::trace::IngressSpanMeta {
+                trace_ctx,
+                parent_span_id: ctx.inbound_parent_span_id,
+                method: ctx.plugin_ctx.method.as_str(),
+                path: ctx.plugin_ctx.path.as_str(),
+                scheme,
+                host: host_str,
+                client_address: &client_addr,
+                upstream: &upstream_str,
+                status,
+                tls_version: tls_version_str.as_deref(),
+                request_body_size: bytes_received,
+                response_body_size: bytes_sent,
+                start_ns,
+                end_ns: now_ns,
+            };
+            exporter.record(crate::trace::create_ingress_span(&meta));
         }
 
         let Some(ref sender) = self.log_sender else {
