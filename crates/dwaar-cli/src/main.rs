@@ -678,6 +678,35 @@ fn run_server(
     let outcome_sink = Arc::new(dwaar_grpc::AnomalyOutcomeSink::new(Arc::clone(&event_bus)));
     let log_buffer = Arc::new(dwaar_grpc::LogChunkBuffer::new(Arc::clone(&event_bus)));
 
+    // OTLP span exporter — built here so the Arc can be shared with both
+    // DwaarProxy (records one span per request in logging()) and the
+    // background flush service (drains the ring buffer to the collector).
+    // Kept as `None` when the Dwaarfile has no `tracing {}` block.
+    let otlp_exporter_for_proxy: Option<Arc<dwaar_analytics::otel::OtlpExporter>> = dwaar_config
+        .global_options
+        .as_ref()
+        .and_then(|g| g.tracing.as_ref())
+        .and_then(|t| {
+            match dwaar_analytics::otel::OtlpExporter::new(
+                &t.otlp_endpoint,
+                env!("CARGO_PKG_VERSION"),
+            ) {
+                Ok(e) => {
+                    info!(endpoint = %t.otlp_endpoint, "OTLP span exporter initialised");
+                    Some(Arc::new(e))
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to initialise OTLP exporter — tracing disabled");
+                    None
+                }
+            }
+        });
+    let otlp_sample_ratio: f64 = dwaar_config
+        .global_options
+        .as_ref()
+        .and_then(|g| g.tracing.as_ref())
+        .map_or(1.0, |t| t.sample_ratio);
+
     let proxy = DwaarProxy::new(
         route_table,
         challenge_solver.clone(),
@@ -697,6 +726,11 @@ fn run_server(
         Arc::clone(&mirror_dispatcher) as Arc<dyn dwaar_core::proxy::MirrorDispatcher>
     )
     .with_outcome_sink(Arc::clone(&outcome_sink) as Arc<dyn dwaar_core::proxy::RequestOutcomeSink>);
+    let proxy = if let Some(ref exp) = otlp_exporter_for_proxy {
+        proxy.with_otlp_exporter(Arc::clone(exp), otlp_sample_ratio)
+    } else {
+        proxy
+    };
     // Hand-off: the admin / metrics wiring consuming `mirror_metrics` and
     // `log_buffer` lands in a follow-up wheel. Explicit drops keep both
     // `Arc`s' ref counts honest for now — cheap atomic decrements.
@@ -960,6 +994,7 @@ fn run_server(
         dwaar_config,
         l4_shared,
         l4_reload_notify,
+        otlp_exporter_for_proxy,
     );
 
     info!("entering run loop, waiting for connections or signals");
@@ -991,6 +1026,7 @@ fn register_background_services(
     config: &dwaar_config::model::DwaarConfig,
     l4_servers: dwaar_core::l4::SharedL4Servers,
     l4_reload_notify: Arc<tokio::sync::Notify>,
+    otlp_exporter: Option<Arc<dwaar_analytics::otel::OtlpExporter>>,
 ) {
     // Upstream health checker — runs as a BackgroundService (Guardrail #20).
     // Always registered; it will sleep if the pool list is empty and wake up
@@ -1116,34 +1152,16 @@ fn register_background_services(
         info!("analytics aggregation service registered");
     }
 
-    // OTLP span exporter — only registered when the Dwaarfile sets `tracing { otlp_endpoint }`.
-    if let Some(tracing_cfg) = config
-        .global_options
-        .as_ref()
-        .and_then(|g| g.tracing.as_ref())
-    {
-        match dwaar_analytics::otel::OtlpExporter::new(
-            &tracing_cfg.otlp_endpoint,
-            env!("CARGO_PKG_VERSION"),
-        ) {
-            Ok(exporter) => {
-                let exporter = Arc::new(exporter);
-                let otel_bg = pingora_core::services::background::background_service(
-                    "OTLP exporter",
-                    OtlpExporterService {
-                        exporter: Arc::clone(&exporter),
-                    },
-                );
-                server.add_service(otel_bg);
-                info!(
-                    endpoint = %tracing_cfg.otlp_endpoint,
-                    "OTLP span exporter registered"
-                );
-            }
-            Err(e) => {
-                warn!(error = %e, "failed to initialize OTLP exporter — tracing disabled");
-            }
-        }
+    // OTLP background flush loop — drains the ring buffer to the collector.
+    // The exporter Arc was initialised before proxy construction so DwaarProxy
+    // can call record() on the hot path; here we just register the flush loop.
+    if let Some(exporter) = otlp_exporter {
+        let otel_bg = pingora_core::services::background::background_service(
+            "OTLP exporter",
+            OtlpExporterService { exporter },
+        );
+        server.add_service(otel_bg);
+        info!("OTLP exporter background flush service registered");
     }
 }
 

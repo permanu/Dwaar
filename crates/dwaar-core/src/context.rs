@@ -185,8 +185,16 @@ pub struct RequestContext {
     /// advertising a protocol the server can't actually serve for this route.
     pub quic_capable: bool,
 
-    /// Trace context parsed/generated in `upstream_request_filter()`.
+    /// Trace context generated for this request (Dwaar's own span).
+    /// Set in `upstream_request_filter()`. The `span_id` here is Dwaar's span ID;
+    /// it is injected into the upstream `traceparent` so downstream services
+    /// appear as children of the Dwaar ingress span.
     pub trace_ctx: Option<crate::trace::TraceContext>,
+
+    /// The inbound client's span ID when the request carried a `traceparent`
+    /// header. Used to set `parent_span_id` on the emitted ingress span so
+    /// the Dwaar span nests correctly under the client's trace.
+    pub inbound_parent_span_id: Option<[u8; 16]>,
 
     /// Upstream response status cached in `response_filter()` for
     /// `response_body_filter()` which doesn't have direct header access.
@@ -285,6 +293,7 @@ impl RequestContext {
             cache_status: None,
             quic_capable: false,
             trace_ctx: None,
+            inbound_parent_span_id: None,
             upstream_status: 0,
             upstream_error_body: None,
             rejected_by: None,

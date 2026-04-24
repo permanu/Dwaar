@@ -4,7 +4,7 @@
 // This file is part of Dwaar — https://dwaar.dev
 // Licensed under the Business Source License 1.1
 
-//! Parser tests — all 69 tests covering happy paths, error cases, and real-world configs.
+//! Parser tests — covering happy paths, error cases, and real-world configs.
 
 use super::*;
 use crate::model::*;
@@ -1861,4 +1861,77 @@ fn parse_wasm_plugin_unknown_subdirective_skipped() {
         panic!("expected WasmPlugin directive");
     };
     assert_eq!(wp.priority, 20);
+}
+
+/// `tracing { otlp_endpoint ... }` with default sample_ratio.
+#[test]
+fn parse_tracing_block_with_default_sample_ratio() {
+    let config = parse(
+        r#"{
+            tracing {
+                otlp_endpoint http://127.0.0.1:4317/v1/traces
+            }
+        }
+        example.com {
+            reverse_proxy localhost:8080
+        }"#,
+    )
+    .expect("should parse tracing block");
+
+    let tc = config
+        .global_options
+        .as_ref()
+        .and_then(|g| g.tracing.as_ref())
+        .expect("tracing config present");
+    assert_eq!(tc.otlp_endpoint, "http://127.0.0.1:4317/v1/traces");
+    assert!((tc.sample_ratio - 1.0).abs() < f64::EPSILON);
+}
+
+/// `tracing { otlp_endpoint ... sample_ratio 0.5 }` parses ratio.
+#[test]
+fn parse_tracing_block_with_sample_ratio() {
+    let config = parse(
+        r#"{
+            tracing {
+                otlp_endpoint http://127.0.0.1:4318/v1/traces
+                sample_ratio 0.5
+            }
+        }
+        example.com {
+            reverse_proxy localhost:8080
+        }"#,
+    )
+    .expect("should parse tracing block with sample_ratio");
+
+    let tc = config
+        .global_options
+        .as_ref()
+        .and_then(|g| g.tracing.as_ref())
+        .expect("tracing config present");
+    assert_eq!(tc.otlp_endpoint, "http://127.0.0.1:4318/v1/traces");
+    assert!((tc.sample_ratio - 0.5).abs() < 1e-9);
+}
+
+/// `sample_ratio` values outside [0,1] are clamped.
+#[test]
+fn parse_tracing_block_sample_ratio_clamped() {
+    let config = parse(
+        r#"{
+            tracing {
+                otlp_endpoint http://127.0.0.1:4318/v1/traces
+                sample_ratio 2.0
+            }
+        }
+        example.com {
+            reverse_proxy localhost:8080
+        }"#,
+    )
+    .expect("should parse with clamped ratio");
+
+    let tc = config
+        .global_options
+        .as_ref()
+        .and_then(|g| g.tracing.as_ref())
+        .expect("tracing config present");
+    assert!((tc.sample_ratio - 1.0).abs() < f64::EPSILON, "ratio should be clamped to 1.0");
 }

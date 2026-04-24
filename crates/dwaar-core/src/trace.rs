@@ -41,6 +41,11 @@ impl TraceContext {
     pub fn traceparent(&self) -> &str {
         std::str::from_utf8(&self.traceparent).expect("traceparent is valid ASCII")
     }
+
+    /// Raw 16-byte span ID array, used when recording this context as a parent.
+    pub fn span_id_bytes(&self) -> [u8; 16] {
+        self.span_id
+    }
 }
 
 /// Validate that `s` is exactly `len` hex characters.
@@ -100,6 +105,30 @@ pub fn parse_traceparent(value: &str) -> Option<TraceContext> {
     Some(ctx)
 }
 
+/// Generate a child `TraceContext` that inherits the trace ID from `parent`
+/// but carries a fresh span ID. Used when the inbound request has a valid
+/// `traceparent`: Dwaar emits its own span nested under the client's span,
+/// then injects this context into the upstream request so downstream services
+/// appear as children of the Dwaar span.
+pub fn generate_child_traceparent(parent: &TraceContext) -> TraceContext {
+    let mut span_bytes = [0u8; 8];
+    fastrand::fill(&mut span_bytes);
+
+    let mut ctx = TraceContext {
+        trace_id: parent.trace_id,
+        span_id: [0u8; 16],
+        traceparent: *b"00-00000000000000000000000000000000-0000000000000000-01",
+    };
+
+    hex_encode_lower_into(&span_bytes, &mut ctx.span_id);
+
+    // Embed into traceparent: "00-" (3) + trace_id (32) + "-" (1) + span_id (16) + "-01" (3)
+    ctx.traceparent[3..35].copy_from_slice(&ctx.trace_id);
+    ctx.traceparent[36..52].copy_from_slice(&ctx.span_id);
+
+    ctx
+}
+
 /// Generate a fresh `TraceContext` with random trace and span IDs.
 ///
 /// Uses `fastrand` (thread-local, no syscall) for speed — this runs on
@@ -130,12 +159,110 @@ pub fn generate_traceparent() -> TraceContext {
     ctx
 }
 
+/// Metadata for a completed HTTP request used to build an ingress span.
+#[derive(Debug)]
+pub struct IngressSpanMeta<'a> {
+    /// Parsed/generated trace context for this request.
+    pub trace_ctx: &'a TraceContext,
+    /// Span ID of the inbound client's traceparent, if present.
+    /// When `Some`, the Dwaar span is a child of the client's span.
+    pub parent_span_id: Option<[u8; 16]>,
+    pub method: &'a str,
+    pub path: &'a str,
+    pub scheme: &'a str,
+    pub host: &'a str,
+    pub client_address: &'a str,
+    /// Upstream address selected by the route (e.g. `"127.0.0.1:3000"`).
+    pub upstream: &'a str,
+    pub status: u16,
+    /// TLS version string if the downstream connection was TLS (e.g. `"TLSv1.3"`).
+    pub tls_version: Option<&'a str>,
+    pub request_body_size: u64,
+    pub response_body_size: u64,
+    pub start_ns: u64,
+    pub end_ns: u64,
+}
+
+/// Build a completed OTLP ingress span from a finished request.
+///
+/// Returns a `dwaar_analytics::otel::Span` ready for `OtlpExporter::record()`.
+/// The trace/span IDs come from the propagated or generated `TraceContext`.
+/// When the inbound request carried a `traceparent`, `meta.parent_span_id` is
+/// set so the Dwaar span nests under the client's trace.
+pub fn create_ingress_span(meta: &IngressSpanMeta<'_>) -> dwaar_analytics::otel::Span {
+    use compact_str::CompactString;
+    use dwaar_analytics::otel::{SpanAttribute, SpanKind, SpanValue};
+
+    let name = CompactString::from(format!("HTTP {} {}", meta.method, meta.path));
+
+    let mut attributes = vec![
+        SpanAttribute {
+            key: CompactString::from("http.request.method"),
+            value: SpanValue::String(CompactString::from(meta.method)),
+        },
+        SpanAttribute {
+            key: CompactString::from("http.response.status_code"),
+            value: SpanValue::Int(i64::from(meta.status)),
+        },
+        SpanAttribute {
+            key: CompactString::from("url.path"),
+            value: SpanValue::String(CompactString::from(meta.path)),
+        },
+        SpanAttribute {
+            key: CompactString::from("url.scheme"),
+            value: SpanValue::String(CompactString::from(meta.scheme)),
+        },
+        SpanAttribute {
+            key: CompactString::from("server.address"),
+            value: SpanValue::String(CompactString::from(meta.host)),
+        },
+        SpanAttribute {
+            key: CompactString::from("client.address"),
+            value: SpanValue::String(CompactString::from(meta.client_address)),
+        },
+        SpanAttribute {
+            key: CompactString::from("dwaar.upstream"),
+            value: SpanValue::String(CompactString::from(meta.upstream)),
+        },
+        SpanAttribute {
+            key: CompactString::from("http.request.body.size"),
+            value: SpanValue::Int(meta.request_body_size.cast_signed()),
+        },
+        SpanAttribute {
+            key: CompactString::from("http.response.body.size"),
+            value: SpanValue::Int(meta.response_body_size.cast_signed()),
+        },
+    ];
+
+    if let Some(tls) = meta.tls_version {
+        attributes.push(SpanAttribute {
+            key: CompactString::from("dwaar.tls.version"),
+            value: SpanValue::String(CompactString::from(tls)),
+        });
+    }
+
+    dwaar_analytics::otel::Span {
+        trace_id: meta.trace_ctx.trace_id,
+        span_id: meta.trace_ctx.span_id,
+        parent_span_id: meta.parent_span_id,
+        name,
+        kind: SpanKind::Server,
+        start_ns: meta.start_ns,
+        end_ns: meta.end_ns,
+        status_code: meta.status,
+        attributes,
+    }
+}
+
 /// Build a completed OTLP span from a finished request. Called at the end
 /// of the request lifecycle when both timing and status are known.
 ///
 /// Returns a `dwaar_analytics::otel::Span` ready for `OtlpExporter::record()`.
 /// The trace/span IDs come from the propagated or generated `TraceContext`;
 /// everything else is request metadata captured during proxying.
+///
+/// Prefer [`create_ingress_span`] for new call sites — this simpler form is
+/// kept for tests that don't need the full attribute set.
 pub fn create_request_span(
     trace_ctx: &TraceContext,
     method: &str,
@@ -326,5 +453,101 @@ mod tests {
         let span = create_request_span(&ctx, "POST", "/upload", 201, "store:9090", 5000, 6000);
         assert_eq!(span.status_code, 201);
         assert_eq!(span.name.as_str(), "HTTP POST /upload");
+    }
+
+    #[test]
+    fn generate_child_traceparent_inherits_trace_id() {
+        let parent_tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let parent = parse_traceparent(parent_tp).expect("valid");
+        let child = generate_child_traceparent(&parent);
+
+        // Child must share the parent's trace ID.
+        assert_eq!(child.trace_id(), parent.trace_id());
+        // Child must have a different span ID.
+        assert_ne!(child.span_id(), parent.span_id());
+        // Child traceparent must be well-formed.
+        assert_eq!(child.traceparent().len(), 55);
+        let reparsed = parse_traceparent(child.traceparent()).expect("child is parseable");
+        assert_eq!(reparsed.trace_id(), parent.trace_id());
+    }
+
+    #[test]
+    fn span_id_bytes_roundtrips() {
+        let tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let ctx = parse_traceparent(tp).expect("valid");
+        let bytes = ctx.span_id_bytes();
+        assert_eq!(
+            std::str::from_utf8(&bytes).expect("ascii"),
+            "00f067aa0ba902b7"
+        );
+    }
+
+    #[test]
+    fn create_ingress_span_root_span_no_parent() {
+        let ctx = generate_traceparent();
+        let meta = IngressSpanMeta {
+            trace_ctx: &ctx,
+            parent_span_id: None,
+            method: "GET",
+            path: "/health",
+            scheme: "http",
+            host: "example.com",
+            client_address: "192.168.1.1",
+            upstream: "127.0.0.1:3000",
+            status: 200,
+            tls_version: None,
+            request_body_size: 0,
+            response_body_size: 512,
+            start_ns: 1_000_000,
+            end_ns: 1_001_000,
+        };
+        let span = create_ingress_span(&meta);
+        assert_eq!(span.parent_span_id, None);
+        assert_eq!(span.status_code, 200);
+        assert_eq!(span.name.as_str(), "HTTP GET /health");
+        // Must include all required semantic convention attributes.
+        let keys: Vec<_> = span.attributes.iter().map(|a| a.key.as_str()).collect();
+        assert!(keys.contains(&"http.request.method"));
+        assert!(keys.contains(&"http.response.status_code"));
+        assert!(keys.contains(&"url.path"));
+        assert!(keys.contains(&"url.scheme"));
+        assert!(keys.contains(&"server.address"));
+        assert!(keys.contains(&"client.address"));
+        assert!(keys.contains(&"dwaar.upstream"));
+        assert!(keys.contains(&"http.request.body.size"));
+        assert!(keys.contains(&"http.response.body.size"));
+        // No TLS version when TLS is absent.
+        assert!(!keys.contains(&"dwaar.tls.version"));
+    }
+
+    #[test]
+    fn create_ingress_span_child_span_sets_parent() {
+        let parent_tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let parent = parse_traceparent(parent_tp).expect("valid");
+        let child_ctx = generate_child_traceparent(&parent);
+        let parent_id = parent.span_id_bytes();
+
+        let meta = IngressSpanMeta {
+            trace_ctx: &child_ctx,
+            parent_span_id: Some(parent_id),
+            method: "POST",
+            path: "/api/data",
+            scheme: "https",
+            host: "api.example.com",
+            client_address: "10.0.0.1",
+            upstream: "127.0.0.1:8080",
+            status: 201,
+            tls_version: Some("TLSv1.3"),
+            request_body_size: 256,
+            response_body_size: 128,
+            start_ns: 2_000_000,
+            end_ns: 2_500_000,
+        };
+        let span = create_ingress_span(&meta);
+        assert_eq!(span.parent_span_id, Some(parent_id));
+        assert_eq!(span.status_code, 201);
+        // TLS version attribute present when TLS is active.
+        let keys: Vec<_> = span.attributes.iter().map(|a| a.key.as_str()).collect();
+        assert!(keys.contains(&"dwaar.tls.version"));
     }
 }
