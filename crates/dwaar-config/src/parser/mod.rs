@@ -532,6 +532,7 @@ fn parse_tracing_block(
     t.next_token(); // consume `{`
 
     let mut endpoint: Option<String> = None;
+    let mut sample_ratio: f64 = 1.0;
 
     loop {
         let tok = t.peek();
@@ -558,10 +559,17 @@ fn parse_tracing_block(
                 };
                 let val = peek_consume_word_or_quoted(t);
 
-                if sub_key.as_str() == "otlp_endpoint" {
-                    endpoint = Some(val);
+                match sub_key.as_str() {
+                    "otlp_endpoint" => {
+                        endpoint = Some(val);
+                    }
+                    "sample_ratio" => {
+                        if let Ok(r) = val.parse::<f64>() {
+                            sample_ratio = r.clamp(0.0, 1.0);
+                        }
+                    }
+                    _ => {} // Ignore unknown sub-directives for forward compat.
                 }
-                // Ignore unknown tracing sub-directives for forward compat.
             }
             _ => {
                 t.next_token();
@@ -579,7 +587,10 @@ fn parse_tracing_block(
         },
     })?;
 
-    Ok(super::model::TracingConfig { otlp_endpoint })
+    Ok(super::model::TracingConfig {
+        otlp_endpoint,
+        sample_ratio,
+    })
 }
 
 /// Parse "HH:MM-HH:MM" into (`start_minutes_from_midnight`, `end_minutes_from_midnight`).

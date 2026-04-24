@@ -63,13 +63,24 @@ pub struct GlobalOptions {
 
 /// Distributed tracing export configuration.
 ///
-/// Parsed from the `tracing { otlp_endpoint <url> }` block inside
-/// global options.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Parsed from the `tracing { ... }` block inside global options.
+#[derive(Debug, Clone)]
 pub struct TracingConfig {
     /// OTLP/HTTP endpoint URL, e.g. `http://localhost:4318/v1/traces`.
     pub otlp_endpoint: String,
+    /// Fraction of requests to sample, in the range `[0.0, 1.0]`.
+    /// Default `1.0` means record every request.
+    pub sample_ratio: f64,
 }
+
+impl PartialEq for TracingConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.otlp_endpoint == other.otlp_endpoint
+            && self.sample_ratio.to_bits() == other.sample_ratio.to_bits()
+    }
+}
+
+impl Eq for TracingConfig {}
 
 /// Connection-level timeouts for slow loris protection (ISSUE-076).
 ///
