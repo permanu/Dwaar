@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-04-24
+
+### Added
+
+- **OTLP ingress span per request** — Dwaar now emits one OpenTelemetry
+  span for every proxied HTTP request when `tracing { otlp_endpoint }` is
+  configured. The span is exported to the OTLP/HTTP collector via the
+  existing `dwaar-analytics` exporter and appears as the root node (or
+  child of the client's span) in the Permanu trace viewer.
+- **W3C Trace Context child-span propagation** — when an inbound request
+  carries a `traceparent` header, Dwaar now generates a *child* span
+  (same `trace_id`, fresh `span_id`) instead of propagating the client's
+  span unchanged. The child context is injected into the upstream request
+  so downstream services appear nested under the Dwaar ingress span.
+  When no `traceparent` is present, a fresh root span is generated as
+  before.
+- **`sample_ratio` config knob** — operators can set
+  `sample_ratio 0.1` inside the `tracing { }` block to record only a
+  fraction of requests (range `[0.0, 1.0]`, default `1.0`). Useful for
+  high-traffic sites where full sampling is cost-prohibitive.
+- **Semantic convention attributes on ingress span** — the span carries
+  `http.request.method`, `http.response.status_code`, `url.path`,
+  `url.scheme`, `server.address`, `client.address`, `dwaar.upstream`,
+  `http.request.body.size`, `http.response.body.size`, and
+  `dwaar.tls.version` (when TLS).
+
+### Changed
+
+- `TracingConfig` gains a `sample_ratio: f64` field (default `1.0`).
+  Existing Dwaarfiles without `sample_ratio` continue to record every
+  request unchanged.
+- The OTLP exporter `Arc` is now shared between `DwaarProxy` (records
+  spans on the hot path) and the background flush loop, eliminating the
+  double initialisation that existed previously.
+
 ## [0.3.6] - 2026-04-18
 
 ### Added
