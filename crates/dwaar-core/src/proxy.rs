@@ -36,6 +36,9 @@ use dwaar_analytics::beacon::{self, BeaconEvent, BeaconSender};
 use dwaar_analytics::decompress::{Decompressor, Encoding};
 use dwaar_analytics::injector::HtmlInjector;
 use dwaar_log::{LogSender, RequestLog};
+use dwaar_plugins::error_script_injection::{
+    csp_allows_injection, ErrorScriptConfig, ErrorScriptInjector,
+};
 use dwaar_plugins::plugin::PluginChain;
 use dwaar_tls::acme::ChallengeSolver;
 
@@ -2061,6 +2064,34 @@ impl ProxyHttp for DwaarProxy {
                     HtmlInjector::new_with_auth(host)
                 });
                 upstream_response.remove_header("Content-Length");
+
+                // Tier-3 browser error capture: inject the configured error-capture
+                // script when the control plane has marked this route for observation.
+                // Config is loaded from env per request (cheap — skips on first None).
+                if let Some(err_cfg) = ErrorScriptConfig::from_env() {
+                    let project_id = upstream_response
+                        .headers
+                        .get("X-Permanu-Observe-Project")
+                        .and_then(|v| v.to_str().ok());
+
+                    if let Some(pid) = project_id {
+                        let csp = upstream_response
+                            .headers
+                            .get("Content-Security-Policy")
+                            .and_then(|v| v.to_str().ok());
+
+                        if csp_allows_injection(csp, &err_cfg.origin)
+                            && let Some(inj) = ErrorScriptInjector::new(pid, &err_cfg)
+                        {
+                            debug!(
+                                request_id = %ctx.request_id(),
+                                project_id = pid,
+                                "error-script injection enabled for this response"
+                            );
+                            ctx.error_script_injector = Some(inj);
+                        }
+                    }
+                }
             }
         }
 
@@ -2164,6 +2195,13 @@ impl ProxyHttp for DwaarProxy {
         // Then inject into the decompressed HTML — core analytics
         if let Some(ref mut injector) = ctx.injector {
             injector.process(body, end_of_stream);
+        }
+
+        // Error-capture script injection (tier-3 browser error tracking).
+        // Runs after analytics injection so both look for </head> without
+        // interfering — analytics injects first, error script second.
+        if let Some(ref mut inj) = ctx.error_script_injector {
+            inj.process(body, end_of_stream);
         }
 
         // Run plugin chain body hooks (compression runs here)

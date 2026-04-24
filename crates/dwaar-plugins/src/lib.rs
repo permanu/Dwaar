@@ -9,6 +9,7 @@
 pub mod basic_auth;
 pub mod bot_detect;
 pub mod compress;
+pub mod error_script_injection;
 pub mod forward_auth;
 pub mod ip_filter;
 pub mod plugin;

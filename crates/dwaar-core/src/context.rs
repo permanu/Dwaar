@@ -40,6 +40,7 @@ use std::time::Instant;
 use compact_str::CompactString;
 use dwaar_analytics::decompress::Decompressor;
 use dwaar_analytics::injector::HtmlInjector;
+use dwaar_plugins::error_script_injection::ErrorScriptInjector;
 use dwaar_plugins::plugin::PluginCtx;
 use uuid::Uuid;
 
@@ -211,6 +212,17 @@ pub struct RequestContext {
     /// When `lb_policy cookie` selects a backend, this holds the `Set-Cookie`
     /// header value to pin the visitor. Applied in `response_filter()`.
     pub sticky_set_cookie: Option<String>,
+
+    /// Error-capture script injector (tier-3 browser error tracking).
+    ///
+    /// Created in `response_filter()` when:
+    /// - `DWAAR_ERROR_INJECTION=on` (feature flag)
+    /// - Response is `text/html`
+    /// - `X-Permanu-Observe-Project` header is present
+    /// - CSP (if present) allows the configured origin
+    ///
+    /// `None` means injection is disabled or not applicable for this request.
+    pub error_script_injector: Option<ErrorScriptInjector>,
 }
 
 impl RequestContext {
@@ -279,6 +291,7 @@ impl RequestContext {
             blocked_by: None,
             retry_count: 0,
             sticky_set_cookie: None,
+            error_script_injector: None,
         }
     }
 
