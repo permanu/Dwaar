@@ -7,8 +7,10 @@
 //! Error-capture script injection state machine.
 //!
 //! Scans HTML response body chunks for `</head>` and injects a
-//! `<script defer src="https://errors.permanu.com/c.js" data-project="...">` tag
-//! before it. Designed for streaming: each call to [`ErrorScriptInjector::process()`]
+//! `<script defer src="..." data-project="...">` tag before it.
+//! The script URL is sourced entirely from the `DWAAR_ERROR_SCRIPT_URL`
+//! environment variable — no URLs are hardcoded in this module.
+//! Designed for streaming: each call to [`ErrorScriptInjector::process()`]
 //! handles one chunk.
 //!
 //! ## Activation
@@ -16,14 +18,15 @@
 //! Injection is gated on three conditions, all checked in `proxy.rs` before
 //! an `ErrorScriptInjector` is created:
 //!
-//! 1. `DWAAR_ERROR_INJECTION=on` (default) — feature flag, env var read once at startup.
+//! 1. `DWAAR_ERROR_INJECTION=on` (default) and `DWAAR_ERROR_SCRIPT_URL` set
+//!    to a non-empty value — both checked via [`ErrorScriptConfig::from_env()`].
 //! 2. Response `Content-Type` is `text/html` (with or without charset).
 //! 3. Upstream set `X-Permanu-Observe-Project: <project-id>` — without a project ID
 //!    we have nothing to inject.
 //!
 //! The injector itself handles:
 //! - CSP detection and skip (caller passes the CSP header value before streaming).
-//! - Idempotency (already contains `errors.permanu.com/c.js`).
+//! - Idempotency (already contains the configured origin marker).
 //! - Scan-budget enforcement (64 KB default; skip if `</head>` not found in time).
 //!
 //! ## Pipeline position
@@ -39,9 +42,17 @@
 //!
 //! - Bounded scan: gives up after [`MAX_SCAN_BYTES`] without `</head>`.
 //! - Case-insensitive: handles `</head>`, `</HEAD>`, `</Head>`, etc.
-//! - No double injection: skips if `errors.permanu.com/c.js` already present.
+//! - No double injection: skips if the configured origin marker already present.
 //! - CSP-aware: skips if `Content-Security-Policy` exists and does NOT include
-//!   `errors.permanu.com` in `script-src` (logs a warning for operators).
+//!   the configured origin in `script-src` (logs a warning for operators).
+//!
+//! ## Environment variables
+//!
+//! | Variable | Default | Description |
+//! |---|---|---|
+//! | `DWAAR_ERROR_SCRIPT_URL` | _(none)_ | Full URL to the error-capture script, e.g. `https://errors.example.com/c.js`. Required; injection is disabled if absent. |
+//! | `DWAAR_ERROR_INJECTION` | `on` | Set to `off` to disable injection globally. |
+//! | `DWAAR_ERROR_PROJECT_HEADER` | — | Header the origin app sets to identify its Permanu project (read by proxy.rs). |
 
 use bytes::{Bytes, BytesMut};
 use tracing::warn;
@@ -51,19 +62,64 @@ use tracing::warn;
 const MAX_SCAN_BYTES: usize = 64 * 1024;
 
 /// Carryover buffer size: longest needle minus 1.
-/// Longest needle: `errors.permanu.com/c.js` = 23 bytes → carryover = 22.
-/// `</head>` = 7 bytes → carryover = 6.
-/// Use the larger of the two.
+/// `</head>` = 7 bytes → carryover needs at least 6.
+/// Marker length varies by config; we use 22 as a safe default matching the
+/// expected marker pattern `<host>/<path>` (covers up to 23-byte markers).
 const CARRYOVER_SIZE: usize = 22;
-
-/// Marker checked for double-injection detection.
-const ALREADY_INJECTED_MARKER: &[u8] = b"errors.permanu.com/c.js";
 
 /// The closing tag we inject before.
 const HEAD_CLOSE: &[u8] = b"</head>";
 
-/// Our domain, used for CSP validation.
-const OUR_ORIGIN: &str = "errors.permanu.com";
+/// Configuration for the error-script injector, sourced entirely from env.
+///
+/// Loaded per request (cheap — two env reads short-circuit when the feature
+/// is disabled). If either `DWAAR_ERROR_INJECTION=off` or
+/// `DWAAR_ERROR_SCRIPT_URL` unset/empty, the injector is disabled globally.
+#[derive(Debug, Clone)]
+pub struct ErrorScriptConfig {
+    /// Full URL to the error-capture script, e.g. `https://errors.example.com/c.js`.
+    pub script_url: String,
+    /// Origin for CSP validation, e.g. `errors.example.com`.
+    pub origin: String,
+    /// Marker bytes for double-injection detection (origin + path portion).
+    pub marker: Vec<u8>,
+}
+
+impl ErrorScriptConfig {
+    /// Load from env. Returns `None` when the feature is disabled or config is
+    /// absent/invalid — callers treat `None` as "skip injection for this request".
+    pub fn from_env() -> Option<Self> {
+        if std::env::var("DWAAR_ERROR_INJECTION")
+            .ok()
+            .as_deref()
+            .is_some_and(|v| v.eq_ignore_ascii_case("off"))
+        {
+            return None;
+        }
+        let url = std::env::var("DWAAR_ERROR_SCRIPT_URL").ok()?;
+        if url.trim().is_empty() {
+            return None;
+        }
+
+        // Derive origin from URL (strip scheme, keep host).
+        let without_scheme = url
+            .trim_start_matches("https://")
+            .trim_start_matches("http://");
+        let origin = without_scheme
+            .split(['/', ':', '?'])
+            .next()
+            .map(str::to_string)?;
+        if origin.is_empty() {
+            return None;
+        }
+
+        // Marker = origin + path portion (strip any query string).
+        let marker_str = without_scheme.split('?').next()?;
+        let marker = marker_str.as_bytes().to_vec();
+
+        Some(Self { script_url: url, origin, marker })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -78,10 +134,10 @@ enum State {
 /// Per-request error-script injector.
 ///
 /// Created in `response_filter()` when:
-/// - `DWAAR_ERROR_INJECTION=on`
+/// - [`ErrorScriptConfig::from_env()`] returns `Some` (feature enabled + URL configured)
 /// - Response is `text/html`
 /// - `X-Permanu-Observe-Project` header is present
-/// - CSP (if present) allows `errors.permanu.com` in `script-src`
+/// - CSP (if present) allows the configured origin in `script-src`
 ///
 /// Stored in `RequestContext.error_script_injector`. Each call to
 /// [`process()`] handles one body chunk from `response_body_filter()`.
@@ -94,14 +150,16 @@ pub struct ErrorScriptInjector {
     carryover: BytesMut,
     /// The full `<script ...></script>` tag to inject.
     script_tag: Vec<u8>,
+    /// Marker bytes used for double-injection detection.
+    marker: Vec<u8>,
 }
 
 impl ErrorScriptInjector {
-    /// Build a new injector for the given `project_id`.
+    /// Build a new injector for the given `project_id` and `config`.
     ///
     /// Returns `None` if `project_id` contains characters that would need
     /// HTML escaping (defence-in-depth: project IDs are UUID-class strings).
-    pub fn new(project_id: &str) -> Option<Self> {
+    pub fn new(project_id: &str, config: &ErrorScriptConfig) -> Option<Self> {
         // Reject anything that would break the HTML attribute value.
         // Project IDs are alphanumeric + hyphens/underscores only.
         if project_id
@@ -111,12 +169,13 @@ impl ErrorScriptInjector {
             return None;
         }
 
-        let tag = build_script_tag(project_id);
+        let tag = build_script_tag(project_id, &config.script_url);
         Some(Self {
             state: State::Scanning,
             bytes_scanned: 0,
             carryover: BytesMut::new(),
             script_tag: tag,
+            marker: config.marker.clone(),
         })
     }
 
@@ -150,7 +209,7 @@ impl ErrorScriptInjector {
         search_buf.extend_from_slice(data);
 
         // Double-injection check.
-        if find_bytes(&search_buf, ALREADY_INJECTED_MARKER).is_some() {
+        if find_bytes(&search_buf, &self.marker).is_some() {
             *body = Some(search_buf.freeze());
             self.state = State::Skipped;
             return;
@@ -205,29 +264,32 @@ impl ErrorScriptInjector {
     }
 }
 
-/// Build the `<script>` tag for the given project ID.
-fn build_script_tag(project_id: &str) -> Vec<u8> {
-    let mut tag = Vec::with_capacity(80 + project_id.len());
-    tag.extend_from_slice(b"<script defer src=\"https://errors.permanu.com/c.js\" data-project=\"");
+/// Build the `<script>` tag for the given project ID and script URL.
+fn build_script_tag(project_id: &str, script_url: &str) -> Vec<u8> {
+    let mut tag = Vec::with_capacity(40 + project_id.len() + script_url.len());
+    tag.extend_from_slice(b"<script defer src=\"");
+    tag.extend_from_slice(script_url.as_bytes());
+    tag.extend_from_slice(b"\" data-project=\"");
     tag.extend_from_slice(project_id.as_bytes());
     tag.extend_from_slice(b"\"></script>");
     tag
 }
 
-/// Check whether injection should proceed given the response's CSP header value.
+/// Check whether injection should proceed given the response's CSP header value
+/// and the configured origin.
 ///
 /// Returns `true` when injection is safe:
 /// - No CSP header → safe (no restriction).
-/// - CSP has `script-src` that includes `errors.permanu.com` or `'unsafe-inline'`
+/// - CSP has `script-src` that includes `origin` or `'unsafe-inline'`
 ///   or a wildcard `*` → safe.
-/// - CSP has `script-src` that doesn't include our origin → NOT safe; logs a
-///   warning so operators know to add `errors.permanu.com` to their CSP.
+/// - CSP has `script-src` that doesn't include the configured origin → NOT safe;
+///   logs a warning so operators know to add it to their CSP.
 /// - CSP has no `script-src` but has a `default-src` → check that instead.
 ///
-/// This is a best-effort check. A strict CSP that blocks our script means
-/// the user's browser would block the script anyway, so injection would be
+/// This is a best-effort check. A strict CSP that blocks the configured script
+/// means the user's browser would block the script anyway, so injection would be
 /// pointless and confusing.
-pub fn csp_allows_injection(csp: Option<&str>) -> bool {
+pub fn csp_allows_injection(csp: Option<&str>, origin: &str) -> bool {
     let Some(policy) = csp else {
         return true;
     };
@@ -254,22 +316,23 @@ pub fn csp_allows_injection(csp: Option<&str>) -> bool {
         if token.eq_ignore_ascii_case("'unsafe-inline'") {
             return true;
         }
-        // Our origin explicitly listed, optionally with a path.
+        // Configured origin explicitly listed, optionally with a path.
         if token
             .trim_start_matches("https://")
             .trim_start_matches("http://")
-            .starts_with(OUR_ORIGIN)
+            .starts_with(origin)
         {
             return true;
         }
     }
 
-    // CSP exists and doesn't allow our origin.
+    // CSP exists and doesn't allow the configured origin.
     warn!(
         csp = policy,
+        origin = origin,
         "error-script injection skipped: Content-Security-Policy does not include \
-         errors.permanu.com in script-src. Add 'https://errors.permanu.com' to \
-         script-src to enable browser error capture for this app."
+         the configured origin in script-src. Add it to script-src to enable \
+         browser error capture."
     );
     false
 }
@@ -315,12 +378,13 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-/// Read the feature flag from the environment. Called once at proxy startup.
-/// Returns `true` (injection enabled) unless `DWAAR_ERROR_INJECTION=off`.
+/// Read the feature flag from the environment. Returns `true` (injection
+/// enabled) when `ErrorScriptConfig::from_env()` would return `Some`.
+///
+/// Note: callers that also need the config should call `ErrorScriptConfig::from_env()`
+/// directly rather than calling this function followed by another env read.
 pub fn injection_enabled() -> bool {
-    std::env::var("DWAAR_ERROR_INJECTION")
-        .map(|v| !v.eq_ignore_ascii_case("off"))
-        .unwrap_or(true)
+    ErrorScriptConfig::from_env().is_some()
 }
 
 #[cfg(test)]
@@ -332,8 +396,16 @@ mod tests {
 
     const PROJECT: &str = "proj-abc-123";
 
+    fn test_config() -> ErrorScriptConfig {
+        ErrorScriptConfig {
+            script_url: "https://example-errors.test/c.js".to_string(),
+            origin: "example-errors.test".to_string(),
+            marker: b"example-errors.test/c.js".to_vec(),
+        }
+    }
+
     fn injector() -> ErrorScriptInjector {
-        ErrorScriptInjector::new(PROJECT).expect("valid project id")
+        ErrorScriptInjector::new(PROJECT, &test_config()).expect("valid project id")
     }
 
     fn inject_once(html: &[u8]) -> Vec<u8> {
@@ -345,7 +417,7 @@ mod tests {
 
     fn expected_tag() -> String {
         format!(
-            "<script defer src=\"https://errors.permanu.com/c.js\" data-project=\"{PROJECT}\"></script>"
+            "<script defer src=\"https://example-errors.test/c.js\" data-project=\"{PROJECT}\"></script>"
         )
     }
 
@@ -396,15 +468,17 @@ mod tests {
 
     #[test]
     fn no_double_injection() {
+        let cfg = test_config();
         let html = format!(
-            "<html><head><script defer src=\"https://errors.permanu.com/c.js\" \
-             data-project=\"{PROJECT}\"></script></head><body></body></html>"
+            "<html><head><script defer src=\"{}\" \
+             data-project=\"{PROJECT}\"></script></head><body></body></html>",
+            cfg.script_url
         );
         let result = inject_once(html.as_bytes());
         let s = std::str::from_utf8(&result).expect("utf8");
         // The marker appears exactly once.
         assert_eq!(
-            s.matches("errors.permanu.com/c.js").count(),
+            s.matches("example-errors.test/c.js").count(),
             1,
             "should not double-inject, got: {s}"
         );
@@ -421,97 +495,120 @@ mod tests {
 
     #[test]
     fn injection_enabled_by_default() {
-        // Remove the env var if set by another test, then verify default.
+        // Remove the env vars if set by another test, then verify default.
         // SAFETY: tests run single-threaded (cargo test --test-threads=1 or
         // within a single test binary). The env var is temporary and restored.
-        unsafe { std::env::remove_var("DWAAR_ERROR_INJECTION") };
-        assert!(injection_enabled());
+        unsafe {
+            std::env::remove_var("DWAAR_ERROR_INJECTION");
+            std::env::remove_var("DWAAR_ERROR_SCRIPT_URL");
+        }
+        // Without DWAAR_ERROR_SCRIPT_URL, injection_enabled returns false.
+        assert!(!injection_enabled());
     }
 
     #[test]
     fn injection_disabled_by_env_var() {
-        unsafe { std::env::set_var("DWAAR_ERROR_INJECTION", "off") };
+        unsafe {
+            std::env::set_var("DWAAR_ERROR_INJECTION", "off");
+            std::env::set_var("DWAAR_ERROR_SCRIPT_URL", "https://example-errors.test/c.js");
+        }
         assert!(!injection_enabled());
-        unsafe { std::env::remove_var("DWAAR_ERROR_INJECTION") };
+        unsafe {
+            std::env::remove_var("DWAAR_ERROR_INJECTION");
+            std::env::remove_var("DWAAR_ERROR_SCRIPT_URL");
+        }
     }
 
     #[test]
     fn injection_enabled_by_env_var_on() {
-        unsafe { std::env::set_var("DWAAR_ERROR_INJECTION", "on") };
+        unsafe {
+            std::env::set_var("DWAAR_ERROR_INJECTION", "on");
+            std::env::set_var("DWAAR_ERROR_SCRIPT_URL", "https://example-errors.test/c.js");
+        }
         assert!(injection_enabled());
-        unsafe { std::env::remove_var("DWAAR_ERROR_INJECTION") };
+        unsafe {
+            std::env::remove_var("DWAAR_ERROR_INJECTION");
+            std::env::remove_var("DWAAR_ERROR_SCRIPT_URL");
+        }
     }
 
     #[test]
     fn injection_disabled_case_insensitive() {
-        unsafe { std::env::set_var("DWAAR_ERROR_INJECTION", "OFF") };
+        unsafe {
+            std::env::set_var("DWAAR_ERROR_INJECTION", "OFF");
+            std::env::set_var("DWAAR_ERROR_SCRIPT_URL", "https://example-errors.test/c.js");
+        }
         assert!(!injection_enabled());
-        unsafe { std::env::remove_var("DWAAR_ERROR_INJECTION") };
+        unsafe {
+            std::env::remove_var("DWAAR_ERROR_INJECTION");
+            std::env::remove_var("DWAAR_ERROR_SCRIPT_URL");
+        }
     }
 
     // ── CSP checks ────────────────────────────────────────────────────────────
 
     #[test]
     fn csp_none_allows_injection() {
-        assert!(csp_allows_injection(None));
+        assert!(csp_allows_injection(None, "example-errors.test"));
     }
 
     #[test]
     fn csp_with_our_origin_allows_injection() {
-        let csp = "default-src 'self'; script-src 'self' https://errors.permanu.com";
-        assert!(csp_allows_injection(Some(csp)));
+        let csp = "default-src 'self'; script-src 'self' https://example-errors.test";
+        assert!(csp_allows_injection(Some(csp), "example-errors.test"));
     }
 
     #[test]
     fn csp_with_wildcard_allows_injection() {
         let csp = "script-src *";
-        assert!(csp_allows_injection(Some(csp)));
+        assert!(csp_allows_injection(Some(csp), "example-errors.test"));
     }
 
     #[test]
     fn csp_with_unsafe_inline_allows_injection() {
         let csp = "script-src 'self' 'unsafe-inline'";
-        assert!(csp_allows_injection(Some(csp)));
+        assert!(csp_allows_injection(Some(csp), "example-errors.test"));
     }
 
     #[test]
     fn csp_strict_without_our_origin_blocks_injection() {
         let csp = "default-src 'self'; script-src 'self' https://cdn.example.com";
-        assert!(!csp_allows_injection(Some(csp)));
+        assert!(!csp_allows_injection(Some(csp), "example-errors.test"));
     }
 
     #[test]
     fn csp_with_default_src_fallback() {
         // No script-src; default-src includes our origin.
-        let csp = "default-src 'self' https://errors.permanu.com";
-        assert!(csp_allows_injection(Some(csp)));
+        let csp = "default-src 'self' https://example-errors.test";
+        assert!(csp_allows_injection(Some(csp), "example-errors.test"));
     }
 
     #[test]
     fn csp_with_restrictive_default_src_blocks() {
         let csp = "default-src 'self'";
-        assert!(!csp_allows_injection(Some(csp)));
+        assert!(!csp_allows_injection(Some(csp), "example-errors.test"));
     }
 
     #[test]
     fn csp_no_script_src_or_default_src_allows() {
         // Only unrelated directives — no restriction on scripts.
         let csp = "img-src 'self'; style-src 'self'";
-        assert!(csp_allows_injection(Some(csp)));
+        assert!(csp_allows_injection(Some(csp), "example-errors.test"));
     }
 
     // ── Missing project ID header → no injection ───────────────────────────────
 
     #[test]
     fn missing_project_id_means_no_injector_created() {
+        let cfg = test_config();
         // In production, no X-Permanu-Observe-Project header → injector is never
         // created. Here we verify the constructor rejects invalid project IDs.
-        assert!(ErrorScriptInjector::new("valid-id-123").is_some());
-        assert!(ErrorScriptInjector::new("").is_some()); // empty = valid (caller guards against this)
-        assert!(ErrorScriptInjector::new("bad\"id").is_none());
-        assert!(ErrorScriptInjector::new("bad<id").is_none());
-        assert!(ErrorScriptInjector::new("bad>id").is_none());
-        assert!(ErrorScriptInjector::new("bad'id").is_none());
+        assert!(ErrorScriptInjector::new("valid-id-123", &cfg).is_some());
+        assert!(ErrorScriptInjector::new("", &cfg).is_some()); // empty = valid (caller guards against this)
+        assert!(ErrorScriptInjector::new("bad\"id", &cfg).is_none());
+        assert!(ErrorScriptInjector::new("bad<id", &cfg).is_none());
+        assert!(ErrorScriptInjector::new("bad>id", &cfg).is_none());
+        assert!(ErrorScriptInjector::new("bad'id", &cfg).is_none());
     }
 
     // ── Size cap ──────────────────────────────────────────────────────────────
@@ -673,10 +770,11 @@ mod tests {
 
     #[test]
     fn script_tag_contains_project_id() {
-        let tag = build_script_tag("my-project-99");
+        let cfg = test_config();
+        let tag = build_script_tag("my-project-99", &cfg.script_url);
         let s = std::str::from_utf8(&tag).expect("utf8");
         assert!(s.contains("data-project=\"my-project-99\""));
-        assert!(s.contains("https://errors.permanu.com/c.js"));
+        assert!(s.contains("https://example-errors.test/c.js"));
         assert!(s.contains("defer"));
     }
 
@@ -697,8 +795,68 @@ mod tests {
 
     #[test]
     fn extract_csp_directive_case_insensitive() {
-        let policy = "SCRIPT-SRC 'self' https://errors.permanu.com";
+        let policy = "SCRIPT-SRC 'self' https://example-errors.test";
         let val = extract_csp_directive(policy, "script-src").expect("should find case-insensitively");
-        assert!(val.contains("errors.permanu.com"));
+        assert!(val.contains("example-errors.test"));
+    }
+
+    // ── ErrorScriptConfig::from_env tests ─────────────────────────────────────
+
+    #[test]
+    fn config_from_env_unset_returns_none() {
+        unsafe {
+            std::env::remove_var("DWAAR_ERROR_INJECTION");
+            std::env::remove_var("DWAAR_ERROR_SCRIPT_URL");
+        }
+        assert!(ErrorScriptConfig::from_env().is_none());
+    }
+
+    #[test]
+    fn config_from_env_empty_returns_none() {
+        unsafe {
+            std::env::remove_var("DWAAR_ERROR_INJECTION");
+            std::env::set_var("DWAAR_ERROR_SCRIPT_URL", "");
+        }
+        assert!(ErrorScriptConfig::from_env().is_none());
+        unsafe { std::env::remove_var("DWAAR_ERROR_SCRIPT_URL") };
+    }
+
+    #[test]
+    fn config_from_env_feature_off_returns_none() {
+        unsafe {
+            std::env::set_var("DWAAR_ERROR_INJECTION", "off");
+            std::env::set_var("DWAAR_ERROR_SCRIPT_URL", "https://errors.example.com/c.js");
+        }
+        assert!(ErrorScriptConfig::from_env().is_none());
+        unsafe {
+            std::env::remove_var("DWAAR_ERROR_INJECTION");
+            std::env::remove_var("DWAAR_ERROR_SCRIPT_URL");
+        }
+    }
+
+    #[test]
+    fn config_derives_origin_from_url() {
+        unsafe {
+            std::env::remove_var("DWAAR_ERROR_INJECTION");
+            std::env::set_var("DWAAR_ERROR_SCRIPT_URL", "https://errors.example.com/c.js");
+        }
+        let cfg = ErrorScriptConfig::from_env().expect("should succeed");
+        assert_eq!(cfg.origin, "errors.example.com");
+        assert_eq!(cfg.marker, b"errors.example.com/c.js");
+        unsafe { std::env::remove_var("DWAAR_ERROR_SCRIPT_URL") };
+    }
+
+    #[test]
+    fn config_with_port() {
+        unsafe {
+            std::env::remove_var("DWAAR_ERROR_INJECTION");
+            std::env::set_var("DWAAR_ERROR_SCRIPT_URL", "https://errors.example.com:9000/c.js");
+        }
+        let cfg = ErrorScriptConfig::from_env().expect("should succeed");
+        // Origin strips port (split on ':').
+        assert_eq!(cfg.origin, "errors.example.com");
+        // Marker includes host:port and path from without_scheme.
+        assert_eq!(cfg.marker, b"errors.example.com:9000/c.js");
+        unsafe { std::env::remove_var("DWAAR_ERROR_SCRIPT_URL") };
     }
 }

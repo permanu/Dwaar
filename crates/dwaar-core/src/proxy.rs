@@ -37,7 +37,7 @@ use dwaar_analytics::decompress::{Decompressor, Encoding};
 use dwaar_analytics::injector::HtmlInjector;
 use dwaar_log::{LogSender, RequestLog};
 use dwaar_plugins::error_script_injection::{
-    csp_allows_injection, injection_enabled, ErrorScriptInjector,
+    csp_allows_injection, ErrorScriptConfig, ErrorScriptInjector,
 };
 use dwaar_plugins::plugin::PluginChain;
 use dwaar_tls::acme::ChallengeSolver;
@@ -2065,11 +2065,10 @@ impl ProxyHttp for DwaarProxy {
                 });
                 upstream_response.remove_header("Content-Length");
 
-                // Tier-3 browser error capture: inject errors.permanu.com/c.js
-                // when the control plane has marked this route for observation.
-                // `injection_enabled()` is read once at startup (env var); if it
-                // returns false the block is skipped entirely (no header reads).
-                if injection_enabled() {
+                // Tier-3 browser error capture: inject the configured error-capture
+                // script when the control plane has marked this route for observation.
+                // Config is loaded from env per request (cheap — skips on first None).
+                if let Some(err_cfg) = ErrorScriptConfig::from_env() {
                     let project_id = upstream_response
                         .headers
                         .get("X-Permanu-Observe-Project")
@@ -2081,15 +2080,15 @@ impl ProxyHttp for DwaarProxy {
                             .get("Content-Security-Policy")
                             .and_then(|v| v.to_str().ok());
 
-                        if csp_allows_injection(csp) {
-                            if let Some(inj) = ErrorScriptInjector::new(pid) {
-                                debug!(
-                                    request_id = %ctx.request_id(),
-                                    project_id = pid,
-                                    "error-script injection enabled for this response"
-                                );
-                                ctx.error_script_injector = Some(inj);
-                            }
+                        if csp_allows_injection(csp, &err_cfg.origin)
+                            && let Some(inj) = ErrorScriptInjector::new(pid, &err_cfg)
+                        {
+                            debug!(
+                                request_id = %ctx.request_id(),
+                                project_id = pid,
+                                "error-script injection enabled for this response"
+                            );
+                            ctx.error_script_injector = Some(inj);
                         }
                     }
                 }

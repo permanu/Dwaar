@@ -219,7 +219,7 @@ pub struct RequestContext {
     /// - `DWAAR_ERROR_INJECTION=on` (feature flag)
     /// - Response is `text/html`
     /// - `X-Permanu-Observe-Project` header is present
-    /// - CSP (if present) allows `errors.permanu.com`
+    /// - CSP (if present) allows the configured origin
     ///
     /// `None` means injection is disabled or not applicable for this request.
     pub error_script_injector: Option<ErrorScriptInjector>,
