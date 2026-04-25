@@ -1,0 +1,36 @@
+name: Version Guard
+
+# Enforce that Cargo.toml dwaar-cli version, LICENSE Licensed Work version,
+# and the top CHANGELOG.md entry agree, AND that any version bump is exactly
+# one increment ahead of the latest published Git tag (no skips).
+#
+# Backstop for the missing-tag class of bugs that produced the v0.3.7
+# (never tagged) → v0.3.8 (LICENSE-mismatch failure) → v0.3.9 (actual
+# release) sequence on 2026-04-25. With this guard, that sequence cannot
+# recur — a PR that bumps Cargo.toml without matching LICENSE + CHANGELOG
+# fails CI before it can land on main.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    name: Version Consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Need full history so `git tag -l` resolves the latest tag.
+          fetch-depth: 0
+      - run: chmod +x scripts/check-version-consistency.sh
+      - run: ./scripts/check-version-consistency.sh

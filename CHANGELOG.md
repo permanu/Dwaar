@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+<<<<<<< HEAD
 ### Added
 
 - **`auto_update { enabled / drain_timeout_secs / health_check_url / rollback_on_health_fail }` knobs** —
@@ -29,11 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Admin `GET /version`** — unauthenticated. Returns `{"version":"<semver>","started_at":"<rfc3339>","pid":<int>}`. Lets the installer confirm the new binary is answering and verify the PID changed after a successful upgrade.
 
-## [0.3.8] - 2026-04-25
+### Security
+- Release binaries are now signed with cosign (keyless OIDC). `install.sh` verifies the signature when cosign is installed. Verification command: `cosign verify-blob --certificate-identity-regexp "^https://github.com/permanu/Dwaar/\\.github/workflows/release\\.yml@.*" --certificate-oidc-issuer "https://token.actions.githubusercontent.com" --certificate <binary>.cert --signature <binary>.sig <binary>`. Permanu's auto-update agent verifies the same way before swapping any binary.
+
+## [0.3.9] - 2026-04-25
 
 First tagged release covering the v0.3.7 OTLP/sample_ratio work, which
 was internally version-bumped in main (#218) but never had a tag or
-GitHub release cut for it. v0.3.8 supersedes v0.3.7 and ships the
+GitHub release cut for it. v0.3.9 supersedes both (the v0.3.8 tag failed to publish — LICENSE version mismatch in CI). Ships the
 following on top of v0.3.6:
 
 ### Security
