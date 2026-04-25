@@ -1933,7 +1933,10 @@ fn parse_tracing_block_sample_ratio_clamped() {
         .as_ref()
         .and_then(|g| g.tracing.as_ref())
         .expect("tracing config present");
-    assert!((tc.sample_ratio - 1.0).abs() < f64::EPSILON, "ratio should be clamped to 1.0");
+    assert!(
+        (tc.sample_ratio - 1.0).abs() < f64::EPSILON,
+        "ratio should be clamped to 1.0"
+    );
 }
 
 /// `sample_ratio nan` and `sample_ratio inf` must not silently zero sampling.

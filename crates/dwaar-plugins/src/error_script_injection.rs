@@ -117,7 +117,11 @@ impl ErrorScriptConfig {
         let marker_str = without_scheme.split('?').next()?;
         let marker = marker_str.as_bytes().to_vec();
 
-        Some(Self { script_url: url, origin, marker })
+        Some(Self {
+            script_url: url,
+            origin,
+            marker,
+        })
     }
 }
 
@@ -217,8 +221,7 @@ impl ErrorScriptInjector {
 
         // Search for </head> before checking budget.
         if let Some(pos) = find_case_insensitive(&search_buf, HEAD_CLOSE) {
-            let mut buf =
-                BytesMut::with_capacity(search_buf.len() + self.script_tag.len());
+            let mut buf = BytesMut::with_capacity(search_buf.len() + self.script_tag.len());
             buf.extend_from_slice(&search_buf[..pos]);
             buf.extend_from_slice(&self.script_tag);
             buf.extend_from_slice(&search_buf[pos..]);
@@ -250,8 +253,7 @@ impl ErrorScriptInjector {
             if !self.carryover.is_empty() {
                 let flush = std::mem::take(&mut self.carryover);
                 if let Some(existing) = body.take() {
-                    let mut combined =
-                        BytesMut::with_capacity(existing.len() + flush.len());
+                    let mut combined = BytesMut::with_capacity(existing.len() + flush.len());
                     combined.extend_from_slice(&existing);
                     combined.extend_from_slice(&flush);
                     *body = Some(combined.freeze());
@@ -639,7 +641,10 @@ mod tests {
         let result = inject_once(&big);
         let tag = expected_tag();
         let s = std::str::from_utf8(&result).expect("utf8");
-        assert!(s.contains(&format!("{tag}</head>")), "should inject despite large chunk");
+        assert!(
+            s.contains(&format!("{tag}</head>")),
+            "should inject despite large chunk"
+        );
         assert_eq!(result.len(), big.len() + tag.len());
     }
 
@@ -727,7 +732,9 @@ mod tests {
         inj.process(&mut body1, false);
         // May or may not be done yet depending on chunk boundary — but once done:
         let mut inj2 = injector();
-        let mut b = Some(Bytes::from_static(b"<html><head></head><body></body></html>"));
+        let mut b = Some(Bytes::from_static(
+            b"<html><head></head><body></body></html>",
+        ));
         inj2.process(&mut b, false);
         // Already processed to done; next chunk passes through.
         if !inj2.is_active() {
@@ -796,7 +803,8 @@ mod tests {
     #[test]
     fn extract_csp_directive_case_insensitive() {
         let policy = "SCRIPT-SRC 'self' https://example-errors.test";
-        let val = extract_csp_directive(policy, "script-src").expect("should find case-insensitively");
+        let val =
+            extract_csp_directive(policy, "script-src").expect("should find case-insensitively");
         assert!(val.contains("example-errors.test"));
     }
 
@@ -850,7 +858,10 @@ mod tests {
     fn config_with_port() {
         unsafe {
             std::env::remove_var("DWAAR_ERROR_INJECTION");
-            std::env::set_var("DWAAR_ERROR_SCRIPT_URL", "https://errors.example.com:9000/c.js");
+            std::env::set_var(
+                "DWAAR_ERROR_SCRIPT_URL",
+                "https://errors.example.com:9000/c.js",
+            );
         }
         let cfg = ErrorScriptConfig::from_env().expect("should succeed");
         // Origin strips port (split on ':').
