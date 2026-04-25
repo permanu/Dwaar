@@ -564,7 +564,12 @@ fn parse_tracing_block(
                         endpoint = Some(val);
                     }
                     "sample_ratio" => {
-                        if let Ok(r) = val.parse::<f64>() {
+                        // Reject NaN/inf: parse::<f64>() accepts "nan"/"inf",
+                        // and NaN.clamp() propagates NaN, which would silently
+                        // disable tracing (NaN < r is always false).
+                        if let Ok(r) = val.parse::<f64>()
+                            && r.is_finite()
+                        {
                             sample_ratio = r.clamp(0.0, 1.0);
                         }
                     }
