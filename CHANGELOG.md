@@ -7,6 +7,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-04-25
+
+First tagged release covering the v0.3.7 OTLP/sample_ratio work, which
+was internally version-bumped in main (#218) but never had a tag or
+GitHub release cut for it. v0.3.8 supersedes v0.3.7 and ships the
+following on top of v0.3.6:
+
+### Security
+
+- **rustls-webpki 0.103.13** (was 0.103.11) — fixes
+  [GHSA-82j2-j2ch-gfr8](https://github.com/rustls/webpki/security/advisories/GHSA-82j2-j2ch-gfr8)
+  (reachable panic when parsing a CRL with negative `thisUpdate` /
+  `nextUpdate`) and [GHSA-965h-392x-2mh5](https://github.com/rustls/webpki/security/advisories/GHSA-965h-392x-2mh5)
+  follow-on (URI name constraint exclusion logic was inverted, allowing
+  excluded URIs to validate). Pulled in via `pingora-core` and the rustls
+  TLS stack — every Dwaar build is exposed.
+- **openssl 0.10.78 + openssl-sys 0.9.114** — patches a dangling stack
+  pointer in custom-extension callbacks, an OID handling panic, an
+  AES key-unwrap bounds check, and callback length validation. No CVE
+  ID assigned but memory-safety relevant.
+
+### Added (carried forward from internal v0.3.7)
+
+- **OTLP ingress span per request** — Dwaar now emits one OpenTelemetry
+  span for every proxied HTTP request when `tracing { otlp_endpoint }` is
+  configured. Exported via the existing `dwaar-analytics` OTLP/HTTP path
+  and appears as the root node (or child of the client's span) in the
+  Permanu trace viewer.
+- **W3C Trace Context child-span propagation** — when a request carries
+  `traceparent`, Dwaar generates a *child* span (same `trace_id`, fresh
+  `span_id`) and injects the new context upstream so downstream services
+  nest under the Dwaar ingress span. Fresh root span when no
+  `traceparent` is present.
+- **`sample_ratio` config knob** — `tracing { sample_ratio 0.1 }` records
+  only a fraction of requests (range `[0.0, 1.0]`, default `1.0`) for
+  cost-controlled sampling on high-traffic sites.
+- **Semantic-convention attributes on the ingress span** —
+  `http.request.method`, `http.response.status_code`, `url.path`,
+  `url.scheme`, `server.address`, `client.address`, `dwaar.upstream`,
+  request/response body sizes, and `dwaar.tls.version` (when TLS).
+- **Error-capture script auto-injection for HTML responses** (#217) —
+  Dwaar can now inject a small client-side error-capture snippet into
+  HTML responses for first-party error tracking.
+
+### Fixed
+
+- **Non-finite `sample_ratio` no longer silently disables tracing.**
+  `f64::parse` accepts `"nan"`, `"inf"`, `"-inf"` as valid floats and
+  `NaN.clamp()` propagates NaN unchanged, so a typo'd
+  `sample_ratio nan` would zero sampling without warning
+  (`fastrand::f64() < NaN` is always false). Parser now adds an
+  `is_finite()` guard so non-finite values fall back to the default
+  `1.0`. Regression test covers `nan`, `inf`, `-inf`, `NaN`, `Inf`.
+
+### Changed
+
+- `TracingConfig` gains a `sample_ratio: f64` field (default `1.0`).
+  Existing Dwaarfiles without `sample_ratio` continue to record every
+  request unchanged.
+- The OTLP exporter `Arc` is now shared between `DwaarProxy` (records
+  spans on the hot path) and the background flush loop, eliminating the
+  prior double-initialisation.
+
+### CI
+
+- Workflows optimised: macOS dropped from the test matrix (release.yml's
+  cross-compile matrix covers it at tag time), build job is dev-profile
+  not `--release` (release-profile compilation moves to tag-time only),
+  `cargo install cargo-deny / cargo-audit` replaced with
+  `taiki-e/install-action` (~5s prebuilt binary vs ~2-3min source
+  compile), `concurrency.cancel-in-progress` added to ci.yml + audit.yml
+  so rapid pushes don't pile up redundant runs, `Swatinem/rust-cache`
+  added to the fmt job. Net wall time per PR drops ~5-10 min.
+- `cargo fmt --all` + `cargo clippy --fix` cleanup applied across
+  `parser/tests.rs`, `proxy.rs`, and `error_script_injection.rs` (carry-
+  over from prior releases that landed without local fmt/clippy).
+
 ## [0.3.7] - 2026-04-24
 
 ### Added
