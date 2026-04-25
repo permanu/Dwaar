@@ -19,16 +19,22 @@ permissions:
   contents: read
 
 jobs:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
   audit:
     name: Dependency Audit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      # Use latest stable Rust for cargo-audit (not our pinned toolchain)
-      # cargo-audit inspects Cargo.lock, doesn't compile our code
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+      # Install cargo-audit from prebuilt binaries (~5s) instead of
+      # compiling from source (~2-3min). cargo-audit only inspects
+      # Cargo.lock — it doesn't need the Rust toolchain.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
       - name: Run audit
         run: >-
           cargo audit

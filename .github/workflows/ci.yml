@@ -9,6 +9,12 @@ on:
 permissions:
   contents: read
 
+# Cancel in-flight runs for the same branch when a new commit lands.
+# Prevents queued-run pile-up during active feature work.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -22,6 +28,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+      - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
 
   clippy:
@@ -39,12 +46,12 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   test:
+    # Linux-only — Dwaar ships as a Linux server binary; macOS coverage adds
+    # 10× runner cost (macos minutes are billed at 10× linux) for negligible
+    # signal. Cross-platform validation happens at release tag time via
+    # release.yml's matrix (linux-amd64, linux-arm64, darwin-arm64).
     name: Test
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -62,6 +69,11 @@ jobs:
         timeout-minutes: 15
 
   build:
+    # Dev-profile build only — the test job already compiles the workspace
+    # in dev. Release-profile compilation runs at tag time in release.yml,
+    # where lto=fat + codegen-units=1 actually matter. Doing it here added
+    # 5–10 min per PR for zero practical signal beyond what `cargo test`
+    # already provides.
     name: Build
     runs-on: ubuntu-latest
     steps:
@@ -71,7 +83,7 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --workspace --release
+      - run: cargo build --workspace
 
   license-headers:
     name: License Headers
@@ -101,8 +113,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
-      - name: Run cargo-deny
-        run: cargo deny check
+      # Install cargo-deny from prebuilt binaries (~5s) instead of
+      # compiling from source (~2-3min on cold runner). Doesn't need
+      # the Rust toolchain at all.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny check
