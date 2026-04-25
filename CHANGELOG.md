@@ -7,11 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.8] - 2026-04-25
+## [0.3.9] - 2026-04-25
 
 First tagged release covering the v0.3.7 OTLP/sample_ratio work, which
 was internally version-bumped in main (#218) but never had a tag or
-GitHub release cut for it. v0.3.8 supersedes v0.3.7 and ships the
+GitHub release cut for it. v0.3.9 supersedes both (the v0.3.8 tag failed to publish — LICENSE version mismatch in CI). Ships the
 following on top of v0.3.6:
 
 ### Security
