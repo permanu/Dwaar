@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- Release binaries are now signed with cosign (keyless OIDC). `install.sh` verifies the signature when cosign is installed. Verification command: `cosign verify-blob --certificate-identity-regexp "^https://github.com/permanu/Dwaar/\\.github/workflows/release\\.yml@.*" --certificate-oidc-issuer "https://token.actions.githubusercontent.com" --certificate <binary>.cert --signature <binary>.sig <binary>`. Permanu's auto-update agent verifies the same way before swapping any binary.
+
 ## [0.3.8] - 2026-04-25
 
 First tagged release covering the v0.3.7 OTLP/sample_ratio work, which

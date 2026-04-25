@@ -15,6 +15,14 @@ jobs:
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    # id-token: write is required for cosign keyless OIDC signing.
+    # Without it cosign cannot exchange an OIDC token with Fulcio to get a
+    # short-lived signing certificate — the step will fail with a clear error
+    # rather than silently skip.  contents:write is needed so the upload
+    # artifact action can stage assets for the release job.
+    permissions:
+      id-token: write
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -76,6 +84,30 @@ jobs:
           cd dist
           sha256sum ${{ matrix.artifact }} > ${{ matrix.artifact }}.sha256
 
+      # Install cosign for keyless OIDC signing.
+      # Pinned to SHA for supply-chain safety — this digest corresponds to
+      # sigstore/cosign-installer@v3.8.2 (2025-04-16). Update by checking
+      # https://github.com/sigstore/cosign-installer/releases and verifying
+      # the commit SHA from the release tag.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@3454372f43399081ed03b604cb2d021dabca52bb # v3.8.2
+
+      # Sign the binary with cosign keyless OIDC.
+      # The GitHub Actions OIDC token (provided by id-token: write above) is
+      # exchanged with Fulcio to obtain a short-lived signing certificate that
+      # encodes this workflow's identity:
+      #   https://github.com/permanu/Dwaar/.github/workflows/release.yml@refs/tags/<tag>
+      # No keys are stored — verification uses the cert chain back to Fulcio.
+      # --yes suppresses the interactive consent prompt in CI.
+      - name: Sign binary with cosign (keyless OIDC)
+        run: |
+          cosign sign-blob \
+            --yes \
+            --bundle "dist/${{ matrix.artifact }}.bundle" \
+            --output-signature "dist/${{ matrix.artifact }}.sig" \
+            --output-certificate "dist/${{ matrix.artifact }}.cert" \
+            "dist/${{ matrix.artifact }}"
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
@@ -117,11 +149,23 @@ jobs:
           echo "$NOTES" >> $GITHUB_OUTPUT
           echo "EOFNOTES" >> $GITHUB_OUTPUT
 
+      # Aggregate all per-artifact sha256 files into a single SHASUMS.txt.
+      # install.sh and the auto-update agent both consume this file.
+      - name: Aggregate SHASUMS.txt
+        run: |
+          cd artifacts
+          cat *.sha256 > SHASUMS.txt
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           body: ${{ steps.changelog.outputs.notes }}
-          files: artifacts/*
+          # Include binaries, per-file sha256, cosign bundles (.bundle),
+          # detached signatures (.sig), signing certificates (.cert), and
+          # the aggregated SHASUMS.txt.
+          files: |
+            artifacts/dwaar-*
+            artifacts/SHASUMS.txt
           generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
