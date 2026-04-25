@@ -7,7 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-<<<<<<< HEAD
 ### Added
 
 - **`auto_update { enabled / drain_timeout_secs / health_check_url / rollback_on_health_fail }` knobs** —
