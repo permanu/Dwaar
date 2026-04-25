@@ -109,7 +109,7 @@ mime_guess = "2"
 instant-acme = "0.7"
 
 # OpenSSL (for TLS cert handling in dwaar-tls)
-openssl = { version = "0.10.77", features = ["vendored"] }
+openssl = { version = "0.10.78", features = ["vendored"] }
 # Async OpenSSL wrapper — used by L4 TLS termination handler
 tokio-openssl = "0.6.5"
 
