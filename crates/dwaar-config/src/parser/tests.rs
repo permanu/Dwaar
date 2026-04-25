@@ -1935,3 +1935,34 @@ fn parse_tracing_block_sample_ratio_clamped() {
         .expect("tracing config present");
     assert!((tc.sample_ratio - 1.0).abs() < f64::EPSILON, "ratio should be clamped to 1.0");
 }
+
+/// `sample_ratio nan` and `sample_ratio inf` must not silently zero sampling.
+/// `f64::parse` accepts both literals; without an `is_finite` guard, NaN/inf
+/// would propagate through `clamp` and disable tracing without warning.
+#[test]
+fn parse_tracing_block_sample_ratio_rejects_non_finite() {
+    for non_finite in ["nan", "inf", "-inf", "NaN", "Inf"] {
+        let src = format!(
+            r#"{{
+                tracing {{
+                    otlp_endpoint http://127.0.0.1:4318/v1/traces
+                    sample_ratio {non_finite}
+                }}
+            }}
+            example.com {{
+                reverse_proxy localhost:8080
+            }}"#
+        );
+        let config = parse(&src).expect("should parse with non-finite ratio");
+        let tc = config
+            .global_options
+            .as_ref()
+            .and_then(|g| g.tracing.as_ref())
+            .expect("tracing config present");
+        assert!(
+            (tc.sample_ratio - 1.0).abs() < f64::EPSILON,
+            "non-finite ratio {non_finite} must fall back to default 1.0, got {}",
+            tc.sample_ratio
+        );
+    }
+}
