@@ -1812,21 +1812,20 @@ impl ProxyHttp for DwaarProxy {
         //
         // When no traceparent is present, generate a fresh trace + span so the
         // downstream service tree is still fully correlated.
-        let (trace_ctx, inbound_parent_span_id) =
-            if let Some(inbound) = session
-                .req_header()
-                .headers
-                .get("traceparent")
-                .and_then(|v| v.to_str().ok())
-                .and_then(crate::trace::parse_traceparent)
-            {
-                // Extract the client's span_id before generating the child context.
-                let parent_id = inbound.span_id_bytes();
-                let child = crate::trace::generate_child_traceparent(&inbound);
-                (child, Some(parent_id))
-            } else {
-                (crate::trace::generate_traceparent(), None)
-            };
+        let (trace_ctx, inbound_parent_span_id) = if let Some(inbound) = session
+            .req_header()
+            .headers
+            .get("traceparent")
+            .and_then(|v| v.to_str().ok())
+            .and_then(crate::trace::parse_traceparent)
+        {
+            // Extract the client's span_id before generating the child context.
+            let parent_id = inbound.span_id_bytes();
+            let child = crate::trace::generate_child_traceparent(&inbound);
+            (child, Some(parent_id))
+        } else {
+            (crate::trace::generate_traceparent(), None)
+        };
 
         upstream_request.insert_header("traceparent", trace_ctx.traceparent())?;
 
@@ -2284,10 +2283,13 @@ impl ProxyHttp for DwaarProxy {
         // a single pointer compare; zero overhead when tracing is disabled.
         if let Some(ref exporter) = self.otlp_exporter
             && let Some(ref trace_ctx) = ctx.trace_ctx
-            && (self.trace_sample_ratio >= 1.0
-                || fastrand::f64() < self.trace_sample_ratio)
+            && (self.trace_sample_ratio >= 1.0 || fastrand::f64() < self.trace_sample_ratio)
         {
-            let scheme = if ctx.plugin_ctx.is_tls { "https" } else { "http" };
+            let scheme = if ctx.plugin_ctx.is_tls {
+                "https"
+            } else {
+                "http"
+            };
             let span_client_ip = ctx
                 .plugin_ctx
                 .client_ip
