@@ -1969,3 +1969,200 @@ fn parse_tracing_block_sample_ratio_rejects_non_finite() {
         );
     }
 }
+
+// ── auto_update directive tests ───────────────────────────────────────────────
+
+#[test]
+fn auto_update_absent_leaves_none() {
+    let config = parse(
+        "{
+            http_port 80
+        }
+        example.com {
+            reverse_proxy localhost:8080
+        }",
+    )
+    .expect("should parse");
+    assert!(
+        config
+            .global_options
+            .as_ref()
+            .and_then(|g| g.auto_update.as_ref())
+            .is_none(),
+        "auto_update should be None when not specified"
+    );
+}
+
+#[test]
+fn auto_update_defaults_when_block_empty() {
+    use crate::model::AutoUpdateConfig;
+    let config = parse(
+        "{
+            auto_update {
+            }
+        }
+        example.com {
+            reverse_proxy localhost:8080
+        }",
+    )
+    .expect("should parse empty auto_update block");
+    let au = config
+        .global_options
+        .as_ref()
+        .and_then(|g| g.auto_update.as_ref())
+        .expect("auto_update should be present");
+    let defaults = AutoUpdateConfig::default();
+    assert_eq!(au.enabled, defaults.enabled);
+    assert_eq!(au.drain_timeout_secs, defaults.drain_timeout_secs);
+    assert_eq!(au.health_check_url, defaults.health_check_url);
+    assert_eq!(au.rollback_on_health_fail, defaults.rollback_on_health_fail);
+    assert_eq!(au.channel, defaults.channel);
+}
+
+#[test]
+fn auto_update_all_knobs_explicit() {
+    use crate::model::AutoUpdateAction;
+    let config = parse(
+        "{
+            auto_update {
+                enabled false
+                channel stable
+                check_interval 1h
+                drain_timeout_secs 30
+                health_check_url http://127.0.0.1:9999/healthz
+                rollback_on_health_fail false
+                on_new_version notify
+            }
+        }
+        example.com {
+            reverse_proxy localhost:8080
+        }",
+    )
+    .expect("should parse all auto_update knobs");
+    let au = config
+        .global_options
+        .as_ref()
+        .and_then(|g| g.auto_update.as_ref())
+        .expect("auto_update present");
+    assert!(!au.enabled);
+    assert_eq!(au.channel, "stable");
+    assert_eq!(au.check_interval_secs, 3600);
+    assert_eq!(au.drain_timeout_secs, 30);
+    assert_eq!(au.health_check_url, "http://127.0.0.1:9999/healthz");
+    assert!(!au.rollback_on_health_fail);
+    assert_eq!(au.on_new_version, AutoUpdateAction::Notify);
+}
+
+#[test]
+fn auto_update_enabled_true_explicit() {
+    let config = parse(
+        "{
+            auto_update {
+                enabled true
+            }
+        }
+        example.com {
+            reverse_proxy localhost:8080
+        }",
+    )
+    .expect("should parse enabled true");
+    let au = config
+        .global_options
+        .as_ref()
+        .and_then(|g| g.auto_update.as_ref())
+        .expect("auto_update present");
+    assert!(au.enabled);
+}
+
+#[test]
+fn auto_update_invalid_enabled_value_errors() {
+    let result = parse(
+        "{
+            auto_update {
+                enabled maybe
+            }
+        }
+        example.com {
+            reverse_proxy localhost:8080
+        }",
+    );
+    assert!(
+        result.is_err(),
+        "invalid enabled value should produce parse error"
+    );
+}
+
+#[test]
+fn auto_update_invalid_drain_timeout_errors() {
+    let result = parse(
+        "{
+            auto_update {
+                drain_timeout_secs notanumber
+            }
+        }
+        example.com {
+            reverse_proxy localhost:8080
+        }",
+    );
+    assert!(
+        result.is_err(),
+        "non-integer drain_timeout_secs should produce parse error"
+    );
+}
+
+#[test]
+fn auto_update_invalid_health_check_url_errors() {
+    let result = parse(
+        "{
+            auto_update {
+                health_check_url ftp://bad-scheme/healthz
+            }
+        }
+        example.com {
+            reverse_proxy localhost:8080
+        }",
+    );
+    assert!(
+        result.is_err(),
+        "non-http health_check_url should produce parse error"
+    );
+}
+
+#[test]
+fn auto_update_rollback_on_health_fail_false() {
+    let config = parse(
+        "{
+            auto_update {
+                rollback_on_health_fail false
+            }
+        }
+        example.com {
+            reverse_proxy localhost:8080
+        }",
+    )
+    .expect("should parse rollback_on_health_fail false");
+    let au = config
+        .global_options
+        .as_ref()
+        .and_then(|g| g.auto_update.as_ref())
+        .expect("auto_update present");
+    assert!(!au.rollback_on_health_fail);
+}
+
+#[test]
+fn auto_update_unknown_directive_errors() {
+    let result = parse(
+        "{
+            auto_update {
+                unknown_knob value
+            }
+        }
+        example.com {
+            reverse_proxy localhost:8080
+        }",
+    );
+    assert!(
+        result.is_err(),
+        "unknown auto_update directive should produce parse error"
+    );
+}

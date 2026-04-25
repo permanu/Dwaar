@@ -7,9 +7,10 @@
 //! Admin API endpoint handlers.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use arc_swap::ArcSwap;
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use dwaar_analytics::aggregation::DomainMetrics;
 use dwaar_analytics::aggregation::snapshot::AnalyticsSnapshot;
@@ -32,6 +33,37 @@ pub struct CreateRouteRequest {
 pub fn health(start_time: &Instant) -> String {
     let uptime = start_time.elapsed().as_secs();
     format!(r#"{{"status":"ok","uptime_secs":{uptime}}}"#)
+}
+
+/// Build the `/healthz` response.
+///
+/// Returns `200 {"status":"ok"}` while the proxy is running normally,
+/// or `503 {"status":"draining"}` once the server enters graceful shutdown.
+/// Callers pass `shutting_down = true` during the drain window so the
+/// installer's health-check loop can detect the swap boundary.
+pub fn healthz(shutting_down: bool) -> (u16, String) {
+    if shutting_down {
+        (503, r#"{"status":"draining"}"#.to_string())
+    } else {
+        (200, r#"{"status":"ok"}"#.to_string())
+    }
+}
+
+/// Build the `/version` response body.
+///
+/// Returns a JSON object with the binary version, the RFC 3339 `started_at`
+/// timestamp, and the current PID. Used by the installer's upgrade-readiness
+/// check to confirm the new binary is answering and to verify the PID changed.
+pub fn version_info(started_at: SystemTime) -> String {
+    let ver = env!("CARGO_PKG_VERSION");
+    // SAFETY: getpid() is always safe to call on Unix.
+    #[allow(unsafe_code)]
+    let pid = unsafe { libc::getpid() };
+    let started_rfc3339: DateTime<Utc> = started_at.into();
+    format!(
+        r#"{{"version":"{ver}","started_at":"{ts}","pid":{pid}}}"#,
+        ts = started_rfc3339.to_rfc3339(),
+    )
 }
 
 /// Outcome of validating a Dwaarfile source string for the `POST /reload`
@@ -221,6 +253,41 @@ mod tests {
         let json = health(&start);
         assert!(json.contains("\"status\":\"ok\""));
         assert!(json.contains("\"uptime_secs\":"));
+    }
+
+    #[test]
+    fn healthz_returns_ok_when_not_draining() {
+        let (status, body) = healthz(false);
+        assert_eq!(status, 200);
+        assert!(body.contains("\"status\":\"ok\""));
+    }
+
+    #[test]
+    fn healthz_returns_503_when_draining() {
+        let (status, body) = healthz(true);
+        assert_eq!(status, 503);
+        assert!(body.contains("\"status\":\"draining\""));
+    }
+
+    #[test]
+    fn version_info_contains_version_pid_started_at() {
+        let now = SystemTime::now();
+        let json = version_info(now);
+        // Version field matches CARGO_PKG_VERSION
+        assert!(
+            json.contains(env!("CARGO_PKG_VERSION")),
+            "version missing from /version response"
+        );
+        // PID is a positive integer — just check the key exists
+        assert!(
+            json.contains("\"pid\":"),
+            "pid missing from /version response"
+        );
+        // started_at is present and is an RFC 3339 timestamp
+        assert!(
+            json.contains("\"started_at\":"),
+            "started_at missing from /version response"
+        );
     }
 
     #[test]

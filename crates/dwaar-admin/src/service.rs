@@ -8,7 +8,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwap;
@@ -48,6 +48,9 @@ pub struct AdminService {
     route_table: Arc<ArcSwap<RouteTable>>,
     metrics: Arc<DashMap<String, DomainMetrics>>,
     start_time: Instant,
+    /// Wall-clock time when this process started. Used by `GET /version` to
+    /// produce an RFC 3339 `started_at` field that persists across requests.
+    started_at: SystemTime,
     auth: Auth,
     /// Notifier to trigger config reload. When signaled, the `ConfigWatcher`
     /// re-reads the Dwaarfile and updates the route table.
@@ -69,6 +72,10 @@ pub struct AdminService {
     window_start: AtomicU64,
     /// Unix epoch seconds when `/reload` was last successfully triggered.
     last_reload: AtomicU64,
+    /// Set to `true` once the server enters graceful shutdown.
+    /// `GET /healthz` returns 503 while this flag is set so the upgrade
+    /// orchestrator (Mission B installer) can detect the drain window.
+    shutting_down: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for AdminService {
@@ -96,6 +103,7 @@ impl AdminService {
             route_table,
             metrics,
             start_time,
+            started_at: SystemTime::now(),
             auth: Auth::new(admin_token),
             reload_notify: None,
             config_path: None,
@@ -104,7 +112,15 @@ impl AdminService {
             request_count: AtomicU64::new(0),
             window_start: AtomicU64::new(0),
             last_reload: AtomicU64::new(0),
+            shutting_down: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Return a cloned handle to the `shutting_down` flag so external code
+    /// (e.g. the SIGUSR2 drain orchestrator) can flip it before Pingora's
+    /// internal shutdown completes. Once set, `GET /healthz` returns 503.
+    pub fn shutting_down_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.shutting_down)
     }
 
     /// Set the reload notifier for `POST /reload` support.
@@ -253,6 +269,22 @@ impl AdminService {
         if method == "GET" && path == "/health" {
             debug!(source, "health check");
             return json_response(200, &handlers::health(&self.start_time));
+        }
+
+        // Healthz — unauthenticated liveness probe used by the upgrade orchestrator.
+        // Returns 503 once the server enters the graceful-shutdown drain window.
+        if method == "GET" && path == "/healthz" {
+            debug!(source, "healthz probe");
+            let draining = self.shutting_down.load(Ordering::Relaxed);
+            let (status, body) = handlers::healthz(draining);
+            return json_response(status, &body);
+        }
+
+        // Version — unauthenticated; lets the installer verify the new binary
+        // is answering and check that the PID changed after an upgrade.
+        if method == "GET" && path == "/version" {
+            debug!(source, "version info");
+            return json_response(200, &handlers::version_info(self.started_at));
         }
 
         // UDS connections are trusted — OS filesystem permissions on the socket
@@ -504,7 +536,7 @@ impl AdminService {
 
 /// Return the `Allow` header value for a given path — used in 405 responses.
 fn allowed_methods_for(path: &str) -> &'static str {
-    if path == "/health" {
+    if path == "/health" || path == "/healthz" || path == "/version" {
         "GET"
     } else if path == "/routes" {
         "GET, POST"

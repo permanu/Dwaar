@@ -1295,6 +1295,7 @@ dependencies = [
  "dwaar-core",
  "dwaar-log",
  "http",
+ "libc",
  "pingora-cache",
  "pingora-core",
  "serde",

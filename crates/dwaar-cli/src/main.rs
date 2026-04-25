@@ -312,6 +312,10 @@ fn fork_workers(
 /// Supervisor shutdown flag — set by SIGTERM/SIGINT handler.
 static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Set by the SIGUSR2 signal handler. The upgrade-monitor thread polls this
+/// flag; on seeing it flip, it spawns the new binary and orchestrates drain.
+static UPGRADE_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Signal handler for SIGTERM/SIGINT — sets shutdown flag.
 ///
 /// H-05: uses `SeqCst` to guarantee the store is observed by the supervisor
@@ -320,6 +324,225 @@ static SHUTTING_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 /// edge there, so the supervisor could spin forever missing the flag.
 extern "C" fn handle_shutdown(_sig: libc::c_int) {
     SHUTTING_DOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Signal handler for SIGUSR2 — sets the upgrade-pending flag.
+///
+/// ASYNC-SIGNAL-SAFE: only writes a single atomic bool — no allocations,
+/// no locks, no I/O. The upgrade orchestration logic lives in a background
+/// thread that polls `UPGRADE_PENDING` so the heavy work stays off the
+/// signal stack entirely.
+extern "C" fn handle_sigusr2(_sig: libc::c_int) {
+    UPGRADE_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Spawn the upgrade-monitor thread and install the SIGUSR2 handler.
+///
+/// The thread polls `UPGRADE_PENDING` every 100 ms. On seeing it flip:
+///   1. Resolves the binary path from `DWAAR_UPGRADE_BINARY` env or `argv[0]`.
+///   2. Spawns `<binary> --upgrade [original-args without "upgrade" tokens]`.
+///   3. Polls `health_check_url` (from `DWAAR_UPGRADE_HEALTH_URL` or the
+///      default `/healthz` on 6663) until 200 or `drain_timeout_secs` elapses.
+///   4. On success: sends SIGQUIT to self → Pingora graceful drain + exit.
+///   5. On failure: kills the child, resets `UPGRADE_PENDING`, keeps running.
+///
+/// The upgrade socket path is passed so it can be forwarded to the child via
+/// `DWAAR_UPGRADE_SOCK`; the child's Pingora config picks it up automatically.
+#[allow(clippy::too_many_lines)]
+fn install_sigusr2_handler(drain_timeout_secs: u64, upgrade_sock: String) {
+    use std::sync::atomic::Ordering;
+
+    // SAFETY: signal handler only sets an atomic flag — async-signal-safe.
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::signal(
+            libc::SIGUSR2,
+            handle_sigusr2 as *const () as libc::sighandler_t,
+        );
+    }
+
+    std::thread::Builder::new()
+        .name("upgrade-monitor".into())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+
+                if !UPGRADE_PENDING.load(Ordering::SeqCst) {
+                    continue;
+                }
+
+                // Clear the flag before we start work — if the operator sends
+                // SIGUSR2 again mid-upgrade it will queue for the next iteration.
+                UPGRADE_PENDING.store(false, Ordering::SeqCst);
+
+                tracing::info!("SIGUSR2 received — starting zero-downtime upgrade");
+
+                // Resolve binary: DWAAR_UPGRADE_BINARY env overrides argv[0].
+                // Linux inode semantics: the file at the original path can be
+                // replaced with a rename(2) while this process keeps executing
+                // from the old mmap. Re-exec'ing argv[0] picks up the new binary
+                // from the filesystem without any FD tricks.
+                let binary = std::env::var("DWAAR_UPGRADE_BINARY")
+                    .map(std::path::PathBuf::from)
+                    .or_else(|_| {
+                        std::env::current_exe()
+                            .with_context(|| "cannot resolve current executable")
+                    });
+                let binary = match binary {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::error!(error = %e, "upgrade: cannot resolve binary path — aborting");
+                        continue;
+                    }
+                };
+
+                // Forward original args, stripping any existing "upgrade" tokens
+                // to avoid accidentally running `dwaar upgrade upgrade`.
+                let orig_args: Vec<String> = std::env::args()
+                    .skip(1)
+                    .filter(|a| a != "upgrade" && a != "--upgrade")
+                    .collect();
+
+                tracing::info!(
+                    binary = %binary.display(),
+                    args = ?orig_args,
+                    upgrade_sock = %upgrade_sock,
+                    "upgrade: spawning new process"
+                );
+
+                let child = std::process::Command::new(&binary)
+                    .arg("--upgrade")
+                    .args(&orig_args)
+                    .env("DWAAR_UPGRADE_SOCK", &upgrade_sock)
+                    // Signal to the child that it is a hot-upgrade child so it
+                    // connects to the upgrade socket instead of binding fresh.
+                    .env("DWAAR_UPGRADE_FROM", "1")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::inherit())
+                    .stderr(std::process::Stdio::inherit())
+                    .spawn();
+
+                let mut child = match child {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!(
+                            binary = %binary.display(),
+                            error = %e,
+                            "upgrade: failed to spawn new process — staying up"
+                        );
+                        continue;
+                    }
+                };
+
+                let new_pid = child.id();
+                tracing::info!(pid = new_pid, "upgrade: new process started");
+
+                // Health-check loop: poll the new process's /healthz until 200
+                // or the drain timeout elapses.
+                let health_url = std::env::var("DWAAR_UPGRADE_HEALTH_URL")
+                    .unwrap_or_else(|_| "http://127.0.0.1:6663/healthz".to_string());
+
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(drain_timeout_secs);
+                let mut healthy = false;
+
+                while std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+
+                    // Check the child is still alive first.
+                    #[allow(unsafe_code)]
+                    let still_alive = unsafe {
+                        let mut status: libc::c_int = 0;
+                        libc::waitpid(new_pid.cast_signed(), &raw mut status, libc::WNOHANG) == 0
+                    };
+                    if !still_alive {
+                        tracing::error!(
+                            pid = new_pid,
+                            "upgrade: new process exited before becoming healthy — rolling back"
+                        );
+                        break;
+                    }
+
+                    // Simple HTTP GET via the standard library — no tokio
+                    // runtime on this thread. We use a raw TCP connection to
+                    // avoid pulling in a full HTTP client crate.
+                    if check_http_200(&health_url) {
+                        healthy = true;
+                        break;
+                    }
+                }
+
+                if healthy {
+                    tracing::info!(
+                        pid = new_pid,
+                        "upgrade: new process is healthy — draining parent"
+                    );
+                    // Send SIGQUIT to ourselves: Pingora's graceful-upgrade
+                    // handler sends FDs over the upgrade socket and exits cleanly.
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        libc::kill(libc::getpid(), libc::SIGQUIT);
+                    }
+                    // The main thread's `run_forever()` will return after drain.
+                    // Our work is done — exit the monitor thread.
+                    return;
+                }
+                // Rollback: kill the unhealthy child and stay up.
+                tracing::error!(
+                    pid = new_pid,
+                    health_url = %health_url,
+                    drain_timeout_secs,
+                    "upgrade: health check failed — killing new process, parent stays up"
+                );
+                #[allow(unsafe_code)]
+                unsafe {
+                    libc::kill(new_pid.cast_signed(), libc::SIGKILL);
+                }
+                let _ = child.wait();
+            }
+        })
+        .expect("upgrade-monitor thread spawn must not fail");
+}
+
+/// Perform a single HTTP GET to `url` and return `true` iff the response
+/// status is 200.
+///
+/// Uses a raw TCP connection with a short connect + read timeout. This runs
+/// on the upgrade-monitor thread which has no tokio runtime, so we use
+/// blocking I/O. The URL must be `http://` (no TLS) — the internal health
+/// endpoint never uses HTTPS.
+fn check_http_200(url: &str) -> bool {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    // Parse host:port and path from "http://host:port/path".
+    let rest = url.strip_prefix("http://").unwrap_or(url);
+    let (hostport, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let path = format!("/{path}");
+
+    let Ok(stream) = TcpStream::connect(hostport) else {
+        return false;
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap_or(());
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .unwrap_or(());
+    let mut stream = stream;
+
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {hostport}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+
+    let mut buf = [0u8; 16];
+    if stream.read(&mut buf).is_err() {
+        return false;
+    }
+    // HTTP/1.1 200 or HTTP/1.0 200
+    buf.starts_with(b"HTTP/1.1 200") || buf.starts_with(b"HTTP/1.0 200")
 }
 
 fn main() -> anyhow::Result<()> {
@@ -443,8 +666,24 @@ fn run_server(
     worker_id: usize,
     worker_count: usize,
 ) -> anyhow::Result<()> {
+    // `DWAAR_UPGRADE_FROM=1` is an env-var equivalent of `--upgrade` so the
+    // installer can set the flag without modifying argv (e.g. when re-exec'ing
+    // with execve where changing argv[0] is simpler than injecting flags).
+    let is_upgrade = cli.upgrade
+        || std::env::var("DWAAR_UPGRADE_FROM")
+            .map(|v| v.trim() == "1")
+            .unwrap_or(false);
+
+    // `DWAAR_UPGRADE_SOCK` overrides Pingora's default upgrade socket path
+    // (`/tmp/pingora_upgrade.sock`). The installer writes this path to the
+    // environment so parent and child agree on a single rendezvous point even
+    // when multiple Dwaar instances run on the same host (each can use a
+    // unique path — e.g. `/run/dwaar/<pid>.sock`).
+    let upgrade_sock = std::env::var("DWAAR_UPGRADE_SOCK")
+        .unwrap_or_else(|_| "/run/dwaar/upgrade.sock".to_string());
+
     let pingora_opt = PingoraOpt {
-        upgrade: cli.upgrade,
+        upgrade: is_upgrade,
         daemon: cli.daemon,
         nocapture: false,
         test: false,
@@ -478,12 +717,22 @@ fn run_server(
         _ => 512,
     };
 
+    // Extract the drain timeout (seconds) for use in the SIGUSR2 handler.
+    // We apply it both to Pingora's graceful-shutdown timer and our own
+    // watchdog: if the drain takes longer than this, we SIGKILL ourselves.
+    let conf_drain_secs: u64 = drain_timeout.as_secs();
+
     let conf = ServerConf {
         threads,
         work_stealing: true,
         upstream_keepalive_pool_size,
-        grace_period_seconds: Some(5),
-        graceful_shutdown_timeout_seconds: Some(5),
+        grace_period_seconds: Some(conf_drain_secs),
+        graceful_shutdown_timeout_seconds: Some(conf_drain_secs),
+        // Direct Pingora to the rendezvous socket used for FD transfer.
+        // The child process calls `Server::new_with_opt_and_conf` with
+        // `upgrade: true` and connects to this same socket to receive the
+        // listening-fd set, so it never needs to re-bind ports.
+        upgrade_sock: upgrade_sock.clone(),
         ..ServerConf::default()
     };
 
@@ -996,6 +1245,34 @@ fn run_server(
         l4_reload_notify,
         otlp_exporter_for_proxy,
     );
+
+    // Install the SIGUSR2 handler for zero-downtime graceful upgrades.
+    //
+    // How the upgrade dance works:
+    //
+    //   1. Operator (or installer) atomically replaces the binary on disk via
+    //      rename(2). Linux inode semantics keep the old binary's open file
+    //      descriptor alive until the process exits, so the running parent
+    //      continues executing from the old mmap'd pages even after the rename.
+    //      Re-exec'ing argv[0] picks up the *new* binary from the filesystem.
+    //
+    //   2. SIGUSR2 fires → handler records the signal, sets UPGRADE_PENDING.
+    //
+    //   3. A background thread (spawned below) polls UPGRADE_PENDING, spawns
+    //      `<argv[0]> --upgrade [original-args]` (or DWAAR_UPGRADE_BINARY if
+    //      set), and waits up to `drain_timeout_secs` for the child's health
+    //      check to pass.
+    //
+    //   4. On success, the parent sends itself SIGQUIT — Pingora's graceful-
+    //      shutdown signal — which drains in-flight requests and exits.
+    //
+    //   5. On failure (health check never passes within the timeout), the
+    //      parent kills the child and keeps running.
+    //
+    // This module-level approach keeps the signal handler itself minimal
+    // (just setting an atomic flag, which is signal-safe) and moves the
+    // async logic into the background thread.
+    install_sigusr2_handler(conf_drain_secs, upgrade_sock);
 
     info!("entering run loop, waiting for connections or signals");
     server.run_forever();

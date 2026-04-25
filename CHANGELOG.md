@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`auto_update { enabled / drain_timeout_secs / health_check_url / rollback_on_health_fail }` knobs** —
+  Four new fields in the `auto_update { }` global-options block:
+  - `enabled` (bool, default `true`) — toggle the background check loop without removing the config block.
+  - `drain_timeout_secs` (u64, default `60`) — how long the parent process waits for in-flight requests to drain after the new binary is healthy before exiting.
+  - `health_check_url` (string, default `http://127.0.0.1:6663/healthz`) — URL polled after spawning the new binary; `200` means ready.
+  - `rollback_on_health_fail` (bool, default `true`) — kill the new binary and keep the parent running if the health check never passes within `drain_timeout_secs`.
+
+- **SIGUSR2 graceful-upgrade orchestration** — the running parent now installs a SIGUSR2 handler. On signal receipt:
+  1. Spawns `<argv[0]> --upgrade` (or the path in `DWAAR_UPGRADE_BINARY` if set) with `DWAAR_UPGRADE_SOCK` forwarded so parent and child share a single FD-transfer rendezvous socket.
+  2. Polls `health_check_url` until `200` or `drain_timeout_secs` elapses.
+  3. On success sends itself SIGQUIT → Pingora graceful drain + exit.
+  4. On failure kills the child and stays up (rollback).
+  - `DWAAR_UPGRADE_SOCK` env overrides the default upgrade socket path (`/run/dwaar/upgrade.sock`).
+  - `DWAAR_UPGRADE_FROM=1` env is equivalent to `--upgrade` so the installer can trigger the child-side FD-receive without modifying argv.
+  - The parent binary path may be atomically replaced via `rename(2)` while the process is running (Linux inode semantics); re-exec'ing `argv[0]` picks up the new binary from the filesystem.
+
+- **Admin `GET /healthz`** — unauthenticated liveness probe. Returns `200 {"status":"ok"}` while the proxy is up, `503 {"status":"draining"}` once the server enters the graceful-shutdown drain window. Used by the upgrade orchestrator and external health checkers.
+
+- **Admin `GET /version`** — unauthenticated. Returns `{"version":"<semver>","started_at":"<rfc3339>","pid":<int>}`. Lets the installer confirm the new binary is answering and verify the PID changed after a successful upgrade.
+
 ### Security
 - Release binaries are now signed with cosign (keyless OIDC). `install.sh` verifies the signature when cosign is installed. Verification command: `cosign verify-blob --certificate-identity-regexp "^https://github.com/permanu/Dwaar/\\.github/workflows/release\\.yml@.*" --certificate-oidc-issuer "https://token.actions.githubusercontent.com" --certificate <binary>.cert --signature <binary>.sig <binary>`. Permanu's auto-update agent verifies the same way before swapping any binary.
 

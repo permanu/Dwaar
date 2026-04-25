@@ -26,6 +26,8 @@ http = { workspace = true }
 dashmap = { workspace = true }
 subtle = "2"
 zeroize = { workspace = true }
+libc = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 compact_str = { workspace = true }

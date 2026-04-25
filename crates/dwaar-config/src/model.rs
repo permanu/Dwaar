@@ -116,15 +116,23 @@ impl Default for TimeoutsConfig {
 /// ```text
 /// {
 ///     auto_update {
+///         enabled true
 ///         channel stable
 ///         check_interval 6h
 ///         window 03:00-05:00
 ///         on_new_version reload
+///         drain_timeout_secs 60
+///         health_check_url http://127.0.0.1:6663/healthz
+///         rollback_on_health_fail true
 ///     }
 /// }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutoUpdateConfig {
+    /// Whether auto-update is active. Setting `enabled false` disables the
+    /// background check loop without removing the block from the Dwaarfile.
+    /// Default: `true`.
+    pub enabled: bool,
     /// Release channel to follow. Only `stable` is supported.
     pub channel: String,
     /// How often to check releases.dwaar.dev for a new version (seconds).
@@ -139,15 +147,30 @@ pub struct AutoUpdateConfig {
     ///   - `reload`  — exec `dwaar upgrade` for zero-downtime swap (default)
     ///   - `notify`  — download + replace binary but don't restart
     pub on_new_version: AutoUpdateAction,
+    /// How long (seconds) the parent process waits for in-flight requests to
+    /// drain after the new binary signals ready via the upgrade socket.
+    /// Passed to Pingora's graceful-shutdown machinery. Default: 60.
+    pub drain_timeout_secs: u64,
+    /// URL that the new process must return `200` on before the parent
+    /// considers the upgrade successful. Default: `http://127.0.0.1:6663/healthz`.
+    pub health_check_url: String,
+    /// When `true`, if the health check returns non-200 after the swap the
+    /// parent process is kept running and the new binary is killed.
+    /// Default: `true`.
+    pub rollback_on_health_fail: bool,
 }
 
 impl Default for AutoUpdateConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             channel: "stable".to_string(),
             check_interval_secs: 6 * 3600, // 6 hours
             window: None,
             on_new_version: AutoUpdateAction::Reload,
+            drain_timeout_secs: 60,
+            health_check_url: "http://127.0.0.1:6663/healthz".to_string(),
+            rollback_on_health_fail: true,
         }
     }
 }

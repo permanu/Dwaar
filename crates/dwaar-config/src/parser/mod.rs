@@ -431,6 +431,23 @@ fn parse_auto_update_block(
                 let val = peek_consume_word_or_quoted(t);
 
                 match sub_key.as_str() {
+                    "enabled" => match val.as_str() {
+                        "true" | "on" | "yes" | "1" => cfg.enabled = true,
+                        "false" | "off" | "no" | "0" => cfg.enabled = false,
+                        _ => {
+                            return Err(ParseError {
+                                line: sub_tok.line,
+                                col: sub_tok.col,
+                                kind: ParseErrorKind::InvalidValue {
+                                    directive: "auto_update.enabled".to_string(),
+                                    message: format!(
+                                        "'{val}' is not a boolean, expected 'true' or 'false'"
+                                    ),
+                                    accepted_format: Some("true or false"),
+                                },
+                            });
+                        }
+                    },
                     "channel" => {
                         if val != "stable" && val != "beta" {
                             return Err(ParseError {
@@ -488,6 +505,51 @@ fn parse_auto_update_block(
                                         "unknown action '{val}', expected 'reload' or 'notify'"
                                     ),
                                     accepted_format: None,
+                                },
+                            });
+                        }
+                    },
+                    "drain_timeout_secs" => {
+                        let secs: u64 = val.parse().map_err(|_| ParseError {
+                            line: sub_tok.line,
+                            col: sub_tok.col,
+                            kind: ParseErrorKind::InvalidValue {
+                                directive: "auto_update.drain_timeout_secs".to_string(),
+                                message: format!("'{val}' is not a valid integer"),
+                                accepted_format: Some("positive integer, e.g., 60"),
+                            },
+                        })?;
+                        cfg.drain_timeout_secs = secs;
+                    }
+                    "health_check_url" => {
+                        if !val.starts_with("http://") && !val.starts_with("https://") {
+                            return Err(ParseError {
+                                line: sub_tok.line,
+                                col: sub_tok.col,
+                                kind: ParseErrorKind::InvalidValue {
+                                    directive: "auto_update.health_check_url".to_string(),
+                                    message: format!("'{val}' must start with http:// or https://"),
+                                    accepted_format: Some(
+                                        "URL, e.g., http://127.0.0.1:6663/healthz",
+                                    ),
+                                },
+                            });
+                        }
+                        cfg.health_check_url = val;
+                    }
+                    "rollback_on_health_fail" => match val.as_str() {
+                        "true" | "on" | "yes" | "1" => cfg.rollback_on_health_fail = true,
+                        "false" | "off" | "no" | "0" => cfg.rollback_on_health_fail = false,
+                        _ => {
+                            return Err(ParseError {
+                                line: sub_tok.line,
+                                col: sub_tok.col,
+                                kind: ParseErrorKind::InvalidValue {
+                                    directive: "auto_update.rollback_on_health_fail".to_string(),
+                                    message: format!(
+                                        "'{val}' is not a boolean, expected 'true' or 'false'"
+                                    ),
+                                    accepted_format: Some("true or false"),
                                 },
                             });
                         }
