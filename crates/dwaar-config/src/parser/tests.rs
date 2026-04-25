@@ -1863,18 +1863,18 @@ fn parse_wasm_plugin_unknown_subdirective_skipped() {
     assert_eq!(wp.priority, 20);
 }
 
-/// `tracing { otlp_endpoint ... }` with default sample_ratio.
+/// `tracing { otlp_endpoint ... }` with default `sample_ratio`.
 #[test]
 fn parse_tracing_block_with_default_sample_ratio() {
     let config = parse(
-        r#"{
+        r"{
             tracing {
                 otlp_endpoint http://127.0.0.1:4317/v1/traces
             }
         }
         example.com {
             reverse_proxy localhost:8080
-        }"#,
+        }",
     )
     .expect("should parse tracing block");
 
@@ -1891,7 +1891,7 @@ fn parse_tracing_block_with_default_sample_ratio() {
 #[test]
 fn parse_tracing_block_with_sample_ratio() {
     let config = parse(
-        r#"{
+        r"{
             tracing {
                 otlp_endpoint http://127.0.0.1:4318/v1/traces
                 sample_ratio 0.5
@@ -1899,7 +1899,7 @@ fn parse_tracing_block_with_sample_ratio() {
         }
         example.com {
             reverse_proxy localhost:8080
-        }"#,
+        }",
     )
     .expect("should parse tracing block with sample_ratio");
 
@@ -1916,7 +1916,7 @@ fn parse_tracing_block_with_sample_ratio() {
 #[test]
 fn parse_tracing_block_sample_ratio_clamped() {
     let config = parse(
-        r#"{
+        r"{
             tracing {
                 otlp_endpoint http://127.0.0.1:4318/v1/traces
                 sample_ratio 2.0
@@ -1924,7 +1924,7 @@ fn parse_tracing_block_sample_ratio_clamped() {
         }
         example.com {
             reverse_proxy localhost:8080
-        }"#,
+        }",
     )
     .expect("should parse with clamped ratio");
 
@@ -1946,7 +1946,7 @@ fn parse_tracing_block_sample_ratio_clamped() {
 fn parse_tracing_block_sample_ratio_rejects_non_finite() {
     for non_finite in ["nan", "inf", "-inf", "NaN", "Inf"] {
         let src = format!(
-            r#"{{
+            r"{{
                 tracing {{
                     otlp_endpoint http://127.0.0.1:4318/v1/traces
                     sample_ratio {non_finite}
@@ -1954,7 +1954,7 @@ fn parse_tracing_block_sample_ratio_rejects_non_finite() {
             }}
             example.com {{
                 reverse_proxy localhost:8080
-            }}"#
+            }}"
         );
         let config = parse(&src).expect("should parse with non-finite ratio");
         let tc = config
