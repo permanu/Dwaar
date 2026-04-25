@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.10] - 2026-04-25
+
+First release of the production auto-update pipeline. After this lands
+on a customer VPS, Permanu's control plane can stage canary rollouts
+to the entire Dwaar fleet with cosign-verified binaries and
+zero-downtime socket handoff.
+
 ### Added
 
 - **`auto_update { enabled / drain_timeout_secs / health_check_url / rollback_on_health_fail }` knobs** —
