@@ -390,13 +390,32 @@ pub fn injection_enabled() -> bool {
 }
 
 #[cfg(test)]
-#[allow(unsafe_code)] // set_var/remove_var require unsafe in edition 2024; safe in single-threaded test context
+#[allow(unsafe_code)] // set_var/remove_var require unsafe in edition 2024; safe under ENV_LOCK serialization
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     // ── Helpers ────────────────────────────────────────────────────────────────
 
     const PROJECT: &str = "proj-abc-123";
+
+    /// Serializes env-touching tests so `cargo test`'s parallel runner doesn't
+    /// race on `DWAAR_ERROR_INJECTION` / `DWAAR_ERROR_SCRIPT_URL`. Every test
+    /// that calls `set_var` / `remove_var` must hold the guard for its
+    /// duration. Without this, the suite is intermittently red on CI as one
+    /// test's `remove_var` can land between another test's `set_var` and its
+    /// `from_env()` read.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Convenience for the common pattern. Returns a guard whose Drop releases
+    /// the lock at end of scope.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        // poisoned -> recover; a previous test panicked but the env state is
+        // about to be reset by this test anyway.
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     fn test_config() -> ErrorScriptConfig {
         ErrorScriptConfig {
@@ -497,6 +516,7 @@ mod tests {
 
     #[test]
     fn injection_enabled_by_default() {
+        let _g = env_guard();
         // Remove the env vars if set by another test, then verify default.
         // SAFETY: tests run single-threaded (cargo test --test-threads=1 or
         // within a single test binary). The env var is temporary and restored.
@@ -510,6 +530,7 @@ mod tests {
 
     #[test]
     fn injection_disabled_by_env_var() {
+        let _g = env_guard();
         unsafe {
             std::env::set_var("DWAAR_ERROR_INJECTION", "off");
             std::env::set_var("DWAAR_ERROR_SCRIPT_URL", "https://example-errors.test/c.js");
@@ -523,6 +544,7 @@ mod tests {
 
     #[test]
     fn injection_enabled_by_env_var_on() {
+        let _g = env_guard();
         unsafe {
             std::env::set_var("DWAAR_ERROR_INJECTION", "on");
             std::env::set_var("DWAAR_ERROR_SCRIPT_URL", "https://example-errors.test/c.js");
@@ -536,6 +558,7 @@ mod tests {
 
     #[test]
     fn injection_disabled_case_insensitive() {
+        let _g = env_guard();
         unsafe {
             std::env::set_var("DWAAR_ERROR_INJECTION", "OFF");
             std::env::set_var("DWAAR_ERROR_SCRIPT_URL", "https://example-errors.test/c.js");
@@ -812,6 +835,7 @@ mod tests {
 
     #[test]
     fn config_from_env_unset_returns_none() {
+        let _g = env_guard();
         unsafe {
             std::env::remove_var("DWAAR_ERROR_INJECTION");
             std::env::remove_var("DWAAR_ERROR_SCRIPT_URL");
@@ -821,6 +845,7 @@ mod tests {
 
     #[test]
     fn config_from_env_empty_returns_none() {
+        let _g = env_guard();
         unsafe {
             std::env::remove_var("DWAAR_ERROR_INJECTION");
             std::env::set_var("DWAAR_ERROR_SCRIPT_URL", "");
@@ -831,6 +856,7 @@ mod tests {
 
     #[test]
     fn config_from_env_feature_off_returns_none() {
+        let _g = env_guard();
         unsafe {
             std::env::set_var("DWAAR_ERROR_INJECTION", "off");
             std::env::set_var("DWAAR_ERROR_SCRIPT_URL", "https://errors.example.com/c.js");
@@ -844,6 +870,7 @@ mod tests {
 
     #[test]
     fn config_derives_origin_from_url() {
+        let _g = env_guard();
         unsafe {
             std::env::remove_var("DWAAR_ERROR_INJECTION");
             std::env::set_var("DWAAR_ERROR_SCRIPT_URL", "https://errors.example.com/c.js");
@@ -856,6 +883,7 @@ mod tests {
 
     #[test]
     fn config_with_port() {
+        let _g = env_guard();
         unsafe {
             std::env::remove_var("DWAAR_ERROR_INJECTION");
             std::env::set_var(
