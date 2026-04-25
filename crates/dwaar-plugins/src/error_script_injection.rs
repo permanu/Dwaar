@@ -412,7 +412,9 @@ mod tests {
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         // poisoned -> recover; a previous test panicked but the env state is
         // about to be reset by this test anyway.
-        ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn test_config() -> ErrorScriptConfig {
