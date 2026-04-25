@@ -50,6 +50,8 @@ fi
 
 DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/${ARTIFACT}"
 CHECKSUM_URL="${DOWNLOAD_URL}.sha256"
+SIG_URL="${DOWNLOAD_URL}.sig"
+CERT_URL="${DOWNLOAD_URL}.cert"
 
 printf "Installing dwaar %s (%s/%s)\n" "$VERSION" "$os" "$arch"
 
@@ -59,6 +61,8 @@ trap 'rm -rf "$TMP"' EXIT
 
 curl -fSL --progress-bar -o "${TMP}/${ARTIFACT}" "$DOWNLOAD_URL"
 curl -fsSL -o "${TMP}/${ARTIFACT}.sha256" "$CHECKSUM_URL"
+curl -fsSL -o "${TMP}/${ARTIFACT}.sig"    "$SIG_URL"
+curl -fsSL -o "${TMP}/${ARTIFACT}.cert"   "$CERT_URL"
 
 # --- Verify checksum ---
 cd "$TMP"
@@ -68,6 +72,32 @@ elif command -v shasum >/dev/null 2>&1; then
   shasum -a 256 -c "${ARTIFACT}.sha256"
 else
   printf "Warning: no sha256 tool found, skipping checksum verification\n" >&2
+fi
+
+# --- Verify cosign signature (keyless OIDC) ---
+# The .sig and .cert files are published alongside every release binary.
+# Verification pins the GitHub Actions workflow identity — no pre-shared keys.
+# If cosign is not installed we fall back to sha256-only and print a loud
+# warning. We never silently bypass signature verification.
+if command -v cosign >/dev/null 2>&1; then
+  printf "Verifying cosign signature...\n"
+  cosign verify-blob \
+    --certificate "${TMP}/${ARTIFACT}.cert" \
+    --signature   "${TMP}/${ARTIFACT}.sig" \
+    --certificate-identity-regexp "^https://github\.com/permanu/Dwaar/\.github/workflows/release\.yml@.*" \
+    --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+    "${TMP}/${ARTIFACT}"
+  printf "Cosign signature verified.\n"
+else
+  printf "Warning: cosign not installed, skipping signature verification (sha256 still checked).\n" >&2
+  printf "         Install cosign: https://github.com/sigstore/cosign/releases\n" >&2
+  printf "         Then verify manually:\n" >&2
+  printf "           cosign verify-blob \\\\\n" >&2
+  printf "             --certificate %s.cert \\\\\n" "$ARTIFACT" >&2
+  printf "             --signature %s.sig \\\\\n" "$ARTIFACT" >&2
+  printf '             --certificate-identity-regexp "^https://github\\.com/permanu/Dwaar/\\.github/workflows/release\\.yml@.*" \\\\\n' >&2
+  printf '             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \\\\\n' >&2
+  printf "             %s\n" "$ARTIFACT" >&2
 fi
 
 # --- Install ---

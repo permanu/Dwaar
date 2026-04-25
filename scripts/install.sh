@@ -433,6 +433,11 @@ main() {
     BINARY_TMP="${TMPDIR_DWAAR}/${ARTIFACT}"
     SHA256_TMP="${TMPDIR_DWAAR}/${ARTIFACT}.sha256"
 
+    SIG_URL="${BINARY_URL}.sig"
+    CERT_URL="${BINARY_URL}.cert"
+    SIG_TMP="${TMPDIR_DWAAR}/${ARTIFACT}.sig"
+    CERT_TMP="${TMPDIR_DWAAR}/${ARTIFACT}.cert"
+
     # 4. Download binary
     info "Downloading ${ARTIFACT}..."
     download "${BINARY_URL}" "${BINARY_TMP}"
@@ -442,6 +447,43 @@ main() {
     download "${SHA256_URL}" "${SHA256_TMP}"
     verify_sha256 "${BINARY_TMP}" "${SHA256_TMP}"
     success "SHA256 checksum verified."
+
+    # 5a. Cosign signature verification (keyless OIDC).
+    # The .sig and .cert files are published alongside every release binary.
+    # If cosign is installed, we verify the cryptographic signature — the cert
+    # chains to Fulcio with the GitHub Actions OIDC issuer and pins the exact
+    # workflow path that produced this binary.  This is a stronger guarantee
+    # than sha256 alone (sha256 only proves download integrity; cosign proves
+    # build provenance).
+    #
+    # If cosign is NOT installed we fall back to sha256-only and print a loud
+    # warning — we never silently bypass signature verification.
+    info "Verifying cosign signature..."
+    download "${SIG_URL}"  "${SIG_TMP}"
+    download "${CERT_URL}" "${CERT_TMP}"
+    if command -v cosign >/dev/null 2>&1; then
+        cosign verify-blob \
+            --certificate "${CERT_TMP}" \
+            --signature "${SIG_TMP}" \
+            --certificate-identity-regexp "^https://github\.com/permanu/Dwaar/\.github/workflows/release\.yml@.*" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "${BINARY_TMP}"
+        success "Cosign signature verified."
+    else
+        printf "%bWarning: cosign not installed, skipping signature verification (sha256 still checked).%b\n" \
+            "${YELLOW}" "${RESET}" >&2
+        printf "%b         Install cosign from https://github.com/sigstore/cosign/releases%b\n" \
+            "${YELLOW}" "${RESET}" >&2
+        printf "%b         then verify manually:%b\n" "${YELLOW}" "${RESET}" >&2
+        printf "%b         cosign verify-blob \\%b\n" "${YELLOW}" "${RESET}" >&2
+        printf "%b           --certificate %s.cert \\%b\n" "${YELLOW}" "${ARTIFACT}" "${RESET}" >&2
+        printf "%b           --signature %s.sig \\%b\n" "${YELLOW}" "${ARTIFACT}" "${RESET}" >&2
+        printf '%b           --certificate-identity-regexp "^https://github\\.com/permanu/Dwaar/\\.github/workflows/release\\.yml@.*" \\%b\n' \
+            "${YELLOW}" "${RESET}" >&2
+        printf '%b           --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \\%b\n' \
+            "${YELLOW}" "${RESET}" >&2
+        printf "%b           %s%b\n" "${YELLOW}" "${ARTIFACT}" "${RESET}" >&2
+    fi
 
     # 6. Install the binary (sets INSTALL_PATH)
     info "Installing to ${SYSTEM_BIN}..."
