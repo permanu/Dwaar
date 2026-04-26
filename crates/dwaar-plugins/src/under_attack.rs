@@ -418,12 +418,12 @@ fn leading_zero_bits(data: &[u8]) -> u32 {
 
 /// Extract a named cookie value from a Cookie header string.
 fn extract_cookie<'a>(cookies: &'a str, name: &str) -> Option<&'a str> {
-    for pair in cookies.split(';') {
-        let pair = pair.trim();
-        if let Some(value) = pair.strip_prefix(name)
-            && let Some(value) = value.strip_prefix('=')
+    for segment in cookies.split(';') {
+        let trimmed = segment.trim();
+        if let Some((seg_name, seg_value)) = trimmed.split_once('=')
+            && seg_name == name
         {
-            return Some(value);
+            return Some(seg_value);
         }
     }
     None
@@ -756,6 +756,30 @@ mod tests {
         assert_eq!(extract_cookie("foo=bar; baz=qux", "foo"), Some("bar"));
         assert_eq!(extract_cookie("foo=bar; baz=qux", "baz"), Some("qux"));
         assert_eq!(extract_cookie("foo=bar; baz=qux", "missing"), None);
+    }
+
+    #[test]
+    fn extract_cookie_rejects_prefix_match() {
+        // Regression for issue #159: cookies named with the target as a
+        // prefix (e.g. `_dwaar_clearance_extra=...`) should NOT match
+        // when looking for `_dwaar_clearance`.
+        let header = "_dwaar_clearance_extra=oops; other=foo";
+        let extracted = extract_cookie(header, "_dwaar_clearance");
+        assert!(extracted.is_none(), "prefix match leaked: {extracted:?}");
+    }
+
+    #[test]
+    fn extract_cookie_finds_exact_match() {
+        let header = "_dwaar_clearance=token123; other=foo";
+        let extracted = extract_cookie(header, "_dwaar_clearance");
+        assert_eq!(extracted, Some("token123"));
+    }
+
+    #[test]
+    fn extract_cookie_handles_whitespace_after_semicolon() {
+        let header = "session=abc;   _dwaar_clearance=tok";
+        let extracted = extract_cookie(header, "_dwaar_clearance");
+        assert_eq!(extracted, Some("tok"));
     }
 
     #[test]
