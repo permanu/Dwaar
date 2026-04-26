@@ -273,6 +273,13 @@ impl UpstreamPool {
     /// without changing the distribution for the common all-healthy case.
     fn select_round_robin(&self) -> Option<SocketAddr> {
         let n = self.backends.len();
+        // Guard against empty pool — `% n` panics on n == 0. The public
+        // `select()` already returns None before reaching here, but this inner
+        // guard makes the function independently safe if the call path changes.
+        // See #170.
+        if n == 0 {
+            return None;
+        }
         let start = self.counter.fetch_add(1, Ordering::Relaxed) as usize % n;
         self.find_available_from(start)
     }
@@ -1404,5 +1411,19 @@ mod tests {
         });
         assert!(pool.retry_config().is_enabled());
         assert_eq!(pool.retry_config().max_retries, 3);
+    }
+
+    // ── regression: issue #170 ───────────────────────────────────────────────
+
+    #[test]
+    fn round_robin_empty_pool_returns_none() {
+        // Regression for issue #170: select_round_robin() previously computed
+        // `counter % backends.len()` without checking len > 0, causing a
+        // division-by-zero panic on an empty pool. The guard in select() caught
+        // this for callers going through the public API, but select_round_robin()
+        // itself was unguarded — reachable if the call path ever changes.
+        let pool = UpstreamPool::new(vec![], LbPolicy::RoundRobin, None, None);
+        // Call the inner method directly to verify it is independently safe.
+        assert!(pool.select_round_robin().is_none());
     }
 }

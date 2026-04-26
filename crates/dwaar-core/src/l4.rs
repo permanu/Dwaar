@@ -1762,6 +1762,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn round_robin_empty_pool_returns_none() {
+        // Regression for issue #170: select_upstream() computed `counter % n`
+        // where n = upstreams.len(). An empty pool made n == 0, which panics.
+        // The guard was added so callers see None rather than a worker crash.
+        let upstreams: Vec<SocketAddr> = vec![];
+        let health: Vec<Arc<L4UpstreamHealth>> = vec![];
+        let rr_counter = Arc::new(AtomicU64::new(0));
+        let result = select_upstream(
+            &upstreams,
+            &health,
+            L4LoadBalancePolicy::RoundRobin,
+            &rr_counter,
+            peer(9000),
+        );
+        assert!(result.is_none(), "empty pool must return None, not panic");
+    }
+
     // -- Passive health tracking --
 
     #[test]
