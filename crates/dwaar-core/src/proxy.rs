@@ -2769,7 +2769,9 @@ mod tests {
         #[test]
         fn cache_hit_within_ttl() {
             let cache: dashmap::DashMap<SocketAddr, std::time::Instant> = dashmap::DashMap::new();
-            let key: SocketAddr = "127.0.0.1:9999".parse().expect("valid socket address literal");
+            let key: SocketAddr = "127.0.0.1:9999"
+                .parse()
+                .expect("valid socket address literal");
             cache.insert(key, std::time::Instant::now());
 
             // A freshly inserted entry is well within the 5s TTL.
@@ -2786,7 +2788,9 @@ mod tests {
         #[test]
         fn cache_miss_after_ttl() {
             let cache: dashmap::DashMap<SocketAddr, std::time::Instant> = dashmap::DashMap::new();
-            let key: SocketAddr = "127.0.0.1:9999".parse().expect("valid socket address literal");
+            let key: SocketAddr = "127.0.0.1:9999"
+                .parse()
+                .expect("valid socket address literal");
 
             // Simulate a stale entry by subtracting more than the TTL from now.
             let past = std::time::Instant::now()
