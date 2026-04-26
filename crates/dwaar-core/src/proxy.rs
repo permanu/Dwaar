@@ -509,7 +509,7 @@ impl DwaarProxy {
     ) -> Result<bool> {
         let mut resp = ResponseHeader::build(plugin_resp.status, Some(plugin_resp.headers.len()))?;
         for (name, value) in &plugin_resp.headers {
-            resp.insert_header(*name, value.as_str()).map_err(|e| {
+            resp.insert_header(*name, value.as_ref()).map_err(|e| {
                 Error::explain(
                     HTTPStatus(plugin_resp.status),
                     format!("plugin response header error: {e}"),

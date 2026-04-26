@@ -143,8 +143,8 @@ impl DwaarPlugin for RateLimitPlugin {
         PluginAction::Respond(PluginResponse {
             status: 429,
             headers: vec![
-                ("Retry-After", "1".to_string()),
-                ("Content-Length", "0".to_string()),
+                ("Retry-After", std::borrow::Cow::Borrowed("1")),
+                ("Content-Length", std::borrow::Cow::Borrowed("0")),
             ],
             body: Bytes::new(),
         })

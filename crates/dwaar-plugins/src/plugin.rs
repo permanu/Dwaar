@@ -79,7 +79,12 @@ pub struct PluginCtx {
 #[derive(Debug, Clone)]
 pub struct PluginResponse {
     pub status: u16,
-    pub headers: Vec<(&'static str, String)>,
+    /// Response headers. Value is `Cow<'static, str>` so static literals
+    /// (Content-Length: "0", Retry-After: "1") are zero-alloc Borrowed,
+    /// while runtime-built values (cookie strings, dynamic Content-Length)
+    /// use Owned. Avoids per-rejected-request heap allocations on the
+    /// rate-limit and ip-filter short-circuit paths.
+    pub headers: Vec<(&'static str, std::borrow::Cow<'static, str>)>,
     pub body: Bytes,
 }
 
@@ -310,7 +315,7 @@ mod tests {
                 request_action: || {
                     PluginAction::Respond(PluginResponse {
                         status: 429,
-                        headers: vec![("Retry-After", "1".to_string())],
+                        headers: vec![("Retry-After", std::borrow::Cow::Borrowed("1"))],
                         body: Bytes::new(),
                     })
                 },
@@ -452,5 +457,18 @@ mod tests {
         })]);
         let debug = format!("{chain:?}");
         assert!(debug.contains("test-plugin"));
+    }
+
+    #[test]
+    fn plugin_response_borrows_static_header_value() {
+        // After the Cow refactor, a literal value should be a Borrowed
+        // variant — the whole point of the change is no per-request alloc
+        // for short-circuit responses (rate-limit 429, ip-filter 403).
+        let r = PluginResponse {
+            status: 200,
+            headers: vec![("Content-Length", std::borrow::Cow::Borrowed("0"))],
+            body: bytes::Bytes::new(),
+        };
+        assert!(matches!(r.headers[0].1, std::borrow::Cow::Borrowed(_)));
     }
 }

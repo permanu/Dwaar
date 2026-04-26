@@ -759,7 +759,7 @@ async fn send_plugin_response<S, B>(
     };
 
     for (name, value) in &plugin_resp.headers {
-        let _ = pingora_resp.insert_header(*name, value.as_str());
+        let _ = pingora_resp.insert_header(*name, value.as_ref());
     }
 
     plugin_chain.run_response(&mut pingora_resp, ctx);

@@ -348,10 +348,10 @@ impl DwaarPlugin for UnderAttackPlugin {
                 return PluginAction::Respond(PluginResponse {
                     status: 302,
                     headers: vec![
-                        ("Set-Cookie", cookie_header),
-                        ("Location", clean_path),
-                        ("Content-Length", "0".to_string()),
-                        ("Cache-Control", "no-store".to_string()),
+                        ("Set-Cookie", std::borrow::Cow::Owned(cookie_header)),
+                        ("Location", std::borrow::Cow::Owned(clean_path)),
+                        ("Content-Length", std::borrow::Cow::Borrowed("0")),
+                        ("Cache-Control", std::borrow::Cow::Borrowed("no-store")),
                     ],
                     body: Bytes::new(),
                 });
@@ -365,9 +365,15 @@ impl DwaarPlugin for UnderAttackPlugin {
         PluginAction::Respond(PluginResponse {
             status: 200,
             headers: vec![
-                ("Content-Type", "text/html; charset=utf-8".to_string()),
-                ("Content-Length", body.len().to_string()),
-                ("Cache-Control", "no-store".to_string()),
+                (
+                    "Content-Type",
+                    std::borrow::Cow::Borrowed("text/html; charset=utf-8"),
+                ),
+                (
+                    "Content-Length",
+                    std::borrow::Cow::Owned(body.len().to_string()),
+                ),
+                ("Cache-Control", std::borrow::Cow::Borrowed("no-store")),
             ],
             body,
         })
