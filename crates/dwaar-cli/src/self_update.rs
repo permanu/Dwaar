@@ -6,14 +6,14 @@
 
 //! Self-update: check GitHub Releases, download, verify, replace.
 //!
-//! Uses the system `curl` to avoid pulling in an HTTP+TLS stack just
-//! for this subcommand. The installer already depends on curl, so every
-//! machine that installed Dwaar already has it.
+//! All HTTP is done in-process via `reqwest` with `rustls` — curl is no
+//! longer in the trust path, so a compromised `curl` binary cannot intercept
+//! the download or inject a malicious binary. Closes issue #147.
 
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::path::Path;
-use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use subtle::ConstantTimeEq;
@@ -111,29 +111,38 @@ pub(crate) fn run(force: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Build the shared HTTP client used by self-update operations.
+///
+/// Reusing a single client across calls is idiomatic reqwest and avoids
+/// redundant TLS handshakes. The 30-second timeout guards against hung
+/// connections during background provisioning (Guardrail #29).
+fn build_client() -> anyhow::Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .user_agent(concat!("dwaar-self-update/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("failed to build HTTP client")
+}
+
 /// Fetch the latest release tag from the GitHub API.
 ///
-/// Uses `curl -H "Accept: application/vnd.github+json"` to get JSON, then
-/// parses the response with `serde_json` to extract `tag_name`. This defends
-/// against malformed JSON that might match a substring pattern.
-/// Falls back to the GitHub Releases redirect URL if the API call fails,
-/// or if the JSON response is malformed.
+/// Primary path: calls the GitHub Releases JSON API and parses `tag_name`.
+/// Fallback: follows the `/releases/latest` redirect and extracts the tag from
+/// the final URL — this mirrors what curl's `%{url_effective}` trick did, but
+/// entirely in-process via reqwest so curl is not in the trust path (#147).
 fn fetch_latest_version() -> anyhow::Result<String> {
-    // Primary: GitHub API
-    let output = Command::new("curl")
-        .args([
-            "-fsSL",
-            "-H",
-            "Accept: application/vnd.github+json",
-            "-H",
-            "X-GitHub-Api-Version: 2022-11-28",
-            LATEST_API,
-        ])
-        .output()
-        .context("failed to run curl — is it installed?")?;
+    let client = build_client()?;
 
-    if output.status.success() {
-        let body = String::from_utf8(output.stdout).context("GitHub API response is not UTF-8")?;
+    // Primary: GitHub REST API returns JSON with `tag_name`.
+    let resp = client
+        .get(LATEST_API)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .send()
+        .context("GitHub API request failed")?;
+
+    if resp.status().is_success() {
+        let body = resp.text().context("GitHub API response is not UTF-8")?;
         if let Ok(release) = serde_json::from_str::<GhRelease>(&body)
             && !release.tag_name.is_empty()
         {
@@ -141,24 +150,18 @@ fn fetch_latest_version() -> anyhow::Result<String> {
         }
     }
 
-    // Fallback: follow the /releases/latest redirect and parse the tag
-    // from the final URL. GitHub redirects to /releases/tag/vX.Y.Z.
-    let output = Command::new("curl")
-        .args([
-            "-fsSL",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{url_effective}",
-            "https://github.com/permanu/Dwaar/releases/latest",
-        ])
-        .output()
+    // Fallback: follow the /releases/latest redirect; reqwest follows redirects
+    // by default and exposes the final URL via `response.url()`.
+    // GitHub redirects /releases/latest → /releases/tag/vX.Y.Z.
+    let resp = client
+        .get("https://github.com/permanu/Dwaar/releases/latest")
+        .send()
         .context("failed to resolve latest release via redirect")?;
 
-    let url = String::from_utf8(output.stdout).context("redirect URL is not UTF-8")?;
-    let tag = url
-        .rsplit('/')
-        .next()
+    let tag = resp
+        .url()
+        .path_segments()
+        .and_then(|mut segs| segs.next_back())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .context("could not extract tag from GitHub redirect URL")?;
@@ -166,18 +169,29 @@ fn fetch_latest_version() -> anyhow::Result<String> {
     Ok(tag)
 }
 
-/// Download a URL to a local file via curl.
+/// Download a URL to a local file in-process via reqwest.
+///
+/// Replaces the previous `curl -fSL -o <dest> <url>` shell-out (#147).
+/// reqwest follows redirects by default (matching curl's `-L`). Writing
+/// directly to the destination file avoids buffering the entire binary in
+/// memory, which matters for large release artifacts.
 fn curl_download(url: &str, dest: &Path) -> anyhow::Result<()> {
-    let output = Command::new("curl")
-        .args(["-fSL", "--progress-bar", "-o"])
-        .arg(dest)
-        .arg(url)
-        .status()
-        .context("failed to run curl")?;
+    let client = build_client()?;
+    let mut resp = client
+        .get(url)
+        .send()
+        .with_context(|| format!("HTTP GET failed: {url}"))?;
 
-    if !output.success() {
-        bail!("download failed: {url}");
+    if !resp.status().is_success() {
+        bail!("download failed ({}): {url}", resp.status());
     }
+
+    let mut file =
+        fs::File::create(dest).with_context(|| format!("failed to create {}", dest.display()))?;
+
+    resp.copy_to(&mut file)
+        .with_context(|| format!("failed to write download to {}", dest.display()))?;
+
     Ok(())
 }
 
@@ -378,5 +392,17 @@ mod tests {
         let json = r#"{"tag_name":"v1.2.3","html_url":"https://...","assets":[]}"#;
         let parsed: GhRelease = serde_json::from_str(json).expect("valid JSON");
         assert_eq!(parsed.tag_name, "v1.2.3");
+    }
+
+    #[test]
+    fn http_client_builds() {
+        // Smoke: the migrated reqwest client builder constructs without
+        // panicking. No network calls are made here — integration tests
+        // cover wire-level behavior. Issue #147: curl shell-out replaced.
+        let client = reqwest::blocking::Client::builder()
+            .user_agent(concat!("dwaar-self-update/", env!("CARGO_PKG_VERSION")))
+            .timeout(std::time::Duration::from_secs(30))
+            .build();
+        assert!(client.is_ok(), "blocking HTTP client failed to build");
     }
 }
