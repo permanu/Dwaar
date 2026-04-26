@@ -243,9 +243,13 @@ impl Decompressor {
 /// Read from a decoder into a `Vec<u8>`, aborting if the output exceeds
 /// [`MAX_DECOMPRESSED_SIZE`]. Prevents decompression bombs from consuming
 /// unbounded memory.
+///
+/// Pre-allocates 32 KiB of output and uses a 16 KiB read buffer. Most
+/// HTML responses decompress to 20–100 KiB, so this trims the typical
+/// realloc cascade from 6–7 grows down to 1–2 (issue #155).
 fn read_bounded<R: Read>(mut reader: R) -> Result<Vec<u8>, std::io::Error> {
-    let mut output = Vec::new();
-    let mut buf = [0u8; 8192];
+    let mut output = Vec::with_capacity(32 * 1024);
+    let mut buf = [0u8; 16 * 1024];
     loop {
         let n = reader.read(&mut buf)?;
         if n == 0 {
@@ -396,5 +400,20 @@ mod tests {
             "expected >=8192 capacity, got {}",
             d.buffer_capacity()
         );
+    }
+
+    #[test]
+    fn decompress_50k_roundtrip() {
+        // Locks in correctness for the read_bounded pre-allocation change
+        // (issue #155). The perf win itself is measured by the
+        // `decompress_50k_gzip_one_shot` criterion bench.
+        let html = vec![b'a'; 50_000];
+        let compressed = gzip_compress(&html);
+        let mut dec = Decompressor::new(Encoding::Gzip);
+        let mut body = Some(Bytes::from(compressed));
+        dec.decompress(&mut body, true);
+        let out = body.expect("body decompressed");
+        assert_eq!(out.len(), 50_000);
+        assert!(out.iter().all(|b| *b == b'a'));
     }
 }
