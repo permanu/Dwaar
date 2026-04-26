@@ -49,6 +49,7 @@ h3 = { workspace = true }
 h3-quinn = { workspace = true }
 httparse = { workspace = true }
 ipnet = { workspace = true }
+url = { workspace = true }
 openssl = { workspace = true }
 tokio-openssl = { workspace = true }
 

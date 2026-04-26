@@ -403,24 +403,52 @@ impl DwaarProxy {
         if let Some(origin_val) = session.req_header().headers.get("origin") {
             let origin_str = origin_val.to_str().unwrap_or("");
             let expected_host = ctx.plugin_ctx.host.as_deref().unwrap_or("");
-            // The Origin header is scheme://host[:port]. We check whether the host
-            // portion of the origin contains our expected host rather than doing a
-            // full URL parse so we avoid a dependency purely for this guard.
-            let host_in_origin = origin_str
-                .trim_start_matches("https://")
-                .trim_start_matches("http://")
-                // Strip any trailing path (origin never has a path, but be safe)
-                .split('/')
-                .next()
-                .unwrap_or("");
-            // Compare host ignoring port (e.g. "example.com:3000" matches "example.com").
-            let origin_host_no_port = host_in_origin.split(':').next().unwrap_or("");
-            if !expected_host.is_empty() && origin_host_no_port != expected_host {
+
+            // Parse the Origin header using url::Url for RFC 3986 compliance.
+            // The Origin header is scheme://host[:port] with no path or query.
+            if let Ok(parsed_url) = url::Url::parse(origin_str) {
+                // Only allow http and https schemes per RFC 6454.
+                if parsed_url.scheme() != "http" && parsed_url.scheme() != "https" {
+                    warn!(
+                        request_id = %ctx.request_id(),
+                        origin = %origin_str,
+                        expected = %expected_host,
+                        "beacon rejected: Origin uses non-HTTP scheme"
+                    );
+                    let resp = ResponseHeader::build(403, Some(0))?;
+                    session.write_response_header(Box::new(resp), true).await?;
+                    return Ok(true);
+                }
+                // Extract the hostname portion (strips port automatically via url::Url).
+                let Some(origin_host_no_port) = parsed_url.host_str() else {
+                    warn!(
+                        request_id = %ctx.request_id(),
+                        origin = %origin_str,
+                        expected = %expected_host,
+                        "beacon rejected: Origin has no valid host"
+                    );
+                    let resp = ResponseHeader::build(403, Some(0))?;
+                    session.write_response_header(Box::new(resp), true).await?;
+                    return Ok(true);
+                };
+
+                if !expected_host.is_empty() && origin_host_no_port != expected_host {
+                    warn!(
+                        request_id = %ctx.request_id(),
+                        origin = %origin_str,
+                        expected = %expected_host,
+                        "beacon rejected: Origin does not match serving host"
+                    );
+                    let resp = ResponseHeader::build(403, Some(0))?;
+                    session.write_response_header(Box::new(resp), true).await?;
+                    return Ok(true);
+                }
+            } else {
                 warn!(
                     request_id = %ctx.request_id(),
                     origin = %origin_str,
                     expected = %expected_host,
-                    "beacon rejected: Origin does not match serving host"
+                    "beacon rejected: Origin is not a valid URL"
                 );
                 let resp = ResponseHeader::build(403, Some(0))?;
                 session.write_response_header(Box::new(resp), true).await?;
@@ -2594,5 +2622,100 @@ mod tests {
     #[test]
     fn extract_cookie_value_handles_empty_header() {
         assert_eq!(extract_cookie_value("", "_dwaar_sticky"), None);
+    }
+
+    // Tests for Origin header parsing via url::Url (issue #157).
+    // These tests verify that Origin validation correctly parses RFC 3986
+    // URLs and extracts the hostname for comparison.
+    mod origin_parsing {
+        use url::Url;
+
+        fn parse_origin_host(origin_str: &str) -> Result<String, &'static str> {
+            match Url::parse(origin_str) {
+                Ok(parsed_url) => {
+                    if parsed_url.scheme() != "http" && parsed_url.scheme() != "https" {
+                        return Err("non-HTTP scheme");
+                    }
+                    parsed_url
+                        .host_str()
+                        .map(ToString::to_string)
+                        .ok_or("no valid host")
+                }
+                Err(_) => Err("invalid URL"),
+            }
+        }
+
+        #[test]
+        fn parses_https_with_default_port() {
+            let origin = "https://example.com";
+            let host = parse_origin_host(origin).expect("parse failed");
+            assert_eq!(host.as_str(), "example.com");
+        }
+
+        #[test]
+        fn parses_https_with_nondefault_port() {
+            let origin = "https://example.com:8443";
+            let host = parse_origin_host(origin).expect("parse failed");
+            assert_eq!(host.as_str(), "example.com");
+        }
+
+        #[test]
+        fn parses_http_with_nondefault_port() {
+            let origin = "http://localhost:3000";
+            let host = parse_origin_host(origin).expect("parse failed");
+            assert_eq!(host.as_str(), "localhost");
+        }
+
+        #[test]
+        fn handles_trailing_slash() {
+            let origin = "https://example.com/";
+            let host = parse_origin_host(origin).expect("parse failed");
+            assert_eq!(host.as_str(), "example.com");
+        }
+
+        #[test]
+        fn rejects_file_scheme() {
+            let origin = "file:///etc/passwd";
+            let result = parse_origin_host(origin);
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn rejects_invalid_url() {
+            let origin = "not a url";
+            let result = parse_origin_host(origin);
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn rejects_url_with_path() {
+            // Origin should not have a path, but url::Url will parse it.
+            // We extract only the host, so path is irrelevant.
+            let origin = "https://example.com/path/to/resource";
+            let host = parse_origin_host(origin).expect("parse failed");
+            assert_eq!(host.as_str(), "example.com");
+        }
+
+        #[test]
+        fn handles_ipv4_address() {
+            let origin = "https://192.0.2.1:8443";
+            let host = parse_origin_host(origin).expect("parse failed");
+            assert_eq!(host.as_str(), "192.0.2.1");
+        }
+
+        #[test]
+        fn handles_ipv6_address() {
+            let origin = "https://[2001:db8::1]:8443";
+            let host = parse_origin_host(origin).expect("parse failed");
+            // url::Url::host_str() returns IPv6 addresses with brackets
+            assert_eq!(host.as_str(), "[2001:db8::1]");
+        }
+
+        #[test]
+        fn rejects_url_without_host() {
+            let origin = "https://";
+            let result = parse_origin_host(origin);
+            assert!(result.is_err());
+        }
     }
 }
