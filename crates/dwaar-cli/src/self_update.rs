@@ -16,6 +16,7 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, bail};
+use subtle::ConstantTimeEq;
 
 /// GitHub Releases base URL for download assets. The URL format for a
 /// specific asset is: `{BASE_URL}/v{version}/{artifact}`.
@@ -174,6 +175,17 @@ fn curl_download(url: &str, dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Constant-time hex string comparison.
+///
+/// Per Guardrail #30 and issue #149, compare hex hashes using constant-time
+/// comparison to mitigate timing side-channels on the expected hash. While
+/// this is a download integrity check (not a secret), constant-time comparison
+/// is consistent with the rest of the codebase and defends against weak local
+/// attackers who might measure timing on the comparison loop.
+fn constant_time_eq_hex(a: &str, b: &str) -> bool {
+    a.as_bytes().ct_eq(b.as_bytes()).into()
+}
+
 /// Verify the SHA-256 checksum of `binary` against the content of `checksum_file`.
 ///
 /// The checksum file is expected to be in the format produced by `sha256sum`:
@@ -193,7 +205,7 @@ fn verify_sha256(binary: &Path, checksum_file: &Path) -> anyhow::Result<()> {
         .context("SHA-256 hash failed")?;
     let actual_hash = hex_encode(&digest);
 
-    if actual_hash != expected_hash {
+    if !constant_time_eq_hex(&actual_hash, &expected_hash) {
         bail!(
             "checksum mismatch!\n  expected: {expected_hash}\n  actual:   {actual_hash}\n\nThe download may be corrupted or tampered with."
         );
@@ -330,5 +342,21 @@ mod tests {
             .expect_err("verify_sha256 should fail on mismatch")
             .to_string();
         assert!(err.contains("checksum mismatch"), "error: {err}");
+    }
+
+    #[test]
+    fn sha256_compare_rejects_mismatch() {
+        // Constant-time compare must still reject as not-equal when
+        // hashes differ — issue #149 guard against the migration breaking
+        // the actual mismatch path.
+        let a = "abc123";
+        let b = "abc124";
+        assert!(!constant_time_eq_hex(a, b));
+    }
+
+    #[test]
+    fn sha256_compare_accepts_match() {
+        let a = "deadbeef";
+        assert!(constant_time_eq_hex(a, a));
     }
 }

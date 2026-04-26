@@ -101,6 +101,7 @@ hex = "0.4"
 rand = "0.10.1"
 base64 = "0.22.1"
 zeroize = "1"
+subtle = "2"
 
 # File serving
 mime_guess = "2"
