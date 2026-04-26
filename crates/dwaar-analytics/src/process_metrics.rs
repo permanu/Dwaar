@@ -34,7 +34,7 @@ fn warn_once_on_proc_failure(path: &str, err: &std::io::Error) {
     });
 }
 
-/// Synchronous /proc read used only at startup (process_start_time_secs init).
+/// Synchronous /proc read used only at startup (`process_start_time_secs` init).
 ///
 /// The async `read_proc` variant below must be used for all per-scrape reads.
 /// Startup happens before the server accepts traffic, so a blocking read here
@@ -50,7 +50,7 @@ fn read_proc_sync(path: &str) -> Option<String> {
     }
 }
 
-/// Offloads a /proc file read onto a blocking thread via spawn_blocking.
+/// Offloads a /proc file read onto a blocking thread via `spawn_blocking`.
 ///
 /// Procfs reads are normally fast, but under disk pressure the kernel can
 /// stall the page-fault path for tens to hundreds of milliseconds. Doing
@@ -71,10 +71,10 @@ async fn read_proc(path: &'static str) -> Option<String> {
     .flatten()
 }
 
-/// Offloads a /proc directory read onto a blocking thread via spawn_blocking.
+/// Offloads a /proc directory read onto a blocking thread via `spawn_blocking`.
 ///
 /// Counting entries in /proc/self/fd requires a readdir syscall, which can
-/// block under I/O pressure. We collect the count inside spawn_blocking to
+/// block under I/O pressure. We collect the count inside `spawn_blocking` to
 /// avoid holding the async worker hostage.
 /// See issue #156.
 #[cfg(target_os = "linux")]
@@ -342,7 +342,7 @@ fn cpu_seconds_total_impl() -> f64 {
 
 #[cfg(target_os = "linux")]
 async fn resident_memory_bytes_impl() -> u64 {
-    // /proc/self/status VmRSS is in kB. The read is offloaded via spawn_blocking
+    // /proc/self/status VmRSS is in kB. The read is offloaded via `spawn_blocking`
     // because procfs can stall on disk pressure (issue #156).
     read_proc("/proc/self/status")
         .await
@@ -424,7 +424,7 @@ fn max_fds_impl() -> u64 {
 
 #[cfg(target_os = "linux")]
 async fn threads_impl() -> u64 {
-    // Threads: field in /proc/self/status. Offloaded via spawn_blocking
+    // Threads: field in /proc/self/status. Offloaded via `spawn_blocking`
     // for the same reason as resident_memory_bytes_impl (issue #156).
     read_proc("/proc/self/status")
         .await
