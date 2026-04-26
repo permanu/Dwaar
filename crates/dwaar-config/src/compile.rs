@@ -980,7 +980,7 @@ fn compile_forward_auth(directives: &[Directive]) -> Option<std::sync::Arc<Forwa
         };
         warn!(
             upstream = %upstream_display,
-            "forward_auth: allow_plaintext is enabled — non-TLS auth subrequests are \
+            "forward_auth: insecure_plaintext is enabled — non-TLS auth subrequests are \
              permitted to non-loopback hosts. On-path attackers can forge responses or \
              inject headers. See issue #150."
         );
