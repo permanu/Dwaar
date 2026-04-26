@@ -15,8 +15,8 @@ path = "src/main.rs"
 
 [dependencies]
 # Kubernetes client and runtime
-kube = { version = "0.98", features = ["runtime", "client", "derive"] }
-k8s-openapi = { version = "0.24", features = ["v1_32"] }
+kube = { workspace = true, features = ["runtime", "client", "derive"] }
+k8s-openapi = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "signal", "sync"] }
@@ -42,9 +42,6 @@ tracing-subscriber = { workspace = true }
 # CLI
 clap = { workspace = true }
 
-# Time (for Lease renewTime handling)
-chrono = { workspace = true }
-
 [features]
 # Enable the K8s integration test suite. Requires a reachable cluster (e.g. kind).
 # Run with: cargo test -p dwaar-ingress --features k8s-integration -- --test-threads=1
@@ -53,8 +50,6 @@ k8s-integration = []
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "signal", "sync"] }
 tempfile = "3"
-# Used by the k8s-integration tests to construct expired Lease timestamps.
-chrono = { workspace = true }
 serde_json = { workspace = true }
 # Required to install the CryptoProvider for kube-rs in integration tests.
 rustls = { workspace = true }

@@ -835,7 +835,8 @@ async fn test_leader_takeover_on_expired_lease() {
     sleep(Duration::from_millis(200)).await;
 
     // Create a Lease whose renewTime is 60 seconds ago — clearly expired.
-    let expired_renew = chrono::Utc::now() - chrono::Duration::seconds(60);
+    let expired_renew =
+        k8s_openapi::jiff::Timestamp::now() - k8s_openapi::jiff::SignedDuration::from_secs(60);
     let stale_lease = Lease {
         metadata: ObjectMeta {
             name: Some(lease_name.to_string()),
@@ -863,10 +864,10 @@ async fn test_leader_takeover_on_expired_lease() {
     // expose it from the crate.
     let is_expired = {
         let spec = fetched.spec.as_ref().expect("spec must exist");
-        if let Some(MicroTime(dt)) = spec.renew_time.as_ref() {
-            let age = chrono::Utc::now()
-                .signed_duration_since(*dt)
-                .num_seconds()
+        if let Some(MicroTime(ts)) = spec.renew_time.as_ref() {
+            let age = k8s_openapi::jiff::Timestamp::now()
+                .duration_since(*ts)
+                .as_secs()
                 .max(0) as u64;
             age >= spec.lease_duration_seconds.unwrap_or(15) as u64
         } else {
