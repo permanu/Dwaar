@@ -15,6 +15,7 @@
 use std::process::Command;
 use std::time::Duration;
 
+use anyhow::Context as _;
 use async_trait::async_trait;
 use dwaar_config::model::{AutoUpdateAction, AutoUpdateConfig};
 use pingora_core::server::ShutdownWatch;
@@ -157,28 +158,26 @@ impl AutoUpdateService {
 
 /// Fetch latest version tag from GitHub Releases (blocking).
 ///
-/// Uses the GitHub redirect `releases/latest` → `releases/tag/vX.Y.Z`
-/// and extracts the tag from the final URL. Lightweight — no JSON parsing,
-/// no API token needed.
+/// Follows the `/releases/latest` redirect in-process via reqwest and
+/// extracts the version tag from the final URL — equivalent to the previous
+/// `curl -w %{url_effective}` trick but without curl in the trust path.
+/// Issue #147: a compromised curl could have silently substituted a tag.
 fn fetch_latest_version() -> anyhow::Result<String> {
-    let output = Command::new("curl")
-        .args([
-            "-fsSL",
-            "-o",
-            "/dev/null",
-            "-w",
-            "%{url_effective}",
-            "https://github.com/permanu/Dwaar/releases/latest",
-        ])
-        .output()?;
+    // Reuse the blocking client from self_update to share TLS config.
+    let client = reqwest::blocking::Client::builder()
+        .user_agent(concat!("dwaar-auto-update/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("failed to build HTTP client")?;
 
-    if !output.status.success() {
-        anyhow::bail!("curl failed: {}", String::from_utf8_lossy(&output.stderr));
-    }
+    let resp = client
+        .get("https://github.com/permanu/Dwaar/releases/latest")
+        .send()
+        .context("GitHub redirect request failed")?;
 
-    let url = String::from_utf8(output.stdout)?;
-    url.rsplit('/')
-        .next()
+    resp.url()
+        .path_segments()
+        .and_then(|mut segs| segs.next_back())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| anyhow::anyhow!("could not extract tag from GitHub redirect URL"))

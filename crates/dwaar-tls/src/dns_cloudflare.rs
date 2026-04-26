@@ -7,12 +7,12 @@
 //! Cloudflare DNS provider for ACME DNS-01 challenges.
 //!
 //! Uses Cloudflare's REST API to create and delete TXT records needed for
-//! wildcard certificate validation. Communicates via `tokio::process::Command`
-//! shelling out to `curl` to avoid adding an HTTP client dependency — this
-//! only runs during background cert provisioning, never on the hot path.
+//! wildcard certificate validation. All HTTP is done in-process via `reqwest`
+//! with `rustls` — the previous curl shell-out was removed in issue #147
+//! because a compromised `curl` could intercept the API token passed via stdin.
+//! With reqwest the token travels only inside the process, in a header value.
 
 use async_trait::async_trait;
-use tokio::io::AsyncWriteExt as _;
 use tracing::{debug, warn};
 use zeroize::Zeroizing;
 
@@ -20,65 +20,73 @@ use crate::dns::{DnsError, DnsProvider};
 
 const CF_API_BASE: &str = "https://api.cloudflare.com/client/v4";
 
-/// Cloudflare DNS provider using the API token authentication.
+/// Cloudflare DNS provider using API token authentication.
 ///
 /// Requires a scoped API token with `Zone:DNS:Edit` permission for the
 /// target zone. The token is passed via config: `tls { dns cloudflare <token> }`.
+///
+/// All HTTP is in-process via a shared `reqwest::Client` (issue #147).
+/// The previous approach shelled out to curl with the token piped through
+/// stdin; reqwest keeps the token inside the process as a header value and
+/// never exposes it to the kernel's argument list.
 #[derive(Debug)]
 pub struct CloudflareDnsProvider {
     api_token: Zeroizing<String>,
+    /// Reused across all Cloudflare API calls to amortise TLS handshakes.
+    client: reqwest::Client,
 }
 
 impl CloudflareDnsProvider {
     pub fn new(api_token: impl Into<String>) -> Self {
+        // 30-second total timeout matches the previous curl `--max-time 30`.
+        // connect_timeout matches the previous `--connect-timeout 10`.
+        let client = reqwest::Client::builder()
+            .user_agent(concat!("dwaar-tls/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("Cloudflare DNS HTTP client failed to build");
+
         Self {
             api_token: Zeroizing::new(api_token.into()),
+            client,
         }
     }
 
-    /// Run a curl command with the auth token passed via stdin, never via argv.
+    /// Execute an authenticated request against the Cloudflare API.
     ///
-    /// The `-H @-` flag tells curl to read one extra header line from stdin.
-    /// This keeps the token out of the process argument list (visible via `ps aux`).
-    /// `--connect-timeout` and `--max-time` guard against hung connections
-    /// during background cert provisioning.
-    async fn run_curl(&self, args: &[&str]) -> Result<Vec<u8>, DnsError> {
-        use std::process::Stdio;
+    /// The token is sent as a request header inside this process — it never
+    /// appears in argv or environment variables, which is strictly safer than
+    /// the previous curl approach even with stdin piping (issue #147).
+    async fn cf_request(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, DnsError> {
+        let mut req = self
+            .client
+            .request(method, url)
+            .header(
+                "Authorization",
+                format!("Bearer {}", self.api_token.as_str()),
+            )
+            .header("Content-Type", "application/json");
 
-        let mut child = tokio::process::Command::new("curl")
-            .args(args)
-            .args(["--connect-timeout", "10", "--max-time", "30"])
-            // Read one extra header line from stdin so the token never appears in argv
-            .args(["-H", "@-"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| DnsError::ApiRequest(format!("curl failed to start: {e}")))?;
-
-        // Write the auth header to the child's stdin, then close it
-        if let Some(mut stdin) = child.stdin.take() {
-            let header = format!("Authorization: Bearer {}\n", self.api_token.as_str());
-            stdin
-                .write_all(header.as_bytes())
-                .await
-                .map_err(|e| DnsError::ApiRequest(format!("curl stdin write failed: {e}")))?;
+        if let Some(payload) = body {
+            req = req.json(&payload);
         }
 
-        let out = child
-            .wait_with_output()
+        let resp = req
+            .send()
             .await
-            .map_err(|e| DnsError::ApiRequest(format!("curl failed: {e}")))?;
+            .map_err(|e| DnsError::ApiRequest(format!("Cloudflare API request failed: {e}")))?;
 
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(DnsError::ApiRequest(format!(
-                "curl exited with {}: {}",
-                out.status, stderr
-            )));
-        }
+        let json: serde_json::Value = resp.json().await.map_err(|e| {
+            DnsError::ApiRequest(format!("failed to parse Cloudflare response: {e}"))
+        })?;
 
-        Ok(out.stdout)
+        Ok(json)
     }
 
     /// Look up the Cloudflare zone ID for a domain by walking up the labels.
@@ -112,16 +120,7 @@ impl CloudflareDnsProvider {
     async fn try_zone_lookup(&self, name: &str) -> Result<Option<String>, DnsError> {
         let url = format!("{CF_API_BASE}/zones?name={name}&status=active");
 
-        let stdout = self
-            .run_curl(&["-s", "-H", "Content-Type: application/json", &url])
-            .await?;
-        let body = String::from_utf8_lossy(&stdout);
-
-        // Parse minimal JSON to extract zone ID. We use serde_json to avoid
-        // adding another dependency.
-        let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
-            DnsError::ApiRequest(format!("failed to parse Cloudflare response: {e}"))
-        })?;
+        let json = self.cf_request(reqwest::Method::GET, &url, None).await?;
 
         let success = json["success"].as_bool().unwrap_or(false);
         if !success {
@@ -143,7 +142,7 @@ impl CloudflareDnsProvider {
         Ok(None)
     }
 
-    /// Create a DNS record via the Cloudflare API.
+    /// Create a DNS TXT record via the Cloudflare API.
     async fn create_record(
         &self,
         zone_id: &str,
@@ -157,25 +156,10 @@ impl CloudflareDnsProvider {
             "content": value,
             "ttl": 120
         });
-        let payload_str = payload.to_string();
 
-        let stdout = self
-            .run_curl(&[
-                "-s",
-                "-X",
-                "POST",
-                "-H",
-                "Content-Type: application/json",
-                "-d",
-                &payload_str,
-                &url,
-            ])
+        let json = self
+            .cf_request(reqwest::Method::POST, &url, Some(payload))
             .await?;
-        let body = String::from_utf8_lossy(&stdout);
-
-        let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
-            DnsError::ApiRequest(format!("failed to parse Cloudflare response: {e}"))
-        })?;
 
         let success = json["success"].as_bool().unwrap_or(false);
         if !success {
@@ -196,21 +180,7 @@ impl CloudflareDnsProvider {
     async fn delete_record(&self, zone_id: &str, record_id: &str) -> Result<(), DnsError> {
         let url = format!("{CF_API_BASE}/zones/{zone_id}/dns_records/{record_id}");
 
-        let stdout = self
-            .run_curl(&[
-                "-s",
-                "-X",
-                "DELETE",
-                "-H",
-                "Content-Type: application/json",
-                &url,
-            ])
-            .await?;
-        let body = String::from_utf8_lossy(&stdout);
-
-        let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
-            DnsError::ApiRequest(format!("failed to parse Cloudflare response: {e}"))
-        })?;
+        let json = self.cf_request(reqwest::Method::DELETE, &url, None).await?;
 
         let success = json["success"].as_bool().unwrap_or(false);
         if !success {
@@ -256,11 +226,23 @@ impl DnsProvider for CloudflareDnsProvider {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn record_id_round_trip() {
         let combined = format!("{}:{}", "zone123", "rec456");
         let (zone, record) = combined.split_once(':').expect("split");
         assert_eq!(zone, "zone123");
         assert_eq!(record, "rec456");
+    }
+
+    #[test]
+    fn http_client_builds() {
+        // Smoke: reqwest async client for the Cloudflare provider constructs
+        // without panicking. No network calls are made. Issue #147: curl
+        // shell-out replaced with in-process reqwest.
+        let provider = CloudflareDnsProvider::new("test-token");
+        // Confirm the name() method is accessible — exercises the DnsProvider impl.
+        assert_eq!(provider.name(), "cloudflare");
     }
 }
