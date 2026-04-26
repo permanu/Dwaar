@@ -81,9 +81,9 @@ impl Decompressor {
     ///
     /// Pre-allocates 8 KiB for the internal feed buffer so that typical
     /// small compressed HTML responses fit in the first chunk without
-    /// triggering a realloc cascade. 8 KiB is the common gzip window size
-    /// and covers the vast majority of HTML `<head>` sections where the
-    /// analytics `<script>` tag must be injected. See issue #153.
+    /// triggering a realloc cascade. The compressed `<head>` of a typical
+    /// HTML page lands in the 2–8 KiB range, so 8 KiB avoids a first-chunk
+    /// realloc without over-committing memory for small responses. See issue #153.
     pub fn new(encoding: Encoding) -> Self {
         Self {
             encoding,

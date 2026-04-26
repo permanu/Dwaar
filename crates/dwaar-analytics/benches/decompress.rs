@@ -27,12 +27,16 @@ fn gzip_payload(size_bytes: usize) -> Vec<u8> {
 fn bench_decompress_50k(c: &mut Criterion) {
     let payload = gzip_payload(50_000);
     c.bench_function("decompress_50k_gzip_one_shot", |b| {
-        b.iter(|| {
-            let mut dec = Decompressor::new(Encoding::Gzip);
-            let mut body = Some(Bytes::from(payload.clone()));
-            dec.decompress(&mut body, true);
-            black_box(body);
-        });
+        b.iter_batched(
+            || Bytes::from(payload.clone()),
+            |body| {
+                let mut dec = Decompressor::new(Encoding::Gzip);
+                let mut body_opt = Some(body);
+                dec.decompress(&mut body_opt, true);
+                black_box(body_opt);
+            },
+            criterion::BatchSize::SmallInput,
+        );
     });
 }
 
