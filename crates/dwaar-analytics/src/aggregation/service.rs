@@ -38,6 +38,20 @@ const FLUSH_INTERVAL: Duration = Duration::from_secs(60);
 /// `dwaar-core` (no circular dependency).
 pub trait RouteValidator: Send + Sync {
     fn is_known_host(&self, host: &str) -> bool;
+
+    /// Return the set of known hosts at the time of the call.
+    ///
+    /// Used by [`AggregationService::new`] to pre-seed the metrics map so
+    /// the first `entry().or_default()` for each domain is a contention-free
+    /// read of an existing entry rather than a write that competes with other
+    /// concurrent first-writes. See issue #163.
+    ///
+    /// The default returns an empty `Vec`, preserving backward compatibility
+    /// for implementations that cannot enumerate domains (pre-seeding
+    /// degrades gracefully to the lazy-allocation status quo).
+    fn known_hosts(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Aggregation background service.
@@ -70,6 +84,20 @@ impl<RT: RouteValidator> AggregationService<RT> {
         beacon_rx: mpsc::Receiver<BeaconEvent>,
         log_rx: AggReceiver,
     ) -> Self {
+        // Pre-seed the map with all currently known domains so the first
+        // event per domain hits an existing entry instead of racing to
+        // create one. Under high concurrency with many new domains appearing
+        // simultaneously, multiple workers could call entry().or_default()
+        // simultaneously, each racing to insert a short-lived DomainMetrics
+        // allocation — DashMap serialises those writes at the shard level,
+        // causing unnecessary contention. With the map pre-seeded, every
+        // ingest() call for a known domain is a contention-free shard read.
+        // Unknown hosts are still gated by is_known_host() before they ever
+        // reach the entry() call, so they never appear in the map. #163
+        for host in route_validator.known_hosts() {
+            metrics.entry(host).or_default();
+        }
+
         Self {
             metrics,
             route_validator,
@@ -466,6 +494,10 @@ mod tests {
         fn is_known_host(&self, host: &str) -> bool {
             self.0.contains(host)
         }
+
+        fn known_hosts(&self) -> Vec<String> {
+            self.0.iter().cloned().collect()
+        }
     }
 
     fn test_event(host: &str, path: &str, status: u16) -> AggEvent {
@@ -548,8 +580,14 @@ mod tests {
             beacon_rx,
             AggReceiver { rx: log_rx },
         );
+        // Pre-seeding adds example.com at construction; unknown hosts must
+        // never be inserted, so the map must not contain evil.com after
+        // this ingest. #163
         svc.ingest_log(&test_event("evil.com", "/hack", 200));
-        assert_eq!(metrics.len(), 0, "unknown host must not create entry");
+        assert!(
+            !metrics.contains_key("evil.com"),
+            "unknown host must not create entry"
+        );
     }
 
     #[test]
@@ -735,6 +773,38 @@ mod tests {
             assert_eq!(entry.bytes_sent, 1024, "only window 2 bytes");
             assert_eq!(entry.human_views, 1);
         }
+    }
+
+    #[test]
+    fn pre_seed_known_domains_no_stampede_on_first_ingest() {
+        // After construction the map already contains an entry for every
+        // known domain, so ingest_log()'s entry().or_default() becomes a
+        // contention-free read of an existing shard entry rather than a
+        // write that races against concurrent first-writes for other new
+        // domains. The map must not grow during the first ingest. #163
+        let known = ["a.example.com", "b.example.com", "c.example.com"];
+        let domain_set: HashSet<String> = known.iter().map(|&s| s.into()).collect();
+        let (_beacon_tx, beacon_rx) = mpsc::channel(1);
+        let (_log_tx, log_rx) = mpsc::channel(1);
+        let metrics = Arc::new(DashMap::new());
+        let _svc = AggregationService::new(
+            Arc::clone(&metrics),
+            TestValidator(domain_set),
+            beacon_rx,
+            AggReceiver { rx: log_rx },
+        );
+
+        // All three domains seeded at construction — no ingest needed.
+        assert_eq!(
+            metrics.len(),
+            3,
+            "all known domains pre-seeded at construction"
+        );
+
+        // First ingest for a known domain: entry already exists, map does not grow.
+        let entry = metrics.entry("a.example.com".to_string()).or_default();
+        drop(entry);
+        assert_eq!(metrics.len(), 3, "first ingest must not grow the map");
     }
 
     #[tokio::test]

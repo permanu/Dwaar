@@ -2089,6 +2089,16 @@ impl RouteValidator for LiveRouteValidator {
     fn is_known_host(&self, host: &str) -> bool {
         self.0.load().resolve(host).is_some()
     }
+
+    fn known_hosts(&self) -> Vec<String> {
+        // Snapshot the domain keys from the current route table so
+        // AggregationService can pre-seed the metrics map at construction.
+        // A snapshot is fine here — new domains that arrive via hot-reload
+        // will still be gated by is_known_host() and lazily inserted on
+        // their first event; the pre-seed only eliminates the stampede for
+        // the domains known at startup. #163
+        self.0.load().domain_keys().map(str::to_owned).collect()
+    }
 }
 
 /// Wraps `AggregationService` as a Pingora `BackgroundService`.
