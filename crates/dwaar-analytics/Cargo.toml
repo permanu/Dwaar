@@ -47,5 +47,9 @@ tempfile = { workspace = true }
 name = "aggregation"
 harness = false
 
+[[bench]]
+name = "decompress"
+harness = false
+
 [lints]
 workspace = true

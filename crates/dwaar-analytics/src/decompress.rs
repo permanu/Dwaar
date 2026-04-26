@@ -78,12 +78,27 @@ pub struct Decompressor {
 
 impl Decompressor {
     /// Create a new decompressor for the given encoding.
+    ///
+    /// Pre-allocates 8 KiB for the internal feed buffer so that typical
+    /// small compressed HTML responses fit in the first chunk without
+    /// triggering a realloc cascade. 8 KiB is the common gzip window size
+    /// and covers the vast majority of HTML `<head>` sections where the
+    /// analytics `<script>` tag must be injected. See issue #153.
     pub fn new(encoding: Encoding) -> Self {
         Self {
             encoding,
-            buffer: Vec::new(),
+            buffer: Vec::with_capacity(8192),
             failed: false,
         }
+    }
+
+    /// Returns the current capacity of the internal compressed-data buffer.
+    ///
+    /// Exposed for testing the pre-allocation guarantee from issue #153.
+    /// Production callers should not rely on this value.
+    #[cfg(test)]
+    pub(crate) fn buffer_capacity(&self) -> usize {
+        self.buffer.capacity()
     }
 
     /// Decompress a chunk. Appends to internal buffer and attempts
@@ -368,5 +383,18 @@ mod tests {
         let mut body: Option<Bytes> = None;
         decomp.decompress(&mut body, false);
         assert!(body.is_none());
+    }
+
+    #[test]
+    fn decompressor_buffer_preallocated() {
+        let d = Decompressor::new(Encoding::Gzip);
+        // Pre-allocation: a fresh decompressor should hold at least 8 KiB
+        // of capacity so the first compressed chunk does not trigger a
+        // re-alloc cascade. See issue #153.
+        assert!(
+            d.buffer_capacity() >= 8192,
+            "expected >=8192 capacity, got {}",
+            d.buffer_capacity()
+        );
     }
 }
