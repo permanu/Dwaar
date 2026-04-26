@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use futures_util::future::join_all;
 use parking_lot::Mutex;
 use pingora_core::OrErr;
 use pingora_core::services::background::BackgroundService;
@@ -737,13 +738,36 @@ impl BackgroundService for HealthChecker {
                 .unwrap_or(Duration::from_secs(10));
 
             // Probe all backends across all active pools.
+            //
+            // Within each pool, backends are probed concurrently via join_all so
+            // the total cycle time is bounded by the slowest probe, not the sum.
+            // This matters at scale: a pool of 10 backends with 500 ms probe
+            // timeouts would take 5 s sequentially but ~500 ms in parallel.
+            //
+            // join_all is the right primitive here: we need every probe to finish
+            // before updating health state, there are no cancellation semantics
+            // required, and pool sizes are bounded by real-world backend counts
+            // (typically single-digit to low tens). For pools that could exceed
+            // ~100 backends, switch to futures_util::stream::iter(...).buffer_unordered(N).
             for pool in &active {
                 let Some(ref uri) = pool.health_uri else {
                     continue;
                 };
-                for backend in &pool.backends {
+
+                // Collect one future per backend, each carrying the addr so the
+                // result can be matched back to the right backend after awaiting.
+                let probe_futs = pool.backends.iter().map(|backend| {
                     let addr = backend.addr;
-                    match probe_backend(addr, uri).await {
+                    let uri = uri.clone();
+                    async move { (addr, probe_backend(addr, &uri).await) }
+                });
+                let results: Vec<(
+                    SocketAddr,
+                    Result<u16, Box<dyn std::error::Error + Send + Sync>>,
+                )> = join_all(probe_futs).await;
+
+                for (addr, outcome) in results {
+                    match outcome {
                         Ok(status) if (200..300).contains(&status) => {
                             pool.mark_healthy(addr);
                         }
@@ -1425,5 +1449,42 @@ mod tests {
         let pool = UpstreamPool::new(vec![], LbPolicy::RoundRobin, None, None);
         // Call the inner method directly to verify it is independently safe.
         assert!(pool.select_round_robin().is_none());
+    }
+
+    // ── parallel health probes (#162) ─────────────────────────────────────────
+
+    /// Verify that `join_all` actually runs probes concurrently, not sequentially.
+    ///
+    /// Three "probes" sleep for 50, 100, and 150 ms respectively. Sequential
+    /// execution would take ~300 ms total; concurrent execution is bounded by
+    /// the slowest at ~150 ms.
+    ///
+    /// Note: this tests the `join_all` primitive directly, not the `HealthChecker`
+    /// loop itself (which requires a real TCP listener). It validates that the
+    /// concurrency pattern we rely on behaves correctly under tokio's scheduler.
+    #[tokio::test]
+    async fn parallel_health_probes_complete_in_max_time_not_sum() {
+        let durations_ms: &[u64] = &[50, 100, 150];
+        let start = std::time::Instant::now();
+
+        let probe_futs = durations_ms.iter().map(|&d| async move {
+            tokio::time::sleep(std::time::Duration::from_millis(d)).await;
+            d
+        });
+        let results: Vec<u64> = join_all(probe_futs).await;
+
+        let elapsed = start.elapsed();
+
+        // All probes must have completed and returned their duration.
+        assert_eq!(results, vec![50, 100, 150]);
+
+        // Parallel: total wall-clock should be close to the slowest (150 ms).
+        // We allow 200 ms headroom for CI scheduler variance; sequential would
+        // be ~300 ms so this threshold reliably distinguishes the two modes.
+        assert!(
+            elapsed.as_millis() < 200,
+            "expected parallel completion ~150 ms, got {} ms — probes may be running sequentially",
+            elapsed.as_millis()
+        );
     }
 }
