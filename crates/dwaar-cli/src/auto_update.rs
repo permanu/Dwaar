@@ -15,7 +15,6 @@
 use std::process::Command;
 use std::time::Duration;
 
-use anyhow::Context as _;
 use async_trait::async_trait;
 use dwaar_config::model::{AutoUpdateAction, AutoUpdateConfig};
 use pingora_core::server::ShutdownWatch;
@@ -75,19 +74,20 @@ impl BackgroundService for AutoUpdateService {
 
 impl AutoUpdateService {
     async fn check_and_apply(&self) {
-        // Fetch latest version — runs reqwest blocking client so we don't
-        // stall the tokio executor.
-        let latest = match tokio::task::spawn_blocking(fetch_latest_version).await {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => {
-                warn!(error = %e, "auto-update: failed to check latest version");
-                return;
-            }
-            Err(e) => {
-                warn!(error = %e, "auto-update: spawn_blocking panicked");
-                return;
-            }
-        };
+        // Fetch latest version — runs the shared blocking client so we don't
+        // stall the tokio executor. Delegates to version_check (#176).
+        let latest =
+            match tokio::task::spawn_blocking(crate::version_check::fetch_latest_version).await {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => {
+                    warn!(error = %e, "auto-update: failed to check latest version");
+                    return;
+                }
+                Err(e) => {
+                    warn!(error = %e, "auto-update: spawn_blocking panicked");
+                    return;
+                }
+            };
 
         let latest_version = latest.strip_prefix('v').unwrap_or(&latest);
         let current = env!("CARGO_PKG_VERSION");
@@ -154,33 +154,6 @@ impl AutoUpdateService {
             }
         }
     }
-}
-
-/// Fetch latest version tag from GitHub Releases (blocking).
-///
-/// Follows the `/releases/latest` redirect in-process via reqwest and
-/// extracts the version tag from the final URL — equivalent to the previous
-/// `curl -w %{url_effective}` trick but without curl in the trust path.
-/// Issue #147: a compromised curl could have silently substituted a tag.
-fn fetch_latest_version() -> anyhow::Result<String> {
-    // Reuse the blocking client from self_update to share TLS config.
-    let client = reqwest::blocking::Client::builder()
-        .user_agent(concat!("dwaar-auto-update/", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(30))
-        .build()
-        .context("failed to build HTTP client")?;
-
-    let resp = client
-        .get("https://github.com/permanu/Dwaar/releases/latest")
-        .send()
-        .context("GitHub redirect request failed")?;
-
-    resp.url()
-        .path_segments()
-        .and_then(|mut segs| segs.next_back())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("could not extract tag from GitHub redirect URL"))
 }
 
 /// Check if current UTC time is within the maintenance window.

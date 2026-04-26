@@ -33,6 +33,7 @@ mod auto_update;
 mod cli;
 mod readiness;
 mod self_update;
+mod version_check;
 
 use std::fs::Permissions;
 use std::os::unix::fs::PermissionsExt;
