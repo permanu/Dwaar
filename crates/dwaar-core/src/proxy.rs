@@ -1318,7 +1318,14 @@ impl ProxyHttp for DwaarProxy {
             let host = ctx.plugin_ctx.host.as_deref().unwrap_or("localhost");
 
             // Read request body for POST — reject with 413 if it exceeds the limit.
-            let mut body_buf = Vec::new();
+            // Pre-size the buffer so the typical small POST (forms, JSON
+            // payloads <16 KiB) lands in a single allocation. Cap at 64 KiB
+            // so we don't speculatively allocate megabytes for unlikely large
+            // bodies — the loop below grows the Vec naturally beyond the
+            // pre-alloc when needed.
+            let body_prealloc =
+                usize::try_from(ctx.request_body_max_size.min(64 * 1024)).unwrap_or(usize::MAX);
+            let mut body_buf = Vec::with_capacity(body_prealloc);
             while let Ok(Some(chunk)) = session.downstream_session.read_request_body().await {
                 body_buf.extend_from_slice(&chunk);
                 if body_buf.len() as u64 > ctx.request_body_max_size {
