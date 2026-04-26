@@ -420,7 +420,11 @@ impl PrometheusMetrics {
     ///
     /// Called on `GET /metrics` — iterates `DashMap` entries and formats
     /// each metric with HELP, TYPE, and value lines.
-    pub fn render(&self) -> String {
+    ///
+    /// Async because `process.render()` offloads /proc reads via
+    /// `spawn_blocking` to avoid stalling runtime workers on slow procfs I/O
+    /// (issue #156).
+    pub async fn render(&self) -> String {
         // Pre-allocate generously — typical output for 10 domains is ~8 KB
         let mut out = String::with_capacity(8192);
 
@@ -432,7 +436,7 @@ impl PrometheusMetrics {
         self.render_upstream_health(&mut out);
         self.render_tls_handshake_duration(&mut out);
         self.render_config_reloads(&mut out);
-        self.process.render(&mut out);
+        self.process.render(&mut out).await;
         self.rate_cache.render(&mut out);
 
         out
@@ -746,10 +750,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn render_empty_registry() {
+    #[tokio::test]
+    async fn render_empty_registry() {
         let m = PrometheusMetrics::new();
-        let text = m.render();
+        let text = m.render().await;
         // Should still have HELP/TYPE lines but no data lines
         assert!(text.contains("# HELP dwaar_requests_total"));
         assert!(text.contains("# TYPE dwaar_requests_total counter"));
@@ -757,15 +761,15 @@ mod tests {
         assert!(!text.contains("domain="));
     }
 
-    #[test]
-    fn render_counter_values() {
+    #[tokio::test]
+    async fn render_counter_values() {
         let m = PrometheusMetrics::new();
         let domain = CompactString::from("app.example.com");
         m.record_request(&domain, "GET", 200, 1_000, 512, 64);
         m.record_request(&domain, "GET", 200, 2_000, 512, 64);
         m.record_request(&domain, "POST", 404, 3_000, 0, 128);
 
-        let text = m.render();
+        let text = m.render().await;
         assert!(text.contains(
             "dwaar_requests_total{domain=\"app.example.com\",method=\"GET\",status=\"2xx\"} 2"
         ));
@@ -775,13 +779,13 @@ mod tests {
         assert!(text.contains("dwaar_bytes_sent_total{domain=\"app.example.com\"} 1024"));
     }
 
-    #[test]
-    fn render_histogram_format() {
+    #[tokio::test]
+    async fn render_histogram_format() {
         let m = PrometheusMetrics::new();
         let domain = CompactString::from("h.test");
         m.record_request(&domain, "GET", 200, 3_000, 0, 0); // 3ms
 
-        let text = m.render();
+        let text = m.render().await;
         // Check bucket format
         assert!(
             text.contains(
@@ -795,31 +799,31 @@ mod tests {
         assert!(text.contains("dwaar_request_duration_seconds_count{domain=\"h.test\"} 1"));
     }
 
-    #[test]
-    fn render_config_reload_counters() {
+    #[tokio::test]
+    async fn render_config_reload_counters() {
         let m = PrometheusMetrics::new();
         m.config_reloads_success.fetch_add(3, Relaxed);
         m.config_reloads_failure.fetch_add(1, Relaxed);
 
-        let text = m.render();
+        let text = m.render().await;
         assert!(text.contains("dwaar_config_reload_total{result=\"success\"} 3"));
         assert!(text.contains("dwaar_config_reload_total{result=\"failure\"} 1"));
     }
 
-    #[test]
-    fn render_skips_zero_config_reloads() {
+    #[tokio::test]
+    async fn render_skips_zero_config_reloads() {
         let m = PrometheusMetrics::new();
-        let text = m.render();
+        let text = m.render().await;
         assert!(!text.contains("dwaar_config_reload_total"));
     }
 
-    #[test]
-    fn render_active_connections_gauge() {
+    #[tokio::test]
+    async fn render_active_connections_gauge() {
         let m = PrometheusMetrics::new();
         let domain = CompactString::from("gauge.test");
         m.connection_start(&domain);
 
-        let text = m.render();
+        let text = m.render().await;
         assert!(text.contains("dwaar_active_connections{domain=\"gauge.test\"} 1"));
     }
 }
