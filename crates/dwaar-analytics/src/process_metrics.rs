@@ -334,8 +334,7 @@ fn resident_memory_bytes_impl() -> u64 {
 #[cfg(target_os = "linux")]
 fn open_fds_impl() -> u64 {
     read_proc_dir("/proc/self/fd")
-        .map(|entries| entries.count() as u64)
-        .unwrap_or(0)
+        .map_or(0, |entries| entries.count() as u64)
 }
 
 #[cfg(target_os = "macos")]
