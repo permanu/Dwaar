@@ -12,8 +12,51 @@
 //! `/proc/self` on Linux and fall back to `libc` / `sysctl` on macOS.
 
 use std::fmt::Write;
+#[cfg(target_os = "linux")]
+use std::sync::Once;
 use std::sync::OnceLock;
 use std::time::SystemTime;
+
+/// Logs a one-shot warning if a /proc read fails, then stays silent.
+///
+/// Used to surface "procfs unavailable" once per process so operators
+/// know why metrics are zero, without flooding the log with every poll.
+/// See issue #171.
+#[cfg(target_os = "linux")]
+fn warn_once_on_proc_failure(path: &str, err: &std::io::Error) {
+    static WARNED: Once = Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            proc_path = %path,
+            error = %err,
+            "process metrics unavailable: /proc read failed (further failures will be silent)"
+        );
+    });
+}
+
+/// Reads a /proc file, logging a one-shot warning if the read fails.
+#[cfg(target_os = "linux")]
+fn read_proc(path: &str) -> Option<String> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            warn_once_on_proc_failure(path, &e);
+            None
+        }
+    }
+}
+
+/// Reads a /proc directory, logging a one-shot warning if the read fails.
+#[cfg(target_os = "linux")]
+fn read_proc_dir(path: &str) -> Option<std::fs::ReadDir> {
+    match std::fs::read_dir(path) {
+        Ok(entries) => Some(entries),
+        Err(e) => {
+            warn_once_on_proc_failure(path, &e);
+            None
+        }
+    }
+}
 
 /// Cached process start time in Unix seconds.
 ///
@@ -161,7 +204,7 @@ fn process_start_time_secs() -> f64 {
 fn linux_process_start_time_secs() -> Option<f64> {
     // /proc/self/stat: split on the LAST `)` to avoid desync from a
     // `comm` field that contains spaces or parens.
-    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    let stat = read_proc("/proc/self/stat")?;
     let rparen = stat.rfind(')')?;
     let after = stat.get(rparen + 1..)?.trim_start();
     // `starttime` is original field 22 → index 22-3 = 19 in `after`.
@@ -178,7 +221,7 @@ fn linux_process_start_time_secs() -> Option<f64> {
     #[allow(clippy::cast_precision_loss)]
     let seconds_since_boot = starttime_ticks as f64 / clk_tck;
 
-    let stat2 = std::fs::read_to_string("/proc/stat").ok()?;
+    let stat2 = read_proc("/proc/stat")?;
     let btime: u64 = stat2
         .lines()
         .find_map(|l| l.strip_prefix("btime "))?
@@ -255,8 +298,7 @@ fn cpu_seconds_total_impl() -> f64 {
 #[cfg(target_os = "linux")]
 fn resident_memory_bytes_impl() -> u64 {
     // /proc/self/status VmRSS is in kB.
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
+    read_proc("/proc/self/status")
         .and_then(|s| {
             s.lines()
                 .find(|line| line.starts_with("VmRSS:"))
@@ -291,7 +333,7 @@ fn resident_memory_bytes_impl() -> u64 {
 
 #[cfg(target_os = "linux")]
 fn open_fds_impl() -> u64 {
-    std::fs::read_dir("/proc/self/fd")
+    read_proc_dir("/proc/self/fd")
         .map(|entries| entries.count() as u64)
         .unwrap_or(0)
 }
@@ -324,8 +366,7 @@ fn max_fds_impl() -> u64 {
 
 #[cfg(target_os = "linux")]
 fn threads_impl() -> u64 {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
+    read_proc("/proc/self/status")
         .and_then(|s| {
             s.lines()
                 .find(|line| line.starts_with("Threads:"))
@@ -415,5 +456,18 @@ mod tests {
     fn is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<ProcessMetrics>();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn warn_once_helper_callable() {
+        // Smoke test: the warn-once helper exists and runs without panicking
+        // when invoked with a synthetic error. Behavior verification of the
+        // Once gate is left to manual inspection (Once is process-global and
+        // doesn't compose with parallel cargo-test execution). See issue #171.
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "synthetic");
+        warn_once_on_proc_failure("/proc/self/synthetic", &err);
+        warn_once_on_proc_failure("/proc/self/synthetic", &err);
+        // Test passes if no panic.
     }
 }
