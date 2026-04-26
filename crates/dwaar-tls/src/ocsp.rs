@@ -267,6 +267,31 @@ fn is_blocked_ocsp_target_raw(ip: IpAddr) -> bool {
     }
 }
 
+/// Global flag used only by integration tests to allow loopback OCSP targets
+/// (so mock responders bound on `127.0.0.1` remain reachable past the SSRF
+/// guard). Gated behind `#[cfg(test)]` so the production binary statically
+/// lacks this bypass — an attacker or a future code typo cannot flip it.
+/// Per-IP unit tests use [`is_blocked_ocsp_target_raw`] directly so they
+/// never race with the integration tests that set this flag.
+#[cfg(test)]
+pub(crate) static ALLOW_LOOPBACK_OCSP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Returns `true` if the OCSP loopback bypass is currently active.
+///
+/// In test builds this reads the [`ALLOW_LOOPBACK_OCSP`] flag so mock
+/// responders on `127.0.0.1` can be reached.  In production builds this
+/// always returns `false` — the bypass is compiled out entirely (issue #158).
+#[cfg(test)]
+fn loopback_bypass_enabled() -> bool {
+    ALLOW_LOOPBACK_OCSP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(not(test))]
+fn loopback_bypass_enabled() -> bool {
+    false
+}
+
 /// SSRF guard: deny outbound OCSP connections to sensitive IP ranges (M-12).
 ///
 /// Cert-embedded OCSP URLs are attacker-influenced (the issuer picks them).
@@ -275,24 +300,14 @@ fn is_blocked_ocsp_target_raw(ip: IpAddr) -> bool {
 /// metadata (`169.254.169.254`), or multicast/broadcast addresses — a
 /// perfect SSRF primitive for reaching internal services.
 ///
-/// The test suite bypasses loopback via [`ALLOW_LOOPBACK_OCSP`] so the
-/// mock OCSP responder on `127.0.0.1` remains reachable. Production
-/// builds never flip that flag.
+/// The loopback bypass used by the test suite is compiled out in production
+/// builds via [`loopback_bypass_enabled`] (issue #158).
 fn is_blocked_ocsp_target(ip: IpAddr) -> bool {
-    // Test-only escape hatch for loopback. Production never sets this flag.
-    if ALLOW_LOOPBACK_OCSP.load(std::sync::atomic::Ordering::Relaxed) && ip.is_loopback() {
+    if loopback_bypass_enabled() && ip.is_loopback() {
         return false;
     }
     is_blocked_ocsp_target_raw(ip)
 }
-
-/// Global flag used only by integration tests in this crate to allow
-/// loopback OCSP targets (so mock responders bound on `127.0.0.1` remain
-/// reachable). Production code never writes to this; once enabled by a
-/// test setup helper it is never flipped back at runtime (per-IP unit
-/// tests use [`is_blocked_ocsp_target_raw`] instead).
-pub(crate) static ALLOW_LOOPBACK_OCSP: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 
 /// Validate an OCSP response: check status, verify signature, check cert status.
 fn validate_ocsp_response(
@@ -831,5 +846,25 @@ mod tests {
         );
 
         server_handle.join().expect("TLS server thread");
+    }
+
+    /// Confirm the loopback bypass mechanism behaves correctly in test builds
+    /// and that the cfg(not(test)) path compiles to an unconditional `false`
+    /// (verified statically — the production binary cannot set this flag,
+    /// issue #158).
+    #[test]
+    fn ocsp_loopback_bypass_only_active_under_test() {
+        // We're in a test build, so ALLOW_LOOPBACK_OCSP exists and
+        // loopback_bypass_enabled() reads it.
+        ALLOW_LOOPBACK_OCSP.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            loopback_bypass_enabled(),
+            "bypass should be active when flag is set"
+        );
+        ALLOW_LOOPBACK_OCSP.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            !loopback_bypass_enabled(),
+            "bypass should be inactive when flag is cleared"
+        );
     }
 }
