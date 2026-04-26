@@ -191,17 +191,13 @@ impl ForwardAuthConfig {
         let body = buf[header_end + 4..].to_vec();
 
         if (200..300).contains(&status) {
-            // Parse response headers we need to copy
+            // Parse response headers we need to copy. The helper handles RFC 7230
+            // §3.2.4 obs-fold (continuation lines starting with SP/HTAB).
             let mut copied = HashMap::new();
-            for line in header_str.lines().skip(1) {
-                if let Some((name, value)) = line.split_once(':') {
-                    let name_trimmed = name.trim();
-                    let value_trimmed = value.trim();
-                    // Only copy headers that are in the copy_headers list
-                    for wanted in &self.copy_headers {
-                        if name_trimmed.eq_ignore_ascii_case(wanted) {
-                            copied.insert(wanted.clone(), CompactString::from(value_trimmed));
-                        }
+            for (name, value) in parse_response_headers(header_str) {
+                for wanted in &self.copy_headers {
+                    if name.eq_ignore_ascii_case(wanted.as_str()) {
+                        copied.insert(wanted.clone(), CompactString::from(value.as_str()));
                     }
                 }
             }
@@ -244,4 +240,108 @@ async fn tls_connect(
         .await
         .map_err(|_| "auth service TLS handshake timed out".to_string())?
         .map_err(|e| format!("auth service TLS handshake failed: {e}"))
+}
+
+/// Parse HTTP response header lines (everything after the status line) into
+/// `(name, value)` pairs, handling RFC 7230 §3.2.4 obs-fold continuations.
+///
+/// A continuation line starts with SP (0x20) or HTAB (0x09). Per the RFC the
+/// recipient must either reject the message or replace each fold with one or
+/// more SP octets — we replace with a single SP. Orphan continuations (a fold
+/// before any header has been seen) are silently discarded as malformed.
+fn parse_response_headers(header_str: &str) -> Vec<(String, String)> {
+    let mut headers: Vec<(String, String)> = Vec::new();
+    // Track the in-progress header so obs-fold lines can append to its value.
+    let mut last_header: Option<(String, String)> = None;
+
+    for line in header_str.lines().skip(1) {
+        if line.is_empty() {
+            continue;
+        }
+
+        // Continuation line — leading SP or HTAB signals obs-fold.
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if let Some((_, value)) = last_header.as_mut() {
+                value.push(' ');
+                value.push_str(line.trim());
+            }
+            // No previous header yet — malformed, skip silently.
+            continue;
+        }
+
+        // Flush the completed previous header before starting a new one.
+        if let Some(prev) = last_header.take() {
+            headers.push(prev);
+        }
+
+        if let Some((name, value)) = line.split_once(':') {
+            last_header = Some((name.trim().to_string(), value.trim().to_string()));
+        }
+    }
+
+    // Flush the final header.
+    if let Some(prev) = last_header {
+        headers.push(prev);
+    }
+
+    headers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_response_headers;
+
+    #[test]
+    fn obs_fold_concatenates_continuation_lines() {
+        // RFC 7230 §3.2.4: a header line starting with SP or HTAB is a
+        // continuation of the previous header's value. We replace the fold with
+        // a single SP. Issue #169.
+        let raw = "HTTP/1.1 200 OK\r\nX-Long: first part\r\n  second part\r\n\tthird part\r\nOther: foo\r\n\r\n";
+        let parsed = parse_response_headers(raw);
+        let x_long = parsed
+            .iter()
+            .find(|(n, _)| n == "X-Long")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(x_long, Some("first part second part third part"));
+        let other = parsed
+            .iter()
+            .find(|(n, _)| n == "Other")
+            .map(|(_, v)| v.as_str());
+        assert_eq!(other, Some("foo"));
+    }
+
+    #[test]
+    fn obs_fold_orphan_continuation_is_ignored() {
+        // Continuation before any header — malformed, skip silently.
+        let raw = "HTTP/1.1 200 OK\r\n  orphan\r\nReal: yes\r\n\r\n";
+        let parsed = parse_response_headers(raw);
+        assert_eq!(
+            parsed
+                .iter()
+                .find(|(n, _)| n == "Real")
+                .map(|(_, v)| v.as_str()),
+            Some("yes")
+        );
+    }
+
+    #[test]
+    fn no_obs_fold_unchanged_behavior() {
+        // Smoke: regular headers without folds parse identically to before.
+        let raw = "HTTP/1.1 200 OK\r\nA: 1\r\nB: 2\r\n\r\n";
+        let parsed = parse_response_headers(raw);
+        assert_eq!(
+            parsed
+                .iter()
+                .find(|(n, _)| n == "A")
+                .map(|(_, v)| v.as_str()),
+            Some("1")
+        );
+        assert_eq!(
+            parsed
+                .iter()
+                .find(|(n, _)| n == "B")
+                .map(|(_, v)| v.as_str()),
+            Some("2")
+        );
+    }
 }
