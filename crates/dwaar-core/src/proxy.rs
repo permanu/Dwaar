@@ -137,6 +137,16 @@ pub struct DwaarProxy {
     otlp_exporter: Option<Arc<dwaar_analytics::otel::OtlpExporter>>,
     /// Fraction of requests to sample for tracing `[0.0, 1.0]`. 0.0 = off.
     trace_sample_ratio: f64,
+    /// Cache of last-confirmed-up timestamps for scale-to-zero upstreams (issue #166).
+    ///
+    /// Before probing an upstream, we check if it was reachable within
+    /// `SCALE_TO_ZERO_PROBE_CACHE_TTL`. A hit skips the 500ms-timeout TCP
+    /// connect, saving ~1ms per request on already-running backends.
+    ///
+    /// The TTL (5s) is short enough that a backend going down is noticed
+    /// within one TTL window, but long enough to absorb burst traffic
+    /// without hammering the upstream with redundant probes.
+    scale_to_zero_probe_cache: dashmap::DashMap<std::net::SocketAddr, std::time::Instant>,
 }
 
 /// Registries consulted by the proxy hot path, populated by the gRPC
@@ -215,6 +225,7 @@ impl DwaarProxy {
             mirror_dispatcher: None,
             otlp_exporter: None,
             trace_sample_ratio: 1.0,
+            scale_to_zero_probe_cache: dashmap::DashMap::new(),
         }
     }
 
@@ -1574,34 +1585,63 @@ impl ProxyHttp for DwaarProxy {
         if let Some(ref pool) = ctx.upstream_pool
             && let Some(s2z) = pool.scale_to_zero()
         {
-            // Quick TCP probe with a short timeout — if the backend is already
-            // running this adds only ~1ms. If it's down, we enter the wake path.
-            let probe = tokio::time::timeout(
-                std::time::Duration::from_millis(500),
-                tokio::net::TcpStream::connect(upstream),
-            )
-            .await;
+            // Cache check: skip the probe if we confirmed this upstream was up
+            // within the TTL window. Running backends stay in the cache, so the
+            // ~1ms TCP round-trip is paid at most once every 5s rather than on
+            // every request. Stale entries are evicted so the probe runs again
+            // and refreshes the timestamp. (issue #166)
+            const SCALE_TO_ZERO_PROBE_CACHE_TTL: std::time::Duration =
+                std::time::Duration::from_secs(5);
 
-            // Backend is down if the connect was refused or the probe timed out.
-            let is_up = matches!(probe, Ok(Ok(_)));
+            let needs_probe = match self.scale_to_zero_probe_cache.get(&upstream) {
+                Some(last_ok) if last_ok.elapsed() < SCALE_TO_ZERO_PROBE_CACHE_TTL => {
+                    // Cache hit — backend was confirmed up recently.
+                    false
+                }
+                Some(_) => {
+                    // Entry exists but is stale; drop the guard before removing
+                    // so we don't hold a read lock across a write operation.
+                    drop(self.scale_to_zero_probe_cache.get(&upstream));
+                    self.scale_to_zero_probe_cache.remove(&upstream);
+                    true
+                }
+                None => true,
+            };
 
-            if !is_up {
-                debug!(
-                    request_id = %ctx.request_id(),
-                    %upstream,
-                    "upstream unreachable, triggering scale-to-zero wake"
-                );
-                if let Err(e) = s2z.wake_and_wait(upstream).await {
-                    warn!(
+            if needs_probe {
+                // No recent confirmation — probe the upstream now.
+                let probe = tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    tokio::net::TcpStream::connect(upstream),
+                )
+                .await;
+
+                // Backend is down if the connect was refused or the probe timed out.
+                let is_up = matches!(probe, Ok(Ok(_)));
+
+                if is_up {
+                    // Record the successful probe so the next request in this TTL
+                    // window skips the round-trip entirely.
+                    self.scale_to_zero_probe_cache
+                        .insert(upstream, std::time::Instant::now());
+                } else {
+                    debug!(
                         request_id = %ctx.request_id(),
                         %upstream,
-                        error = %e,
-                        "scale-to-zero wake failed — returning 504"
+                        "upstream unreachable, triggering scale-to-zero wake"
                     );
-                    return Err(Error::explain(
-                        HTTPStatus(504),
-                        format!("upstream {upstream} failed to wake: {e}"),
-                    ));
+                    if let Err(e) = s2z.wake_and_wait(upstream).await {
+                        warn!(
+                            request_id = %ctx.request_id(),
+                            %upstream,
+                            error = %e,
+                            "scale-to-zero wake failed — returning 504"
+                        );
+                        return Err(Error::explain(
+                            HTTPStatus(504),
+                            format!("upstream {upstream} failed to wake: {e}"),
+                        ));
+                    }
                 }
             }
         }
@@ -2716,6 +2756,52 @@ mod tests {
             let origin = "https://";
             let result = parse_origin_host(origin);
             assert!(result.is_err());
+        }
+    }
+
+    mod scale_to_zero_probe_cache {
+        use std::net::SocketAddr;
+
+        // TTL used in production — replicated here so the tests can assert
+        // the same boundary condition without coupling to the impl's private constant.
+        const TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+        #[test]
+        fn cache_hit_within_ttl() {
+            let cache: dashmap::DashMap<SocketAddr, std::time::Instant> = dashmap::DashMap::new();
+            let key: SocketAddr = "127.0.0.1:9999".parse().expect("valid socket address literal");
+            cache.insert(key, std::time::Instant::now());
+
+            // A freshly inserted entry is well within the 5s TTL.
+            let elapsed = cache
+                .get(&key)
+                .map(|v| v.elapsed())
+                .expect("entry must be present");
+            assert!(
+                elapsed < TTL,
+                "fresh entry should be within TTL; elapsed={elapsed:?}"
+            );
+        }
+
+        #[test]
+        fn cache_miss_after_ttl() {
+            let cache: dashmap::DashMap<SocketAddr, std::time::Instant> = dashmap::DashMap::new();
+            let key: SocketAddr = "127.0.0.1:9999".parse().expect("valid socket address literal");
+
+            // Simulate a stale entry by subtracting more than the TTL from now.
+            let past = std::time::Instant::now()
+                .checked_sub(TTL + std::time::Duration::from_secs(1))
+                .expect("subtraction must succeed on any sane platform");
+            cache.insert(key, past);
+
+            let elapsed = cache
+                .get(&key)
+                .map(|v| v.elapsed())
+                .expect("entry must be present");
+            assert!(
+                elapsed >= TTL,
+                "stale entry should fail the TTL check; elapsed={elapsed:?}"
+            );
         }
     }
 }
