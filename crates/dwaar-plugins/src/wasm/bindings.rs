@@ -83,7 +83,7 @@ pub fn wit_action_to_native(action: wit_types::PluginAction) -> PluginAction {
         wit_types::PluginAction::Continue => PluginAction::Continue,
         wit_types::PluginAction::Respond => PluginAction::Respond(crate::plugin::PluginResponse {
             status: 503,
-            headers: vec![("content-type", "text/plain".to_string())],
+            headers: vec![("content-type", std::borrow::Cow::Borrowed("text/plain"))],
             body: bytes::Bytes::from_static(b"plugin short-circuit"),
         }),
         wit_types::PluginAction::Skip => PluginAction::Skip,

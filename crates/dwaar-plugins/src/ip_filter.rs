@@ -218,7 +218,7 @@ impl DwaarPlugin for IpFilterPlugin {
         } else {
             PluginAction::Respond(PluginResponse {
                 status: 403,
-                headers: vec![("Content-Length", "0".to_string())],
+                headers: vec![("Content-Length", std::borrow::Cow::Borrowed("0"))],
                 body: Bytes::new(),
             })
         }
