@@ -34,7 +34,7 @@ libc = { workspace = true }
 parking_lot = { workspace = true }
 pingora-core = { workspace = true }
 sonic-rs = { workspace = true }
-tokio = { workspace = true, features = ["sync", "time", "net", "io-util"] }
+tokio = { workspace = true, features = ["sync", "time", "net", "io-util", "rt"] }
 
 [dev-dependencies]
 chrono = { workspace = true }
@@ -42,6 +42,7 @@ compact_str = { workspace = true }
 criterion = { workspace = true }
 hyperloglog = { workspace = true }
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
 
 [[bench]]
 name = "aggregation"

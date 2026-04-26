@@ -34,9 +34,13 @@ fn warn_once_on_proc_failure(path: &str, err: &std::io::Error) {
     });
 }
 
-/// Reads a /proc file, logging a one-shot warning if the read fails.
+/// Synchronous /proc read used only at startup (process_start_time_secs init).
+///
+/// The async `read_proc` variant below must be used for all per-scrape reads.
+/// Startup happens before the server accepts traffic, so a blocking read here
+/// does not stall any runtime workers.
 #[cfg(target_os = "linux")]
-fn read_proc(path: &str) -> Option<String> {
+fn read_proc_sync(path: &str) -> Option<String> {
     match std::fs::read_to_string(path) {
         Ok(s) => Some(s),
         Err(e) => {
@@ -46,16 +50,44 @@ fn read_proc(path: &str) -> Option<String> {
     }
 }
 
-/// Reads a /proc directory, logging a one-shot warning if the read fails.
+/// Offloads a /proc file read onto a blocking thread via spawn_blocking.
+///
+/// Procfs reads are normally fast, but under disk pressure the kernel can
+/// stall the page-fault path for tens to hundreds of milliseconds. Doing
+/// this on a runtime worker thread blocks all tasks on that thread. Moving
+/// the read onto a dedicated blocking thread keeps the async workers free.
+/// See issue #156.
 #[cfg(target_os = "linux")]
-fn read_proc_dir(path: &str) -> Option<std::fs::ReadDir> {
-    match std::fs::read_dir(path) {
-        Ok(entries) => Some(entries),
+async fn read_proc(path: &'static str) -> Option<String> {
+    tokio::task::spawn_blocking(move || match std::fs::read_to_string(path) {
+        Ok(s) => Some(s),
         Err(e) => {
             warn_once_on_proc_failure(path, &e);
             None
         }
-    }
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Offloads a /proc directory read onto a blocking thread via spawn_blocking.
+///
+/// Counting entries in /proc/self/fd requires a readdir syscall, which can
+/// block under I/O pressure. We collect the count inside spawn_blocking to
+/// avoid holding the async worker hostage.
+/// See issue #156.
+#[cfg(target_os = "linux")]
+async fn read_proc_dir_count(path: &'static str) -> u64 {
+    tokio::task::spawn_blocking(move || match std::fs::read_dir(path) {
+        Ok(entries) => entries.count() as u64,
+        Err(e) => {
+            warn_once_on_proc_failure(path, &e);
+            0
+        }
+    })
+    .await
+    .unwrap_or(0)
 }
 
 /// Cached process start time in Unix seconds.
@@ -101,12 +133,14 @@ impl ProcessMetrics {
         cpu_seconds_total_impl()
     }
 
-    pub fn resident_memory_bytes(&self) -> u64 {
-        resident_memory_bytes_impl()
+    /// Async — offloads the /proc/self/status read onto a blocking thread.
+    pub async fn resident_memory_bytes(&self) -> u64 {
+        resident_memory_bytes_impl().await
     }
 
-    pub fn open_fds(&self) -> u64 {
-        open_fds_impl()
+    /// Async — offloads the /proc/self/fd readdir onto a blocking thread.
+    pub async fn open_fds(&self) -> u64 {
+        open_fds_impl().await
     }
 
     pub fn start_time_seconds(&self) -> f64 {
@@ -117,12 +151,17 @@ impl ProcessMetrics {
         max_fds_impl()
     }
 
-    pub fn threads(&self) -> u64 {
-        threads_impl()
+    /// Async — offloads the /proc/self/status thread-count read onto a blocking thread.
+    pub async fn threads(&self) -> u64 {
+        threads_impl().await
     }
 
     /// Render all 6 `process_*` metrics in Prometheus text exposition format.
-    pub fn render(&self, out: &mut String) {
+    ///
+    /// Async because the per-scrape /proc reads are offloaded via
+    /// `spawn_blocking` to avoid blocking the runtime worker on slow procfs
+    /// I/O (issue #156).
+    pub async fn render(&self, out: &mut String) {
         out.push_str(
             "# HELP process_cpu_seconds_total Total user and system CPU time spent in seconds.\n",
         );
@@ -138,12 +177,12 @@ impl ProcessMetrics {
         let _ = writeln!(
             out,
             "process_resident_memory_bytes {}",
-            self.resident_memory_bytes()
+            self.resident_memory_bytes().await
         );
 
         out.push_str("# HELP process_open_fds Number of open file descriptors.\n");
         out.push_str("# TYPE process_open_fds gauge\n");
-        let _ = writeln!(out, "process_open_fds {}", self.open_fds());
+        let _ = writeln!(out, "process_open_fds {}", self.open_fds().await);
 
         out.push_str("# HELP process_start_time_seconds Start time of the process since Unix epoch in seconds.\n");
         out.push_str("# TYPE process_start_time_seconds gauge\n");
@@ -159,7 +198,7 @@ impl ProcessMetrics {
 
         out.push_str("# HELP process_threads Number of OS threads in the process.\n");
         out.push_str("# TYPE process_threads gauge\n");
-        let _ = writeln!(out, "process_threads {}", self.threads());
+        let _ = writeln!(out, "process_threads {}", self.threads().await);
     }
 }
 
@@ -184,10 +223,15 @@ fn current_unix_secs() -> f64 {
 ///
 /// Every path returns a finite non-negative `f64` — callers never have to
 /// handle errors because the metric is a best-effort gauge.
+///
+/// Uses synchronous /proc reads deliberately: this runs exactly once at
+/// startup (cached by `PROCESS_START_TIME_SECS`), before the server accepts
+/// traffic, so blocking is acceptable here. Per-scrape reads use the async
+/// helpers instead.
 fn process_start_time_secs() -> f64 {
     #[cfg(target_os = "linux")]
     {
-        if let Some(secs) = linux_process_start_time_secs() {
+        if let Some(secs) = linux_process_start_time_secs_sync() {
             return secs;
         }
     }
@@ -200,11 +244,12 @@ fn process_start_time_secs() -> f64 {
     current_unix_secs()
 }
 
+/// Sync version of the Linux start-time lookup, used only at startup init.
 #[cfg(target_os = "linux")]
-fn linux_process_start_time_secs() -> Option<f64> {
+fn linux_process_start_time_secs_sync() -> Option<f64> {
     // /proc/self/stat: split on the LAST `)` to avoid desync from a
     // `comm` field that contains spaces or parens.
-    let stat = read_proc("/proc/self/stat")?;
+    let stat = read_proc_sync("/proc/self/stat")?;
     let rparen = stat.rfind(')')?;
     let after = stat.get(rparen + 1..)?.trim_start();
     // `starttime` is original field 22 → index 22-3 = 19 in `after`.
@@ -221,7 +266,7 @@ fn linux_process_start_time_secs() -> Option<f64> {
     #[allow(clippy::cast_precision_loss)]
     let seconds_since_boot = starttime_ticks as f64 / clk_tck;
 
-    let stat2 = read_proc("/proc/stat")?;
+    let stat2 = read_proc_sync("/proc/stat")?;
     let btime: u64 = stat2
         .lines()
         .find_map(|l| l.strip_prefix("btime "))?
@@ -296,9 +341,11 @@ fn cpu_seconds_total_impl() -> f64 {
 }
 
 #[cfg(target_os = "linux")]
-fn resident_memory_bytes_impl() -> u64 {
-    // /proc/self/status VmRSS is in kB.
+async fn resident_memory_bytes_impl() -> u64 {
+    // /proc/self/status VmRSS is in kB. The read is offloaded via spawn_blocking
+    // because procfs can stall on disk pressure (issue #156).
     read_proc("/proc/self/status")
+        .await
         .and_then(|s| {
             s.lines()
                 .find(|line| line.starts_with("VmRSS:"))
@@ -313,8 +360,10 @@ fn resident_memory_bytes_impl() -> u64 {
 }
 
 #[cfg(target_os = "macos")]
-#[allow(unsafe_code)]
-fn resident_memory_bytes_impl() -> u64 {
+#[allow(unsafe_code, clippy::unused_async)]
+// getrusage is a syscall with no blocking I/O, so spawn_blocking is not needed
+// here. The async signature is kept so callers are uniform across platforms.
+async fn resident_memory_bytes_impl() -> u64 {
     // ru_maxrss is in bytes on macOS (unlike Linux where it's KB).
     unsafe {
         let mut usage: libc::rusage = std::mem::zeroed();
@@ -327,25 +376,36 @@ fn resident_memory_bytes_impl() -> u64 {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn resident_memory_bytes_impl() -> u64 {
+#[allow(clippy::unused_async)]
+// Stub for unsupported platforms; async signature kept for API uniformity.
+async fn resident_memory_bytes_impl() -> u64 {
     0
 }
 
 #[cfg(target_os = "linux")]
-fn open_fds_impl() -> u64 {
-    read_proc_dir("/proc/self/fd").map_or(0, |entries| entries.count() as u64)
+async fn open_fds_impl() -> u64 {
+    // Counting /proc/self/fd entries requires readdir, which can block under
+    // I/O pressure. Offload to a blocking thread (issue #156).
+    read_proc_dir_count("/proc/self/fd").await
 }
 
 #[cfg(target_os = "macos")]
-fn open_fds_impl() -> u64 {
-    // /dev/fd is macOS's equivalent of /proc/self/fd.
-    std::fs::read_dir("/dev/fd")
-        .map(|entries| entries.count() as u64)
-        .unwrap_or(0)
+async fn open_fds_impl() -> u64 {
+    // /dev/fd is macOS's equivalent of /proc/self/fd. readdir can block
+    // under I/O pressure; offload to a blocking thread (issue #156).
+    tokio::task::spawn_blocking(|| {
+        std::fs::read_dir("/dev/fd")
+            .map(|entries| entries.count() as u64)
+            .unwrap_or(0)
+    })
+    .await
+    .unwrap_or(0)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn open_fds_impl() -> u64 {
+#[allow(clippy::unused_async)]
+// Stub for unsupported platforms; async signature kept for API uniformity.
+async fn open_fds_impl() -> u64 {
     0
 }
 
@@ -363,8 +423,11 @@ fn max_fds_impl() -> u64 {
 }
 
 #[cfg(target_os = "linux")]
-fn threads_impl() -> u64 {
+async fn threads_impl() -> u64 {
+    // Threads: field in /proc/self/status. Offloaded via spawn_blocking
+    // for the same reason as resident_memory_bytes_impl (issue #156).
     read_proc("/proc/self/status")
+        .await
         .and_then(|s| {
             s.lines()
                 .find(|line| line.starts_with("Threads:"))
@@ -375,7 +438,9 @@ fn threads_impl() -> u64 {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn threads_impl() -> u64 {
+#[allow(clippy::unused_async)]
+// Stub for non-Linux platforms; async signature kept for API uniformity.
+async fn threads_impl() -> u64 {
     // No portable way without platform-specific APIs.
     0
 }
@@ -395,19 +460,19 @@ mod tests {
         assert!(m.cpu_seconds_total() >= 0.0);
     }
 
-    #[test]
-    fn resident_memory_is_positive() {
+    #[tokio::test]
+    async fn resident_memory_is_positive() {
         let m = ProcessMetrics::new();
         assert!(
-            m.resident_memory_bytes() > 0,
+            m.resident_memory_bytes().await > 0,
             "process must use some memory"
         );
     }
 
-    #[test]
-    fn open_fds_positive() {
+    #[tokio::test]
+    async fn open_fds_positive() {
         let m = ProcessMetrics::new();
-        assert!(m.open_fds() > 0, "stdin/stdout/stderr at minimum");
+        assert!(m.open_fds().await > 0, "stdin/stdout/stderr at minimum");
     }
 
     #[test]
@@ -424,11 +489,11 @@ mod tests {
         assert!(m.max_fds() > 0);
     }
 
-    #[test]
-    fn render_contains_all_metrics() {
+    #[tokio::test]
+    async fn render_contains_all_metrics() {
         let m = ProcessMetrics::new();
         let mut out = String::new();
-        m.render(&mut out);
+        m.render(&mut out).await;
 
         assert!(out.contains("process_cpu_seconds_total"));
         assert!(out.contains("process_resident_memory_bytes"));
@@ -438,11 +503,11 @@ mod tests {
         assert!(out.contains("process_threads"));
     }
 
-    #[test]
-    fn render_has_help_and_type_lines() {
+    #[tokio::test]
+    async fn render_has_help_and_type_lines() {
         let m = ProcessMetrics::new();
         let mut out = String::new();
-        m.render(&mut out);
+        m.render(&mut out).await;
 
         let help_count = out.matches("# HELP").count();
         let type_count = out.matches("# TYPE").count();
@@ -467,5 +532,24 @@ mod tests {
         warn_once_on_proc_failure("/proc/self/synthetic", &err);
         warn_once_on_proc_failure("/proc/self/synthetic", &err);
         // Test passes if no panic.
+    }
+
+    /// Smoke test: the async read_proc helper returns Some for a real path.
+    /// This is a regression guard — if spawn_blocking is broken or the path
+    /// doesn't exist in the test environment, the scraper would silently
+    /// report zeros.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn read_proc_returns_some_for_existing_file() {
+        let r = read_proc("/proc/self/stat").await;
+        assert!(r.is_some(), "expected Some(_) for /proc/self/stat");
+    }
+
+    /// Smoke test: a missing path returns None without panicking.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn read_proc_returns_none_for_missing_file() {
+        let r = read_proc("/proc/self/this-file-does-not-exist").await;
+        assert!(r.is_none());
     }
 }

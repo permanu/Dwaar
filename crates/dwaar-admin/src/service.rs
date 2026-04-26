@@ -401,7 +401,7 @@ impl AdminService {
                 }
             }
             ("GET", "/metrics") => match &self.prometheus {
-                Some(prom) => prometheus_response(&prom.render()),
+                Some(prom) => prometheus_response(&prom.render().await),
                 None => json_response(
                     404,
                     r#"{"error":"metrics not enabled — start with --no-metrics=false"}"#,
