@@ -116,7 +116,8 @@ pub(crate) fn run(force: bool) -> anyhow::Result<()> {
 /// Uses `curl -H "Accept: application/vnd.github+json"` to get JSON, then
 /// parses the response with `serde_json` to extract `tag_name`. This defends
 /// against malformed JSON that might match a substring pattern.
-/// Falls back to the GitHub Releases redirect URL if the API call fails.
+/// Falls back to the GitHub Releases redirect URL if the API call fails,
+/// or if the JSON response is malformed.
 fn fetch_latest_version() -> anyhow::Result<String> {
     // Primary: GitHub API
     let output = Command::new("curl")
@@ -133,9 +134,9 @@ fn fetch_latest_version() -> anyhow::Result<String> {
 
     if output.status.success() {
         let body = String::from_utf8(output.stdout).context("GitHub API response is not UTF-8")?;
-        let release: GhRelease =
-            serde_json::from_str(&body).context("parsing GitHub release JSON")?;
-        if !release.tag_name.is_empty() {
+        if let Ok(release) = serde_json::from_str::<GhRelease>(&body)
+            && !release.tag_name.is_empty()
+        {
             return Ok(release.tag_name);
         }
     }
