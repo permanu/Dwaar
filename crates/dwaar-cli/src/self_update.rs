@@ -9,11 +9,13 @@
 //! All HTTP is done in-process via `reqwest` with `rustls` — curl is no
 //! longer in the trust path, so a compromised `curl` binary cannot intercept
 //! the download or inject a malicious binary. Closes issue #147.
+//!
+//! Version resolution is delegated to `version_check::fetch_latest_version`
+//! (issue #176) so that `auto_update` uses the same JSON-then-redirect logic.
 
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::path::Path;
-use std::time::Duration;
 
 use anyhow::{Context, bail};
 use subtle::ConstantTimeEq;
@@ -26,26 +28,13 @@ use subtle::ConstantTimeEq;
 /// and the R2 bucket can be decommissioned.
 const BASE_URL: &str = "https://github.com/permanu/Dwaar/releases/download";
 
-/// GitHub API endpoint to resolve the latest release tag.
-const LATEST_API: &str = "https://api.github.com/repos/permanu/Dwaar/releases/latest";
-
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// Minimal GitHub Release object for deserialization.
-///
-/// The GitHub API returns many fields; we only care about `tag_name`.
-/// `serde_json` ignores extra fields by default, so this struct remains
-/// robust to API changes.
-#[derive(serde::Deserialize)]
-struct GhRelease {
-    tag_name: String,
-}
 
 /// Run the self-update flow. Returns a human-readable status message.
 // Self-update is an interactive CLI subcommand; println! is correct here.
 #[allow(clippy::disallowed_macros, clippy::print_stdout)]
 pub(crate) fn run(force: bool) -> anyhow::Result<()> {
-    let latest_tag = fetch_latest_version()?;
+    let latest_tag = crate::version_check::fetch_latest_version()?;
     let latest_version = latest_tag.strip_prefix('v').unwrap_or(&latest_tag);
 
     println!("Current version: {CURRENT_VERSION}");
@@ -111,64 +100,6 @@ pub(crate) fn run(force: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Build the shared HTTP client used by self-update operations.
-///
-/// Reusing a single client across calls is idiomatic reqwest and avoids
-/// redundant TLS handshakes. The 30-second timeout guards against hung
-/// connections during background provisioning (Guardrail #29).
-fn build_client() -> anyhow::Result<reqwest::blocking::Client> {
-    reqwest::blocking::Client::builder()
-        .user_agent(concat!("dwaar-self-update/", env!("CARGO_PKG_VERSION")))
-        .timeout(Duration::from_secs(30))
-        .build()
-        .context("failed to build HTTP client")
-}
-
-/// Fetch the latest release tag from the GitHub API.
-///
-/// Primary path: calls the GitHub Releases JSON API and parses `tag_name`.
-/// Fallback: follows the `/releases/latest` redirect and extracts the tag from
-/// the final URL — this mirrors what curl's `%{url_effective}` trick did, but
-/// entirely in-process via reqwest so curl is not in the trust path (#147).
-fn fetch_latest_version() -> anyhow::Result<String> {
-    let client = build_client()?;
-
-    // Primary: GitHub REST API returns JSON with `tag_name`.
-    let resp = client
-        .get(LATEST_API)
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2022-11-28")
-        .send()
-        .context("GitHub API request failed")?;
-
-    if resp.status().is_success() {
-        let body = resp.text().context("GitHub API response is not UTF-8")?;
-        if let Ok(release) = serde_json::from_str::<GhRelease>(&body)
-            && !release.tag_name.is_empty()
-        {
-            return Ok(release.tag_name);
-        }
-    }
-
-    // Fallback: follow the /releases/latest redirect; reqwest follows redirects
-    // by default and exposes the final URL via `response.url()`.
-    // GitHub redirects /releases/latest → /releases/tag/vX.Y.Z.
-    let resp = client
-        .get("https://github.com/permanu/Dwaar/releases/latest")
-        .send()
-        .context("failed to resolve latest release via redirect")?;
-
-    let tag = resp
-        .url()
-        .path_segments()
-        .and_then(|mut segs| segs.next_back())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .context("could not extract tag from GitHub redirect URL")?;
-
-    Ok(tag)
-}
-
 /// Download a URL to a local file in-process via reqwest.
 ///
 /// Replaces the previous `curl -fSL -o <dest> <url>` shell-out (#147).
@@ -176,7 +107,7 @@ fn fetch_latest_version() -> anyhow::Result<String> {
 /// directly to the destination file avoids buffering the entire binary in
 /// memory, which matters for large release artifacts.
 fn curl_download(url: &str, dest: &Path) -> anyhow::Result<()> {
-    let client = build_client()?;
+    let client = crate::version_check::build_http_client()?;
     let mut resp = client
         .get(url)
         .send()
@@ -381,28 +312,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_release_tag_from_json() {
-        let json = r#"{"tag_name":"v0.3.10","name":"v0.3.10","draft":false}"#;
-        let parsed: GhRelease = serde_json::from_str(json).expect("valid JSON");
-        assert_eq!(parsed.tag_name, "v0.3.10");
-    }
-
-    #[test]
-    fn parse_release_tag_ignores_extra_fields() {
-        let json = r#"{"tag_name":"v1.2.3","html_url":"https://...","assets":[]}"#;
-        let parsed: GhRelease = serde_json::from_str(json).expect("valid JSON");
-        assert_eq!(parsed.tag_name, "v1.2.3");
-    }
-
-    #[test]
     fn http_client_builds() {
-        // Smoke: the migrated reqwest client builder constructs without
-        // panicking. No network calls are made here — integration tests
-        // cover wire-level behavior. Issue #147: curl shell-out replaced.
-        let client = reqwest::blocking::Client::builder()
-            .user_agent(concat!("dwaar-self-update/", env!("CARGO_PKG_VERSION")))
-            .timeout(std::time::Duration::from_secs(30))
-            .build();
-        assert!(client.is_ok(), "blocking HTTP client failed to build");
+        // Smoke: delegates to the shared client builder in version_check.
+        // No network calls are made here — integration tests cover
+        // wire-level behaviour. Issue #147: curl shell-out replaced.
+        // Issue #176: builder is now shared across self_update and auto_update.
+        crate::version_check::build_http_client().expect("blocking HTTP client should build");
     }
 }
