@@ -968,6 +968,24 @@ fn compile_forward_auth(directives: &[Directive]) -> Option<std::sync::Arc<Forwa
         .map(|h| CompactString::from(h.as_str()))
         .collect();
 
+    // Warn once at config load so operators see this choice in startup logs.
+    // allow_plaintext lets subrequests travel in cleartext to non-loopback
+    // auth services; an on-path attacker can forge a 2xx or inject headers.
+    // The flag still requires explicit opt-in, but a silent opt-in is exactly
+    // what gets cargo-culted into production without review. See issue #150.
+    if fa.insecure_plaintext {
+        let upstream_display = match &fa.upstream {
+            UpstreamAddr::HostPort(hp) => hp.clone(),
+            UpstreamAddr::SocketAddr(sa) => sa.to_string(),
+        };
+        warn!(
+            upstream = %upstream_display,
+            "forward_auth: allow_plaintext is enabled — non-TLS auth subrequests are \
+             permitted to non-loopback hosts. On-path attackers can forge responses or \
+             inject headers. See issue #150."
+        );
+    }
+
     Some(std::sync::Arc::new(ForwardAuthConfig {
         upstream,
         auth_uri,
@@ -2711,5 +2729,32 @@ mod tests {
         let block = route.handlers.first().expect("has handler block");
         assert!(block.copy_response_headers.is_none());
         assert!(block.intercepts.is_empty());
+    }
+
+    // Smoke test: compile_forward_auth must succeed (return Some) both with and
+    // without allow_plaintext. When true, a tracing::warn! fires at config load
+    // (verified manually in startup logs). See issue #150.
+    #[test]
+    fn forward_auth_allow_plaintext_does_not_break_compilation() {
+        let fa_directive = |insecure_plaintext: bool| ForwardAuthDirective {
+            upstream: UpstreamAddr::SocketAddr("127.0.0.1:9091".parse().expect("valid")),
+            uri: Some("/api/authz/forward-auth".to_string()),
+            copy_headers: vec!["Remote-User".to_string()],
+            tls: false,
+            insecure_plaintext,
+        };
+
+        let directives_plain = vec![Directive::ForwardAuth(fa_directive(true))];
+        let directives_tls = vec![Directive::ForwardAuth(fa_directive(false))];
+
+        // Both configs must compile without error (the warning path must not panic).
+        assert!(
+            compile_forward_auth(&directives_plain).is_some(),
+            "allow_plaintext=true should still produce a valid ForwardAuthConfig"
+        );
+        assert!(
+            compile_forward_auth(&directives_tls).is_some(),
+            "allow_plaintext=false should produce a valid ForwardAuthConfig"
+        );
     }
 }
