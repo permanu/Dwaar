@@ -31,6 +31,16 @@ const LATEST_API: &str = "https://api.github.com/repos/permanu/Dwaar/releases/la
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Minimal GitHub Release object for deserialization.
+///
+/// The GitHub API returns many fields; we only care about `tag_name`.
+/// `serde_json` ignores extra fields by default, so this struct remains
+/// robust to API changes.
+#[derive(serde::Deserialize)]
+struct GhRelease {
+    tag_name: String,
+}
+
 /// Run the self-update flow. Returns a human-readable status message.
 // Self-update is an interactive CLI subcommand; println! is correct here.
 #[allow(clippy::disallowed_macros, clippy::print_stdout)]
@@ -104,9 +114,10 @@ pub(crate) fn run(force: bool) -> anyhow::Result<()> {
 /// Fetch the latest release tag from the GitHub API.
 ///
 /// Uses `curl -H "Accept: application/vnd.github+json"` to get JSON, then
-/// extracts `tag_name` with a simple string search — avoids pulling in a
-/// JSON parser just for this one field. Falls back to the GitHub Releases
-/// redirect URL if the API call fails.
+/// parses the response with `serde_json` to extract `tag_name`. This defends
+/// against malformed JSON that might match a substring pattern.
+/// Falls back to the GitHub Releases redirect URL if the API call fails,
+/// or if the JSON response is malformed.
 fn fetch_latest_version() -> anyhow::Result<String> {
     // Primary: GitHub API
     let output = Command::new("curl")
@@ -123,15 +134,10 @@ fn fetch_latest_version() -> anyhow::Result<String> {
 
     if output.status.success() {
         let body = String::from_utf8(output.stdout).context("GitHub API response is not UTF-8")?;
-        // Extract "tag_name":"vX.Y.Z" without a JSON parser.
-        if let Some(start) = body.find("\"tag_name\":\"") {
-            let rest = &body[start + 12..];
-            if let Some(end) = rest.find('"') {
-                let tag = rest[..end].trim().to_string();
-                if !tag.is_empty() {
-                    return Ok(tag);
-                }
-            }
+        if let Ok(release) = serde_json::from_str::<GhRelease>(&body)
+            && !release.tag_name.is_empty()
+        {
+            return Ok(release.tag_name);
         }
     }
 
@@ -358,5 +364,19 @@ mod tests {
     fn sha256_compare_accepts_match() {
         let a = "deadbeef";
         assert!(constant_time_eq_hex(a, a));
+    }
+
+    #[test]
+    fn parse_release_tag_from_json() {
+        let json = r#"{"tag_name":"v0.3.10","name":"v0.3.10","draft":false}"#;
+        let parsed: GhRelease = serde_json::from_str(json).expect("valid JSON");
+        assert_eq!(parsed.tag_name, "v0.3.10");
+    }
+
+    #[test]
+    fn parse_release_tag_ignores_extra_fields() {
+        let json = r#"{"tag_name":"v1.2.3","html_url":"https://...","assets":[]}"#;
+        let parsed: GhRelease = serde_json::from_str(json).expect("valid JSON");
+        assert_eq!(parsed.tag_name, "v1.2.3");
     }
 }
