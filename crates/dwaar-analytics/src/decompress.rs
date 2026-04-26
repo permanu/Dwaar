@@ -55,6 +55,17 @@ const MAX_BUFFER_SIZE: usize = 256 * 1024;
 /// response body cap.
 const MAX_DECOMPRESSED_SIZE: usize = 100 * 1024 * 1024;
 
+/// Initial capacity for the `read_bounded` output buffer. 32 KiB covers
+/// the lower end of typical decompressed HTML pages without re-growing,
+/// while staying small enough not to over-commit memory for tiny
+/// responses. See issue #155.
+const READ_BOUNDED_INITIAL_CAPACITY: usize = 32 * 1024;
+
+/// Read chunk size for `read_bounded`. 16 KiB matches typical decoder
+/// output granularity and halves the syscall count vs the old 8 KiB
+/// chunk size on large payloads. See issue #155.
+const READ_BOUNDED_CHUNK_SIZE: usize = 16 * 1024;
+
 /// Streaming decompressor for response body chunks.
 ///
 /// Buffers compressed data internally and attempts decompression on each
@@ -244,12 +255,13 @@ impl Decompressor {
 /// [`MAX_DECOMPRESSED_SIZE`]. Prevents decompression bombs from consuming
 /// unbounded memory.
 ///
-/// Pre-allocates 32 KiB of output and uses a 16 KiB read buffer. Most
-/// HTML responses decompress to 20–100 KiB, so this trims the typical
-/// realloc cascade from 6–7 grows down to 1–2 (issue #155).
+/// Pre-allocates [`READ_BOUNDED_INITIAL_CAPACITY`] of output and reads in
+/// [`READ_BOUNDED_CHUNK_SIZE`] chunks. Most HTML responses decompress to
+/// 20–100 KiB, so this trims the typical realloc cascade from 6–7 grows
+/// down to 1–2 (issue #155).
 fn read_bounded<R: Read>(mut reader: R) -> Result<Vec<u8>, std::io::Error> {
-    let mut output = Vec::with_capacity(32 * 1024);
-    let mut buf = [0u8; 16 * 1024];
+    let mut output = Vec::with_capacity(READ_BOUNDED_INITIAL_CAPACITY);
+    let mut buf = [0u8; READ_BOUNDED_CHUNK_SIZE];
     loop {
         let n = reader.read(&mut buf)?;
         if n == 0 {
@@ -404,9 +416,13 @@ mod tests {
 
     #[test]
     fn decompress_50k_roundtrip() {
-        // Locks in correctness for the read_bounded pre-allocation change
-        // (issue #155). The perf win itself is measured by the
-        // `decompress_50k_gzip_one_shot` criterion bench.
+        // Correctness regression guard for the read_bounded change in
+        // issue #155. Verifies the round-trip still produces byte-exact
+        // output at a typical HTML-page size; the pre-alloc invariant
+        // itself (READ_BOUNDED_INITIAL_CAPACITY output, READ_BOUNDED_CHUNK_SIZE
+        // read buffer) is enforced structurally by the constants defined above
+        // and exercised perf-wise by the decompress_50k_gzip_one_shot
+        // criterion bench.
         let html = vec![b'a'; 50_000];
         let compressed = gzip_compress(&html);
         let mut dec = Decompressor::new(Encoding::Gzip);
