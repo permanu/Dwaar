@@ -13,6 +13,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::Semaphore;
 
 use arc_swap::ArcSwap;
 use bytes::{Buf, Bytes};
@@ -30,6 +31,23 @@ use super::stream_guard::{BodyDeadline, with_chunk_deadline};
 /// Close-delimited responses have no declared length — cap them to prevent
 /// unbounded memory growth and downstream stream exhaustion.
 const MAX_CLOSE_DELIMITED_BODY: u64 = 1 << 30; // 1 GiB
+
+/// Cap on concurrently active H3 request handlers per QUIC connection.
+///
+/// Per-connection scope is intentional: a single misbehaving client cannot
+/// exhaust the process-wide task budget, while well-behaved connections
+/// are unaffected by each other. 1024 matches the HTTP/2 typical
+/// `SETTINGS_MAX_CONCURRENT_STREAMS` ceiling and is far above any realistic
+/// request-in-flight count for a single connection.
+///
+/// When all permits are taken the next `accept()` still runs, but the
+/// handler awaits `acquire_owned()` before work begins — giving natural
+/// backpressure without dropping streams. QUIC's own flow-control windows
+/// reinforce this at the transport layer.
+///
+/// TODO: emit a `quic_h3_pending_streams` Gauge so operators can observe
+/// semaphore pressure. Tracked in issue #173.
+const MAX_IN_FLIGHT_H3_STREAMS: usize = 1024;
 use super::convert::{
     build_plugin_ctx, h3_to_pingora_headers, is_hop_by_hop, is_idempotent_method,
     pingora_resp_to_h3, resolve_upstream_addr,
@@ -92,6 +110,13 @@ pub async fn handle_h3_connection(
 
     let mut in_flight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
+    // One semaphore per connection: caps in-flight task count without
+    // interfering with other connections. Acquiring a permit before spawning
+    // means a burst client blocks here (in the async accept loop) instead of
+    // inflating the task heap unboundedly. The permit is moved into the task
+    // and dropped on completion, releasing the slot automatically.
+    let in_flight_sem = Arc::new(Semaphore::new(MAX_IN_FLIGHT_H3_STREAMS));
+
     loop {
         match h3_server.accept().await {
             Ok(Some(resolver)) => {
@@ -101,7 +126,24 @@ pub async fn handle_h3_connection(
                 let h2_pool = Arc::clone(&h2_pool);
                 let is_early_data = early_data_active.load(Ordering::Acquire);
 
+                // Acquire before spawning. Under normal load this is instant
+                // (permits available). Under burst — all 1024 slots busy — this
+                // awaits, pausing the accept loop and letting QUIC flow control
+                // propagate backpressure to the client. We prefer waiting over
+                // sending 503 because the client already opened a legitimate
+                // stream; dropping it would be surprising. The wait is bounded
+                // indirectly by handlers completing (each one drops its permit).
+                let permit = in_flight_sem
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("in-flight semaphore should never be closed");
+
                 in_flight.spawn(async move {
+                    // Hold the permit for the lifetime of this handler; the drop
+                    // at the end of the block releases the slot back to the pool.
+                    let _permit = permit;
+
                     if let Err(e) = handle_h3_request(
                         resolver,
                         route_table,
@@ -783,4 +825,50 @@ async fn send_plugin_response<S, B>(
     }
 
     let _ = stream.finish().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Structural sanity: the semaphore is sized to `MAX_IN_FLIGHT_H3_STREAMS` and
+    /// a single permit acquisition decrements the available count by exactly one.
+    ///
+    /// Behavioural tests that exercise the actual backpressure path require real
+    /// QUIC connections and live in the integration suite (issue #173).
+    #[test]
+    fn h3_in_flight_semaphore_capacity() {
+        let sem = Arc::new(Semaphore::new(MAX_IN_FLIGHT_H3_STREAMS));
+        assert_eq!(sem.available_permits(), MAX_IN_FLIGHT_H3_STREAMS);
+
+        // Taking one permit shrinks the pool by exactly one.
+        let _p = sem.try_acquire().expect("permit should be available");
+        assert_eq!(sem.available_permits(), MAX_IN_FLIGHT_H3_STREAMS - 1);
+    }
+
+    /// When all permits are exhausted, `try_acquire` returns `Err` — meaning the
+    /// next `acquire_owned().await` would block. The bounded task count is enforced.
+    #[test]
+    fn h3_in_flight_semaphore_exhaustion() {
+        // Use a small cap so the test is cheap without spawning real tasks.
+        let cap = 4usize;
+        let sem = Arc::new(Semaphore::new(cap));
+        let mut permits = Vec::with_capacity(cap);
+
+        for _ in 0..cap {
+            permits.push(sem.try_acquire().expect("permit available within cap"));
+        }
+
+        // No permits remain — the semaphore would block the next acquisition.
+        assert_eq!(sem.available_permits(), 0);
+        assert!(
+            sem.try_acquire().is_err(),
+            "semaphore should be exhausted after all permits taken"
+        );
+
+        // Dropping one permit releases it back.
+        drop(permits.pop());
+        assert_eq!(sem.available_permits(), 1);
+        let _released = sem.try_acquire().expect("permit available after release");
+    }
 }
