@@ -534,8 +534,8 @@ mod tests {
         // Test passes if no panic.
     }
 
-    /// Smoke test: the async read_proc helper returns Some for a real path.
-    /// This is a regression guard — if spawn_blocking is broken or the path
+    /// Smoke test: the async `read_proc` helper returns Some for a real path.
+    /// This is a regression guard — if `spawn_blocking` is broken or the path
     /// doesn't exist in the test environment, the scraper would silently
     /// report zeros.
     #[cfg(target_os = "linux")]
