@@ -75,7 +75,7 @@ impl BackgroundService for AutoUpdateService {
 
 impl AutoUpdateService {
     async fn check_and_apply(&self) {
-        // Fetch latest version — runs curl in a blocking thread so we don't
+        // Fetch latest version — runs reqwest blocking client so we don't
         // stall the tokio executor.
         let latest = match tokio::task::spawn_blocking(fetch_latest_version).await {
             Ok(Ok(v)) => v,

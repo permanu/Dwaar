@@ -82,6 +82,15 @@ impl CloudflareDnsProvider {
             .await
             .map_err(|e| DnsError::ApiRequest(format!("Cloudflare API request failed: {e}")))?;
 
+        // Check for 5xx errors before attempting JSON parse to surface actual HTTP status
+        if resp.status().is_server_error() {
+            let status = resp.status();
+            let body_text = resp.text().await.unwrap_or_default();
+            return Err(DnsError::ApiRequest(format!(
+                "Cloudflare API server error {status}: {body_text}"
+            )));
+        }
+
         let json: serde_json::Value = resp.json().await.map_err(|e| {
             DnsError::ApiRequest(format!("failed to parse Cloudflare response: {e}"))
         })?;
