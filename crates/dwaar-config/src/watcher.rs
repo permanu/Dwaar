@@ -98,6 +98,11 @@ pub struct ConfigWatcher {
     /// Entries are keyed by absolute path. `None` values mean "we have never
     /// successfully stat'd this path" (e.g., symlink to a dangling target).
     wasm_mtimes: Mutex<HashMap<PathBuf, Option<SystemTime>>>,
+    /// Fired after every successful reload so subscribers can clean up
+    /// stale state that was valid under the old config but isn't in the
+    /// new one — e.g. the aggregation `DashMap` evicting removed domains.
+    /// `None` means no subscriber registered. See issue #167.
+    post_reload_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl std::fmt::Debug for ConfigWatcher {
@@ -134,6 +139,7 @@ impl ConfigWatcher {
             l4_notify: None,
             wasm_invalidator: None,
             wasm_mtimes: Mutex::new(HashMap::new()),
+            post_reload_notify: None,
         }
     }
 
@@ -221,6 +227,20 @@ impl ConfigWatcher {
     #[must_use]
     pub fn with_wasm_invalidator(mut self, invalidator: WasmInvalidator) -> Self {
         self.wasm_invalidator = Some(invalidator);
+        self
+    }
+
+    /// Register a `Notify` that fires after every successful reload.
+    ///
+    /// Subscribers use this to evict state that was valid under the old config
+    /// but is stale in the new one. The aggregation service uses it to drop
+    /// `DashMap` entries for domains that were removed from the route table.
+    /// The route table swap happens before this fires, so subscribers that
+    /// call `route_validator.known_hosts()` immediately see the new domain set.
+    /// See issue #167.
+    #[must_use]
+    pub fn with_post_reload_notify(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
+        self.post_reload_notify = Some(notify);
         self
     }
 
@@ -422,6 +442,13 @@ impl ConfigWatcher {
         // Update hash — must run in both branches
         let mut last = self.last_hash.lock();
         *last = new_hash;
+
+        // Notify post-reload subscribers (e.g. the aggregation eviction loop).
+        // The route table swap happened above, so subscribers that enumerate
+        // known_hosts() now see the updated domain set. #167
+        if let Some(ref n) = self.post_reload_notify {
+            n.notify_one();
+        }
     }
 }
 

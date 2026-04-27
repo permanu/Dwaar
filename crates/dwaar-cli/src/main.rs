@@ -1355,6 +1355,11 @@ fn register_background_services(
         info!("log writer registered (JSON lines to stdout)");
     }
 
+    // Shared notify for post-reload eviction. ConfigWatcher fires it after
+    // every successful reload; AggregationService listens and drops DashMap
+    // entries for domains that are no longer in the route table. #167
+    let agg_evict_notify = Arc::new(tokio::sync::Notify::new());
+
     // Config file watcher for hot-reload
     let initial_hash = hash_content(&std::fs::read(config_path).unwrap_or_default());
     let config_watcher = ConfigWatcher::new(
@@ -1364,6 +1369,7 @@ fn register_background_services(
     )
     .with_drain_timeout(drain_timeout)
     .with_reload_notify(Arc::clone(config_notify))
+    .with_post_reload_notify(Arc::clone(&agg_evict_notify))
     .with_sni_domain_map(sni_domain_map)
     .with_health_pools(health_pools)
     .with_acme_domains(acme_domains)
@@ -1419,7 +1425,8 @@ fn register_background_services(
             LiveRouteValidator(Arc::clone(route_table_for_agg)),
             br,
             ar,
-        );
+        )
+        .with_evict_notify(Arc::clone(&agg_evict_notify));
         let agg_bg = pingora_core::services::background::background_service(
             "analytics aggregation",
             AggServiceWrapper {
