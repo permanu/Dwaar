@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.11] - 2026-04-27
+
+Audit-batch sweep release: 28 GitHub issues (the 2026-04-13 audit drop) closed across security, performance, bug, dependency, code-quality, and testing categories. No public Dwaarfile or operator-facing API changes — pure stability and hot-path improvements. Operators upgrading from 0.3.10 should see lower per-request allocation, faster health-check cycles, and reduced background-task contention.
+
+### Security
+
+- **Self-update integrity** — `subtle::ConstantTimeEq` for SHA-256 hex comparison so a local timing side-channel cannot leak the expected hash (#149).
+- **Self-update tag parsing** — GitHub release JSON parsed via `serde_json` instead of substring search; defends against malformed-pattern injections, retains silent fallback to redirect URL on malformed JSON (#152).
+- **`curl` shell-out removed** — self-update, auto-update, and Cloudflare DNS-01 ACME provider now use in-process `reqwest` with rustls; no external `curl` binary in the trust path; Cloudflare 5xx surfaced as a typed error rather than an opaque JSON parse failure (#147).
+- **Origin header parsing** — beacon Origin validation uses `url::Url` (RFC 3986/6454) instead of manual prefix-strip+split; rejects non-HTTP schemes and malformed URLs explicitly (#157).
+- **Cookie matching** — `under_attack` clearance cookie lookup splits on `=` and compares names exactly, no longer matching cookies whose name starts with the target prefix (#159).
+- **OCSP loopback bypass hardened** — `ALLOW_LOOPBACK_OCSP` global flag and the bypass branch are now gated `#[cfg(test)]`; production builds statically lack the bypass (#158).
+- **`forward_auth` insecure_plaintext warned at startup** — operators see the choice in startup logs even though the flag still requires explicit opt-in (#150).
+- **`forward_auth` obs-fold (RFC 7230 §3.2.4)** — multi-line continuation headers now concatenated with a single SP separator; previously dropped on the floor (#169).
+
+### Performance
+
+- **Pre-allocated decompression buffers** — `Decompressor::new()` reserves 8 KiB; `read_bounded` reserves 32 KiB output and reads in 16 KiB chunks; typical 50 KiB HTML response: realloc cascade trimmed from 6-7 grows to 1-2 (#153, #155). New `decompress_50k_gzip_one_shot` criterion bench tracks regressions.
+- **FastCGI request body buffer** pre-allocates `min(body_max, 64 KiB)` instead of starting from zero capacity.
+- **`PluginResponse.headers` value type** — `String` → `Cow<'static, str>` so static literals (`Content-Length: "0"`, `Retry-After: "1"`) are zero-alloc on rate-limit (429) and ip-filter (403) short-circuit paths.
+- **HttpPeer pre-built per route** — `Handler::ReverseProxy` carries an `Arc<HttpPeer>` constructed once at route compile time; single-backend routes clone the inner peer instead of building a fresh one per request (#164).
+- **O(1) upstream pool lookup** — `UpstreamPool` carries a `HashMap<SocketAddr, usize>` index alongside the backends `Vec`; five hot-path scans (`acquire_connection`, `release_connection`, `mark_healthy`, `mark_unhealthy`, `record_probe_error`) flipped from O(n) to O(1) (#161).
+- **Parallel health probes per pool** — `futures::future::join_all` instead of sequential `for` loop; cycle time bounded by slowest probe, not the sum (#162).
+- **Scale-to-zero TCP probe cache** — `DashMap<SocketAddr, Instant>` with 5 s TTL skips the per-request `tokio::time::timeout(500ms, TcpStream::connect)` for recently-confirmed-up backends (#166).
+- **Aggregation DashMap pre-seed + reload eviction** — known domains pre-inserted at construction (eliminates first-write stampede #163), and entries for removed-from-config domains evicted on hot reload (bounds memory growth #167).
+- **Process-metrics offloaded** — Prometheus `/metrics` `/proc/*` reads (`/proc/self/stat`, `/proc/self/status`, `/proc/self/fd`) wrapped in `tokio::task::spawn_blocking` so the runtime worker stays free under disk pressure (#156).
+- **HTTP/3 in-flight tasks bounded** — per-connection `tokio::sync::Semaphore` (default cap 1024 streams) provides backpressure; prevents OOM under burst (#173).
+
+### Reliability / Bug fixes
+
+- **Round-robin `% n` panic guard** — `UpstreamPool::select_round_robin` and L4 selector both early-return `None` when the backend pool is empty; previously panicked with division-by-zero (#170).
+- **`/proc` read failures surfaced** — first failure emits a one-shot `tracing::warn!` so operators in containers without procfs see why metrics are zero; subsequent failures stay silent via `Once` (#171).
+- **`socket_writer` buffer lock no longer held across `.await`** — flush loop drains pending entries via `mem::take` under a brief `Mutex` lock, drops the guard, then writes to the socket; concurrent writers no longer serialize on network latency (#160).
+
+### Dependencies
+
+- **`kube` 0.98 → 3.1, `k8s-openapi` 0.24 → 0.27** — `dwaar-ingress` aligned with workspace versions; eliminates duplicate compilation of these heavy graphs. `chrono` removed (k8s-openapi 0.27 switched to `jiff` for timestamps) (#168).
+- **`tonic` 0.12 → 0.14, `prost` 0.13 → 0.14** — proto compilation moved to `tonic-prost-build` (the codec lives in new `tonic-prost` crate); TLS feature `tls` → `tls-ring` to match the workspace's existing rustls-ring backend.
+- Routine dependabot bumps merged: `tokio` 1.51.1 → 1.52.1, `rustls` 0.23.38 → 0.23.39, `lru` 0.16.3 → 0.17.0, `clap` 4.6.0 → 4.6.1, `daachorse` 2.0.0 → 2.1.1, `uuid` 1.23.0 → 1.23.1, `libc` 0.2.184 → 0.2.186, `wat` 1.246.2 → 1.247.0, `assert_cmd` 2.2.0 → 2.2.1; CI `sigstore/cosign-installer` 3.8.2 → 4.1.1.
+
+### Code quality
+
+- **`PluginResponse.headers` Cow refactor** (#-, internal allocation cleanup paired with rate-limit/ip-filter perf).
+- **`ProxyConfig` struct replaces 13-param `DwaarProxy::new`** — call sites name each field; adding a new field no longer requires touching every caller (#175).
+- **God functions split** (#172):
+  - `fork_workers` (260 lines) → 6 named helpers (`fork_one_worker`, `probe_worker0_readiness`, `install_supervisor_signal_handlers`, `apply_crash_backoff`, `restart_worker`, `run_supervisor_loop`); orchestrator now ~45 lines. SAFETY constraints around fork-before-tokio preserved.
+  - `compile_routes` (215 lines) → orchestrator (~68 lines) + 4 per-handler-block compilers + shared `SiteMiddleware` builder.
+  - `run_server` (620 lines) → orchestrator (~135 lines) + 7 phase helpers (`build_pingora_server`, `build_route_state`, `build_feature_state`, `build_proxy`, `bind_proxy_listeners`, `add_admin_service`, `add_grpc_and_l4_services`).
+- **Shared `version_check::fetch_latest_version` helper** in `dwaar-cli` deduplicates GitHub-release-tag lookup logic between `self_update` and `auto_update` (#176).
+
+### Testing
+
+- **Lifecycle-hook decision logic unit-tested** — 25 new tests added; `strip_port_from_host` extracted as a pure function and tested directly (host port stripping, redirect-path safety, essential-header preservation, idempotent retry gate, route draining state machine) (#174).
+- **Leak monitoring tests** for cache reload (`leak_counters_increment_on_each_new_backend`, `realloc_no_leak_when_size_unchanged`, `realloc_increments_leak_on_resize`).
+- New criterion bench `decompress_50k_gzip_one_shot`.
+- Multiple regression-guard tests for the bug fixes above.
+
+### Documentation
+
+- **`Box::leak` constraint documented** at module level in `cache.rs` — Pingora's `HttpCache::enable()` requires `&'static (dyn Storage + Sync)` and `Arc<T>` cannot satisfy that. `LEAKED_BACKEND_COUNT` doc comment now lists concrete recycling thresholds: 1000 reloads ≈ 1 MB, ~3 years at one reload/day, ~41 days at one reload/hour, alert at >1000 (#154).
+- **Issue #165** (full `ResponseHeader` clone for cache filter) closed as won't-fix-in-dwaar with technical analysis: Pingora's `resp_cacheable` takes the header by value and replays it verbatim on cache HITS, so trimming would break replays. Future path: upstream Pingora contribution for `Arc<ResponseHeader>` sharing.
+
 ## [0.3.10] - 2026-04-25
 
 First release of the production auto-update pipeline. After this lands
