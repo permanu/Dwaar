@@ -34,12 +34,166 @@ use crate::model::{
 use dwaar_plugins::basic_auth::BasicAuthConfig;
 use dwaar_plugins::forward_auth::ForwardAuthConfig;
 
+/// Shared per-site middleware compiled once and passed to whichever
+/// handler branch matches first. Bundles all fields that appear identically
+/// in every `HandlerBlock` regardless of handler type.
+///
+/// `Clone` is cheap: the `Arc` fields share their heap allocation; only the
+/// `Vec` fields allocate. Config compilation runs on the cold hot-reload path,
+/// so the cost is negligible compared to DNS resolution.
+///
+/// Motivation: `compile_routes` used to repeat these 12+ fields verbatim in 4
+/// nearly-identical branches. Bundling them removes the duplication and makes
+/// adding a new middleware field a one-line change here instead of four. (#172b)
+#[derive(Clone)]
+struct SiteMiddleware {
+    rate_limit_rps: Option<u32>,
+    ip_filter: Option<std::sync::Arc<dwaar_plugins::ip_filter::IpFilterConfig>>,
+    request_body_max_size: Option<u64>,
+    response_body_max_size: Option<u64>,
+    cache: Option<std::sync::Arc<dwaar_core::cache::CacheConfig>>,
+    rewrites: Vec<RewriteRule>,
+    basic_auth: Option<std::sync::Arc<dwaar_plugins::basic_auth::BasicAuthConfig>>,
+    forward_auth: Option<std::sync::Arc<dwaar_plugins::forward_auth::ForwardAuthConfig>>,
+    maps: Vec<dwaar_core::route::CompiledMap>,
+    log_append_fields: Vec<(String, dwaar_core::template::CompiledTemplate)>,
+    log_name: Option<String>,
+    intercepts: Vec<dwaar_core::route::CompiledIntercept>,
+    copy_response_headers: Option<dwaar_core::route::CompiledCopyResponseHeaders>,
+    is_grpc_route: bool,
+}
+
+/// Compile the shared middleware bag from a flat site's directive list.
+fn compile_site_middleware(directives: &[Directive], var_registry: &VarRegistry) -> SiteMiddleware {
+    SiteMiddleware {
+        rate_limit_rps: find_rate_limit(directives),
+        ip_filter: compile_ip_filter(directives),
+        request_body_max_size: find_request_body_max_size(directives),
+        response_body_max_size: find_response_body_limit(directives),
+        cache: compile_cache(directives),
+        rewrites: collect_rewrites(directives, var_registry),
+        basic_auth: compile_basic_auth(directives),
+        forward_auth: compile_forward_auth(directives),
+        is_grpc_route: directives.iter().any(|d| matches!(d, Directive::Grpc)),
+        maps: compile_maps(directives, var_registry),
+        log_append_fields: compile_log_append(directives, var_registry),
+        log_name: find_log_name(directives),
+        intercepts: compile_intercepts(directives),
+        copy_response_headers: compile_copy_response_headers(directives),
+    }
+}
+
+/// Assemble a flat-site `HandlerBlock` from a resolved handler and the shared
+/// middleware bag. All handler branches produce the same outer structure; only
+/// the `handler` field varies.
+fn build_handler_block(handler: Handler, mw: SiteMiddleware) -> HandlerBlock {
+    HandlerBlock {
+        kind: BlockKind::Handle,
+        matcher: PathMatcher::Any,
+        rate_limit_rps: mw.rate_limit_rps,
+        under_attack: false,
+        rewrites: mw.rewrites,
+        basic_auth: mw.basic_auth,
+        forward_auth: mw.forward_auth,
+        maps: mw.maps,
+        log_append_fields: mw.log_append_fields,
+        log_name: mw.log_name,
+        handler,
+        intercepts: mw.intercepts,
+        copy_response_headers: mw.copy_response_headers,
+        ip_filter: mw.ip_filter,
+        request_body_max_size: mw.request_body_max_size,
+        response_body_max_size: mw.response_body_max_size,
+        cache: mw.cache,
+        is_grpc_route: mw.is_grpc_route,
+    }
+}
+
+/// Build a `HandlerBlock` for a `reverse_proxy` directive.
+///
+/// Returns `None` when the directive is absent or upstream resolution fails
+/// (already warned inside `compile_reverse_proxy_handler`). gRPC sites force
+/// H/2 on the upstream connection.
+fn compile_reverse_proxy_block(
+    directives: &[Directive],
+    address: &str,
+    mw: SiteMiddleware,
+) -> Option<HandlerBlock> {
+    let rp = find_reverse_proxy(directives)?;
+    let mut proxy_handler = compile_reverse_proxy_handler(rp, address)?;
+    // gRPC requires HTTP/2 upstream — force h2 when the grpc directive is present.
+    if mw.is_grpc_route {
+        force_upstream_h2(&mut proxy_handler);
+    }
+    Some(build_handler_block(proxy_handler, mw))
+}
+
+/// Build a `HandlerBlock` for a `respond` directive (static response, no upstream).
+fn compile_respond_block(directives: &[Directive], mw: SiteMiddleware) -> Option<HandlerBlock> {
+    let resp = find_respond(directives)?;
+    let handler = Handler::StaticResponse {
+        status: resp.status,
+        body: Bytes::from(resp.body.clone()),
+    };
+    Some(build_handler_block(handler, mw))
+}
+
+/// Build a `HandlerBlock` for a `file_server` directive.
+///
+/// Logs a warning and falls back to `"."` when no `root` directive is present.
+fn compile_file_server_block(
+    directives: &[Directive],
+    address: &str,
+    mw: SiteMiddleware,
+) -> Option<HandlerBlock> {
+    let fs_directive = find_file_server(directives)?;
+    let root_path = find_root(directives).map_or_else(
+        || {
+            warn!(address = %address, "file_server without root directive, using '.'");
+            PathBuf::from(".")
+        },
+        |r| PathBuf::from(&r.path),
+    );
+    let handler = Handler::FileServer {
+        root: root_path.canonicalize().unwrap_or(root_path),
+        browse: fs_directive.browse,
+    };
+    Some(build_handler_block(handler, mw))
+}
+
+/// Build a `HandlerBlock` for a `php_fastcgi` directive.
+///
+/// Returns `None` when the directive is absent or the `FastCGI` upstream
+/// address cannot be resolved.
+fn compile_php_fastcgi_block(
+    directives: &[Directive],
+    address: &str,
+    mw: SiteMiddleware,
+) -> Option<HandlerBlock> {
+    let fcgi = find_php_fastcgi(directives)?;
+    let Some(addr) = resolve_upstream(std::slice::from_ref(&fcgi.upstream)) else {
+        warn!(address = %address, "could not resolve FastCGI upstream, skipping");
+        return None;
+    };
+    let root_path =
+        find_root(directives).map_or_else(|| PathBuf::from("."), |r| PathBuf::from(&r.path));
+    let handler = Handler::FastCgi {
+        upstream: addr,
+        root: root_path,
+    };
+    Some(build_handler_block(handler, mw))
+}
+
 /// Compile a parsed config into a route table for the proxy engine.
 ///
 /// Each site block produces one `Route`. Sites with `reverse_proxy` get a
 /// `Handler::ReverseProxy`; sites with `respond` get a `Handler::StaticResponse`.
 /// Sites without a handler directive are skipped with a warning.
-#[allow(clippy::too_many_lines)]
+///
+/// The per-handler logic lives in the four `compile_*_block` helpers above;
+/// this function is responsible only for validation, middleware compilation,
+/// and first-match dispatch (`reverse_proxy` → `respond` → `file_server` → `php_fastcgi`).
+/// (#172b)
 pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
     let mut routes = Vec::with_capacity(config.sites.len());
 
@@ -54,7 +208,7 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
             continue;
         }
 
-        // Warn about directives that parse but don't have runtime support yet
+        // Warn about directives that parse but don't have runtime support yet.
         warn_pending_runtime(&site.address, &site.directives);
         for d in &site.directives {
             if let Directive::Handle(h) = d {
@@ -63,11 +217,9 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
         }
 
         let tls = site_has_tls(&site.directives);
-
-        // Build variable registry from vars/map directives (ISSUE-055)
         let (var_registry, var_defaults) = compile_vars(&site.directives);
 
-        // Check for handle/handle_path/route blocks first — these create multi-handler routes
+        // handle/handle_path/route blocks take precedence — multi-handler routes.
         let handle_blocks = compile_handle_blocks(&site.directives, &var_registry);
         if !handle_blocks.is_empty() {
             routes.push(Route::with_handlers(
@@ -79,179 +231,32 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
             continue;
         }
 
-        // Flat site (no handle blocks) — extract single handler + site-level middleware
-        let rate_limit_rps = find_rate_limit(&site.directives);
-        let ip_filter = compile_ip_filter(&site.directives);
-        let request_body_max_size = find_request_body_max_size(&site.directives);
-        let response_body_max_size = find_response_body_limit(&site.directives);
-        let cache = compile_cache(&site.directives);
-        let rewrites = collect_rewrites(&site.directives, &var_registry);
-        let basic_auth = compile_basic_auth(&site.directives);
-        let forward_auth = compile_forward_auth(&site.directives);
-        let is_grpc_route = site.directives.iter().any(|d| matches!(d, Directive::Grpc));
+        // Flat site — compile shared middleware once, then dispatch to the matching
+        // handler. The middleware is cloned for the fallback branches; cloning is
+        // cheap on this cold path (Arc ref-counts + small Vec copies).
+        let mw = compile_site_middleware(&site.directives, &var_registry);
 
-        // Compile response-phase directives shared across all flat-site handler types.
-        let intercepts = compile_intercepts(&site.directives);
-        let copy_response_headers = compile_copy_response_headers(&site.directives);
+        let block = compile_reverse_proxy_block(&site.directives, &site.address, mw.clone())
+            .or_else(|| compile_respond_block(&site.directives, mw.clone()))
+            .or_else(|| compile_file_server_block(&site.directives, &site.address, mw.clone()))
+            .or_else(|| compile_php_fastcgi_block(&site.directives, &site.address, mw));
 
-        // Try reverse_proxy first (most common)
-        if let Some(rp) = find_reverse_proxy(&site.directives) {
-            let handler_result = compile_reverse_proxy_handler(rp, &site.address);
-            let Some(mut proxy_handler) = handler_result else {
-                continue;
-            };
-            // gRPC requires HTTP/2 upstream — force h2 when the grpc directive is present.
-            if is_grpc_route {
-                force_upstream_h2(&mut proxy_handler);
+        match block {
+            Some(handler_block) => {
+                routes.push(Route::with_handlers(
+                    &site.address,
+                    tls,
+                    vec![handler_block],
+                    var_defaults,
+                ));
             }
-            let handler = HandlerBlock {
-                kind: BlockKind::Handle,
-                matcher: PathMatcher::Any,
-                rate_limit_rps,
-                under_attack: false,
-                rewrites,
-                basic_auth,
-                forward_auth,
-                maps: compile_maps(&site.directives, &var_registry),
-                log_append_fields: compile_log_append(&site.directives, &var_registry),
-                log_name: find_log_name(&site.directives),
-                handler: proxy_handler,
-                intercepts: intercepts.clone(),
-                copy_response_headers: copy_response_headers.clone(),
-                ip_filter: ip_filter.clone(),
-                request_body_max_size,
-                response_body_max_size,
-                cache: cache.clone(),
-                is_grpc_route,
-            };
-            routes.push(Route::with_handlers(
-                &site.address,
-                tls,
-                vec![handler],
-                var_defaults,
-            ));
-            continue;
+            None => {
+                warn!(
+                    address = %site.address,
+                    "site has no handler directive (reverse_proxy, respond, file_server, php_fastcgi), skipping"
+                );
+            }
         }
-
-        // Try respond (static response, no upstream)
-        if let Some(resp) = find_respond(&site.directives) {
-            let handler = HandlerBlock {
-                kind: BlockKind::Handle,
-                matcher: PathMatcher::Any,
-                rate_limit_rps,
-                under_attack: false,
-                rewrites,
-                basic_auth,
-                forward_auth,
-                maps: compile_maps(&site.directives, &var_registry),
-                log_append_fields: compile_log_append(&site.directives, &var_registry),
-                log_name: find_log_name(&site.directives),
-                handler: Handler::StaticResponse {
-                    status: resp.status,
-                    body: Bytes::from(resp.body.clone()),
-                },
-                intercepts: intercepts.clone(),
-                copy_response_headers: copy_response_headers.clone(),
-                ip_filter: ip_filter.clone(),
-                request_body_max_size,
-                response_body_max_size,
-                cache: cache.clone(),
-                is_grpc_route,
-            };
-            routes.push(Route::with_handlers(
-                &site.address,
-                tls,
-                vec![handler],
-                var_defaults,
-            ));
-            continue;
-        }
-
-        // Try file_server (static file serving, no upstream)
-        if let Some(fs_directive) = find_file_server(&site.directives) {
-            let root_path = find_root(&site.directives).map_or_else(
-                || {
-                    warn!(address = %site.address, "file_server without root directive, using '.'");
-                    PathBuf::from(".")
-                },
-                |r| PathBuf::from(&r.path),
-            );
-            let handler = HandlerBlock {
-                kind: BlockKind::Handle,
-                matcher: PathMatcher::Any,
-                rate_limit_rps,
-                under_attack: false,
-                rewrites,
-                basic_auth,
-                forward_auth,
-                maps: compile_maps(&site.directives, &var_registry),
-                log_append_fields: compile_log_append(&site.directives, &var_registry),
-                log_name: find_log_name(&site.directives),
-                handler: Handler::FileServer {
-                    root: root_path.canonicalize().unwrap_or(root_path),
-                    browse: fs_directive.browse,
-                },
-                intercepts: intercepts.clone(),
-                copy_response_headers: copy_response_headers.clone(),
-                ip_filter: ip_filter.clone(),
-                request_body_max_size,
-                response_body_max_size,
-                cache: cache.clone(),
-                is_grpc_route,
-            };
-            routes.push(Route::with_handlers(
-                &site.address,
-                tls,
-                vec![handler],
-                var_defaults,
-            ));
-            continue;
-        }
-
-        // Try php_fastcgi
-        if let Some(fcgi) = find_php_fastcgi(&site.directives) {
-            let Some(addr) = resolve_upstream(std::slice::from_ref(&fcgi.upstream)) else {
-                warn!(address = %site.address, "could not resolve FastCGI upstream, skipping");
-                continue;
-            };
-            let root_path = find_root(&site.directives)
-                .map_or_else(|| PathBuf::from("."), |r| PathBuf::from(&r.path));
-            let handler = HandlerBlock {
-                kind: BlockKind::Handle,
-                matcher: PathMatcher::Any,
-                rate_limit_rps,
-                under_attack: false,
-                rewrites,
-                basic_auth,
-                forward_auth,
-                maps: compile_maps(&site.directives, &var_registry),
-                log_append_fields: compile_log_append(&site.directives, &var_registry),
-                log_name: find_log_name(&site.directives),
-                handler: Handler::FastCgi {
-                    upstream: addr,
-                    root: root_path,
-                },
-                intercepts,
-                copy_response_headers,
-                ip_filter,
-                request_body_max_size,
-                response_body_max_size,
-                cache,
-                is_grpc_route,
-            };
-            routes.push(Route::with_handlers(
-                &site.address,
-                tls,
-                vec![handler],
-                var_defaults,
-            ));
-            continue;
-        }
-
-        warn!(
-            address = %site.address,
-            "site has no handler directive (reverse_proxy, respond, file_server, php_fastcgi), skipping"
-        );
     }
 
     RouteTable::new(routes)
