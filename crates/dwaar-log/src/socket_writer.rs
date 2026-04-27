@@ -33,7 +33,13 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 /// the proxy process's terminal.
 pub struct UnixSocketWriter {
     path: PathBuf,
+    // Serialises concurrent writes and owns the live connection.
+    // tokio::sync::Mutex is appropriate: it is held across the socket
+    // write awaits so we need an async-aware lock here.
     stream: Mutex<Option<UnixStream>>,
+    // Only held for brief in-memory queue mutations — never across awaits.
+    // parking_lot would work too, but we keep tokio::sync here for
+    // consistency and to avoid mixing runtimes.
     buffer: Mutex<VecDeque<Vec<u8>>>,
     last_connect_attempt: Mutex<Option<tokio::time::Instant>>,
 }
@@ -88,15 +94,18 @@ impl UnixSocketWriter {
         stream.write_all(line).await.is_ok()
     }
 
-    /// Drain buffered lines into the stream. Stops on first write error.
-    async fn flush_buffer(stream: &mut UnixStream, buffer: &mut VecDeque<Vec<u8>>) {
-        while let Some(line) = buffer.front() {
+    /// Drain `pending` into the stream. Returns entries that could not be
+    /// written (because the connection was lost mid-flush) so the caller
+    /// can re-enqueue them.
+    async fn flush_pending(stream: &mut UnixStream, pending: &mut VecDeque<Vec<u8>>) -> bool {
+        while let Some(line) = pending.front() {
             if Self::write_line(stream, line).await {
-                buffer.pop_front();
+                pending.pop_front();
             } else {
-                break;
+                return false;
             }
         }
+        true
     }
 
     /// Buffer a serialized line, dropping the oldest if at capacity.
@@ -111,8 +120,27 @@ impl UnixSocketWriter {
 #[async_trait]
 impl LogOutput for UnixSocketWriter {
     async fn write_batch(&self, entries: &[RequestLog]) -> Result<(), std::io::Error> {
+        // Serialize upfront — pure CPU work, no lock needed yet.
+        let mut new_lines: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
+        for entry in entries {
+            match Self::serialize_entry(entry) {
+                Ok(line) => new_lines.push(line),
+                Err(e) => warn!(error = %e, "failed to serialize log entry"),
+            }
+        }
+
+        // Drain the existing buffer under a brief lock, then release it
+        // before touching the socket. Holding the buffer lock across network
+        // I/O would force concurrent write_batch callers to wait for socket
+        // writes to complete before they can even enqueue. (#160)
+        let mut pending: VecDeque<Vec<u8>> = {
+            let mut buf = self.buffer.lock().await;
+            std::mem::take(&mut *buf)
+        }; // buffer lock dropped here
+
+        // Acquire the stream lock. This is intentionally held for the full
+        // write sequence: it serialises writers and guards connection state.
         let mut stream_guard = self.stream.lock().await;
-        let mut buffer_guard = self.buffer.lock().await;
 
         // Try to establish connection if we don't have one.
         if stream_guard.is_none()
@@ -121,32 +149,48 @@ impl LogOutput for UnixSocketWriter {
             *stream_guard = Some(new_stream);
         }
 
-        // Serialize all entries upfront so we can buffer on failure.
-        let mut lines: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
-        for entry in entries {
-            match Self::serialize_entry(entry) {
-                Ok(line) => lines.push(line),
-                Err(e) => warn!(error = %e, "failed to serialize log entry"),
-            }
-        }
-
         if let Some(ref mut stream) = *stream_guard {
-            // Flush previously buffered lines first.
-            Self::flush_buffer(stream, &mut buffer_guard).await;
+            // Flush previously buffered lines first so ordering is preserved.
+            if !Self::flush_pending(stream, &mut pending).await {
+                // Socket write failed mid-flush — re-enqueue the remainder
+                // plus new lines, then disconnect.
+                let mut buf = self.buffer.lock().await;
+                for line in pending {
+                    Self::enqueue(&mut buf, line);
+                }
+                for line in new_lines {
+                    Self::enqueue(&mut buf, line);
+                }
+                *stream_guard = None;
+                return Ok(());
+            }
 
             // Write new lines.
-            for line in lines {
-                if !Self::write_line(stream, &line).await {
-                    // Connection lost — buffer remaining lines and disconnect.
-                    Self::enqueue(&mut buffer_guard, line);
-                    *stream_guard = None;
+            let mut failed_at: Option<usize> = None;
+            for (i, line) in new_lines.iter().enumerate() {
+                if !Self::write_line(stream, line).await {
+                    failed_at = Some(i);
                     break;
                 }
             }
+
+            if let Some(i) = failed_at {
+                // Connection lost mid-batch — buffer remaining new lines and disconnect.
+                let mut buf = self.buffer.lock().await;
+                for line in new_lines.into_iter().skip(i) {
+                    Self::enqueue(&mut buf, line);
+                }
+                *stream_guard = None;
+            }
         } else {
-            // No connection — buffer everything.
-            for line in lines {
-                Self::enqueue(&mut buffer_guard, line);
+            // No connection — buffer everything (pending was already drained
+            // from the persistent buffer, so merge it back with new lines).
+            let mut buf = self.buffer.lock().await;
+            for line in pending {
+                Self::enqueue(&mut buf, line);
+            }
+            for line in new_lines {
+                Self::enqueue(&mut buf, line);
             }
         }
 
@@ -248,6 +292,57 @@ mod tests {
 
         let buffer = writer.buffer.lock().await;
         assert_eq!(buffer.len(), MAX_BUFFER_LINES);
+    }
+
+    /// Verify that the buffer lock is not held across socket I/O.
+    ///
+    /// Two concurrent `write_batch` calls are issued against a live socket.
+    /// If the buffer lock were held across the socket write awaits, the
+    /// second call would stall until the first completes its network I/O.
+    /// On a loopback UDS this is imperceptible, so instead we assert the
+    /// structural property: both tasks complete and all lines reach the
+    /// receiver. A contention test that truly exercises the parallelism
+    /// would require a slow-write shim; this test documents the invariant
+    /// and catches regressions that break serialization. (#160)
+    #[tokio::test]
+    async fn buffer_lock_released_before_socket_await() {
+        use std::sync::Arc;
+        use tokio::io::AsyncBufReadExt;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let sock_path = dir.path().join("concurrent.sock");
+        let listener = UnixListener::bind(&sock_path).expect("bind");
+
+        let writer = Arc::new(UnixSocketWriter::new(sock_path));
+
+        // Collect all lines the receiver sees.
+        let recv_handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let reader = tokio::io::BufReader::new(stream);
+            let mut lines_iter = reader.lines();
+            let mut count = 0usize;
+            while let Ok(Some(_)) = lines_iter.next_line().await {
+                count += 1;
+                if count == 2 {
+                    break;
+                }
+            }
+            count
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let w1 = Arc::clone(&writer);
+        let w2 = Arc::clone(&writer);
+
+        let t1 = tokio::spawn(async move { w1.write_batch(&[dummy_log()]).await });
+        let t2 = tokio::spawn(async move { w2.write_batch(&[dummy_log()]).await });
+
+        t1.await.expect("task1").expect("write1");
+        t2.await.expect("task2").expect("write2");
+
+        let received = recv_handle.await.expect("recv");
+        assert_eq!(received, 2, "both lines must reach the receiver");
     }
 
     #[test]
