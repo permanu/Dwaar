@@ -876,6 +876,11 @@ pub struct RootDirective {
 pub struct FileServerDirective {
     /// Enable directory listing.
     pub browse: bool,
+    /// SPA fallback: if a request resolves to `NotFound` and the request
+    /// doesn't look like a static asset, serve this path (relative to
+    /// `root`) with status 200. Used for client-side routed apps
+    /// (`SvelteKit`, React Router, Vue Router).
+    pub fallback: Option<String>,
 }
 
 /// `rewrite` — replace the request URI sent to upstream.

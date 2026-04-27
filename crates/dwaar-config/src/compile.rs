@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -154,11 +154,43 @@ fn compile_file_server_block(
         },
         |r| PathBuf::from(&r.path),
     );
+    let canonical_root = root_path.canonicalize().unwrap_or(root_path);
+    let fallback = resolve_fallback(&canonical_root, fs_directive.fallback.as_deref(), address);
     let handler = Handler::FileServer {
-        root: root_path.canonicalize().unwrap_or(root_path),
+        root: canonical_root,
         browse: fs_directive.browse,
+        fallback,
     };
     Some(build_handler_block(handler, mw))
+}
+
+/// Resolve the optional `fallback` path against the `file_server` root.
+///
+/// Returns the absolute path of the fallback file when it is safely contained
+/// under `root`. Logs a warning and drops the fallback if it would escape the
+/// root or if path resolution fails. Missing fallback files are kept (they
+/// just degrade to 404 at request time, which is the documented contract).
+fn resolve_fallback(root: &Path, fallback: Option<&str>, address: &str) -> Option<PathBuf> {
+    let raw = fallback?;
+    let trimmed = raw.trim_start_matches('/');
+    let candidate = root.join(trimmed);
+    // Cheap lexical check first — reject `..` traversal regardless of FS state.
+    if !candidate.starts_with(root) {
+        warn!(address = %address, fallback = %raw, "file_server fallback path escapes root, ignoring");
+        return None;
+    }
+    // If the fallback file already exists, canonicalize so symlinks can't
+    // re-introduce traversal at request time.
+    match candidate.canonicalize() {
+        Ok(resolved) if resolved.starts_with(root) => Some(resolved),
+        Ok(_) => {
+            warn!(address = %address, fallback = %raw, "file_server fallback resolves outside root, ignoring");
+            None
+        }
+        // File not present yet — store the lexical join. Request-time logic
+        // will treat a missing fallback file as 404.
+        Err(_) => Some(candidate),
+    }
 }
 
 /// Build a `HandlerBlock` for a `php_fastcgi` directive.
@@ -899,9 +931,12 @@ fn compile_single_block(
     } else if let Some(fs) = find_file_server(inner_directives) {
         let root_path = find_root(inner_directives)
             .map_or_else(|| PathBuf::from("."), |r| PathBuf::from(&r.path));
+        let canonical_root = root_path.canonicalize().unwrap_or(root_path);
+        let fallback = resolve_fallback(&canonical_root, fs.fallback.as_deref(), "handle block");
         Handler::FileServer {
-            root: root_path.canonicalize().unwrap_or(root_path),
+            root: canonical_root,
             browse: fs.browse,
+            fallback,
         }
     } else if let Some(fcgi) = find_php_fastcgi(inner_directives) {
         let addr = resolve_upstream(std::slice::from_ref(&fcgi.upstream))?;

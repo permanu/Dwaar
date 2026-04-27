@@ -937,8 +937,12 @@ impl ProxyHttp for DwaarProxy {
                         crate::route::Handler::StaticResponse { status, body } => {
                             ctx.static_response = Some((*status, body.clone()));
                         }
-                        crate::route::Handler::FileServer { root, browse } => {
-                            ctx.file_server = Some((root.clone(), *browse));
+                        crate::route::Handler::FileServer {
+                            root,
+                            browse,
+                            fallback,
+                        } => {
+                            ctx.file_server = Some((root.clone(), *browse, fallback.clone()));
                         }
                         crate::route::Handler::ReverseProxy {
                             upstream,
@@ -1333,13 +1337,22 @@ impl ProxyHttp for DwaarProxy {
         }
 
         // --- File server handler (ISSUE-048) ---
-        if let Some((ref root, browse)) = ctx.file_server {
+        if let Some((ref root, browse, ref fallback)) = ctx.file_server {
             let request_path = ctx
                 .effective_path
                 .as_deref()
                 .unwrap_or(ctx.plugin_ctx.path.as_str());
+            let method = ctx.plugin_ctx.method.as_str();
 
-            match crate::file_server::serve_file(root, request_path, browse).await {
+            match crate::file_server::serve_file(
+                root,
+                request_path,
+                browse,
+                fallback.as_deref(),
+                method,
+            )
+            .await
+            {
                 crate::file_server::FileResponse::Found {
                     body,
                     content_type,

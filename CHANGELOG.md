@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.12] - 2026-04-27
+
+### Added
+
+- **`file_server` SPA fallback** — new `fallback PATH` subdirective inside a `file_server { ... }` block serves the configured file (typically `/index.html`) when a request would otherwise 404. Enables client-side routed apps (`SvelteKit`, React Router, Vue Router) to be served as static builds without bringing up a separate proxy. Asset-shaped requests (`.js`, `.css`, `.wasm`, fonts, images, …) are excluded from fallback so missing chunks still produce real 404s. Method-gated to `GET`/`HEAD`. Fallback paths are canonicalized inside `root` at compile time and re-checked at request time.
+
 ## [0.3.11] - 2026-04-27
 
 Audit-batch sweep release: 28 GitHub issues (the 2026-04-13 audit drop) closed across security, performance, bug, dependency, code-quality, and testing categories. No public Dwaarfile or operator-facing API changes — pure stability and hot-path improvements. Operators upgrading from 0.3.10 should see lower per-request allocation, faster health-check cycles, and reduced background-task contention.

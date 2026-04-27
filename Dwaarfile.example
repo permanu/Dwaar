@@ -19,3 +19,16 @@ blog.example.com {
     proxy localhost:4000
     analytics on
 }
+
+# Single-page app (SvelteKit / React Router / Vue Router) served as a
+# static build. The `fallback` subdirective serves /index.html for any
+# request that would otherwise 404, so client-side routes like
+# /blog/post-slug resolve to the SPA shell. Asset-shaped paths
+# (*.js, *.css, *.wasm, fonts, images, …) still 404 cleanly.
+app.example.com {
+    root * /var/www/app-build
+    file_server {
+        browse off
+        fallback /index.html
+    }
+}

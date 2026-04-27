@@ -67,7 +67,7 @@ fn format_directive_at_depth(out: &mut String, directive: &Directive, depth: usi
         Directive::BasicAuth(ba) => format_basicauth(out, ba, depth),
         Directive::ForwardAuth(fa) => format_forward_auth(out, fa, depth),
         Directive::Root(r) => format_root(out, r),
-        Directive::FileServer(fs) => format_file_server(out, fs),
+        Directive::FileServer(fs) => format_file_server(out, fs, depth),
         Directive::Handle(h) => {
             format_handle_block(out, "handle", h.matcher.as_deref(), &h.directives, depth);
         }
@@ -440,10 +440,26 @@ fn format_root(out: &mut String, r: &RootDirective) {
     out.push_str(&r.path);
 }
 
-fn format_file_server(out: &mut String, fs: &FileServerDirective) {
+fn format_file_server(out: &mut String, fs: &FileServerDirective, depth: usize) {
     out.push_str("file_server");
-    if fs.browse {
-        out.push_str(" browse");
+    match (fs.browse, fs.fallback.as_deref()) {
+        (false, None) => {}
+        (true, None) => out.push_str(" browse"),
+        (browse, Some(fallback)) => {
+            let inner = "    ".repeat(depth + 1);
+            let outer = "    ".repeat(depth);
+            out.push_str(" {\n");
+            if browse {
+                out.push_str(&inner);
+                out.push_str("browse on\n");
+            }
+            out.push_str(&inner);
+            out.push_str("fallback ");
+            out.push_str(fallback);
+            out.push('\n');
+            out.push_str(&outer);
+            out.push('}');
+        }
     }
 }
 

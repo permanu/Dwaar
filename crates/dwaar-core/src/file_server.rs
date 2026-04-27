@@ -60,12 +60,104 @@ pub enum FileResponse {
     Forbidden,
 }
 
+/// File extensions that are obviously assets, not client-side routes.
+/// Requests with these extensions never trigger SPA fallback — otherwise a
+/// missing JS chunk would silently return `index.html`, which browsers and
+/// build tools would then try to execute as JavaScript and produce confusing
+/// MIME-type or syntax errors. Keep this list conservative: better to skip
+/// fallback for a few odd routes than to corrupt asset resolution.
+const ASSET_EXTENSIONS: &[&str] = &[
+    "js", "mjs", "cjs", "css", "map", "wasm", "woff", "woff2", "ttf", "otf", "eot", "svg", "png",
+    "jpg", "jpeg", "gif", "webp", "avif", "ico", "json", "txt", "xml", "pdf", "zip", "gz", "br",
+    "mp3", "mp4", "webm", "ogg", "wav",
+];
+
+/// Returns true when `request_path` ends with an extension we consider a
+/// static asset (and therefore should NOT fall back to `index.html` on 404).
+fn is_asset_extension(request_path: &str) -> bool {
+    // Strip query string and fragment if present (defensive — proxy normally
+    // hands us a path-only string, but be safe).
+    let no_query = request_path
+        .split_once('?')
+        .map_or(request_path, |(p, _)| p);
+    let path = no_query.split_once('#').map_or(no_query, |(p, _)| p);
+
+    let last_segment = path.rsplit('/').next().unwrap_or("");
+    let Some((_, ext)) = last_segment.rsplit_once('.') else {
+        return false;
+    };
+    let ext_lower = ext.to_ascii_lowercase();
+    ASSET_EXTENSIONS.iter().any(|e| *e == ext_lower)
+}
+
 /// Resolve a request path to a file response.
 ///
 /// `root`: the configured filesystem root (already canonicalized at compile time).
 /// `request_path`: the URL path from the client (e.g., `/css/style.css`).
 /// `browse`: whether directory listing is enabled.
-pub async fn serve_file(root: &Path, request_path: &str, browse: bool) -> FileResponse {
+/// `fallback`: optional SPA fallback path (already canonicalized inside `root`
+///   at compile time). When set, a request that would otherwise return
+///   `NotFound` and is not an asset-shaped path will be retried with this
+///   file. Used for client-routed apps (`SvelteKit`, React Router, Vue Router).
+/// `method`: HTTP method (only `GET`/`HEAD` trigger fallback).
+pub async fn serve_file(
+    root: &Path,
+    request_path: &str,
+    browse: bool,
+    fallback: Option<&Path>,
+    method: &str,
+) -> FileResponse {
+    let primary = serve_file_inner(root, request_path, browse).await;
+
+    // Fast path: anything other than NotFound (or NotFound without a configured
+    // fallback) returns immediately. Preserves backwards compat exactly.
+    let FileResponse::NotFound = primary else {
+        return primary;
+    };
+    let Some(fallback_path) = fallback else {
+        return FileResponse::NotFound;
+    };
+
+    // Method gating: fallback is a GET-shaped recovery, not a generic retry.
+    if !matches!(method, "GET" | "HEAD") {
+        return FileResponse::NotFound;
+    }
+
+    // Don't rewrite missing assets to index.html — see ASSET_EXTENSIONS rationale.
+    if is_asset_extension(request_path) {
+        return FileResponse::NotFound;
+    }
+
+    // Dotfile gate is enforced inside serve_file_inner already; if the original
+    // request was a dotfile we've returned Forbidden above (not NotFound) and
+    // never reach this branch.
+
+    // Defense-in-depth: re-verify the fallback path is contained in root.
+    // compile.rs guarantees this, but a runtime check is cheap.
+    if !fallback_path.starts_with(root) {
+        return FileResponse::NotFound;
+    }
+
+    let fallback_owned = fallback_path.to_path_buf();
+    let is_file = tokio::task::spawn_blocking(move || fallback_owned.is_file())
+        .await
+        .unwrap_or(false);
+    if !is_file {
+        return FileResponse::NotFound;
+    }
+
+    tracing::debug!(
+        from = %request_path,
+        to = %fallback_path.display(),
+        "serve_file: SPA fallback engaged"
+    );
+    read_file(fallback_path).await
+}
+
+/// Inner resolver — original `serve_file` logic without the fallback layer.
+/// Kept as a separate function so the fallback wrapper can call it twice
+/// without re-implementing path validation.
+async fn serve_file_inner(root: &Path, request_path: &str, browse: bool) -> FileResponse {
     // Reject null bytes before any filesystem access
     if request_path.contains('\0') {
         return FileResponse::Forbidden;
@@ -308,10 +400,17 @@ mod tests {
         (dir, canonical)
     }
 
+    /// Convenience wrapper that calls `serve_file` with the legacy
+    /// no-fallback contract — keeps existing tests focused on their
+    /// original behavior.
+    async fn serve(root: &Path, path: &str, browse: bool) -> FileResponse {
+        serve_file(root, path, browse, None, "GET").await
+    }
+
     #[tokio::test]
     async fn serves_existing_file() {
         let (_dir, root) = setup_test_dir();
-        let resp = serve_file(&root, "/style.css", false).await;
+        let resp = serve(&root, "/style.css", false).await;
         match resp {
             FileResponse::Found {
                 content_type, body, ..
@@ -326,21 +425,21 @@ mod tests {
     #[tokio::test]
     async fn serves_index_html_for_directory() {
         let (_dir, root) = setup_test_dir();
-        let resp = serve_file(&root, "/", false).await;
+        let resp = serve(&root, "/", false).await;
         assert!(matches!(resp, FileResponse::Found { .. }));
     }
 
     #[tokio::test]
     async fn not_found_for_missing_file() {
         let (_dir, root) = setup_test_dir();
-        let resp = serve_file(&root, "/nonexistent.txt", false).await;
+        let resp = serve(&root, "/nonexistent.txt", false).await;
         assert!(matches!(resp, FileResponse::NotFound));
     }
 
     #[tokio::test]
     async fn rejects_path_traversal() {
         let (_dir, root) = setup_test_dir();
-        let resp = serve_file(&root, "/../../../etc/passwd", false).await;
+        let resp = serve(&root, "/../../../etc/passwd", false).await;
         assert!(matches!(
             resp,
             FileResponse::Forbidden | FileResponse::NotFound
@@ -350,21 +449,21 @@ mod tests {
     #[tokio::test]
     async fn rejects_null_bytes() {
         let (_dir, root) = setup_test_dir();
-        let resp = serve_file(&root, "/style.css\0.txt", false).await;
+        let resp = serve(&root, "/style.css\0.txt", false).await;
         assert!(matches!(resp, FileResponse::Forbidden));
     }
 
     #[tokio::test]
     async fn rejects_dotfiles() {
         let (_dir, root) = setup_test_dir();
-        let resp = serve_file(&root, "/.env", false).await;
+        let resp = serve(&root, "/.env", false).await;
         assert!(matches!(resp, FileResponse::Forbidden));
     }
 
     #[tokio::test]
     async fn directory_listing_when_browse_enabled() {
         let (_dir, root) = setup_test_dir();
-        let resp = serve_file(&root, "/sub/", true).await;
+        let resp = serve(&root, "/sub/", true).await;
         match resp {
             FileResponse::DirectoryListing { body } => {
                 let html = std::str::from_utf8(&body).expect("valid utf8");
@@ -379,21 +478,21 @@ mod tests {
     async fn no_listing_when_browse_disabled() {
         let (_dir, root) = setup_test_dir();
         // /sub/ has page.html but no index.html — without browse, returns NotFound
-        let resp = serve_file(&root, "/sub/", false).await;
+        let resp = serve(&root, "/sub/", false).await;
         assert!(matches!(resp, FileResponse::NotFound));
     }
 
     #[tokio::test]
     async fn serves_subdirectory_file() {
         let (_dir, root) = setup_test_dir();
-        let resp = serve_file(&root, "/sub/page.html", false).await;
+        let resp = serve(&root, "/sub/page.html", false).await;
         assert!(matches!(resp, FileResponse::Found { .. }));
     }
 
     #[tokio::test]
     async fn etag_is_set() {
         let (_dir, root) = setup_test_dir();
-        if let FileResponse::Found { etag, .. } = serve_file(&root, "/style.css", false).await {
+        if let FileResponse::Found { etag, .. } = serve(&root, "/style.css", false).await {
             assert!(etag.is_some());
             let tag = etag.expect("etag");
             assert!(tag.starts_with('"'));
@@ -401,6 +500,113 @@ mod tests {
         } else {
             panic!("expected Found");
         }
+    }
+
+    // ── SPA fallback tests ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn fallback_engages_for_missing_route() {
+        let (_dir, root) = setup_test_dir();
+        let fallback = root.join("index.html");
+        let resp = serve_file(&root, "/blog/post-slug", false, Some(&fallback), "GET").await;
+        match resp {
+            FileResponse::Found {
+                content_type, body, ..
+            } => {
+                assert_eq!(content_type, "text/html; charset=utf-8");
+                assert_eq!(body.as_ref(), b"<html>hello</html>");
+            }
+            other => panic!("expected fallback Found, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_skipped_for_asset_extensions() {
+        let (_dir, root) = setup_test_dir();
+        let fallback = root.join("index.html");
+        // A missing .js must NOT serve index.html — that would corrupt the page.
+        let resp = serve_file(&root, "/missing.js", false, Some(&fallback), "GET").await;
+        assert!(matches!(resp, FileResponse::NotFound));
+    }
+
+    #[tokio::test]
+    async fn fallback_serves_existing_file_unchanged() {
+        let (_dir, root) = setup_test_dir();
+        let fallback = root.join("index.html");
+        // Existing files are never rerouted to fallback.
+        let resp = serve_file(&root, "/style.css", false, Some(&fallback), "GET").await;
+        match resp {
+            FileResponse::Found {
+                content_type, body, ..
+            } => {
+                assert_eq!(content_type, "text/css; charset=utf-8");
+                assert_eq!(body.as_ref(), b"body{}");
+            }
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_returns_404_when_fallback_file_missing() {
+        let (_dir, root) = setup_test_dir();
+        let fallback = root.join("does-not-exist.html");
+        let resp = serve_file(&root, "/blog/post", false, Some(&fallback), "GET").await;
+        assert!(matches!(resp, FileResponse::NotFound));
+    }
+
+    #[tokio::test]
+    async fn fallback_engages_for_head_method() {
+        let (_dir, root) = setup_test_dir();
+        let fallback = root.join("index.html");
+        let resp = serve_file(&root, "/blog/post", false, Some(&fallback), "HEAD").await;
+        assert!(matches!(resp, FileResponse::Found { .. }));
+    }
+
+    #[tokio::test]
+    async fn fallback_does_not_engage_for_post() {
+        let (_dir, root) = setup_test_dir();
+        let fallback = root.join("index.html");
+        let resp = serve_file(&root, "/blog/post", false, Some(&fallback), "POST").await;
+        assert!(matches!(resp, FileResponse::NotFound));
+    }
+
+    #[tokio::test]
+    async fn fallback_does_not_override_dotfile_forbidden() {
+        let (_dir, root) = setup_test_dir();
+        let fallback = root.join("index.html");
+        // Dotfile requests are 403 before fallback can be considered.
+        let resp = serve_file(&root, "/.env", false, Some(&fallback), "GET").await;
+        assert!(matches!(resp, FileResponse::Forbidden));
+    }
+
+    #[tokio::test]
+    async fn fallback_rejected_when_outside_root() {
+        let (_dir, root) = setup_test_dir();
+        // Fabricate a fallback that points outside the root.
+        let outside = std::env::temp_dir().join("totally-elsewhere.html");
+        let resp = serve_file(&root, "/blog/post", false, Some(&outside), "GET").await;
+        assert!(matches!(resp, FileResponse::NotFound));
+    }
+
+    #[tokio::test]
+    async fn no_fallback_preserves_legacy_404() {
+        let (_dir, root) = setup_test_dir();
+        // Regression guard: missing file with no fallback configured.
+        let resp = serve_file(&root, "/blog/post", false, None, "GET").await;
+        assert!(matches!(resp, FileResponse::NotFound));
+    }
+
+    #[test]
+    fn asset_extension_detection() {
+        assert!(is_asset_extension("/app.js"));
+        assert!(is_asset_extension("/styles/main.CSS"));
+        assert!(is_asset_extension("/_app/immutable/chunks/abc.js"));
+        assert!(is_asset_extension("/img/logo.png"));
+        assert!(!is_asset_extension("/blog/post"));
+        assert!(!is_asset_extension("/about"));
+        assert!(!is_asset_extension("/"));
+        // Query string shouldn't fool us
+        assert!(is_asset_extension("/app.js?v=1"));
     }
 
     #[test]
