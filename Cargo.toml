@@ -78,7 +78,7 @@ uuid = { version = "1.23.0", features = ["v7"] }
 chrono = { version = "0.4.44", default-features = false, features = ["clock", "serde"] }
 
 # Pattern matching (bot detection)
-daachorse = "2.0"
+daachorse = "2.1"
 
 # IP network / CIDR parsing (L4 remote_ip matcher)
 ipnet = "2"

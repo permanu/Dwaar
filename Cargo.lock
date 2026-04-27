@@ -1072,9 +1072,9 @@ dependencies = [
 
 [[package]]
 name = "daachorse"
-version = "2.0.0"
+version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8aeeee06247cda0cae43eb40dd19dcb5360e38e839f870df54a97ca1be4cf1a7"
+checksum = "db756b5eb7d81d31f31f660f4132f8cf5698de52fca144c143d0ae0cbb5f2e06"
 
 [[package]]
 name = "daemonize"
