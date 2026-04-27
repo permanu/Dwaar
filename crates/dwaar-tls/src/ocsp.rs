@@ -854,17 +854,21 @@ mod tests {
     /// issue #158).
     #[test]
     fn ocsp_loopback_bypass_only_active_under_test() {
-        // We're in a test build, so ALLOW_LOOPBACK_OCSP exists and
-        // loopback_bypass_enabled() reads it.
+        // Save and restore the global so we don't trample tests that
+        // expect bypass=true during their concurrent OCSP fetch.
+        // See issue #158 for the gating, and #160-CI for the race fix.
+        let prior = ALLOW_LOOPBACK_OCSP.load(std::sync::atomic::Ordering::SeqCst);
         ALLOW_LOOPBACK_OCSP.store(true, std::sync::atomic::Ordering::SeqCst);
         assert!(
             loopback_bypass_enabled(),
-            "bypass should be active when flag is set"
+            "loopback bypass should be active when flag set in test build"
         );
         ALLOW_LOOPBACK_OCSP.store(false, std::sync::atomic::Ordering::SeqCst);
         assert!(
             !loopback_bypass_enabled(),
-            "bypass should be inactive when flag is cleared"
+            "loopback bypass should be inactive when flag cleared"
         );
+        // Restore.
+        ALLOW_LOOPBACK_OCSP.store(prior, std::sync::atomic::Ordering::SeqCst);
     }
 }
