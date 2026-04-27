@@ -19,6 +19,7 @@
 //! | Security | `max_conns` enforced atomically before accepting new work |
 //! | Competitive Parity | Round-robin, least-conn, random, ip-hash match nginx/Caddy |
 
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -97,6 +98,11 @@ const STICKY_COOKIE_ATTRS: &str = "; Path=/; HttpOnly; SameSite=Lax; Max-Age=864
 #[derive(Debug)]
 pub struct UpstreamPool {
     pub(crate) backends: Vec<Backend>,
+    /// Maps each backend's `SocketAddr` to its position in `backends`, so
+    /// acquire/release/mark operations are O(1) instead of O(n). Built once at
+    /// construction and never mutated — backends are immutable after the pool
+    /// is created, so no synchronization is needed. See issue #161.
+    addr_index: HashMap<SocketAddr, usize>,
     policy: LbPolicy,
     /// Monotonically increasing counter — wrapped on overflow (2^64 >> backend count).
     counter: AtomicU64,
@@ -150,7 +156,7 @@ impl UpstreamPool {
         health_uri: Option<String>,
         health_interval: Option<u64>,
     ) -> Self {
-        let compiled = backends
+        let compiled: Vec<Backend> = backends
             .into_iter()
             .map(|b| Backend {
                 addr: b.addr,
@@ -165,8 +171,15 @@ impl UpstreamPool {
             })
             .collect();
 
+        let addr_index = compiled
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (b.addr, i))
+            .collect();
+
         Self {
             backends: compiled,
+            addr_index,
             policy,
             counter: AtomicU64::new(0),
             health_uri,
@@ -456,25 +469,24 @@ impl UpstreamPool {
     /// On an unhealthy→healthy transition this logs at `INFO` and clears any
     /// previously stored `last_error` (ISSUE-127). No-op on repeat transitions.
     pub fn mark_healthy(&self, addr: SocketAddr) {
-        for b in &self.backends {
-            if b.addr == addr {
-                // `Release` here pairs with `Acquire` loads in the selection path so
-                // a thread that observes `healthy = true` also observes the
-                // `last_error` clear below.
-                let previous = b.healthy.swap(true, Ordering::Release);
-                if previous {
-                    debug!(%addr, "backend already healthy");
-                } else {
-                    // false → true: transition
-                    *b.last_error.lock() = None;
-                    let masked = mask_addr(&addr);
-                    info!(
-                        upstream = %masked,
-                        "upstream transitioned to healthy",
-                    );
-                }
-                return;
-            }
+        let Some(&i) = self.addr_index.get(&addr) else {
+            return;
+        };
+        let b = &self.backends[i];
+        // `Release` here pairs with `Acquire` loads in the selection path so
+        // a thread that observes `healthy = true` also observes the
+        // `last_error` clear below.
+        let previous = b.healthy.swap(true, Ordering::Release);
+        if previous {
+            debug!(%addr, "backend already healthy");
+        } else {
+            // false → true: transition
+            *b.last_error.lock() = None;
+            let masked = mask_addr(&addr);
+            info!(
+                upstream = %masked,
+                "upstream transitioned to healthy",
+            );
         }
     }
 
@@ -490,23 +502,22 @@ impl UpstreamPool {
     /// endpoint, which emits full socket addresses over an authenticated
     /// channel.
     pub fn mark_unhealthy(&self, addr: SocketAddr) {
-        for b in &self.backends {
-            if b.addr == addr {
-                let previous = b.healthy.swap(false, Ordering::Release);
-                if previous {
-                    // true → false: transition
-                    let err_str = b.last_error.lock().clone();
-                    let masked = mask_addr(&addr);
-                    warn!(
-                        upstream = %masked,
-                        reason = %err_str.as_deref().unwrap_or("<no details>"),
-                        "upstream transitioned to unhealthy",
-                    );
-                } else {
-                    debug!(%addr, "backend already unhealthy");
-                }
-                return;
-            }
+        let Some(&i) = self.addr_index.get(&addr) else {
+            return;
+        };
+        let b = &self.backends[i];
+        let previous = b.healthy.swap(false, Ordering::Release);
+        if previous {
+            // true → false: transition
+            let err_str = b.last_error.lock().clone();
+            let masked = mask_addr(&addr);
+            warn!(
+                upstream = %masked,
+                reason = %err_str.as_deref().unwrap_or("<no details>"),
+                "upstream transitioned to unhealthy",
+            );
+        } else {
+            debug!(%addr, "backend already unhealthy");
         }
     }
 
@@ -517,11 +528,8 @@ impl UpstreamPool {
     ///
     /// Safe to call repeatedly — the most recent error wins.
     pub fn record_probe_error(&self, addr: SocketAddr, reason: String) {
-        for b in &self.backends {
-            if b.addr == addr {
-                *b.last_error.lock() = Some(reason);
-                return;
-            }
+        if let Some(&i) = self.addr_index.get(&addr) {
+            *self.backends[i].last_error.lock() = Some(reason);
         }
     }
 
@@ -530,48 +538,46 @@ impl UpstreamPool {
     /// Returns `false` if the backend is at `max_conns` and the increment was
     /// rejected — the caller should try another backend or return 502.
     pub fn acquire_connection(&self, addr: SocketAddr) -> bool {
-        for b in &self.backends {
-            if b.addr == addr {
-                if let Some(max) = b.max_conns {
-                    // Compare-and-swap loop to atomically check + increment
-                    let mut current = b.active_conns.load(Ordering::Relaxed);
-                    loop {
-                        if current >= max {
-                            return false;
-                        }
-                        match b.active_conns.compare_exchange_weak(
-                            current,
-                            current + 1,
-                            Ordering::AcqRel,
-                            Ordering::Relaxed,
-                        ) {
-                            Ok(_) => return true,
-                            Err(actual) => current = actual,
-                        }
-                    }
-                } else {
-                    b.active_conns.fetch_add(1, Ordering::Relaxed);
-                    return true;
+        let Some(&i) = self.addr_index.get(&addr) else {
+            // Unknown addr — don't block it
+            return true;
+        };
+        let b = &self.backends[i];
+        if let Some(max) = b.max_conns {
+            // Compare-and-swap loop to atomically check + increment
+            let mut current = b.active_conns.load(Ordering::Relaxed);
+            loop {
+                if current >= max {
+                    return false;
+                }
+                match b.active_conns.compare_exchange_weak(
+                    current,
+                    current + 1,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return true,
+                    Err(actual) => current = actual,
                 }
             }
+        } else {
+            b.active_conns.fetch_add(1, Ordering::Relaxed);
+            true
         }
-        // Unknown addr — don't block it
-        true
     }
 
     /// Decrement the active-connection counter when a request completes.
     pub fn release_connection(&self, addr: SocketAddr) {
-        for b in &self.backends {
-            if b.addr == addr {
-                // Saturating sub prevents underflow if release is called without acquire
-                b.active_conns
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                        Some(v.saturating_sub(1))
-                    })
-                    .ok();
-                return;
-            }
-        }
+        let Some(&i) = self.addr_index.get(&addr) else {
+            return;
+        };
+        // Saturating sub prevents underflow if release is called without acquire
+        self.backends[i]
+            .active_conns
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            })
+            .ok();
     }
 
     /// The address of the first backend — used for the `default_upstream` inline
@@ -588,6 +594,12 @@ impl UpstreamPool {
     /// Returns `true` if the pool has no backends.
     pub fn is_empty(&self) -> bool {
         self.backends.is_empty()
+    }
+
+    /// Expose the addr→index map for tests that verify the O(1) path is wired up.
+    #[cfg(test)]
+    pub(crate) fn addr_index(&self) -> &HashMap<SocketAddr, usize> {
+        &self.addr_index
     }
 }
 
@@ -1485,6 +1497,80 @@ mod tests {
             elapsed.as_millis() < 200,
             "expected parallel completion ~150 ms, got {} ms — probes may be running sequentially",
             elapsed.as_millis()
+        );
+    }
+
+    // ── O(1) index: issue #161 ───────────────────────────────────────────────
+
+    /// Verify that the addr→index map is built correctly at construction time and
+    /// that acquire/release operate on the backend the index points to — not on
+    /// whichever backend happens to be at position 0.  This is the regression test
+    /// for issue #161: before the fix these methods did an O(n) linear scan; now
+    /// they go through `addr_index` for O(1) lookup.
+    #[test]
+    fn addr_index_covers_all_backends() {
+        let ports = [8001u16, 8002, 8003, 8004, 8005];
+        let pool = make_pool(&ports, LbPolicy::RoundRobin);
+
+        // Every backend must appear in the index with the correct Vec position.
+        for (expected_i, &port) in ports.iter().enumerate() {
+            let addr = make_addr(port);
+            let &actual_i = pool
+                .addr_index()
+                .get(&addr)
+                .expect("addr must be present in index");
+            assert_eq!(
+                actual_i, expected_i,
+                "index must point to the right Vec slot"
+            );
+            assert_eq!(
+                pool.backends[actual_i].addr, addr,
+                "Vec slot must hold the expected backend"
+            );
+        }
+    }
+
+    /// `acquire_connection` and `release_connection` must affect the backend that
+    /// matches the given addr — not any other backend.  With 5 backends, a linear
+    /// scan and an index lookup are only observationally equivalent when both
+    /// touch the same slot; here we target the middle backend (8003) to rule out
+    /// accidental correctness from always hitting index 0 or the last element.
+    #[test]
+    fn acquire_release_targets_correct_backend_via_index() {
+        let pool = make_pool(&[8001, 8002, 8003, 8004, 8005], LbPolicy::RoundRobin);
+        let target: SocketAddr = "127.0.0.1:8003"
+            .parse()
+            .expect("literal socket addr must parse");
+
+        // All counters start at zero.
+        for b in &pool.backends {
+            assert_eq!(b.active_conns.load(Ordering::Relaxed), 0);
+        }
+
+        assert!(pool.acquire_connection(target), "acquire must succeed");
+
+        // Only the backend at 8003 should have a non-zero counter.
+        let &i = pool.addr_index().get(&target).expect("must be indexed");
+        assert_eq!(
+            pool.backends[i].active_conns.load(Ordering::Relaxed),
+            1,
+            "acquire must increment the counter on the indexed backend"
+        );
+        for (j, b) in pool.backends.iter().enumerate() {
+            if j != i {
+                assert_eq!(
+                    b.active_conns.load(Ordering::Relaxed),
+                    0,
+                    "acquire must not touch other backends"
+                );
+            }
+        }
+
+        pool.release_connection(target);
+        assert_eq!(
+            pool.backends[i].active_conns.load(Ordering::Relaxed),
+            0,
+            "release must decrement the counter back to zero"
         );
     }
 }
