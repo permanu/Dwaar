@@ -15,6 +15,27 @@
 //! compiled from the Dwaarfile, [`CacheBackend`] bundles the `'static`
 //! references that Pingora's `Storage` trait demands, and helper functions
 //! build cache keys and meta defaults.
+//!
+//! # Intentional leak on resize (ISSUE-154)
+//!
+//! Pingora's `HttpCache::enable()` requires `&'static` references for the
+//! storage backend, eviction manager, and cache lock — a hard API constraint
+//! (see `pingora_cache::storage::Storage`, upstream TODO: "shouldn't have to
+//! be static").  `Arc` cannot satisfy `&'static T`, so every time the
+//! operator changes the cache's `max_size` a fresh set of control structs is
+//! allocated via `Box::leak` (~1 KB each).  Old in-flight requests continue
+//! to hold the previous `&'static` refs safely; the leaked memory is never
+//! reclaimed.
+//!
+//! **Monitoring:** `leaked_cache_backend_count()` and
+//! `leaked_cache_backend_bytes()` are exported for Prometheus.  Both are
+//! monotonically increasing counters.  A spike indicates frequent resizes.
+//!
+//! **Recycling guidance:** With ~1 KB leaked per resize, 1000 resizes ≈ 1 MB
+//! total.  At one reload per day this budget spans ~2–3 years; at one per
+//! hour, ~41 days.  Configure your supervisor to recycle the process
+//! periodically if automated reloads are frequent.  The `leaked_backend_count`
+//! Prometheus metric is the right signal for an alert.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -26,6 +47,26 @@ use pingora_cache::{CacheKey, CacheMetaDefaults, MemCache};
 
 /// Number of cache backends that have been leaked since process start.
 /// Increments by one on every successful [`new_cache_backend`] call.
+///
+/// # Leak budget and process recycling (ISSUE-154)
+///
+/// Each increment represents ~1 KB of leaked control-struct memory.  The
+/// recommendation is to recycle the process when this counter approaches
+/// `1000` — i.e., after ~1000 cache resizes, which at the typical rate of
+/// one operator-driven reload per day corresponds to about **2–3 years** of
+/// uptime.  For sites that reload more aggressively (e.g., 10 reloads/day
+/// via automation) the equivalent budget runs out after ~100 days; at 100
+/// reloads/day, after ~10 days.
+///
+/// Why `Box::leak` and not `Arc`?  Pingora's `HttpCache::enable()` signature
+/// requires `&'static (dyn Storage + Sync)` and `&'static (dyn
+/// EvictionManager + Sync)` — the `'static` bound is a hard API requirement
+/// (see `pingora_cache::storage::Storage`; upstream comment: "TODO: shouldn't
+/// have to be static").  `Arc<T>` does not satisfy `&'static T` because an
+/// `Arc` is bounded by the `Arc`'s own lifetime, not the process lifetime.
+/// The only way to obtain `&'static T` from a heap allocation today is
+/// `Box::leak`.  If Pingora relaxes the `'static` bound in a future release,
+/// this leak can be eliminated.
 static LEAKED_BACKEND_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Approximate cumulative bytes intentionally leaked by [`new_cache_backend`]
@@ -168,12 +209,24 @@ pub type SharedCacheBackend = std::sync::Arc<arc_swap::ArcSwap<Option<CacheBacke
 /// and is abandoned, not leaked again.  Since cache resizes happen at
 /// most a handful of times per deployment the cumulative leak is
 /// negligible.
+///
+/// # Why Arc doesn't help (ISSUE-154)
+///
+/// `Arc<MemCache>` has a lifetime bounded by the `Arc` itself — it is not
+/// `'static`.  Pingora's `HttpCache::enable()` requires
+/// `&'static (dyn Storage + Sync)` (source: `pingora_cache::lib`).  You
+/// cannot coerce `&Arc<T>` into `&'static T` without unsafe transmutation,
+/// which defeats the purpose.  `Box::leak` is the only safe mechanism.  If
+/// Pingora ever relaxes the `'static` bound, this function should be
+/// rewritten to use `Arc` + `ArcSwap` — see ISSUE-154.
 pub fn new_cache_backend(max_size: usize) -> CacheBackend {
-    // WHY Box::leak: Pingora's Storage trait requires `&'static` references to
-    // the backing store, eviction manager, and cache lock.  The only safe way
-    // to produce a `'static` reference from a heap allocation (without a true
-    // program-lifetime static) is `Box::leak`, which forfeits ownership to the
-    // allocator and prevents the destructor from ever running.
+    // WHY Box::leak: Pingora's `HttpCache::enable()` requires `&'static`
+    // references for storage, eviction, and lock.  The `'static` bound is
+    // explicit in the function signature
+    // (`pingora_cache::HttpCache::enable`, lines 487-490) and acknowledged
+    // as a temporary constraint by the Pingora maintainers ("TODO: shouldn't
+    // have to be static").  `Arc<T>` cannot satisfy `&'static T` — the Arc
+    // borrow ends when the Arc is dropped, not at process exit.
     //
     // On the first call this is effectively free.  On subsequent calls (config
     // reload / eviction-budget resize) the *old* structs are abandoned — their
@@ -183,6 +236,9 @@ pub fn new_cache_backend(max_size: usize) -> CacheBackend {
     // control structs accumulate.  Reloads are rare (operator-driven), so the
     // total leak stays negligible over a typical deployment lifetime.
     // Monitor via `leaked_reload_count()` / `leaked_cache_backend_bytes()`.
+    //
+    // Recycling guidance: 1000 reloads ≈ 1 MB.  At one reload/day → ~3 years.
+    // At one reload/hour → ~41 days.  Alert on `leaked_backend_count > 1000`.
 
     // SAFETY: Box::leak is intentional — see comment above.
     let eviction: &'static LruManager<16> =
@@ -394,6 +450,7 @@ mod tests {
 
     #[test]
     fn new_backend_returns_valid_refs() {
+        let _guard = lock_leak_tests();
         let backend = new_cache_backend(1024 * 1024);
         let _ = format!("{backend:?}");
         assert_eq!(backend.max_size, 1024 * 1024);
@@ -401,6 +458,7 @@ mod tests {
 
     #[test]
     fn new_backend_can_be_called_multiple_times() {
+        let _guard = lock_leak_tests();
         let a = new_cache_backend(1_000_000);
         let b = new_cache_backend(2_000_000);
         assert_eq!(a.max_size, 1_000_000);
@@ -425,6 +483,7 @@ mod tests {
 
     #[test]
     fn realloc_swaps_backend() {
+        let _guard = lock_leak_tests();
         let shared: SharedCacheBackend = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
             Some(new_cache_backend(1_000_000)),
         ));
@@ -436,6 +495,7 @@ mod tests {
 
     #[test]
     fn realloc_skips_unchanged() {
+        let _guard = lock_leak_tests();
         let shared: SharedCacheBackend = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
             Some(new_cache_backend(1_000_000)),
         ));
@@ -459,5 +519,105 @@ mod tests {
         ) as usize;
 
         assert_eq!(ptr_before, ptr_after, "no reallocation expected");
+    }
+
+    // -- leak metric tracking (ISSUE-154) ------------------------------------
+    //
+    // These tests use a module-level mutex to serialize access to the global
+    // leak-counter atomics.  Without serialization, concurrent tests that call
+    // `new_cache_backend` would increment the shared counters between a test's
+    // snapshot and its assertion, causing spurious failures.
+
+    use std::sync::{Mutex, MutexGuard};
+
+    static LEAK_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn lock_leak_tests() -> MutexGuard<'static, ()> {
+        LEAK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Verify that each `new_cache_backend` call increments both leak counters
+    /// by the expected deltas.  This proves the monitoring mechanism is wired
+    /// correctly — operators can trust these Prometheus metrics to signal when
+    /// it is time to recycle the process.
+    #[test]
+    fn leak_counters_increment_on_each_new_backend() {
+        let _guard = lock_leak_tests();
+
+        let count_before = leaked_cache_backend_count();
+        let bytes_before = leaked_cache_backend_bytes();
+
+        let _b = new_cache_backend(512 * 1024);
+
+        // Each call leaks exactly one backend (count +1) and APPROX_BACKEND_OVERHEAD_BYTES.
+        assert_eq!(
+            leaked_cache_backend_count(),
+            count_before + 1,
+            "backend count should increment by 1 per allocation"
+        );
+        assert_eq!(
+            leaked_cache_backend_bytes(),
+            bytes_before + APPROX_BACKEND_OVERHEAD_BYTES,
+            "leaked bytes should increment by APPROX_BACKEND_OVERHEAD_BYTES per allocation"
+        );
+    }
+
+    /// Verify that `realloc_cache_backend` does not call `new_cache_backend`
+    /// (and therefore does not increment leak counters) when the size is
+    /// unchanged.  This ensures the no-op guard eliminates needless leaks.
+    #[test]
+    fn realloc_no_leak_when_size_unchanged() {
+        let _guard = lock_leak_tests();
+
+        let shared: SharedCacheBackend = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+            Some(new_cache_backend(8 * 1024 * 1024)),
+        ));
+
+        let count_before = leaked_cache_backend_count();
+        let bytes_before = leaked_cache_backend_bytes();
+
+        // Same size — must not allocate a new backend.
+        realloc_cache_backend(&shared, 8 * 1024 * 1024);
+
+        assert_eq!(
+            leaked_cache_backend_count(),
+            count_before,
+            "no new leak when size is unchanged"
+        );
+        assert_eq!(
+            leaked_cache_backend_bytes(),
+            bytes_before,
+            "no new leaked bytes when size is unchanged"
+        );
+    }
+
+    /// Verify that `realloc_cache_backend` increments leak counters by exactly
+    /// one backend when the size changes.
+    #[test]
+    fn realloc_increments_leak_on_resize() {
+        let _guard = lock_leak_tests();
+
+        let shared: SharedCacheBackend = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+            Some(new_cache_backend(4 * 1024 * 1024)),
+        ));
+
+        let count_before = leaked_cache_backend_count();
+        let bytes_before = leaked_cache_backend_bytes();
+
+        // Different size — should allocate and leak a new backend.
+        realloc_cache_backend(&shared, 8 * 1024 * 1024);
+
+        assert_eq!(
+            leaked_cache_backend_count(),
+            count_before + 1,
+            "leak count increments by 1 on resize"
+        );
+        assert_eq!(
+            leaked_cache_backend_bytes(),
+            bytes_before + APPROX_BACKEND_OVERHEAD_BYTES,
+            "leaked bytes increment on resize"
+        );
     }
 }
