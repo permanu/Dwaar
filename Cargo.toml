@@ -36,7 +36,7 @@ pingora-cache = { version = "0.8.0" }
 pingora-error = { version = "0.8.0" }
 
 # Async runtime
-tokio = { version = "1.50.0", default-features = false }
+tokio = { version = "1.52.1", default-features = false }
 async-trait = "0.1"
 
 # Serialization
