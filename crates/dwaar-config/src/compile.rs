@@ -1306,10 +1306,14 @@ fn compile_reverse_proxy_handler(rp: &ReverseProxyDirective, location: &str) -> 
 
     if rp.upstreams.len() <= 1 && !is_block_form {
         // Common single-upstream case — zero overhead path.
+        // Build the HttpPeer once here so upstream_peer() can clone it on the
+        // hot path instead of constructing a new one per request.
         let addr = resolve_upstream(&rp.upstreams)?;
+        let pre_built_peer = Arc::new(dwaar_core::route::build_single_backend_peer(addr));
         return Some(Handler::ReverseProxy {
             upstream: addr,
             upstream_h2: rp.transport_h2,
+            pre_built_peer: Some(pre_built_peer),
         });
     }
 
@@ -2733,6 +2737,65 @@ mod tests {
 
     // Smoke test: compile_forward_auth must succeed (return Some) both with and
     // without allow_plaintext. When true, a tracing::warn! fires at config load
+    // ── Pre-built peer tests (#164) ──────────────────────────────────────────
+
+    #[test]
+    fn single_backend_route_has_pre_built_peer() {
+        // A single-backend route compiled by compile_routes should carry a
+        // pre-built HttpPeer so upstream_peer() can clone it instead of
+        // constructing one from scratch on every request.
+        let config = DwaarConfig {
+            global_options: None,
+            sites: vec![make_site("example.com", rp("127.0.0.1:8080"))],
+        };
+        let table = compile_routes(&config);
+        let route = table.resolve("example.com").expect("should resolve");
+        let block = route.handlers.first().expect("has handler block");
+        match &block.handler {
+            Handler::ReverseProxy {
+                pre_built_peer,
+                upstream,
+                ..
+            } => {
+                assert!(
+                    pre_built_peer.is_some(),
+                    "single-backend route must carry a pre-built HttpPeer"
+                );
+                // The pre-built peer must target the configured upstream address.
+                if let Some(peer) = pre_built_peer {
+                    assert_eq!(
+                        peer._address.to_string(),
+                        upstream.to_string(),
+                        "pre-built peer must target the same upstream as the route"
+                    );
+                }
+            }
+            other => panic!("expected ReverseProxy handler, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multi_backend_route_has_no_pre_built_peer() {
+        // Multi-backend routes go through pool selection per request; there is
+        // no single fixed peer to pre-build.
+        let config = DwaarConfig {
+            global_options: None,
+            sites: vec![make_site(
+                "example.com",
+                rp_multi(&["127.0.0.1:8080", "127.0.0.1:8081"]),
+            )],
+        };
+        let table = compile_routes(&config);
+        let route = table.resolve("example.com").expect("should resolve");
+        let block = route.handlers.first().expect("has handler block");
+        assert!(
+            matches!(&block.handler, Handler::ReverseProxyPool { .. }),
+            "multi-backend route must use ReverseProxyPool, not ReverseProxy"
+        );
+        // ReverseProxyPool has no pre_built_peer field — absence of the field
+        // is the contract for pool routes (peer chosen per request at runtime).
+    }
+
     // (verified manually in startup logs). See issue #150.
     #[test]
     fn forward_auth_allow_plaintext_does_not_break_compilation() {

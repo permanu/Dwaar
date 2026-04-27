@@ -59,6 +59,7 @@ use compact_str::CompactString;
 
 use crate::template::{CompiledTemplate, TemplateContext, VarSlots};
 use crate::upstream::UpstreamPool;
+use pingora_core::upstreams::peer::HttpPeer;
 use regex::Regex;
 
 /// Validate that a string is a legal hostname or wildcard pattern.
@@ -125,11 +126,19 @@ pub enum Handler {
     /// Forward the request to a single upstream backend (zero-overhead common case).
     ///
     /// Used when the config has exactly one upstream and no block-form options.
-    /// Keeps `upstream_peer()` allocation-free: no `Arc` load, no pool scan.
+    /// `pre_built_peer` is constructed once at route-compile time so the hot
+    /// path skips `HttpPeer::new` and `PeerOptions` initialization on every
+    /// request. Pingora's trait requires `Box<HttpPeer>`, so the clone is
+    /// unavoidable, but cloning a pre-configured struct is cheaper than
+    /// constructing one from scratch (no `to_socket_addrs` call, no field-by-
+    /// field option setup).
     ReverseProxy {
         upstream: SocketAddr,
         /// Use HTTP/2 multiplexing for the upstream connection (H3 path only).
         upstream_h2: bool,
+        /// Pre-built peer for the common (non-gRPC) fast path. `None` only
+        /// during construction before `compile_routes` sets it.
+        pre_built_peer: Option<Arc<HttpPeer>>,
     },
     /// Forward the request through a load-balancing pool of backends.
     ///
@@ -500,6 +509,36 @@ pub enum CompiledMapPattern {
     Default,
 }
 
+// ── Pre-built peer helpers ────────────────────────────────────
+
+/// Build a plain HTTP/1.1 `HttpPeer` for a single-backend route with the
+/// standard Dwaar connection options pre-applied.
+///
+/// Called once at route-compile time per single-backend handler. The result is
+/// stored as `Arc<HttpPeer>` and cloned into the `Box` that Pingora's
+/// `upstream_peer` API requires — cloning a pre-configured struct is cheaper
+/// than constructing one from scratch on every request (no `to_socket_addrs`
+/// call, no field-by-field setup).
+///
+/// TLS is always `false` here — single-backend routes created via
+/// `Handler::ReverseProxy` are plain-HTTP. TLS upstreams go through
+/// `ReverseProxyPool` where the per-backend `tls` flag drives the peer.
+pub fn build_single_backend_peer(upstream: SocketAddr) -> HttpPeer {
+    let mut peer = HttpPeer::new(upstream, false, String::new());
+    peer.options.connection_timeout = Some(std::time::Duration::from_secs(10));
+    peer.options.read_timeout = Some(std::time::Duration::from_secs(30));
+    peer.options.write_timeout = Some(std::time::Duration::from_secs(30));
+    peer.options.tcp_keepalive = Some(pingora_core::protocols::TcpKeepalive {
+        idle: std::time::Duration::from_secs(60),
+        interval: std::time::Duration::from_secs(10),
+        count: 3,
+        #[cfg(target_os = "linux")]
+        user_timeout: std::time::Duration::ZERO,
+    });
+    peer.options.idle_timeout = Some(std::time::Duration::from_secs(60));
+    peer
+}
+
 // ── Route ────────────────────────────────────────────────────
 
 /// A site: one domain with its handler blocks.
@@ -598,6 +637,12 @@ impl Route {
                 handler: Handler::ReverseProxy {
                     upstream,
                     upstream_h2: false,
+                    // Peer is built here for the common single-backend case.
+                    // The compile path (compile_routes) overwrites this with a
+                    // fully-configured peer including timeout options. This
+                    // inline build covers the admin-API / test-construction path
+                    // where no compile_routes pass runs.
+                    pre_built_peer: Some(Arc::new(build_single_backend_peer(upstream))),
                 },
                 intercepts: vec![],
                 copy_response_headers: None,
