@@ -163,7 +163,7 @@ zstd = "0.13"
 # Testing
 tokio-test = "0.4.5"
 tempfile = "3.27.0"
-assert_cmd = "2.2.0"
+assert_cmd = "2.2.1"
 predicates = "3.1.4"
 criterion = { version = "0.8.2", features = ["html_reports"] }
 proptest = "1.11.0"
