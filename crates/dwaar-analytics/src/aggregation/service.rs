@@ -14,6 +14,7 @@
 //! The `DashMap` is shared via `Arc` so ISSUE-029's Admin API can
 //! read it concurrently without blocking the aggregation loop.
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -67,6 +68,11 @@ pub struct AggregationService<RT: RouteValidator> {
     /// External sink for analytics snapshots (ISSUE-116). `None` uses the
     /// legacy stdout flush path for backwards compatibility.
     sink: Option<Box<dyn AnalyticsSink>>,
+    /// When set, `run()` listens for notifications and calls
+    /// `evict_unknown_domains()` each time one arrives. Wire this to the
+    /// same `Notify` that `ConfigWatcher::with_post_reload_notify` fires so
+    /// the map shrinks whenever domains are removed from the config. #167
+    evict_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl<RT: RouteValidator> std::fmt::Debug for AggregationService<RT> {
@@ -104,6 +110,7 @@ impl<RT: RouteValidator> AggregationService<RT> {
             beacon_rx: Mutex::new(Some(beacon_rx)),
             log_rx: Mutex::new(Some(log_rx)),
             sink: None,
+            evict_notify: None,
         }
     }
 
@@ -114,6 +121,35 @@ impl<RT: RouteValidator> AggregationService<RT> {
     pub fn with_sink(mut self, sink: Box<dyn AnalyticsSink>) -> Self {
         self.sink = Some(sink);
         self
+    }
+
+    /// Register the `Notify` that fires after each hot-reload. On every
+    /// notification, `run()` calls `evict_unknown_domains()` so the metrics
+    /// map shrinks when domains are removed from the config. Wire this to
+    /// `ConfigWatcher::with_post_reload_notify`. See issue #167.
+    #[must_use]
+    pub fn with_evict_notify(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
+        self.evict_notify = Some(notify);
+        self
+    }
+
+    /// Drop metrics entries for domains that are no longer in the known-hosts
+    /// set.
+    ///
+    /// Called on hot-reload to keep the working set bounded as domains are
+    /// added and removed from the config over time. The pre-seeding pass at
+    /// construction (issue #163) keeps lookup contention-free; this paired
+    /// eviction sweep keeps the map from growing indefinitely. A `retain()`
+    /// over the `DashMap` is O(N) — one shard lock per shard — which is
+    /// acceptable since reloads are rare. #167
+    pub fn evict_unknown_domains(&self) {
+        let known: HashSet<String> = self.route_validator.known_hosts().into_iter().collect();
+        let before = self.metrics.len();
+        self.metrics.retain(|domain, _| known.contains(domain));
+        let removed = before.saturating_sub(self.metrics.len());
+        if removed > 0 {
+            debug!(removed, "evicted stale domain metrics after config reload");
+        }
     }
 
     /// Read-only access to the shared metrics map.
@@ -230,6 +266,17 @@ impl<RT: RouteValidator> AggregationService<RT> {
                 }
                 _ = flush_timer.tick() => {
                     self.flush();
+                }
+                // Hot-reload: drop entries for domains no longer in the config.
+                // The ConfigWatcher fires this after swapping the route table,
+                // so known_hosts() already reflects the new domain set. #167
+                () = async {
+                    match &self.evict_notify {
+                        Some(n) => n.notified().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.evict_unknown_domains();
                 }
                 _ = shutdown.changed() => {
                     self.flush();
@@ -805,6 +852,145 @@ mod tests {
         let entry = metrics.entry("a.example.com".to_string()).or_default();
         drop(entry);
         assert_eq!(metrics.len(), 3, "first ingest must not grow the map");
+    }
+
+    /// A test validator whose known-host set can be swapped at runtime,
+    /// simulating what happens when a hot-reload changes the route table.
+    struct MutableTestValidator(Arc<std::sync::Mutex<HashSet<String>>>);
+
+    impl MutableTestValidator {
+        fn new(domains: &[&str]) -> Self {
+            Self(Arc::new(std::sync::Mutex::new(
+                domains.iter().map(|&s| s.into()).collect(),
+            )))
+        }
+
+        fn set_known(&self, domains: &[&str]) {
+            *self.0.lock().expect("test mutex poisoned") =
+                domains.iter().map(|&s| s.into()).collect();
+        }
+    }
+
+    impl RouteValidator for MutableTestValidator {
+        fn is_known_host(&self, host: &str) -> bool {
+            self.0.lock().expect("test mutex poisoned").contains(host)
+        }
+
+        fn known_hosts(&self) -> Vec<String> {
+            self.0
+                .lock()
+                .expect("test mutex poisoned")
+                .iter()
+                .cloned()
+                .collect()
+        }
+    }
+
+    #[test]
+    fn evict_drops_domains_not_in_new_known_set() {
+        // Pair with #163 pre-seed: on hot reload, entries for domains that were
+        // removed from the config must be cleaned up. Without this, the DashMap
+        // grows indefinitely as domains are cycled in and out over the process
+        // lifetime. The retain() sweep is O(N) per reload — acceptable since
+        // reloads are rare. #167
+        let validator = MutableTestValidator::new(&["a.example.com", "b.example.com"]);
+        let (_beacon_tx, beacon_rx) = mpsc::channel(1);
+        let (_log_tx, log_rx) = mpsc::channel(1);
+        let metrics = Arc::new(DashMap::new());
+        let svc = AggregationService::new(
+            Arc::clone(&metrics),
+            validator,
+            beacon_rx,
+            AggReceiver { rx: log_rx },
+        );
+
+        // Both domains pre-seeded at construction (#163).
+        assert!(metrics.contains_key("a.example.com"), "a pre-seeded");
+        assert!(metrics.contains_key("b.example.com"), "b pre-seeded");
+
+        // Simulate config reload: 'a' removed from route table.
+        svc.route_validator.set_known(&["b.example.com"]);
+        svc.evict_unknown_domains();
+
+        assert!(
+            !metrics.contains_key("a.example.com"),
+            "a must be evicted after reload removes it from config"
+        );
+        assert!(
+            metrics.contains_key("b.example.com"),
+            "b must survive — it is still in the config"
+        );
+    }
+
+    #[test]
+    fn evict_with_empty_known_set_clears_all() {
+        // When all domains are removed from the config (e.g. the operator
+        // blanks the Dwaarfile during debugging), eviction must clear the map
+        // completely so no stale entry consumes memory.
+        let validator = MutableTestValidator::new(&["a.example.com"]);
+        let (_beacon_tx, beacon_rx) = mpsc::channel(1);
+        let (_log_tx, log_rx) = mpsc::channel(1);
+        let metrics = Arc::new(DashMap::new());
+        let svc = AggregationService::new(
+            Arc::clone(&metrics),
+            validator,
+            beacon_rx,
+            AggReceiver { rx: log_rx },
+        );
+
+        assert_eq!(metrics.len(), 1);
+        svc.route_validator.set_known(&[]);
+        svc.evict_unknown_domains();
+        assert_eq!(metrics.len(), 0, "empty known set must clear the map");
+    }
+
+    #[tokio::test]
+    async fn evict_notify_triggers_eviction_in_run_loop() {
+        // Verify the end-to-end wiring: when evict_notify fires, the run loop
+        // calls evict_unknown_domains() and drops stale entries. #167
+        let validator = MutableTestValidator::new(&["a.example.com", "b.example.com"]);
+        let (beacon_tx, beacon_rx) = mpsc::channel(8192);
+        let (log_tx, log_rx) = mpsc::channel(8192);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let evict_notify = Arc::new(tokio::sync::Notify::new());
+        let metrics = Arc::new(DashMap::new());
+
+        let svc = Arc::new(
+            AggregationService::new(
+                Arc::clone(&metrics),
+                validator,
+                beacon_rx,
+                AggReceiver { rx: log_rx },
+            )
+            .with_evict_notify(Arc::clone(&evict_notify)),
+        );
+
+        // Both domains pre-seeded.
+        assert!(metrics.contains_key("a.example.com"));
+        assert!(metrics.contains_key("b.example.com"));
+
+        // Start the run loop in the background.
+        let svc_clone = Arc::clone(&svc);
+        tokio::spawn(async move { svc_clone.run(shutdown_rx).await });
+
+        // Simulate reload: remove 'a' from the route table, then fire the notify.
+        svc.route_validator.set_known(&["b.example.com"]);
+        evict_notify.notify_one();
+
+        // Give the run loop a chance to process the notification.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(
+            !metrics.contains_key("a.example.com"),
+            "run loop must evict 'a' after notify"
+        );
+        assert!(metrics.contains_key("b.example.com"), "b survives");
+
+        // Clean up
+        drop(beacon_tx);
+        drop(log_tx);
+        shutdown_tx.send(true).expect("shutdown");
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     #[tokio::test]
