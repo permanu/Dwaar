@@ -174,6 +174,7 @@ pub fn resolve_upstream_addr(
             Handler::ReverseProxy {
                 upstream,
                 upstream_h2,
+                ..
             } => {
                 return Ok((*upstream, *upstream_h2));
             }

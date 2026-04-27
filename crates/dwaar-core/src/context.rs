@@ -47,6 +47,7 @@ use uuid::Uuid;
 use crate::route::{CompiledCopyResponseHeaders, CompiledIntercept};
 use crate::template::VarSlots;
 use crate::upstream::UpstreamPool;
+use pingora_core::upstreams::peer::HttpPeer;
 
 /// Per-request state shared across all Pingora lifecycle hooks.
 ///
@@ -133,6 +134,15 @@ pub struct RequestContext {
     /// `None` for single-upstream routes — they use `route_upstream` directly,
     /// avoiding all pool overhead on the common case.
     pub upstream_pool: Option<Arc<UpstreamPool>>,
+
+    /// Pre-built `HttpPeer` for single-backend routes (#164).
+    ///
+    /// Built once at route-compile time and shared across requests via `Arc`.
+    /// `upstream_peer()` clones the inner peer into the `Box` Pingora requires —
+    /// cloning a pre-configured struct avoids `HttpPeer::new` + `PeerOptions`
+    /// setup on every request. `None` when the route uses a pool or when gRPC
+    /// ALPN override is needed (those paths build the peer inline).
+    pub pre_built_peer: Option<Arc<HttpPeer>>,
 
     /// WebSocket upgrade detected — preserves hop-by-hop headers and skips
     /// analytics injection so Pingora can establish the bidirectional tunnel.
@@ -280,6 +290,7 @@ impl RequestContext {
             intercept_body: None,
             copy_response_headers: None,
             upstream_pool: None,
+            pre_built_peer: None,
             is_websocket: false,
             is_grpc: false,
             grpc_web_mode: None,

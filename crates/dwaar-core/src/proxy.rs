@@ -894,9 +894,16 @@ impl ProxyHttp for DwaarProxy {
                         crate::route::Handler::FileServer { root, browse } => {
                             ctx.file_server = Some((root.clone(), *browse));
                         }
-                        crate::route::Handler::ReverseProxy { upstream, .. } => {
+                        crate::route::Handler::ReverseProxy {
+                            upstream,
+                            pre_built_peer,
+                            ..
+                        } => {
                             ctx.route_upstream = Some(*upstream);
                             ctx.quic_capable = true;
+                            // Cache the pre-built peer so upstream_peer() can
+                            // clone it instead of constructing one from scratch.
+                            ctx.pre_built_peer.clone_from(pre_built_peer);
                         }
                         crate::route::Handler::ReverseProxyPool { pool, .. } => {
                             ctx.quic_capable = true;
@@ -1654,10 +1661,38 @@ impl ProxyHttp for DwaarProxy {
             "route resolved"
         );
 
-        let mut peer = HttpPeer::new(upstream, use_tls, sni);
-        peer.options.connection_timeout = Some(std::time::Duration::from_secs(10));
-        peer.options.read_timeout = Some(std::time::Duration::from_secs(30));
-        peer.options.write_timeout = Some(std::time::Duration::from_secs(30));
+        // Fast path (#164): single-backend routes carry a pre-built peer so we
+        // skip HttpPeer::new + PeerOptions construction on every request.
+        // The Arc clone is cheap; Box::new(Clone) copies the struct — still
+        // one allocation, but cheaper than field-by-field setup from scratch.
+        //
+        // Conditions that bypass the fast path and build inline:
+        //   • Pool route (mTLS, custom CA, TLS SNI — all pool-only features)
+        //   • gRPC request (needs ALPN::H2 override)
+        let mut peer = if let Some(ref cached) = ctx.pre_built_peer
+            && !ctx.is_grpc
+            && client_cert_key.is_none()
+            && trusted_ca.is_none()
+        {
+            // Clone the pre-configured peer — all timeout/keepalive fields are
+            // already set; nothing to patch for standard HTTP/1.1 requests.
+            (**cached).clone()
+        } else {
+            // Build the peer from scratch for pool routes and gRPC requests.
+            let mut p = HttpPeer::new(upstream, use_tls, sni);
+            p.options.connection_timeout = Some(std::time::Duration::from_secs(10));
+            p.options.read_timeout = Some(std::time::Duration::from_secs(30));
+            p.options.write_timeout = Some(std::time::Duration::from_secs(30));
+            p.options.tcp_keepalive = Some(pingora_core::protocols::TcpKeepalive {
+                idle: std::time::Duration::from_secs(60),
+                interval: std::time::Duration::from_secs(10),
+                count: 3,
+                #[cfg(target_os = "linux")]
+                user_timeout: std::time::Duration::ZERO,
+            });
+            p.options.idle_timeout = Some(std::time::Duration::from_secs(60));
+            p
+        };
 
         // Wire mTLS client cert into the peer (ISSUE-077)
         if let Some(ck) = client_cert_key {
@@ -1667,22 +1702,6 @@ impl ProxyHttp for DwaarProxy {
         if let Some(ca) = trusted_ca {
             peer.options.ca = Some(ca);
         }
-
-        // Detect dead upstream connections via TCP keepalive probes instead of
-        // waiting for read_timeout (30s) on a silently broken connection.
-        // Probes start after 60s idle, retry every 10s, give up after 3 failures.
-        peer.options.tcp_keepalive = Some(pingora_core::protocols::TcpKeepalive {
-            idle: std::time::Duration::from_secs(60),
-            interval: std::time::Duration::from_secs(10),
-            count: 3,
-            #[cfg(target_os = "linux")]
-            user_timeout: std::time::Duration::ZERO,
-        });
-
-        // Evict idle connections from the pool before the upstream closes them.
-        // Set slightly below common upstream keepalive_timeout (nginx default: 75s)
-        // to avoid sending requests on connections the upstream is about to close.
-        peer.options.idle_timeout = Some(std::time::Duration::from_secs(60));
 
         // gRPC requires HTTP/2 end-to-end — force h2 ALPN negotiation
         if ctx.is_grpc {
