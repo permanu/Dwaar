@@ -957,20 +957,20 @@ fn run_server(
         .and_then(|g| g.tracing.as_ref())
         .map_or(1.0, |t| t.sample_ratio);
 
-    let proxy = DwaarProxy::new(
+    let proxy = DwaarProxy::new(dwaar_core::proxy::ProxyConfig {
         route_table,
-        challenge_solver.clone(),
+        challenge_solver: challenge_solver.clone(),
         log_sender,
         beacon_sender,
         agg_sender,
         geo_lookup,
         plugin_chain,
-        prometheus.clone(),
+        prometheus: prometheus.clone(),
         cache_backend,
-        u64::from(timeouts.keepalive_secs),
-        u64::from(timeouts.body_secs),
+        keepalive_secs: u64::from(timeouts.keepalive_secs),
+        body_timeout_secs: u64::from(timeouts.body_secs),
         h3_enabled,
-    )
+    })
     .with_control_plane(control_plane_hooks)
     .with_mirror_dispatcher(
         Arc::clone(&mirror_dispatcher) as Arc<dyn dwaar_core::proxy::MirrorDispatcher>
