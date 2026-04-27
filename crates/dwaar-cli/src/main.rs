@@ -814,15 +814,52 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-#[allow(clippy::too_many_lines)]
-fn run_server(
+/// State produced by compiling the route table and wrapping it in hot-reload
+/// handles. Every field here is an `Arc` so callers can freely clone without
+/// transferring ownership.
+struct RouteState {
+    route_table: Arc<ArcSwap<dwaar_core::route::RouteTable>>,
+    health_pools: Arc<ArcSwap<Vec<Arc<dwaar_core::upstream::UpstreamPool>>>>,
+    dwaarfile_snapshot: Arc<ArcSwap<Vec<dwaar_core::route::Route>>>,
+    config_notify: Arc<tokio::sync::Notify>,
+    acme_domains: Arc<ArcSwap<Vec<String>>>,
+    challenge_solver: Option<Arc<ChallengeSolver>>,
+}
+
+/// Per-feature channels and optional subsystems that the proxy and background
+/// services both consume. Each field is `Option` — absent when the feature is
+/// disabled via CLI flag.
+struct FeatureState {
+    log_sender: Option<dwaar_log::LogSender>,
+    log_receiver: Option<dwaar_log::LogReceiver>,
+    beacon_sender: Option<dwaar_analytics::beacon::BeaconSender>,
+    beacon_receiver: Option<tokio::sync::mpsc::Receiver<dwaar_analytics::beacon::BeaconEvent>>,
+    agg_sender: Option<aggregation::AggSender>,
+    agg_receiver: Option<aggregation::AggReceiver>,
+    geo_lookup: Option<Arc<dwaar_geo::GeoLookup>>,
+    plugin_chain: Arc<dwaar_plugins::plugin::PluginChain>,
+    prometheus: Option<Arc<dwaar_analytics::prometheus::PrometheusMetrics>>,
+    cache_backend: Option<dwaar_core::cache::SharedCacheBackend>,
+}
+
+/// Outputs of the proxy-construction phase: the ready proxy instance and the
+/// gRPC service + OTLP exporter that need to be wired into other services.
+struct ProxyState {
+    proxy: DwaarProxy,
+    grpc_service: dwaar_grpc::DwaarControlService,
+    otlp_exporter: Option<Arc<dwaar_analytics::otel::OtlpExporter>>,
+}
+
+/// Build the `Server` from CLI flags and config, computing thread counts and
+/// keepalive sizing from the route hint so we don't oversubscribe on small
+/// deployments.
+fn build_pingora_server(
     cli: &Cli,
     dwaar_config: &dwaar_config::model::DwaarConfig,
-    config_path: &std::path::Path,
     drain_timeout: std::time::Duration,
     worker_id: usize,
     worker_count: usize,
-) -> anyhow::Result<()> {
+) -> (Server, String, u64) {
     // `DWAAR_UPGRADE_FROM=1` is an env-var equivalent of `--upgrade` so the
     // installer can set the flag without modifying argv (e.g. when re-exec'ing
     // with execve where changing argv[0] is simpler than injecting flags).
@@ -905,7 +942,19 @@ fn run_server(
         "server bootstrapped"
     );
 
-    // Compile routes (has_l4 already computed above for thread sizing)
+    (server, upgrade_sock, conf_drain_secs)
+}
+
+/// Compile routes, wrap them in `ArcSwap` hot-reload handles, and initialise
+/// ACME domain tracking. The returned `RouteState` is the single source of
+/// truth that `FeatureState`, `ProxyState`, and all background services
+/// reference via `Arc::clone`.
+fn build_route_state(dwaar_config: &dwaar_config::model::DwaarConfig) -> RouteState {
+    let has_l4 = dwaar_config
+        .global_options
+        .as_ref()
+        .is_some_and(|g| g.layer4.is_some() || !g.layer4_listener_wrappers.is_empty());
+
     let route_table = compile_routes(dwaar_config);
     if route_table.is_empty() && !has_l4 {
         warn!("no routes configured — proxy is idle, waiting for config reload");
@@ -919,13 +968,11 @@ fn run_server(
     // Capture initial routes before wrapping — DockerWatcher needs a
     // separate snapshot of Dwaarfile routes for merge operations.
     let initial_routes = route_table.all_routes();
-
     let route_table = Arc::new(ArcSwap::from_pointee(route_table));
 
     // Shared state for Docker mode: the snapshot holds compiled Dwaarfile
     // routes, and the Notify wakes DockerWatcher to re-merge after changes.
-    let dwaarfile_snapshot: Arc<ArcSwap<Vec<dwaar_core::route::Route>>> =
-        Arc::new(ArcSwap::from_pointee(initial_routes));
+    let dwaarfile_snapshot = Arc::new(ArcSwap::from_pointee(initial_routes));
     let config_notify = Arc::new(tokio::sync::Notify::new());
 
     // ACME domain list — wrapped in ArcSwap so ConfigWatcher can swap in
@@ -937,6 +984,23 @@ fn run_server(
         Some(Arc::new(ChallengeSolver::new()))
     };
 
+    RouteState {
+        route_table,
+        health_pools,
+        dwaarfile_snapshot,
+        config_notify,
+        acme_domains,
+        challenge_solver,
+    }
+}
+
+/// Open log/analytics channels and initialise feature subsystems (`GeoIP`,
+/// plugins, Prometheus, HTTP cache) according to CLI feature flags. Each
+/// subsystem is independent — a failure in one doesn't affect the others.
+fn build_feature_state(
+    cli: &Cli,
+    route_table: &Arc<ArcSwap<dwaar_core::route::RouteTable>>,
+) -> FeatureState {
     let (log_sender, log_receiver) = if cli.logging_enabled() {
         let (s, r) = log_channel();
         (Some(s), Some(r))
@@ -953,12 +1017,6 @@ fn run_server(
         info!("analytics disabled via CLI flag");
         (None, None, None, None)
     };
-
-    let route_table_for_admin = Arc::clone(&route_table);
-    let route_table_for_watcher = Arc::clone(&route_table);
-    let route_table_for_docker = Arc::clone(&route_table);
-    let route_table_for_agg = Arc::clone(&route_table);
-    let route_table_for_grpc = Arc::clone(&route_table);
 
     // GeoIP — load the MaxMind database if present. Not a hard requirement;
     // country enrichment simply won't happen without it.
@@ -1010,7 +1068,7 @@ fn run_server(
 
     // Prometheus metrics registry (ISSUE-072)
     let prometheus = if cli.metrics_enabled() {
-        Some(std::sync::Arc::new(
+        Some(Arc::new(
             dwaar_analytics::prometheus::PrometheusMetrics::new(),
         ))
     } else {
@@ -1049,6 +1107,30 @@ fn run_server(
         "feature flags resolved"
     );
 
+    FeatureState {
+        log_sender,
+        log_receiver,
+        beacon_sender,
+        beacon_receiver,
+        agg_sender,
+        agg_receiver,
+        geo_lookup,
+        plugin_chain,
+        prometheus,
+        cache_backend,
+    }
+}
+
+/// Wire together the gRPC control-plane service, the OTLP span exporter, and
+/// the `DwaarProxy` instance. The gRPC service is built first so its split and
+/// header-rule registries can be plumbed into the proxy's hot path before any
+/// request arrives.
+fn build_proxy(
+    dwaar_config: &dwaar_config::model::DwaarConfig,
+    routes: &RouteState,
+    features: FeatureState,
+    worker_id: usize,
+) -> ProxyState {
     let timeouts = extract_timeouts(dwaar_config);
 
     let h3_enabled = dwaar_config
@@ -1056,11 +1138,7 @@ fn run_server(
         .as_ref()
         .is_some_and(|g| g.h3_enabled);
 
-    // Clone before moving into DwaarProxy — QUIC service needs the same Arcs.
-    let route_table_for_quic = Arc::clone(&route_table);
-    let plugin_chain_for_quic = Arc::clone(&plugin_chain);
-    let cache_backend_for_admin = cache_backend.clone();
-    let cache_backend_for_watcher = cache_backend.clone();
+    let route_table_for_grpc = Arc::clone(&routes.route_table);
 
     // Build the DwaarControl service up-front so its registries can be
     // shared with DwaarProxy's hot path (Wheel #2 Week 4) AND handed to the
@@ -1068,7 +1146,7 @@ fn run_server(
     // internal handle is an `Arc` — so both consumers get independent clones.
     let grpc_service = dwaar_grpc::DwaarControlService::new(
         format!("dwaar-worker-{worker_id}"),
-        Arc::clone(&route_table_for_grpc),
+        route_table_for_grpc,
     );
     let control_plane_hooks = dwaar_core::proxy::ControlPlaneHooks {
         splits: grpc_service.split_registry(),
@@ -1088,7 +1166,7 @@ fn run_server(
     // DwaarProxy (records one span per request in logging()) and the
     // background flush service (drains the ring buffer to the collector).
     // Kept as `None` when the Dwaarfile has no `tracing {}` block.
-    let otlp_exporter_for_proxy: Option<Arc<dwaar_analytics::otel::OtlpExporter>> = dwaar_config
+    let otlp_exporter: Option<Arc<dwaar_analytics::otel::OtlpExporter>> = dwaar_config
         .global_options
         .as_ref()
         .and_then(|g| g.tracing.as_ref())
@@ -1114,15 +1192,15 @@ fn run_server(
         .map_or(1.0, |t| t.sample_ratio);
 
     let proxy = DwaarProxy::new(dwaar_core::proxy::ProxyConfig {
-        route_table,
-        challenge_solver: challenge_solver.clone(),
-        log_sender,
-        beacon_sender,
-        agg_sender,
-        geo_lookup,
-        plugin_chain,
-        prometheus: prometheus.clone(),
-        cache_backend,
+        route_table: Arc::clone(&routes.route_table),
+        challenge_solver: routes.challenge_solver.clone(),
+        log_sender: features.log_sender,
+        beacon_sender: features.beacon_sender,
+        agg_sender: features.agg_sender,
+        geo_lookup: features.geo_lookup,
+        plugin_chain: Arc::clone(&features.plugin_chain),
+        prometheus: features.prometheus.clone(),
+        cache_backend: features.cache_backend.clone(),
         keepalive_secs: u64::from(timeouts.keepalive_secs),
         body_timeout_secs: u64::from(timeouts.body_secs),
         h3_enabled,
@@ -1132,7 +1210,7 @@ fn run_server(
         Arc::clone(&mirror_dispatcher) as Arc<dyn dwaar_core::proxy::MirrorDispatcher>
     )
     .with_outcome_sink(Arc::clone(&outcome_sink) as Arc<dyn dwaar_core::proxy::RequestOutcomeSink>);
-    let proxy = if let Some(ref exp) = otlp_exporter_for_proxy {
+    let proxy = if let Some(ref exp) = otlp_exporter {
         proxy.with_otlp_exporter(Arc::clone(exp), otlp_sample_ratio)
     } else {
         proxy
@@ -1142,6 +1220,50 @@ fn run_server(
     // `Arc`s' ref counts honest for now — cheap atomic decrements.
     drop(mirror_metrics);
     drop(log_buffer);
+
+    ProxyState {
+        proxy,
+        grpc_service,
+        otlp_exporter,
+    }
+}
+
+/// Return type of `bind_proxy_listeners`: cert store, SNI map, optional OTLP
+/// exporter, and the gRPC service handle (all needed by later setup phases).
+type ListenerOutputs = (
+    Arc<CertStore>,
+    DomainConfigMap,
+    Option<Arc<dwaar_analytics::otel::OtlpExporter>>,
+    dwaar_grpc::DwaarControlService,
+);
+
+/// Create the HTTP proxy service, bind all plain-HTTP and TLS listeners, and
+/// register the HTTP/3 QUIC listener when enabled. Returns the cert store and
+/// SNI domain map so `ConfigWatcher` can swap in new certs on hot-reload.
+///
+/// The proxy service is added to `server` before returning; QUIC runs as a
+/// separate `BackgroundService` alongside it.
+fn bind_proxy_listeners(
+    server: &mut Server,
+    dwaar_config: &dwaar_config::model::DwaarConfig,
+    proxy_state: ProxyState,
+    routes: &RouteState,
+    features_plugin_chain: Arc<dwaar_plugins::plugin::PluginChain>,
+    timeouts: &dwaar_config::model::TimeoutsConfig,
+    worker_count: usize,
+) -> anyhow::Result<ListenerOutputs> {
+    let h3_enabled = dwaar_config
+        .global_options
+        .as_ref()
+        .is_some_and(|g| g.h3_enabled);
+
+    let route_table_for_quic = Arc::clone(&routes.route_table);
+
+    let ProxyState {
+        proxy,
+        grpc_service,
+        otlp_exporter,
+    } = proxy_state;
 
     let mut proxy_service = pingora_proxy::http_proxy_service(&server.configuration, proxy);
 
@@ -1214,7 +1336,7 @@ fn run_server(
                 &tls_cfg.cert_path,
                 &tls_cfg.key_path,
                 route_table_for_quic,
-                plugin_chain_for_quic,
+                features_plugin_chain,
                 None, // max_streams — use default (100)
             ) {
                 Ok(quic_service) => {
@@ -1235,22 +1357,36 @@ fn run_server(
         }
     }
 
+    Ok((cert_store, sni_domain_map, otlp_exporter, grpc_service))
+}
+
+/// Build and register the admin HTTP service. Worker 0 binds both the TCP
+/// address and the optional UDS path; other workers skip binding to avoid
+/// EADDRINUSE races. Returns the shared `agg_metrics` map so the aggregation
+/// background service can write into it.
+fn add_admin_service(
+    server: &mut Server,
+    cli: &Cli,
+    routes: &RouteState,
+    features_prometheus: Option<&Arc<dwaar_analytics::prometheus::PrometheusMetrics>>,
+    cache_backend_for_admin: Option<dwaar_core::cache::SharedCacheBackend>,
+    worker_id: usize,
+) -> anyhow::Result<Arc<DashMap<String, dwaar_analytics::aggregation::DomainMetrics>>> {
     // Shared analytics metrics — created here so both AdminService and
     // AggregationService reference the same DashMap instance.
     let agg_metrics: Arc<DashMap<String, dwaar_analytics::aggregation::DomainMetrics>> =
         Arc::new(DashMap::new());
 
-    // Admin API service
     let admin_token = std::env::var("DWAAR_ADMIN_TOKEN").ok();
     let admin_service = AdminService::new(
-        route_table_for_admin,
+        Arc::clone(&routes.route_table),
         Arc::clone(&agg_metrics),
         std::time::Instant::now(),
         admin_token,
     )
-    .with_reload_notify(Arc::clone(&config_notify));
+    .with_reload_notify(Arc::clone(&routes.config_notify));
 
-    let admin_service = if let Some(ref prom) = prometheus {
+    let admin_service = if let Some(prom) = features_prometheus {
         admin_service.with_prometheus(Arc::clone(prom))
     } else {
         admin_service
@@ -1302,7 +1438,21 @@ fn run_server(
     }
 
     server.add_service(admin_listening);
+    Ok(agg_metrics)
+}
 
+/// Register the gRPC control-plane server and the Layer 4 TCP proxy service.
+/// Both run as Pingora `BackgroundService`s so they share the server's
+/// shutdown lifecycle. Returns the L4 shared state for hot-reload.
+fn add_grpc_and_l4_services(
+    server: &mut Server,
+    cli: &Cli,
+    dwaar_config: &dwaar_config::model::DwaarConfig,
+    grpc_service: dwaar_grpc::DwaarControlService,
+    cert_store: &Arc<CertStore>,
+    worker_id: usize,
+) -> anyhow::Result<(dwaar_core::l4::SharedL4Servers, Arc<tokio::sync::Notify>)> {
+    use dwaar_config::compile::{compile_l4_servers, compile_l4_wrappers};
     // DwaarControl gRPC server (Wheel #2) — only worker 0 binds. Runs as a
     // Pingora BackgroundService so it shares the server's shutdown watch:
     // a SIGTERM on the Pingora side tears down the gRPC listener alongside
@@ -1334,73 +1484,152 @@ fn run_server(
 
     // Layer 4 TCP proxy — bind separate listeners for non-HTTP protocols.
     // Shared via ArcSwap so ConfigWatcher can hot-reload L4 config.
-    let l4_shared: dwaar_core::l4::SharedL4Servers;
     let l4_reload_notify = Arc::new(tokio::sync::Notify::new());
-    {
-        use dwaar_config::compile::{compile_l4_servers, compile_l4_wrappers};
 
-        let mut l4_servers = Vec::new();
-        if let Some(l4_cfg) = dwaar_config
-            .global_options
-            .as_ref()
-            .and_then(|g| g.layer4.as_ref())
-        {
-            l4_servers.extend(compile_l4_servers(l4_cfg));
-        }
-        if let Some(ref opts) = dwaar_config.global_options
-            && !opts.layer4_listener_wrappers.is_empty()
-        {
-            l4_servers.extend(compile_l4_wrappers(&opts.layer4_listener_wrappers));
-        }
-        // Inject the shared cert store into any L4 TLS handlers so they
-        // can look up certs by SNI at accept time.
-        for server_cfg in &mut l4_servers {
-            for route in &mut server_cfg.routes {
-                for handler in &mut route.handlers {
-                    if let dwaar_core::l4::CompiledL4Handler::Tls { cert_store: cs, .. } = handler {
-                        *cs = Some(Arc::clone(&cert_store));
-                    }
+    let mut l4_servers = Vec::new();
+    if let Some(l4_cfg) = dwaar_config
+        .global_options
+        .as_ref()
+        .and_then(|g| g.layer4.as_ref())
+    {
+        l4_servers.extend(compile_l4_servers(l4_cfg));
+    }
+    if let Some(ref opts) = dwaar_config.global_options
+        && !opts.layer4_listener_wrappers.is_empty()
+    {
+        l4_servers.extend(compile_l4_wrappers(&opts.layer4_listener_wrappers));
+    }
+    // Inject the shared cert store into any L4 TLS handlers so they
+    // can look up certs by SNI at accept time.
+    for server_cfg in &mut l4_servers {
+        for route in &mut server_cfg.routes {
+            for handler in &mut route.handlers {
+                if let dwaar_core::l4::CompiledL4Handler::Tls { cert_store: cs, .. } = handler {
+                    *cs = Some(Arc::clone(cert_store));
                 }
             }
         }
-
-        let count = l4_servers.len();
-        l4_shared = Arc::new(arc_swap::ArcSwap::from_pointee(l4_servers));
-        let l4_service = dwaar_core::l4::Layer4Service::new(
-            Arc::clone(&l4_shared),
-            Arc::clone(&l4_reload_notify),
-        );
-        let l4_bg = pingora_core::services::background::background_service("layer4", l4_service);
-        server.add_service(l4_bg);
-        if count > 0 {
-            info!(listeners = count, "layer4 TCP proxy service registered");
-        }
     }
+
+    let count = l4_servers.len();
+    let l4_shared = Arc::new(arc_swap::ArcSwap::from_pointee(l4_servers));
+    let l4_service =
+        dwaar_core::l4::Layer4Service::new(Arc::clone(&l4_shared), Arc::clone(&l4_reload_notify));
+    let l4_bg = pingora_core::services::background::background_service("layer4", l4_service);
+    server.add_service(l4_bg);
+    if count > 0 {
+        info!(listeners = count, "layer4 TCP proxy service registered");
+    }
+
+    Ok((l4_shared, l4_reload_notify))
+}
+
+/// Orchestrate the full server startup sequence. Each phase is a named helper
+/// that does one thing; this function threads the outputs between them and
+/// hands off to Pingora's `run_forever` once everything is wired.
+fn run_server(
+    cli: &Cli,
+    dwaar_config: &dwaar_config::model::DwaarConfig,
+    config_path: &std::path::Path,
+    drain_timeout: std::time::Duration,
+    worker_id: usize,
+    worker_count: usize,
+) -> anyhow::Result<()> {
+    let (mut server, upgrade_sock, conf_drain_secs) =
+        build_pingora_server(cli, dwaar_config, drain_timeout, worker_id, worker_count);
+
+    let routes = build_route_state(dwaar_config);
+
+    let FeatureState {
+        log_sender,
+        log_receiver,
+        beacon_sender,
+        beacon_receiver,
+        agg_sender,
+        agg_receiver,
+        geo_lookup,
+        plugin_chain,
+        prometheus,
+        cache_backend,
+    } = build_feature_state(cli, &routes.route_table);
+
+    // Clone handles needed by later phases before moving into build_proxy.
+    let plugin_chain_for_quic = Arc::clone(&plugin_chain);
+    let prometheus_for_admin = prometheus.clone();
+    let cache_for_admin = cache_backend.clone();
+    let cache_for_watcher = cache_backend.clone();
+    let route_table_for_watcher = Arc::clone(&routes.route_table);
+    let route_table_for_docker = Arc::clone(&routes.route_table);
+    let route_table_for_agg = Arc::clone(&routes.route_table);
+
+    let features_for_proxy = FeatureState {
+        log_sender,
+        log_receiver: None,
+        beacon_sender,
+        beacon_receiver: None,
+        agg_sender,
+        agg_receiver: None,
+        geo_lookup,
+        plugin_chain,
+        prometheus,
+        cache_backend,
+    };
+
+    let timeouts = extract_timeouts(dwaar_config);
+    let proxy_state = build_proxy(dwaar_config, &routes, features_for_proxy, worker_id);
+
+    let (cert_store, sni_domain_map, otlp_exporter, grpc_service) = bind_proxy_listeners(
+        &mut server,
+        dwaar_config,
+        proxy_state,
+        &routes,
+        plugin_chain_for_quic,
+        &timeouts,
+        worker_count,
+    )?;
+
+    let agg_metrics = add_admin_service(
+        &mut server,
+        cli,
+        &routes,
+        prometheus_for_admin.as_ref(),
+        cache_for_admin,
+        worker_id,
+    )?;
+
+    let (l4_shared, l4_reload_notify) = add_grpc_and_l4_services(
+        &mut server,
+        cli,
+        dwaar_config,
+        grpc_service,
+        &cert_store,
+        worker_id,
+    )?;
 
     register_background_services(
         &mut server,
         cli,
-        challenge_solver.as_ref(),
+        routes.challenge_solver.as_ref(),
         &cert_store,
         log_receiver,
         config_path,
         &route_table_for_watcher,
         &route_table_for_docker,
-        &dwaarfile_snapshot,
-        &config_notify,
+        &routes.dwaarfile_snapshot,
+        &routes.config_notify,
         beacon_receiver,
         agg_receiver,
         &route_table_for_agg,
         &agg_metrics,
-        health_pools,
-        acme_domains,
+        routes.health_pools,
+        routes.acme_domains,
         drain_timeout,
         sni_domain_map,
-        cache_backend_for_watcher,
+        cache_for_watcher,
         dwaar_config,
         l4_shared,
         l4_reload_notify,
-        otlp_exporter_for_proxy,
+        otlp_exporter,
     );
 
     // Install the SIGUSR2 handler for zero-downtime graceful upgrades.
