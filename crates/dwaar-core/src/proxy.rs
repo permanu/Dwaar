@@ -76,6 +76,26 @@ fn sanitize_redirect_path(path: &str) -> String {
     }
 }
 
+/// Strip the port from a `Host` header value, handling both hostname:port and
+/// IPv6 bracket-notation (`[::1]:port`). Returns a borrow of just the host part.
+///
+/// Called in `request_filter()` before the route-table lookup and in
+/// `upstream_peer()` as a defensive fallback when `ctx.route_upstream` is
+/// absent. Extracted so both sites share one path and the logic is testable
+/// without a live Pingora `Session`.
+pub(crate) fn strip_port_from_host(host: &str) -> &str {
+    if host.starts_with('[') {
+        // IPv6 bracket notation: [::1]:8080 — strip leading `[` and everything from `]` on.
+        host.split(']')
+            .next()
+            .unwrap_or(host)
+            .trim_start_matches('[')
+    } else {
+        // IPv4 / hostname: example.com:8080 — strip the last `:port` segment.
+        host.rsplit_once(':').map_or(host, |(h, _)| h)
+    }
+}
+
 /// Extract a named cookie's value from a `Cookie` header string.
 ///
 /// Parses `key1=val1; key2=val2` format. Returns `None` if the cookie isn't present.
@@ -825,16 +845,7 @@ impl ProxyHttp for DwaarProxy {
         // Look up the route before running plugins so rate_limit_rps and
         // under_attack flags are available to the plugin chain.
         if let Some(ref host) = ctx.plugin_ctx.host {
-            let host_stripped = if host.starts_with('[') {
-                // IPv6 bracket notation: [::1]:8080
-                host.split(']')
-                    .next()
-                    .unwrap_or(host)
-                    .trim_start_matches('[')
-            } else {
-                // IPv4 or hostname: example.com:8080
-                host.rsplit_once(':').map_or(host.as_str(), |(h, _)| h)
-            };
+            let host_stripped = strip_port_from_host(host);
             let table = self.route_table.load();
             if let Some(route) = table.resolve(host_stripped) {
                 // Route is being drained (removed in a config reload but still
@@ -1575,13 +1586,11 @@ impl ProxyHttp for DwaarProxy {
             addr
         } else {
             // Defensive fallback — should not happen in normal flow
-            let host = ctx.plugin_ctx.host.as_deref().map_or("", |h| {
-                if h.starts_with('[') {
-                    h.split(']').next().unwrap_or(h).trim_start_matches('[')
-                } else {
-                    h.rsplit_once(':').map_or(h, |(host, _)| host)
-                }
-            });
+            let host = ctx
+                .plugin_ctx
+                .host
+                .as_deref()
+                .map_or("", strip_port_from_host);
             let table = self.route_table.load();
             let route = table.resolve(host).ok_or_else(|| {
                 warn!(host = %host, request_id = %ctx.request_id(), "no route for host");
@@ -2886,6 +2895,240 @@ mod tests {
             assert!(
                 elapsed >= TTL,
                 "stale entry should fail the TTL check; elapsed={elapsed:?}"
+            );
+        }
+    }
+
+    // ── strip_port_from_host ──────────────────────────────────────────────────
+    //
+    // This helper is called in two places: `request_filter()` before the route-
+    // table lookup and `upstream_peer()` in the defensive fallback branch. Tests
+    // here cover the cases that matter for correct routing — the function must
+    // never return an empty string or a string containing a port, and it must
+    // handle all four address forms the proxy sees in practice.
+
+    mod strip_port_tests {
+        use super::super::strip_port_from_host;
+
+        #[test]
+        fn hostname_with_port_strips_port() {
+            assert_eq!(strip_port_from_host("example.com:8080"), "example.com");
+        }
+
+        #[test]
+        fn hostname_without_port_is_unchanged() {
+            // No colon present — the rsplit_once branch must return the original.
+            assert_eq!(strip_port_from_host("example.com"), "example.com");
+        }
+
+        #[test]
+        fn ipv4_with_port_strips_port() {
+            assert_eq!(strip_port_from_host("10.0.0.1:3000"), "10.0.0.1");
+        }
+
+        #[test]
+        fn ipv6_bracketed_with_port_strips_port_and_brackets() {
+            // Browsers and curl send `[::1]:8080` in the Host header.
+            assert_eq!(strip_port_from_host("[::1]:8080"), "::1");
+        }
+
+        #[test]
+        fn ipv6_bracketed_without_port_strips_brackets() {
+            // Some clients omit the port for the default port.
+            assert_eq!(strip_port_from_host("[::1]"), "::1");
+        }
+
+        #[test]
+        fn ipv6_full_address_with_port() {
+            assert_eq!(strip_port_from_host("[2001:db8::1]:443"), "2001:db8::1");
+        }
+    }
+
+    // ── sanitize_redirect_path ────────────────────────────────────────────────
+    //
+    // `sanitize_redirect_path` runs on every HTTPS redirect. The three cases
+    // tested here correspond to the three branches in the function body and
+    // cover the two security invariants: no CRLF injection, no open-redirect
+    // via protocol-relative URLs (`//evil.com`).
+
+    mod redirect_path_tests {
+        use super::super::sanitize_redirect_path;
+
+        #[test]
+        fn normal_path_is_returned_unchanged() {
+            assert_eq!(sanitize_redirect_path("/foo/bar?q=1"), "/foo/bar?q=1");
+        }
+
+        #[test]
+        fn crlf_characters_are_stripped() {
+            // A `\r\n` in the path would allow injecting arbitrary HTTP headers
+            // into the redirect response.
+            let evil = "/path\r\nX-Injected: header";
+            let result = sanitize_redirect_path(evil);
+            assert!(!result.contains('\r'), "CR must be stripped");
+            assert!(!result.contains('\n'), "LF must be stripped");
+            assert_eq!(result, "/pathX-Injected: header");
+        }
+
+        #[test]
+        fn double_slash_prefix_collapsed_to_prevent_open_redirect() {
+            // `//evil.com` is treated as a protocol-relative URL by browsers —
+            // they'd redirect to https://evil.com. Collapse to a single `/`.
+            assert_eq!(sanitize_redirect_path("//evil.com/path"), "/evil.com/path");
+        }
+
+        #[test]
+        fn empty_path_becomes_root() {
+            assert_eq!(sanitize_redirect_path(""), "/");
+        }
+    }
+
+    // ── is_essential_header ───────────────────────────────────────────────────
+    //
+    // `is_essential_header` guards `copy_response_headers include` from stripping
+    // headers that are required for correct HTTP framing. A false negative here
+    // means a plugin config can break the connection.
+
+    mod essential_header_tests {
+        use super::super::is_essential_header;
+
+        #[test]
+        fn content_type_is_essential() {
+            assert!(is_essential_header("content-type"));
+        }
+
+        #[test]
+        fn content_length_is_essential() {
+            assert!(is_essential_header("content-length"));
+        }
+
+        #[test]
+        fn case_insensitive_match() {
+            // HTTP header names are case-insensitive (RFC 7230 §3.2).
+            assert!(is_essential_header("Content-Type"));
+            assert!(is_essential_header("CONTENT-LENGTH"));
+        }
+
+        #[test]
+        fn custom_header_is_not_essential() {
+            // Custom headers must be strippable so the include-list feature works.
+            assert!(!is_essential_header("x-custom-header"));
+            assert!(!is_essential_header("x-request-id"));
+        }
+    }
+
+    // ── upstream retry — idempotent method guard ──────────────────────────────
+    //
+    // `fail_to_connect()` gates retries on `RetryConfig::is_idempotent_method`.
+    // These tests verify that the gate accepts the safe methods (GET, HEAD,
+    // OPTIONS) and rejects the unsafe ones (POST, PUT, DELETE, PATCH).
+    // A false positive here would replay a non-idempotent request — a correctness
+    // bug visible to the upstream service.
+
+    mod retry_idempotent_tests {
+        use crate::upstream::RetryConfig;
+
+        #[test]
+        fn get_is_idempotent() {
+            assert!(RetryConfig::is_idempotent_method("GET"));
+        }
+
+        #[test]
+        fn head_is_idempotent() {
+            assert!(RetryConfig::is_idempotent_method("HEAD"));
+        }
+
+        #[test]
+        fn options_is_idempotent() {
+            assert!(RetryConfig::is_idempotent_method("OPTIONS"));
+        }
+
+        #[test]
+        fn post_is_not_idempotent() {
+            assert!(!RetryConfig::is_idempotent_method("POST"));
+        }
+
+        #[test]
+        fn put_is_not_idempotent() {
+            assert!(!RetryConfig::is_idempotent_method("PUT"));
+        }
+
+        #[test]
+        fn delete_is_not_idempotent() {
+            assert!(!RetryConfig::is_idempotent_method("DELETE"));
+        }
+
+        #[test]
+        fn patch_is_not_idempotent() {
+            assert!(!RetryConfig::is_idempotent_method("PATCH"));
+        }
+    }
+
+    // ── route draining ────────────────────────────────────────────────────────
+    //
+    // `request_filter()` checks `route.is_draining()` before accepting a new
+    // connection and responds 502 when the route is being torn down. These tests
+    // verify the state transition used by that branch without requiring a live
+    // Session: a freshly created Route must not be draining, and it must be
+    // draining after `mark_draining()` is called. The active-connection counter
+    // must also start at zero so the drain-wait logic terminates correctly.
+
+    mod route_draining_tests {
+        use super::*;
+        use crate::route::Route;
+
+        fn make_route(domain: &str) -> Route {
+            Route::new(
+                domain,
+                "127.0.0.1:8080".parse().expect("valid"),
+                false,
+                None,
+            )
+        }
+
+        #[test]
+        fn new_route_is_not_draining() {
+            let route = make_route("example.com");
+            assert!(!route.is_draining(), "new route must not be draining");
+        }
+
+        #[test]
+        fn mark_draining_sets_flag() {
+            let route = make_route("example.com");
+            route.mark_draining();
+            assert!(
+                route.is_draining(),
+                "route must be draining after mark_draining()"
+            );
+        }
+
+        #[test]
+        fn new_route_has_zero_active_connections() {
+            let route = make_route("example.com");
+            assert_eq!(
+                route.active_connection_count(),
+                0,
+                "active_connection_count must start at zero"
+            );
+        }
+
+        #[test]
+        fn route_table_resolves_by_stripped_host() {
+            // Verify that the route-table lookup following strip_port_from_host
+            // finds the route registered under the bare domain. This is the
+            // combined code path exercised by request_filter() on every request.
+            let table = RouteTable::new(vec![Route::new(
+                "example.com",
+                "127.0.0.1:8080".parse().expect("valid"),
+                false,
+                None,
+            )]);
+            // Host header arrives as "example.com:80" — after stripping the port
+            // the lookup must succeed.
+            let stripped = super::super::strip_port_from_host("example.com:80");
+            assert!(
+                table.resolve(stripped).is_some(),
+                "route lookup after port stripping must succeed"
             );
         }
     }
