@@ -739,13 +739,104 @@ pub(super) fn parse_root(t: &mut Tokenizer<'_>) -> Result<RootDirective, ParseEr
     }
 }
 
-/// `file_server` or `file_server browse`
-pub(super) fn parse_file_server(t: &mut Tokenizer<'_>) -> FileServerDirective {
-    let browse = matches!(t.peek().kind, TokenKind::Word(ref w) if w == "browse");
-    if browse {
+/// `file_server` — either inline (`file_server` / `file_server browse`)
+/// or block form:
+/// ```text
+/// file_server {
+///     browse on|off
+///     fallback /index.html
+/// }
+/// ```
+///
+/// The block form supports SPA-style fallback so that client-routed apps
+/// (`SvelteKit`, React Router, Vue Router) can recover from 404 by serving
+/// `index.html` for non-asset paths.
+pub(super) fn parse_file_server(t: &mut Tokenizer<'_>) -> Result<FileServerDirective, ParseError> {
+    let mut browse = false;
+    let mut fallback: Option<String> = None;
+
+    // Inline shorthand: `file_server browse` (preserves backwards compat).
+    if matches!(t.peek().kind, TokenKind::Word(ref w) if w == "browse") {
         t.next_token();
+        browse = true;
     }
-    FileServerDirective { browse }
+
+    // Optional block form follows.
+    if matches!(t.peek().kind, TokenKind::OpenBrace) {
+        t.next_token();
+        loop {
+            let tok = t.next_token();
+            let (line, col) = (tok.line, tok.col);
+            match tok.kind {
+                TokenKind::CloseBrace | TokenKind::Eof => break,
+                TokenKind::Word(ref sub) => match sub.as_str() {
+                    "browse" => {
+                        // `browse` (toggle on) or `browse on|off`
+                        match t.peek().kind {
+                            TokenKind::Word(ref w) if w == "on" => {
+                                t.next_token();
+                                browse = true;
+                            }
+                            TokenKind::Word(ref w) if w == "off" => {
+                                t.next_token();
+                                browse = false;
+                            }
+                            _ => {
+                                browse = true;
+                            }
+                        }
+                    }
+                    "fallback" => {
+                        let val = expect_word_or_quoted(t, "file_server", "fallback path")?;
+                        if val.contains("..") {
+                            return Err(ParseError {
+                                line,
+                                col,
+                                kind: ParseErrorKind::InvalidValue {
+                                    directive: "file_server".to_string(),
+                                    message: format!(
+                                        "fallback path '{val}' contains '..' (path traversal not allowed)"
+                                    ),
+                                    accepted_format: Some(
+                                        "fallback /index.html  (relative to root)",
+                                    ),
+                                },
+                            });
+                        }
+                        if val.contains('\0') {
+                            return Err(ParseError {
+                                line,
+                                col,
+                                kind: ParseErrorKind::InvalidValue {
+                                    directive: "file_server".to_string(),
+                                    message: "fallback path contains null byte".to_string(),
+                                    accepted_format: None,
+                                },
+                            });
+                        }
+                        fallback = Some(val);
+                    }
+                    other => {
+                        return Err(ParseError {
+                            line,
+                            col,
+                            kind: ParseErrorKind::InvalidValue {
+                                directive: "file_server".to_string(),
+                                message: format!(
+                                    "unknown subdirective '{other}' inside file_server block; \
+                                     expected 'browse' or 'fallback'"
+                                ),
+                                accepted_format: None,
+                            },
+                        });
+                    }
+                },
+                _ => {}
+            }
+        }
+    }
+
+    Ok(FileServerDirective { browse, fallback })
 }
 
 /// `php_fastcgi localhost:9000` — proxy to `FastCGI` backend.

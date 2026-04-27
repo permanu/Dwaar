@@ -856,7 +856,10 @@ fn file_server_parses() {
     assert!(matches!(config.sites[0].directives[0], Directive::Root(_)));
     assert!(matches!(
         config.sites[0].directives[1],
-        Directive::FileServer(FileServerDirective { browse: false })
+        Directive::FileServer(FileServerDirective {
+            browse: false,
+            fallback: None,
+        })
     ));
 }
 
@@ -866,8 +869,62 @@ fn file_server_browse() {
         parse("a.com {\n    root * /var/www\n    file_server browse\n}\n").expect("should parse");
     assert!(matches!(
         config.sites[0].directives[1],
-        Directive::FileServer(FileServerDirective { browse: true })
+        Directive::FileServer(FileServerDirective {
+            browse: true,
+            fallback: None,
+        })
     ));
+}
+
+#[test]
+fn file_server_block_with_fallback() {
+    let src =
+        "a.com {\n    root * /var/www\n    file_server {\n        fallback /index.html\n    }\n}\n";
+    let config = parse(src).expect("should parse");
+    let Directive::FileServer(fs) = &config.sites[0].directives[1] else {
+        panic!("expected FileServer");
+    };
+    assert!(!fs.browse);
+    assert_eq!(fs.fallback.as_deref(), Some("/index.html"));
+}
+
+#[test]
+fn file_server_block_browse_off_with_fallback() {
+    let src = "a.com {\n    root * /var/www\n    file_server {\n        browse off\n        fallback /index.html\n    }\n}\n";
+    let config = parse(src).expect("should parse");
+    let Directive::FileServer(fs) = &config.sites[0].directives[1] else {
+        panic!("expected FileServer");
+    };
+    assert!(!fs.browse);
+    assert_eq!(fs.fallback.as_deref(), Some("/index.html"));
+}
+
+#[test]
+fn file_server_block_browse_on_with_fallback() {
+    let src = "a.com {\n    root * /var/www\n    file_server {\n        browse on\n        fallback /index.html\n    }\n}\n";
+    let config = parse(src).expect("should parse");
+    let Directive::FileServer(fs) = &config.sites[0].directives[1] else {
+        panic!("expected FileServer");
+    };
+    assert!(fs.browse);
+    assert_eq!(fs.fallback.as_deref(), Some("/index.html"));
+}
+
+#[test]
+fn file_server_fallback_rejects_path_traversal() {
+    let src = "a.com {\n    root * /var/www\n    file_server {\n        fallback /../etc/passwd\n    }\n}\n";
+    let err = parse(src).expect_err("should reject ..");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("traversal") || msg.contains(".."),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn file_server_unknown_subdirective_rejected() {
+    let src = "a.com {\n    root * /var/www\n    file_server {\n        bogus value\n    }\n}\n";
+    parse(src).expect_err("should reject unknown subdirective");
 }
 
 #[test]

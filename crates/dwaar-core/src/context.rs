@@ -101,7 +101,9 @@ pub struct RequestContext {
     pub forward_auth: Option<std::sync::Arc<dwaar_plugins::forward_auth::ForwardAuthConfig>>,
 
     /// File server config cached from route lookup (Guardrail #27).
-    pub file_server: Option<(std::path::PathBuf, bool)>,
+    /// Tuple: `(root, browse, fallback)` where `fallback` is the optional
+    /// SPA fallback path (already canonicalized inside `root` at compile time).
+    pub file_server: Option<(std::path::PathBuf, bool, Option<std::path::PathBuf>)>,
 
     /// `FastCGI` document root cached from route lookup (Guardrail #27).
     pub fastcgi_root: Option<std::path::PathBuf>,

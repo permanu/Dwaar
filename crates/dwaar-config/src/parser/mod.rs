@@ -997,7 +997,7 @@ fn parse_directive(t: &mut Tokenizer<'_>) -> Result<Directive, ParseError> {
         )?)),
         "route" => Ok(Directive::Route(directives::parse_route(t)?)),
         "root" => Ok(Directive::Root(directives::parse_root(t)?)),
-        "file_server" => Ok(Directive::FileServer(directives::parse_file_server(t))),
+        "file_server" => Ok(Directive::FileServer(directives::parse_file_server(t)?)),
         "php_fastcgi" => Ok(Directive::PhpFastcgi(directives::parse_php_fastcgi(t)?)),
         "forward_auth" => Ok(Directive::ForwardAuth(directives::parse_forward_auth(t)?)),
         "try_files" => Ok(Directive::TryFiles(directives::parse_try_files(t)?)),

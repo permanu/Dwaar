@@ -155,6 +155,10 @@ pub enum Handler {
     FileServer {
         root: std::path::PathBuf,
         browse: bool,
+        /// Optional SPA fallback path (already canonicalized inside `root`
+        /// at compile time). Engaged when a request would otherwise 404
+        /// and the path doesn't look like a static asset.
+        fallback: Option<std::path::PathBuf>,
     },
     /// Proxy to a `FastCGI` backend (`php-fpm`). Used by `php_fastcgi` directive.
     FastCgi {
@@ -191,12 +195,14 @@ impl PartialEq for Handler {
                 Handler::FileServer {
                     root: r1,
                     browse: b1,
+                    fallback: f1,
                 },
                 Handler::FileServer {
                     root: r2,
                     browse: b2,
+                    fallback: f2,
                 },
-            ) => r1 == r2 && b1 == b2,
+            ) => r1 == r2 && b1 == b2 && f1 == f2,
             (
                 Handler::FastCgi {
                     upstream: u1,
