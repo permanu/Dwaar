@@ -89,73 +89,151 @@ enum WorkerRole {
 /// multi-threaded process is undefined behaviour; forking here (before Pingora's
 /// `run_forever()`) guarantees we are still single-threaded.
 #[allow(unsafe_code)]
-#[allow(clippy::too_many_lines)]
 fn fork_workers(
     count: usize,
     readiness_target: &readiness::ReadinessTarget,
 ) -> anyhow::Result<WorkerRole> {
     let mut children: Vec<libc::pid_t> = Vec::with_capacity(count);
 
+    // Spawn each worker via fork_one_worker. Children return immediately;
+    // the supervisor collects their PIDs and continues below.
     for id in 0..count {
-        // SAFETY: fork() before any tokio/Pingora initialisation — single-threaded.
-        let pid = unsafe { libc::fork() };
-        match pid {
-            -1 => {
-                let err = std::io::Error::last_os_error();
-                tracing::error!(worker = id, error = %err, "fork failed");
-                anyhow::bail!("fork failed for worker {id}: {err}");
-            }
-            0 => {
-                // Child — each worker returns immediately and starts its own server.
-                return Ok(WorkerRole::Worker(id));
-            }
-            child_pid => {
-                children.push(child_pid);
-            }
+        match fork_one_worker(id)? {
+            ForkOutcome::Worker(worker_id) => return Ok(WorkerRole::Worker(worker_id)),
+            ForkOutcome::Supervisor(child_pid) => children.push(child_pid),
         }
     }
 
     info!(workers = count, "supervisor: all worker processes started");
 
-    // Verify that worker 0 (the only worker that binds the admin listener)
-    // actually becomes reachable before we hand the supervisor loop control.
-    // Non-worker-0 children share the public SO_REUSEPORT listeners; they
-    // have no deterministic bind we can probe, so we accept fork() success
-    // as their readiness signal. This is the initial-boot probe; restart
-    // readiness is handled inside the supervisor loop below.
-    if let Some(&worker0_pid) = children.first() {
-        if let Err(e) = readiness::wait_for_child_ready(
-            worker0_pid,
-            readiness_target,
-            readiness::MAX_READINESS_TIMEOUT,
-        ) {
-            tracing::error!(
-                pid = worker0_pid,
-                error = %e,
-                "supervisor: worker 0 failed readiness probe on initial boot — aborting"
-            );
-            // Kill every worker we already started so the launcher doesn't
-            // leave half-bound processes around.
-            for &pid in &children {
-                // SAFETY: sending SIGKILL to known child PIDs.
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
-                }
-            }
-            anyhow::bail!("worker 0 readiness probe failed: {e}");
-        }
-        info!(
-            pid = worker0_pid,
-            "supervisor: worker 0 passed readiness probe"
-        );
-    }
+    // Block until worker 0 passes its readiness probe. Worker 0 is the only
+    // child that binds the admin listener, so it is the only one we can probe
+    // deterministically.
+    probe_worker0_readiness(&children, readiness_target)?;
 
-    // Track worker ID by PID so restarts preserve the logical ID.
+    // Build reverse mapping so restarts can preserve logical worker IDs.
     let mut pid_to_id: std::collections::HashMap<libc::pid_t, usize> =
         children.iter().enumerate().map(|(i, &p)| (p, i)).collect();
 
-    // Install signal handlers — propagate SIGTERM/SIGINT to workers.
-    // SAFETY: signal handler only sets an atomic flag.
+    // Install SIGTERM/SIGINT handlers so the supervisor can relay shutdown to
+    // workers when the operator sends a signal.
+    install_supervisor_signal_handlers();
+
+    let max_backoff = std::time::Duration::from_secs(30);
+    let crash_window = std::time::Duration::from_secs(5);
+    let stable_run = std::time::Duration::from_secs(30);
+    let mut backoff = std::time::Duration::from_secs(1);
+    let mut worker_started: std::collections::HashMap<libc::pid_t, std::time::Instant> = children
+        .iter()
+        .map(|&p| (p, std::time::Instant::now()))
+        .collect();
+
+    Ok(run_supervisor_loop(
+        &mut children,
+        &mut pid_to_id,
+        &mut worker_started,
+        &mut backoff,
+        max_backoff,
+        crash_window,
+        stable_run,
+        readiness_target,
+    ))
+}
+
+/// Outcome of a single `fork()` call during initial worker spawning.
+enum ForkOutcome {
+    /// This process is the supervisor; child has the given PID.
+    Supervisor(libc::pid_t),
+    /// This process is the new child with the given logical worker ID.
+    Worker(usize),
+}
+
+/// Fork one worker process with the given logical `id`.
+///
+/// Returns immediately in both parent and child. The caller must check the
+/// variant and either continue the spawn loop (supervisor) or break out and
+/// start the server (worker).
+///
+/// # Safety
+/// Must be called before any tokio/threading initialisation. `fork()` in a
+/// multi-threaded process is undefined behaviour.
+#[allow(unsafe_code)]
+fn fork_one_worker(id: usize) -> anyhow::Result<ForkOutcome> {
+    // SAFETY: fork() before any tokio/Pingora initialisation — single-threaded.
+    let pid = unsafe { libc::fork() };
+    match pid {
+        -1 => {
+            let err = std::io::Error::last_os_error();
+            tracing::error!(worker = id, error = %err, "fork failed");
+            anyhow::bail!("fork failed for worker {id}: {err}");
+        }
+        0 => Ok(ForkOutcome::Worker(id)),
+        child_pid => Ok(ForkOutcome::Supervisor(child_pid)),
+    }
+}
+
+/// Probe worker 0's readiness after the initial fork loop.
+///
+/// Worker 0 is the only child that binds the admin listener; it is therefore
+/// the only one we can probe deterministically. Non-zero workers share the
+/// public `SO_REUSEPORT` listeners and have no stable endpoint to hit before
+/// sibling workers are running, so their `fork()` success is treated as readiness.
+///
+/// On failure, sends SIGKILL to every child in `children` before returning the
+/// error so the caller doesn't leave half-bound processes around.
+///
+/// # Safety
+/// Sends SIGKILL to known child PIDs via `libc::kill` on readiness failure.
+#[allow(unsafe_code)]
+fn probe_worker0_readiness(
+    children: &[libc::pid_t],
+    readiness_target: &readiness::ReadinessTarget,
+) -> anyhow::Result<()> {
+    let Some(&worker0_pid) = children.first() else {
+        return Ok(());
+    };
+
+    if let Err(e) = readiness::wait_for_child_ready(
+        worker0_pid,
+        readiness_target,
+        readiness::MAX_READINESS_TIMEOUT,
+    ) {
+        tracing::error!(
+            pid = worker0_pid,
+            error = %e,
+            "supervisor: worker 0 failed readiness probe on initial boot — aborting"
+        );
+        // Kill every worker we already started so the launcher doesn't
+        // leave half-bound processes around.
+        for &pid in children {
+            // SAFETY: sending SIGKILL to known child PIDs.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        anyhow::bail!("worker 0 readiness probe failed: {e}");
+    }
+
+    info!(
+        pid = worker0_pid,
+        "supervisor: worker 0 passed readiness probe"
+    );
+    Ok(())
+}
+
+/// Install SIGTERM and SIGINT handlers that set the supervisor shutdown flag.
+///
+/// The handlers are async-signal-safe: they only write an atomic bool. The
+/// supervisor loop reads the flag with `SeqCst` ordering to guarantee the store
+/// is observed (H-05: Relaxed is a data race across the signal/main boundary
+/// because the C11 memory model provides no happens-before edge there).
+///
+/// # Safety
+/// Installs signal handlers via `libc::signal`. Must be called from the
+/// single-threaded supervisor before the wait loop.
+#[allow(unsafe_code)]
+fn install_supervisor_signal_handlers() {
+    // SAFETY: signal handler only sets an atomic flag — async-signal-safe.
     unsafe {
         libc::signal(
             libc::SIGTERM,
@@ -166,29 +244,167 @@ fn fork_workers(
             handle_shutdown as *const () as libc::sighandler_t,
         );
     }
+}
 
-    // Backoff for crash loops.
-    let max_backoff = std::time::Duration::from_secs(30);
-    let crash_window = std::time::Duration::from_secs(5);
-    let stable_run = std::time::Duration::from_secs(30);
-    let mut backoff = std::time::Duration::from_secs(1);
-    let mut worker_started: std::collections::HashMap<libc::pid_t, std::time::Instant> = children
-        .iter()
-        .map(|&p| (p, std::time::Instant::now()))
-        .collect();
+/// Apply crash-loop backoff for a worker that exited too quickly.
+///
+/// If the worker lived shorter than `crash_window`, sleeps for `backoff` and
+/// doubles it (capped at `max_backoff`). If it ran for at least `stable_run`,
+/// resets backoff to 1 s — a long-lived worker is not in a crash loop.
+///
+/// Returns the (possibly updated) backoff duration.
+fn apply_crash_backoff(
+    started_at: Option<std::time::Instant>,
+    exited_pid: libc::pid_t,
+    reason: &str,
+    backoff: std::time::Duration,
+    crash_window: std::time::Duration,
+    stable_run: std::time::Duration,
+    max_backoff: std::time::Duration,
+) -> std::time::Duration {
+    let Some(start) = started_at else {
+        return backoff;
+    };
 
-    // Supervisor loop — restart any worker that exits.
-    //
-    // H-05: the load below pairs with the SeqCst store inside the async-signal
-    // `handle_shutdown` handler. `Relaxed` is not safe across a signal / main
-    // thread boundary because the C11 memory model gives no happens-before
-    // edge there; only sequentially-consistent ordering on both ends gives a
-    // defined hand-off. The cost is a single cache-coherency barrier per loop
-    // iteration, which is already dominated by the blocking `waitpid` call.
+    if start.elapsed() < crash_window {
+        tracing::warn!(
+            pid = exited_pid,
+            reason,
+            backoff_ms = backoff.as_millis(),
+            "supervisor: worker crashed quickly — backing off"
+        );
+        std::thread::sleep(backoff);
+        return (backoff * 2).min(max_backoff);
+    }
+
+    if start.elapsed() >= stable_run {
+        return std::time::Duration::from_secs(1);
+    }
+
+    backoff
+}
+
+/// Fork a replacement for a dead worker and register it in the supervisor's
+/// tracking state.
+///
+/// Returns `Ok(Some(WorkerRole::Worker(id)))` when this process is the new
+/// child, so the caller can propagate the role immediately. Returns
+/// `Ok(None)` in the supervisor once the child has been registered (or
+/// dropped after a failed readiness probe).
+///
+/// # Safety
+/// Calls `fork()` — must be invoked from the single-threaded supervisor
+/// before any tokio/threading initialisation. Also calls `libc::kill` and
+/// `libc::waitpid` to clean up a child that fails its readiness probe.
+#[allow(unsafe_code)]
+fn restart_worker(
+    dead_id: usize,
+    readiness_target: &readiness::ReadinessTarget,
+    children: &mut Vec<libc::pid_t>,
+    pid_to_id: &mut std::collections::HashMap<libc::pid_t, usize>,
+    worker_started: &mut std::collections::HashMap<libc::pid_t, std::time::Instant>,
+    backoff: &mut std::time::Duration,
+    max_backoff: std::time::Duration,
+) -> Option<WorkerRole> {
+    // SAFETY: same single-threaded fork guarantee as the initial spawn.
+    let pid = unsafe { libc::fork() };
+    match pid {
+        -1 => {
+            let err = std::io::Error::last_os_error();
+            tracing::error!(error = %err, "supervisor: restart fork failed");
+        }
+        0 => {
+            return Some(WorkerRole::Worker(dead_id));
+        }
+        child_pid => {
+            // Only worker 0 owns the admin listener — its readiness can
+            // be verified by connecting to that endpoint. Non-zero worker
+            // restarts are accepted as ready on fork() success because
+            // they share `SO_REUSEPORT` listeners with their siblings and
+            // have no deterministic bind to probe.
+            if dead_id == 0 {
+                match readiness::wait_for_child_ready(
+                    child_pid,
+                    readiness_target,
+                    readiness::MAX_READINESS_TIMEOUT,
+                ) {
+                    Ok(()) => {
+                        info!(
+                            pid = child_pid,
+                            worker_id = dead_id,
+                            "supervisor: restarted worker passed readiness probe"
+                        );
+                        children.push(child_pid);
+                        pid_to_id.insert(child_pid, dead_id);
+                        worker_started.insert(child_pid, std::time::Instant::now());
+                    }
+                    Err(e) => {
+                        // Readiness failed — SIGKILL and fall back to the
+                        // normal crash-loop backoff so we don't spin.
+                        tracing::warn!(
+                            pid = child_pid,
+                            worker_id = dead_id,
+                            error = %e,
+                            "supervisor: restarted worker failed readiness probe — killing"
+                        );
+                        // SAFETY: SIGKILL to a known child PID.
+                        unsafe {
+                            libc::kill(child_pid, libc::SIGKILL);
+                        }
+                        // Reap the zombie so waitpid() above doesn't
+                        // double-report it in a later iteration.
+                        let mut wstatus: libc::c_int = 0;
+                        // SAFETY: blocking wait on the exact PID we just signalled.
+                        unsafe {
+                            libc::waitpid(child_pid, &raw mut wstatus, 0);
+                        }
+                        let _ = wstatus;
+                        std::thread::sleep(*backoff);
+                        *backoff = (*backoff * 2).min(max_backoff);
+                    }
+                }
+            } else {
+                children.push(child_pid);
+                pid_to_id.insert(child_pid, dead_id);
+                worker_started.insert(child_pid, std::time::Instant::now());
+            }
+        }
+    }
+    None
+}
+
+/// Supervisor wait loop — blocks until all workers have exited.
+///
+/// Waits for any child to exit via `waitpid(-1, ...)`, applies crash-loop
+/// backoff if it died quickly, then forks a replacement. Exits the loop
+/// when the shutdown flag is set or `waitpid` returns no more children.
+///
+/// # Safety
+/// Calls `fork()`, `libc::kill`, and `libc::waitpid` — must run in the
+/// single-threaded supervisor context (before tokio initialisation in any
+/// surviving child).
+///
+/// H-05: the `SHUTTING_DOWN` load uses `SeqCst` to pair with the `SeqCst`
+/// store in the async-signal handler. `Relaxed` is not safe here because
+/// the C11 memory model provides no happens-before edge across a signal
+/// boundary.
+#[allow(unsafe_code)]
+#[allow(clippy::too_many_arguments)]
+fn run_supervisor_loop(
+    children: &mut Vec<libc::pid_t>,
+    pid_to_id: &mut std::collections::HashMap<libc::pid_t, usize>,
+    worker_started: &mut std::collections::HashMap<libc::pid_t, std::time::Instant>,
+    backoff: &mut std::time::Duration,
+    max_backoff: std::time::Duration,
+    crash_window: std::time::Duration,
+    stable_run: std::time::Duration,
+    readiness_target: &readiness::ReadinessTarget,
+) -> WorkerRole {
     loop {
+        // H-05: SeqCst pairs with the SeqCst store in handle_shutdown.
         if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
             info!("supervisor: shutdown signal received, terminating workers");
-            for &pid in &children {
+            for &pid in children.iter() {
                 // SAFETY: sending SIGTERM to known child PIDs.
                 unsafe {
                     libc::kill(pid, libc::SIGTERM);
@@ -213,21 +429,15 @@ fn fork_workers(
             "unknown".to_string()
         };
 
-        // Backoff if the worker crashed quickly.
-        if let Some(&start) = worker_started.get(&exited_pid) {
-            if start.elapsed() < crash_window {
-                tracing::warn!(
-                    pid = exited_pid,
-                    reason,
-                    backoff_ms = backoff.as_millis(),
-                    "supervisor: worker crashed quickly — backing off"
-                );
-                std::thread::sleep(backoff);
-                backoff = (backoff * 2).min(max_backoff);
-            } else if start.elapsed() >= stable_run {
-                backoff = std::time::Duration::from_secs(1);
-            }
-        }
+        *backoff = apply_crash_backoff(
+            worker_started.get(&exited_pid).copied(),
+            exited_pid,
+            &reason,
+            *backoff,
+            crash_window,
+            stable_run,
+            max_backoff,
+        );
 
         tracing::warn!(
             pid = exited_pid,
@@ -235,79 +445,25 @@ fn fork_workers(
             "supervisor: worker exited — restarting"
         );
 
-        // Recover the dead worker's logical ID.
+        // Recover the dead worker's logical ID so the replacement keeps it.
         let dead_id = pid_to_id.remove(&exited_pid).unwrap_or(children.len());
         children.retain(|&p| p != exited_pid);
         worker_started.remove(&exited_pid);
 
-        // SAFETY: same single-threaded fork guarantee as above.
-        let pid = unsafe { libc::fork() };
-        match pid {
-            -1 => {
-                let err = std::io::Error::last_os_error();
-                tracing::error!(error = %err, "supervisor: restart fork failed");
-            }
-            0 => {
-                return Ok(WorkerRole::Worker(dead_id));
-            }
-            child_pid => {
-                // Only worker 0 owns the admin listener — its readiness can
-                // be verified by connecting to that endpoint. Non-zero worker
-                // restarts are accepted as ready on fork() success because
-                // they share SO_REUSEPORT listeners with their siblings and
-                // have no deterministic bind to probe.
-                if dead_id == 0 {
-                    match readiness::wait_for_child_ready(
-                        child_pid,
-                        readiness_target,
-                        readiness::MAX_READINESS_TIMEOUT,
-                    ) {
-                        Ok(()) => {
-                            info!(
-                                pid = child_pid,
-                                worker_id = dead_id,
-                                "supervisor: restarted worker passed readiness probe"
-                            );
-                            children.push(child_pid);
-                            pid_to_id.insert(child_pid, dead_id);
-                            worker_started.insert(child_pid, std::time::Instant::now());
-                        }
-                        Err(e) => {
-                            // Readiness failed — SIGKILL and fall back to the
-                            // normal crash-loop backoff so we don't spin.
-                            tracing::warn!(
-                                pid = child_pid,
-                                worker_id = dead_id,
-                                error = %e,
-                                "supervisor: restarted worker failed readiness probe — killing"
-                            );
-                            // SAFETY: SIGKILL to a known child PID.
-                            unsafe {
-                                libc::kill(child_pid, libc::SIGKILL);
-                            }
-                            // Reap the zombie so waitpid() above doesn't
-                            // double-report it in a later iteration.
-                            let mut wstatus: libc::c_int = 0;
-                            // SAFETY: blocking wait on the exact PID we just
-                            // signalled.
-                            unsafe {
-                                libc::waitpid(child_pid, &raw mut wstatus, 0);
-                            }
-                            let _ = wstatus;
-                            std::thread::sleep(backoff);
-                            backoff = (backoff * 2).min(max_backoff);
-                        }
-                    }
-                } else {
-                    children.push(child_pid);
-                    pid_to_id.insert(child_pid, dead_id);
-                    worker_started.insert(child_pid, std::time::Instant::now());
-                }
-            }
+        if let Some(role) = restart_worker(
+            dead_id,
+            readiness_target,
+            children,
+            pid_to_id,
+            worker_started,
+            backoff,
+            max_backoff,
+        ) {
+            return role;
         }
     }
 
-    Ok(WorkerRole::Supervisor)
+    WorkerRole::Supervisor
 }
 
 /// Supervisor shutdown flag — set by SIGTERM/SIGINT handler.
@@ -2182,5 +2338,19 @@ fn init_logging(cli: &Cli) {
             .with_max_level(level)
             .with_target(false)
             .init();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Smoke test for the `fork_workers` helper split (issue #172a).
+    ///
+    /// Real `fork()` behaviour is verified by integration / E2E tests. This
+    /// test exists to fail loudly if a refactor regression breaks compilation
+    /// in subtle ways — e.g. a helper signature changes while the orchestrator
+    /// still calls the old one.
+    #[test]
+    fn fork_workers_compiles_and_helpers_callable() {
+        // No-op: the test passes if the file compiles. Issue #172.
     }
 }
