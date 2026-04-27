@@ -90,6 +90,50 @@ fn extract_cookie_value<'a>(cookie_header: &'a str, name: &str) -> Option<&'a st
     })
 }
 
+/// All configuration required to construct a [`DwaarProxy`].
+///
+/// Replaces the previous 12-positional-parameter `DwaarProxy::new` signature.
+/// Every field is named so callers read as a struct literal — no positional
+/// confusion when adding or reordering fields in the future.
+#[derive(Debug)]
+pub struct ProxyConfig {
+    /// Lock-free route table shared with the config watcher (for hot reloads)
+    /// and the QUIC service.
+    pub route_table: Arc<ArcSwap<RouteTable>>,
+    /// ACME challenge solver for HTTP-01 challenges. `None` if TLS/ACME is
+    /// not in use.
+    pub challenge_solver: Option<Arc<ChallengeSolver>>,
+    /// Channel for structured request log events (async batch writer).
+    /// `None` when `--no-logging` is set.
+    pub log_sender: Option<LogSender>,
+    /// Channel for analytics beacon events (JS analytics pipeline).
+    /// `None` when `--no-analytics` is set.
+    pub beacon_sender: Option<BeaconSender>,
+    /// Channel for per-domain aggregation snapshots (HLL, t-digest, Top-K).
+    /// `None` when `--no-analytics` is set.
+    pub agg_sender: Option<AggSender>,
+    /// `GeoIP` lookup handle. `None` when `--no-geoip` is set or the `MaxMind`
+    /// database wasn't found.
+    pub geo_lookup: Option<Arc<dwaar_geo::GeoLookup>>,
+    /// Compiled plugin chain — bot detection, rate limiting, compression, etc.
+    /// Always present; an empty chain is used when `--no-plugins` is set.
+    pub plugin_chain: Arc<PluginChain>,
+    /// Prometheus metrics registry. `None` when `--no-metrics` is set.
+    pub prometheus: Option<Arc<dwaar_analytics::prometheus::PrometheusMetrics>>,
+    /// HTTP cache backend wrapped in an `ArcSwap` so the config watcher can
+    /// hot-swap the backend when cache sizes change. `None` when
+    /// `--no-cache` is set.
+    pub cache_backend: Option<crate::cache::SharedCacheBackend>,
+    /// Downstream keepalive timeout in seconds. Overrides Pingora's default.
+    pub keepalive_secs: u64,
+    /// Body read timeout in seconds. Applied after request headers arrive so
+    /// slow body senders get disconnected before consuming thread resources.
+    pub body_timeout_secs: u64,
+    /// When `true`, `response_filter` injects `Alt-Svc` to advertise HTTP/3
+    /// availability to browsers.
+    pub h3_enabled: bool,
+}
+
 /// The Dwaar proxy engine.
 ///
 /// Routes requests to upstreams based on the `Host` header, using a lock-free
@@ -191,35 +235,26 @@ pub trait MirrorDispatcher: std::fmt::Debug + Send + Sync {
     fn mirror(&self, domain: &str, method: &str, path: &str, headers: &[(String, String)]);
 }
 
-#[allow(clippy::too_many_arguments)]
 impl DwaarProxy {
-    pub fn new(
-        route_table: Arc<ArcSwap<RouteTable>>,
-        challenge_solver: Option<Arc<ChallengeSolver>>,
-        log_sender: Option<LogSender>,
-        beacon_sender: Option<BeaconSender>,
-        agg_sender: Option<AggSender>,
-        geo_lookup: Option<Arc<dwaar_geo::GeoLookup>>,
-        plugin_chain: Arc<PluginChain>,
-        prometheus: Option<Arc<dwaar_analytics::prometheus::PrometheusMetrics>>,
-        cache_backend: Option<crate::cache::SharedCacheBackend>,
-        keepalive_secs: u64,
-        body_timeout_secs: u64,
-        h3_enabled: bool,
-    ) -> Self {
+    /// Construct a new proxy from a [`ProxyConfig`].
+    ///
+    /// Optional capabilities (control plane, anomaly sink, mirror dispatcher,
+    /// OTLP exporter) are wired in after construction via the `with_*` builder
+    /// methods below.
+    pub fn new(config: ProxyConfig) -> Self {
         Self {
-            route_table,
-            challenge_solver,
-            log_sender,
-            beacon_sender,
-            agg_sender,
-            geo_lookup,
-            plugin_chain,
-            prometheus,
-            cache_backend,
-            keepalive_secs,
-            body_timeout: std::time::Duration::from_secs(body_timeout_secs),
-            h3_enabled,
+            route_table: config.route_table,
+            challenge_solver: config.challenge_solver,
+            log_sender: config.log_sender,
+            beacon_sender: config.beacon_sender,
+            agg_sender: config.agg_sender,
+            geo_lookup: config.geo_lookup,
+            plugin_chain: config.plugin_chain,
+            prometheus: config.prometheus,
+            cache_backend: config.cache_backend,
+            keepalive_secs: config.keepalive_secs,
+            body_timeout: std::time::Duration::from_secs(config.body_timeout_secs),
+            h3_enabled: config.h3_enabled,
             control_plane: None,
             outcome_sink: None,
             mirror_dispatcher: None,
@@ -2597,20 +2632,47 @@ mod tests {
     fn make_proxy(routes: Vec<Route>) -> DwaarProxy {
         let table = RouteTable::new(routes);
         let chain = Arc::new(PluginChain::new(vec![]));
-        DwaarProxy::new(
-            Arc::new(ArcSwap::from_pointee(table)),
-            None,
-            None,
-            None,
-            None,
-            None,
-            chain,
-            None,
-            None,
-            60,    // keepalive_secs
-            30,    // body_timeout_secs
-            false, // h3_enabled
-        )
+        DwaarProxy::new(ProxyConfig {
+            route_table: Arc::new(ArcSwap::from_pointee(table)),
+            challenge_solver: None,
+            log_sender: None,
+            beacon_sender: None,
+            agg_sender: None,
+            geo_lookup: None,
+            plugin_chain: chain,
+            prometheus: None,
+            cache_backend: None,
+            keepalive_secs: 60,
+            body_timeout_secs: 30,
+            h3_enabled: false,
+        })
+    }
+
+    /// Smoke test: `ProxyConfig` with all fields populated builds a `DwaarProxy`
+    /// successfully. Verifies the struct literal compiles and the constructor
+    /// wires fields correctly. Issue #175.
+    #[test]
+    fn proxy_config_construction_compiles_and_runs() {
+        let table = RouteTable::new(vec![]);
+        let chain = Arc::new(PluginChain::new(vec![]));
+        let config = ProxyConfig {
+            route_table: Arc::new(ArcSwap::from_pointee(table)),
+            challenge_solver: None,
+            log_sender: None,
+            beacon_sender: None,
+            agg_sender: None,
+            geo_lookup: None,
+            plugin_chain: chain,
+            prometheus: None,
+            cache_backend: None,
+            keepalive_secs: 30,
+            body_timeout_secs: 60,
+            h3_enabled: true,
+        };
+        let proxy = DwaarProxy::new(config);
+        // Verify a couple of fields were wired through.
+        assert_eq!(proxy.keepalive_secs, 30);
+        assert!(proxy.h3_enabled);
     }
 
     #[test]
