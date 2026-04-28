@@ -653,8 +653,7 @@ impl DwaarProxy {
     /// the platform can confirm Dwaar itself is alive; the application's own
     /// metrics are available once a matching public-hostname route resolves.
     async fn send_internal_health_response(session: &mut Session) -> Result<bool> {
-        const BODY: &[u8] =
-            br#"{"status":"ok","service":"dwaar","version":"#;
+        const BODY: &[u8] = br#"{"status":"ok","service":"dwaar","version":"#;
         let version = env!("CARGO_PKG_VERSION");
         // Build body: {"status":"ok","service":"dwaar","version":"0.3.13"}
         let mut body_vec = Vec::with_capacity(BODY.len() + version.len() + 3);
@@ -670,9 +669,7 @@ impl DwaarProxy {
             .map_err(|e| Error::explain(HTTPStatus(200), format!("bad header: {e}")))?;
         resp.insert_header("Content-Type", "application/json")
             .map_err(|e| Error::explain(HTTPStatus(200), format!("bad header: {e}")))?;
-        session
-            .write_response_header(Box::new(resp), false)
-            .await?;
+        session.write_response_header(Box::new(resp), false).await?;
         session.write_response_body(Some(body), true).await?;
         Ok(true)
     }
