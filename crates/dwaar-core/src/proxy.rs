@@ -96,6 +96,52 @@ pub(crate) fn strip_port_from_host(host: &str) -> &str {
     }
 }
 
+/// Return `true` when `host` (with port stripped) is an RFC 1918 private
+/// address or a Docker-default bridge address.
+///
+/// Ranges checked:
+/// - `10.0.0.0/8`
+/// - `172.16.0.0/12`  (includes Docker's default `172.17.0.0/16`)
+/// - `192.168.0.0/16`
+///
+/// The input may carry a port suffix (`172.18.0.19:8080`) which is stripped
+/// before parsing. IPv6 and bare hostnames always return `false`.
+pub(crate) fn is_rfc1918_host(host: &str) -> bool {
+    let bare = strip_port_from_host(host);
+    let Ok(ip) = bare.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let std::net::IpAddr::V4(v4) = ip else {
+        return false;
+    };
+    let octets = v4.octets();
+    // 10.0.0.0/8
+    if octets[0] == 10 {
+        return true;
+    }
+    // 172.16.0.0/12 — second octet 16..=31
+    if octets[0] == 172 && (16..=31).contains(&octets[1]) {
+        return true;
+    }
+    // 192.168.0.0/16
+    if octets[0] == 192 && octets[1] == 168 {
+        return true;
+    }
+    false
+}
+
+/// Return `true` when `path` is a standard infrastructure healthcheck endpoint.
+///
+/// Matched paths: `/health`, `/healthz`, `/metrics`, `/ready`, `/live`.
+/// Only the exact paths match — `/healthz/deep` does NOT match, preventing
+/// accidental bypass of auth on deeper sub-paths.
+pub(crate) fn is_healthcheck_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/health" | "/healthz" | "/metrics" | "/ready" | "/live"
+    )
+}
+
 /// Extract a named cookie's value from a `Cookie` header string.
 ///
 /// Parses `key1=val1; key2=val2` format. Returns `None` if the cookie isn't present.
@@ -596,6 +642,38 @@ impl DwaarProxy {
         Ok(true)
     }
 
+    /// Serve an internal healthcheck response for RFC 1918 source requests.
+    ///
+    /// Returns `200 OK` with a small JSON body so the Permanu agent (and any
+    /// other platform healthchecker) gets a deterministic success response even
+    /// when it hits Dwaar via a docker-network IP that has no configured route.
+    ///
+    /// `/health` and `/healthz` are answered entirely by Dwaar (no upstream).
+    /// `/metrics`, `/ready`, and `/live` receive the same internal response so
+    /// the platform can confirm Dwaar itself is alive; the application's own
+    /// metrics are available once a matching public-hostname route resolves.
+    async fn send_internal_health_response(session: &mut Session) -> Result<bool> {
+        const BODY: &[u8] = br#"{"status":"ok","service":"dwaar","version":"#;
+        let version = env!("CARGO_PKG_VERSION");
+        // Build body: {"status":"ok","service":"dwaar","version":"0.3.13"}
+        let mut body_vec = Vec::with_capacity(BODY.len() + version.len() + 3);
+        body_vec.extend_from_slice(BODY);
+        body_vec.push(b'"');
+        body_vec.extend_from_slice(version.as_bytes());
+        body_vec.extend_from_slice(b"\"}");
+        let body = Bytes::from(body_vec);
+
+        let mut resp = ResponseHeader::build(200, Some(2))?;
+        let mut cl_buf = itoa::Buffer::new();
+        resp.insert_header("Content-Length", cl_buf.format(body.len()))
+            .map_err(|e| Error::explain(HTTPStatus(200), format!("bad header: {e}")))?;
+        resp.insert_header("Content-Type", "application/json")
+            .map_err(|e| Error::explain(HTTPStatus(200), format!("bad header: {e}")))?;
+        session.write_response_header(Box::new(resp), false).await?;
+        session.write_response_body(Some(body), true).await?;
+        Ok(true)
+    }
+
     /// Send a plugin-generated short-circuit response to the client.
     async fn send_plugin_response(
         session: &mut Session,
@@ -840,6 +918,34 @@ impl ProxyHttp for DwaarProxy {
             is_grpc = ctx.is_grpc,
             "request metadata extracted"
         );
+
+        // --- RFC 1918 internal healthcheck bypass ---
+        // When the Permanu platform agent runs healthchecks it hits the
+        // container directly at its docker-network IP (e.g. `172.18.0.19:8080`).
+        // That IP is never in the route table (which only knows public hostnames),
+        // so Dwaar would 502. Intercept these requests early and serve a small
+        // `{"status":"ok"}` JSON so the agent gets a deterministic 200.
+        //
+        // Conditions that must ALL be true:
+        //   1. Host is an RFC 1918 address (10/8, 172.16/12, 192.168/16).
+        //   2. Path is one of the standard healthcheck / readiness paths.
+        //   3. Method is GET or HEAD (ignore POSTs to these paths).
+        if let Some(ref host) = ctx.plugin_ctx.host {
+            let path = ctx.plugin_ctx.path.as_str();
+            let method = ctx.plugin_ctx.method.as_str();
+            if is_rfc1918_host(host)
+                && is_healthcheck_path(path)
+                && matches!(method, "GET" | "HEAD")
+            {
+                debug!(
+                    request_id = %ctx.request_id(),
+                    host = %host,
+                    path = %path,
+                    "RFC 1918 healthcheck bypass — serving internal 200"
+                );
+                return Self::send_internal_health_response(session).await;
+            }
+        }
 
         // --- Populate route-level plugin config ---
         // Look up the route before running plugins so rate_limit_rps and
@@ -3143,6 +3249,127 @@ mod tests {
                 table.resolve(stripped).is_some(),
                 "route lookup after port stripping must succeed"
             );
+        }
+    }
+
+    // ── is_rfc1918_host ───────────────────────────────────────────────────────
+    //
+    // The RFC 1918 guard is the source-IP check that gates the internal
+    // healthcheck bypass. These tests verify all three private ranges plus
+    // Docker-default bridge addresses and the public / non-IP cases that
+    // must NOT trigger the bypass.
+
+    mod rfc1918_tests {
+        use super::super::is_rfc1918_host;
+
+        // ── True positives — private ranges ──────────────────────────────────
+
+        #[test]
+        fn class_a_private_range() {
+            assert!(is_rfc1918_host("10.0.0.1"));
+            assert!(is_rfc1918_host("10.255.255.255"));
+            assert!(is_rfc1918_host("10.1.2.3"));
+        }
+
+        #[test]
+        fn class_b_private_range() {
+            assert!(is_rfc1918_host("172.16.0.1"));
+            assert!(is_rfc1918_host("172.31.255.255"));
+            assert!(is_rfc1918_host("172.20.0.10")); // Docker default bridge
+        }
+
+        #[test]
+        fn docker_default_bridge_172_18() {
+            // Docker's default bridge network is 172.17.0.0/16;
+            // user-defined networks commonly land in 172.18–172.31.
+            assert!(is_rfc1918_host("172.18.0.1"));
+            assert!(is_rfc1918_host("172.18.0.19")); // exact address from the bug report
+            assert!(is_rfc1918_host("172.17.0.2"));
+        }
+
+        #[test]
+        fn class_c_private_range() {
+            assert!(is_rfc1918_host("192.168.0.1"));
+            assert!(is_rfc1918_host("192.168.255.255"));
+            assert!(is_rfc1918_host("192.168.1.100"));
+        }
+
+        #[test]
+        fn port_suffix_stripped_before_parse() {
+            assert!(is_rfc1918_host("172.18.0.19:8080"));
+            assert!(is_rfc1918_host("10.0.0.1:9090"));
+            assert!(is_rfc1918_host("192.168.1.1:80"));
+        }
+
+        // ── True negatives — public / non-IP / IPv6 ──────────────────────────
+
+        #[test]
+        fn public_ipv4_not_rfc1918() {
+            assert!(!is_rfc1918_host("8.8.8.8"));
+            assert!(!is_rfc1918_host("1.1.1.1"));
+            assert!(!is_rfc1918_host("203.0.113.1")); // TEST-NET-3
+        }
+
+        #[test]
+        fn just_outside_class_b_boundary() {
+            // 172.15.x is public; 172.32.x is public
+            assert!(!is_rfc1918_host("172.15.255.255"));
+            assert!(!is_rfc1918_host("172.32.0.1"));
+        }
+
+        #[test]
+        fn loopback_not_rfc1918() {
+            // 127.0.0.1 is loopback, not RFC 1918
+            assert!(!is_rfc1918_host("127.0.0.1"));
+            assert!(!is_rfc1918_host("127.0.0.1:8080"));
+        }
+
+        #[test]
+        fn hostname_not_rfc1918() {
+            assert!(!is_rfc1918_host("deploy.permanu.com"));
+            assert!(!is_rfc1918_host("localhost"));
+            assert!(!is_rfc1918_host("api.example.com:8080"));
+        }
+
+        #[test]
+        fn ipv6_not_rfc1918() {
+            assert!(!is_rfc1918_host("[::1]:8080"));
+            assert!(!is_rfc1918_host("::1"));
+            assert!(!is_rfc1918_host("[2001:db8::1]:443"));
+        }
+    }
+
+    // ── is_healthcheck_path ───────────────────────────────────────────────────
+    //
+    // Exact-match semantics: only the five listed paths pass.
+    // Paths with sub-segments (e.g. `/healthz/deep`) must NOT match to avoid
+    // accidentally bypassing auth on deeper app endpoints.
+
+    mod healthcheck_path_tests {
+        use super::super::is_healthcheck_path;
+
+        #[test]
+        fn exact_matches() {
+            assert!(is_healthcheck_path("/health"));
+            assert!(is_healthcheck_path("/healthz"));
+            assert!(is_healthcheck_path("/metrics"));
+            assert!(is_healthcheck_path("/ready"));
+            assert!(is_healthcheck_path("/live"));
+        }
+
+        #[test]
+        fn sub_paths_do_not_match() {
+            assert!(!is_healthcheck_path("/health/deep"));
+            assert!(!is_healthcheck_path("/healthz/check"));
+            assert!(!is_healthcheck_path("/metrics/something"));
+            assert!(!is_healthcheck_path("/readyz"));
+        }
+
+        #[test]
+        fn arbitrary_paths_do_not_match() {
+            assert!(!is_healthcheck_path("/"));
+            assert!(!is_healthcheck_path("/api/v1/users"));
+            assert!(!is_healthcheck_path("/admin"));
         }
     }
 }

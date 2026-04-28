@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.13] - 2026-04-27
+
+### Fixed
+
+- **RFC 1918 healthcheck routing** — requests arriving with a docker-network IP as the `Host` header (e.g. `172.18.0.19:8080`) and a standard healthcheck path (`/health`, `/healthz`, `/metrics`, `/ready`, `/live`) now receive a `200 OK` JSON response from Dwaar directly instead of 502-ing with "no route configured for host". This unblocks the Permanu platform agent's healthcheck cycle for `permanu-frontend` and any other service fronted by Dwaar.
+
 ## [0.3.12] - 2026-04-27
 
 ### Added
