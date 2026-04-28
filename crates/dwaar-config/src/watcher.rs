@@ -1176,13 +1176,14 @@ b.com {
         let watcher = ConfigWatcher::new(config_path.clone(), Arc::clone(&table), initial_hash)
             .with_acme_domains(Arc::clone(&acme_domains));
 
-        // Remove b.com's tls auto (just plain reverse_proxy)
+        // Remove b.com's tls auto and explicitly disable TLS
         let updated = "\
 a.com {
     tls auto
     reverse_proxy 127.0.0.1:8080
 }
 b.com {
+    tls off
     reverse_proxy 127.0.0.1:9090
 }
 ";

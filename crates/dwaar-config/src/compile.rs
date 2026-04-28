@@ -248,7 +248,7 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
             }
         }
 
-        let tls = site_has_tls(&site.directives);
+        let tls = site_has_tls(&site.directives, &site.address);
         let (var_registry, var_defaults) = compile_vars(&site.directives);
 
         // handle/handle_path/route blocks take precedence — multi-handler routes.
@@ -663,18 +663,35 @@ pub fn has_tls_sites(config: &DwaarConfig) -> bool {
     config
         .sites
         .iter()
-        .any(|site| site_has_tls(&site.directives))
+        .any(|site| site_has_tls(&site.directives, &site.address))
 }
 
-/// Extract domains that use `tls auto` — these need ACME cert provisioning.
+/// Extract domains that need ACME cert provisioning.
+///
+/// A site needs ACME if it has an explicit `tls auto` directive, or if it has
+/// no `tls` directive at all but its address is a domain name (implicit auto-HTTPS).
 pub fn compile_acme_domains(config: &DwaarConfig) -> Vec<String> {
     config
         .sites
         .iter()
         .filter(|site| {
-            site.directives
+            let has_auto = site
+                .directives
                 .iter()
-                .any(|d| matches!(d, Directive::Tls(TlsDirective::Auto)))
+                .any(|d| matches!(d, Directive::Tls(TlsDirective::Auto)));
+            let has_explicit_tls = site
+                .directives
+                .iter()
+                .any(|d| matches!(d, Directive::Tls(_)));
+            // Explicit `tls auto` → ACME.
+            if has_auto {
+                return true;
+            }
+            // No tls directive at all and looks like a domain → implicit ACME.
+            if !has_explicit_tls && is_domain_name(&site.address) {
+                return true;
+            }
+            false
         })
         .map(|site| site.address.to_lowercase())
         .collect()
@@ -721,7 +738,7 @@ pub fn extract_bind_addresses(config: &DwaarConfig) -> Vec<BindAddress> {
     for site in &config.sites {
         // Sites with TLS get their own listener via extract_tls_bind_addresses.
         // Only non-TLS sites contribute to the plaintext HTTP listener here.
-        if site_has_tls(&site.directives) {
+        if site_has_tls(&site.directives, &site.address) {
             continue;
         }
         if let Some(bind) = find_bind(&site.directives) {
@@ -740,9 +757,14 @@ pub fn extract_bind_addresses(config: &DwaarConfig) -> Vec<BindAddress> {
         }
     }
 
-    // Fall back to the built-in default when no non-TLS site specifies bind.
+    // Fall back to the global http_port directive, or the built-in default.
     if addrs.is_empty() {
-        addrs.push(BindAddress::Tcp(DEFAULT_HTTP_BIND.to_owned()));
+        let default = config
+            .global_options
+            .as_ref()
+            .and_then(|g| g.http_port)
+            .map_or_else(|| DEFAULT_HTTP_BIND.to_owned(), |p| format!("0.0.0.0:{p}"));
+        addrs.push(BindAddress::Tcp(default));
     }
 
     addrs
@@ -758,7 +780,7 @@ pub fn extract_tls_bind_addresses(config: &DwaarConfig) -> Vec<BindAddress> {
     let mut addrs: Vec<BindAddress> = Vec::new();
 
     for site in &config.sites {
-        if site_has_tls(&site.directives)
+        if site_has_tls(&site.directives, &site.address)
             && let Some(bind) = find_bind(&site.directives)
         {
             for raw in &bind.addresses {
@@ -774,9 +796,14 @@ pub fn extract_tls_bind_addresses(config: &DwaarConfig) -> Vec<BindAddress> {
         }
     }
 
-    // Fall back to the built-in default when no TLS site specifies bind.
+    // Fall back to the global https_port directive, or the built-in default.
     if addrs.is_empty() {
-        addrs.push(BindAddress::Tcp(DEFAULT_TLS_BIND.to_owned()));
+        let default = config
+            .global_options
+            .as_ref()
+            .and_then(|g| g.https_port)
+            .map_or_else(|| DEFAULT_TLS_BIND.to_owned(), |p| format!("0.0.0.0:{p}"));
+        addrs.push(BindAddress::Tcp(default));
     }
 
     addrs
@@ -833,12 +860,46 @@ fn find_bind(directives: &[Directive]) -> Option<&BindDirective> {
 /// Returns true if a site's directives include a TLS config that
 /// isn't explicitly `off`. Sites with `tls auto`, `tls internal`,
 /// or `tls /cert /key` all want HTTPS; only `tls off` opts out.
-fn site_has_tls(directives: &[Directive]) -> bool {
-    directives.iter().any(|d| match d {
-        Directive::Tls(TlsDirective::Off) => false,
-        Directive::Tls(_) => true,
-        _ => false,
-    })
+///
+/// Caddy-like implicit auto-HTTPS: if no `tls` directive is present and
+/// the site address looks like a domain name (not an IP, not `:port`),
+/// the site is treated as `tls auto` — Dwaar will bind the HTTPS listener
+/// and ACME-provision a certificate automatically.
+fn site_has_tls(directives: &[Directive], site_address: &str) -> bool {
+    let mut has_explicit_tls = false;
+    let mut tls_off = false;
+    for d in directives {
+        match d {
+            Directive::Tls(TlsDirective::Off) => tls_off = true,
+            Directive::Tls(_) => has_explicit_tls = true,
+            _ => {}
+        }
+    }
+    if tls_off {
+        return false;
+    }
+    if has_explicit_tls {
+        return true;
+    }
+    // No tls directive at all — implicit auto-HTTPS for domain-named sites.
+    is_domain_name(site_address)
+}
+
+/// Returns true if the address looks like a domain name rather than an
+/// IP address, port-only bind (`:80`), or localhost.
+fn is_domain_name(address: &str) -> bool {
+    // Strip trailing port (e.g. "example.com:8443").
+    let host = address.rsplit_once(':').map_or(address, |(h, _)| h);
+    // Reject empty, port-only, IP addresses, localhost.
+    if host.is_empty() || host.starts_with('[') || host == "localhost" || host == "127.0.0.1" {
+        return false;
+    }
+    // If it parses as an IP, it's not a domain.
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    // Contains a dot and no path separators — treat as domain.
+    host.contains('.') && !host.contains('/')
 }
 
 fn find_reverse_proxy(directives: &[Directive]) -> Option<&ReverseProxyDirective> {
@@ -2005,6 +2066,25 @@ mod tests {
         let config = DwaarConfig {
             global_options: None,
             sites: vec![SiteBlock {
+                address: "127.0.0.1".to_string(),
+                matchers: vec![],
+                directives: vec![rp("127.0.0.1:3000")],
+            }],
+        };
+
+        let table = compile_routes(&config);
+        let route = table.resolve("127.0.0.1").expect("should resolve");
+        assert!(
+            !route.tls,
+            "no TLS directive on IP address should default to tls = false"
+        );
+    }
+
+    #[test]
+    fn route_tls_flag_true_for_domain_without_explicit_tls() {
+        let config = DwaarConfig {
+            global_options: None,
+            sites: vec![SiteBlock {
                 address: "default.example.com".to_string(),
                 matchers: vec![],
                 directives: vec![rp("127.0.0.1:3000")],
@@ -2015,7 +2095,10 @@ mod tests {
         let route = table
             .resolve("default.example.com")
             .expect("should resolve");
-        assert!(!route.tls, "no TLS directive should default to tls = false");
+        assert!(
+            route.tls,
+            "domain-named site without tls directive should get implicit auto-HTTPS"
+        );
     }
 
     #[test]
@@ -2031,7 +2114,7 @@ mod tests {
                 SiteBlock {
                     address: "plain.example.com".to_string(),
                     matchers: vec![],
-                    directives: vec![rp("127.0.0.1:4000")],
+                    directives: vec![rp("127.0.0.1:4000"), Directive::Tls(TlsDirective::Off)],
                 },
             ],
         };
@@ -2460,7 +2543,7 @@ mod tests {
     fn bind_port_shorthand_expands_to_all_interfaces() {
         let config = DwaarConfig {
             global_options: None,
-            sites: vec![site_with_bind("example.com", &[":8443"])],
+            sites: vec![site_with_bind("127.0.0.1", &[":8443"])],
         };
         let addrs = extract_bind_addresses(&config);
         assert_eq!(addrs, vec![BindAddress::Tcp("0.0.0.0:8443".to_string())]);
@@ -2470,7 +2553,7 @@ mod tests {
     fn bind_bare_ip_appends_default_port() {
         let config = DwaarConfig {
             global_options: None,
-            sites: vec![site_with_bind("example.com", &["127.0.0.1"])],
+            sites: vec![site_with_bind("10.0.0.1", &["127.0.0.1"])],
         };
         let addrs = extract_bind_addresses(&config);
         assert_eq!(addrs, vec![BindAddress::Tcp("127.0.0.1:6188".to_string())]);
@@ -2480,7 +2563,7 @@ mod tests {
     fn bind_ip_port_passes_through() {
         let config = DwaarConfig {
             global_options: None,
-            sites: vec![site_with_bind("example.com", &["10.0.0.1:9090"])],
+            sites: vec![site_with_bind("127.0.0.1", &["10.0.0.1:9090"])],
         };
         let addrs = extract_bind_addresses(&config);
         assert_eq!(addrs, vec![BindAddress::Tcp("10.0.0.1:9090".to_string())]);
@@ -2491,7 +2574,7 @@ mod tests {
         let config = DwaarConfig {
             global_options: None,
             // `unix//tmp/dwaar.sock` → strip `unix/` → `/tmp/dwaar.sock`
-            sites: vec![site_with_bind("example.com", &["unix//tmp/dwaar.sock"])],
+            sites: vec![site_with_bind("127.0.0.1", &["unix//tmp/dwaar.sock"])],
         };
         let addrs = extract_bind_addresses(&config);
         assert_eq!(
@@ -2506,7 +2589,7 @@ mod tests {
     fn bind_unix_socket_relative_path() {
         let config = DwaarConfig {
             global_options: None,
-            sites: vec![site_with_bind("example.com", &["unix/run/dwaar.sock"])],
+            sites: vec![site_with_bind("127.0.0.1", &["unix/run/dwaar.sock"])],
         };
         let addrs = extract_bind_addresses(&config);
         assert_eq!(
@@ -2522,7 +2605,7 @@ mod tests {
         let config = DwaarConfig {
             global_options: None,
             sites: vec![SiteBlock {
-                address: "example.com".to_string(),
+                address: "127.0.0.1".to_string(),
                 matchers: vec![],
                 directives: vec![rp("127.0.0.1:8080")],
             }],
@@ -2535,10 +2618,7 @@ mod tests {
     fn bind_multiple_addresses_on_one_site() {
         let config = DwaarConfig {
             global_options: None,
-            sites: vec![site_with_bind(
-                "example.com",
-                &["0.0.0.0:80", "0.0.0.0:8080"],
-            )],
+            sites: vec![site_with_bind("127.0.0.1", &["0.0.0.0:80", "0.0.0.0:8080"])],
         };
         let addrs = extract_bind_addresses(&config);
         assert_eq!(addrs.len(), 2);
@@ -2552,8 +2632,8 @@ mod tests {
         let config = DwaarConfig {
             global_options: None,
             sites: vec![
-                site_with_bind("a.example.com", &["0.0.0.0:80"]),
-                site_with_bind("b.example.com", &["0.0.0.0:80"]),
+                site_with_bind("10.0.0.1", &["0.0.0.0:80"]),
+                site_with_bind("10.0.0.2", &["0.0.0.0:80"]),
             ],
         };
         let addrs = extract_bind_addresses(&config);
