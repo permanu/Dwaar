@@ -1,6 +1,6 @@
 [package]
 name = "dwaar-cli"
-version = "0.3.13"
+version = "0.3.14"
 description = "Dwaar CLI — binary entry point, commands, process management"
 edition.workspace = true
 publish = false
