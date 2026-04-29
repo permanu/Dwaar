@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.15] - 2026-04-29
+
+### Fixed
+- Import directives (`import apps/*.dwaar`) resolved relative to Dwaarfile directory, not CWD — fixes zero routes on startup when running as systemd service
+- Initial config hash uses expanded content to match watcher behavior, preventing spurious first-reload
+
 ## [0.3.14] - 2026-04-29
 
 ### Fixed

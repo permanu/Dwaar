@@ -1746,7 +1746,13 @@ fn register_background_services(
     let agg_evict_notify = Arc::new(tokio::sync::Notify::new());
 
     // Config file watcher for hot-reload
-    let initial_hash = hash_content(&std::fs::read(config_path).unwrap_or_default());
+    // Hash expanded content so it matches the watcher's hash (which expands imports).
+    let initial_hash = {
+        let raw = std::fs::read_to_string(config_path).unwrap_or_default();
+        let base = config_path.parent().unwrap_or(std::path::Path::new("."));
+        let expanded = dwaar_config::import::expand_imports(&raw, base).unwrap_or(raw);
+        hash_content(expanded.as_bytes())
+    };
     let config_watcher = ConfigWatcher::new(
         config_path.to_path_buf(),
         Arc::clone(route_table),
@@ -1949,7 +1955,9 @@ fn load_config(path: &std::path::Path) -> anyhow::Result<dwaar_config::model::Dw
     let config_text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config file: {}", path.display()))?;
 
-    let config = dwaar_config::parser::parse(&config_text).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let base_dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let config = dwaar_config::parser::parse_with_base_dir(&config_text, base_dir)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     info!(
         sites = config.sites.len(),
