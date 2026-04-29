@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.16] - 2026-04-29
+
+### Fixed
+- Install rustls ring CryptoProvider before server bootstrap — prevents ACME/TLS panic when routes with implicit auto-HTTPS are compiled at startup
+
 ## [0.3.15] - 2026-04-29
 
 ### Fixed

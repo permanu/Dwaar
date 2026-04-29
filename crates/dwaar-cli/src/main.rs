@@ -931,6 +931,14 @@ fn build_pingora_server(
     };
 
     let mut server = Server::new_with_opt_and_conf(Some(pingora_opt), conf);
+
+    // Install rustls crypto provider before any TLS operations (ACME, TLS
+    // handshakes). Required since rustls 0.23 removed the implicit default.
+    // Must happen before server.bootstrap() which may start TLS services.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok(); // ok if already installed
+
     server.bootstrap();
 
     info!(
