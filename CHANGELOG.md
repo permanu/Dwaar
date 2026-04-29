@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.14] - 2026-04-29
+
+### Fixed
+- `http_port` and `https_port` global directives now correctly control bind addresses (were parsed but ignored)
+- Implicit auto-HTTPS for domain-named sites without explicit `tls` directive (Caddy-compatible behavior)
+- `compile_acme_domains` includes domain-named sites with no TLS directive for automatic ACME cert provisioning
+
 ## [0.3.13] - 2026-04-27
 
 ### Fixed
