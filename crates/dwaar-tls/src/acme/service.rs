@@ -6,9 +6,13 @@
 
 //! Pingora background service for TLS certificate management.
 //!
-//! On startup, checks all `tls auto` domains for missing or expiring certs
-//! and fetches OCSP responses. Then runs a 12-hour loop to refresh OCSP
-//! staples and renew certs within 30 days of expiry.
+//! On startup, checks all `tls auto` / `tls { dns cloudflare }` domains for
+//! missing or expiring certs and fetches OCSP responses. Then runs a 12-hour
+//! loop to refresh OCSP staples and renew certs within 30 days of expiry.
+//!
+//! DNS-01 challenge domains are issued via the attached [`DnsProvider`] (e.g.
+//! Cloudflare). Non-wildcard `tls auto` domains prefer TLS-ALPN-01 and fall
+//! back to HTTP-01.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -27,17 +31,26 @@ use super::{
     AcmeError, GTS_DIRECTORY_URL, INTER_DOMAIN_DELAY, RENEWAL_WINDOW_DAYS, le_directory_url,
 };
 use crate::cert_store::CertStore;
+use crate::dns::DnsProvider;
 
 /// Background service that provisions/renews ACME certificates and refreshes
 /// OCSP staples.
 ///
 /// The domain list is behind `ArcSwap` so that `ConfigWatcher` can swap in a
 /// new set of domains on hot-reload without restarting this service.
+///
+/// When a [`DnsProvider`] is supplied (e.g. Cloudflare), wildcard domains and
+/// any domain listed as a DNS-01 challenge site are issued via DNS-01 rather
+/// than HTTP-01 / TLS-ALPN-01.
 pub struct TlsBackgroundService {
     domains: Arc<ArcSwap<Vec<String>>>,
+    /// Domains that must use DNS-01 (typically wildcard or `tls { dns … }` sites).
+    dns_domains: Arc<ArcSwap<Vec<String>>>,
     cert_dir: String,
     issuer: Arc<CertIssuer>,
     cert_store: Arc<CertStore>,
+    /// Optional DNS provider for DNS-01 challenges (e.g. Cloudflare).
+    dns_provider: Option<Arc<dyn DnsProvider>>,
     in_flight: tokio::sync::Mutex<HashSet<String>>,
 }
 
@@ -45,6 +58,10 @@ impl std::fmt::Debug for TlsBackgroundService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TlsBackgroundService")
             .field("cert_dir", &self.cert_dir)
+            .field(
+                "dns_provider",
+                &self.dns_provider.as_ref().map(|p| p.name()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -58,11 +75,29 @@ impl TlsBackgroundService {
     ) -> Self {
         Self {
             domains,
+            dns_domains: Arc::new(ArcSwap::from_pointee(Vec::new())),
             cert_dir: cert_dir.to_string(),
             issuer,
             cert_store,
+            dns_provider: None,
             in_flight: tokio::sync::Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Attach a DNS provider for DNS-01 challenge issuance.
+    ///
+    /// Call this before the service starts (before `server.add_service`).
+    /// `dns_domains` lists the domains that must use DNS-01 — typically
+    /// wildcard domains or any site configured with `tls { dns cloudflare }`.
+    #[must_use]
+    pub fn with_dns_provider(
+        mut self,
+        provider: Arc<dyn DnsProvider>,
+        dns_domains: Arc<ArcSwap<Vec<String>>>,
+    ) -> Self {
+        self.dns_provider = Some(provider);
+        self.dns_domains = dns_domains;
+        self
     }
 
     /// Check if a domain's cert is missing or expiring within the renewal window.
@@ -116,23 +151,61 @@ impl TlsBackgroundService {
         result
     }
 
+    /// Returns `true` if `domain` must use DNS-01 (it's in the `dns_domains`
+    /// list or is a wildcard like `*.example.com`).
+    fn needs_dns01(&self, domain: &str) -> bool {
+        if domain.starts_with("*.") {
+            return true;
+        }
+        self.dns_domains.load().iter().any(|d| d == domain)
+    }
+
     async fn try_issue(&self, domain: &str) -> Result<(), AcmeError> {
         let le_url = le_directory_url();
 
-        // For non-wildcard domains, prefer TLS-ALPN-01 (needs only port 443)
-        // over HTTP-01 (needs port 80). Fall back to HTTP-01 if ALPN fails.
-        let is_wildcard = domain.starts_with("*.");
+        // DNS-01 path — used for wildcard domains and sites configured with
+        // `tls { dns cloudflare <token> }`. Requires a DNS provider.
+        if self.needs_dns01(domain) {
+            let Some(ref provider) = self.dns_provider else {
+                return Err(AcmeError::NoDnsProvider {
+                    domain: domain.to_string(),
+                });
+            };
 
-        if !is_wildcard {
-            match self.issuer.issue_tls_alpn01(domain, le_url, "le").await {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    debug!(
+            return match self
+                .issuer
+                .issue_dns01(domain, le_url, "le", provider.as_ref())
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(le_err) => {
+                    warn!(
                         domain,
-                        error = %e,
-                        "TLS-ALPN-01 failed, falling back to HTTP-01"
+                        error = %le_err,
+                        "Let's Encrypt DNS-01 failed, trying Google Trust Services"
                     );
+                    self.issuer
+                        .issue_dns01(domain, GTS_DIRECTORY_URL, "gts", provider.as_ref())
+                        .await
+                        .map_err(|gts_err| AcmeError::AllCasFailed {
+                            domain: domain.to_string(),
+                            le_error: le_err.to_string(),
+                            gts_error: gts_err.to_string(),
+                        })
                 }
+            };
+        }
+
+        // Non-wildcard path: prefer TLS-ALPN-01 (needs only port 443),
+        // fall back to HTTP-01, then GTS.
+        match self.issuer.issue_tls_alpn01(domain, le_url, "le").await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                debug!(
+                    domain,
+                    error = %e,
+                    "TLS-ALPN-01 failed, falling back to HTTP-01"
+                );
             }
         }
 
@@ -379,6 +452,7 @@ mod tests {
             solver,
             Arc::clone(&cert_store),
         ));
+        // No DNS provider in unit tests — DNS-01 requires a live API.
         TlsBackgroundService::new(
             Arc::new(ArcSwap::from_pointee(domains)),
             cert_dir.to_str().expect("utf8"),
@@ -405,6 +479,32 @@ mod tests {
         let svc = make_service(vec!["valid.example.com".into()], dir.path());
         // generate_self_signed creates certs valid for 365 days
         assert!(!svc.needs_issuance("valid.example.com").await);
+    }
+
+    // ── needs_dns01 ──────────────────────────────────────────
+
+    #[test]
+    fn needs_dns01_wildcard_returns_true() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let svc = make_service(vec!["*.example.com".into()], dir.path());
+        assert!(svc.needs_dns01("*.example.com"));
+    }
+
+    #[test]
+    fn needs_dns01_explicit_dns_domain_returns_true() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut svc = make_service(vec![], dir.path());
+        svc.dns_domains = Arc::new(ArcSwap::from_pointee(vec!["api.example.com".into()]));
+        assert!(svc.needs_dns01("api.example.com"));
+    }
+
+    #[test]
+    fn needs_dns01_unregistered_non_wildcard_returns_false() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let svc = make_service(vec!["www.example.com".into()], dir.path());
+        // www.example.com is in `domains` (acme list) but not in dns_domains
+        // and is not a wildcard, so needs_dns01 must return false.
+        assert!(!svc.needs_dns01("www.example.com"));
     }
 
     #[test]

@@ -1372,7 +1372,7 @@ dependencies = [
 
 [[package]]
 name = "dwaar-cli"
-version = "0.3.13"
+version = "0.3.17"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1400,6 +1400,7 @@ dependencies = [
  "predicates",
  "rand 0.10.1",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "subtle",

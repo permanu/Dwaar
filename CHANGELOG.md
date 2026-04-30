@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.17] - 2026-04-30
+
+### Added
+- DNS-01 ACME challenge support via Cloudflare — enables wildcard cert issuance (`*.example.com`) without requiring an exposed HTTP-01/TLS-ALPN-01 listener
+- `tls { dns cloudflare <api_token> }` directive for per-site DNS-01 opt-in
+- Hot-reload support for `dns_domains` list — zero-downtime config swaps without restarting TLS background service
+- Multi-token DNS-01 warning: logs when multiple sites specify different Cloudflare tokens (first token wins, others ignored)
+- Unit tests for `compile_dns01_domains` covering single-site, multi-site, shared-token, and multi-token scenarios
+
 ## [0.3.16] - 2026-04-29
 
 ### Fixed

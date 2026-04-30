@@ -47,4 +47,10 @@ pub enum AcmeError {
 
     #[error("TLS-ALPN-01 challenge cert generation failed for {domain}: {reason}")]
     AlpnCertGeneration { domain: String, reason: String },
+
+    #[error(
+        "DNS-01 required for '{domain}' but no DNS provider is configured — \
+         add `tls {{ dns cloudflare {{env.CLOUDFLARE_API_TOKEN}} }}` to the site block"
+    )]
+    NoDnsProvider { domain: String },
 }
