@@ -2212,6 +2212,74 @@ mod tests {
         assert!(domains.is_empty());
     }
 
+    // ── DNS-01 domain extraction ─────────────────────────────
+
+    #[test]
+    fn compile_dns01_domains_extracts_dns_challenge_sites() {
+        let config = DwaarConfig {
+            global_options: None,
+            sites: vec![SiteBlock {
+                address: "*.example.com".to_string(),
+                matchers: vec![],
+                directives: vec![
+                    rp("127.0.0.1:3000"),
+                    Directive::Tls(TlsDirective::DnsChallenge {
+                        provider: "cloudflare".to_string(),
+                        api_token: "tok123".to_string(),
+                    }),
+                ],
+            }],
+        };
+        let entries = compile_dns01_domains(&config);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "*.example.com");
+        assert_eq!(entries[0].1, "cloudflare");
+        assert_eq!(entries[0].2, "tok123");
+    }
+
+    #[test]
+    fn compile_dns01_domains_mixed_auto_and_dns() {
+        let config = DwaarConfig {
+            global_options: None,
+            sites: vec![
+                SiteBlock {
+                    address: "auto.example.com".to_string(),
+                    matchers: vec![],
+                    directives: vec![rp("127.0.0.1:3000"), Directive::Tls(TlsDirective::Auto)],
+                },
+                SiteBlock {
+                    address: "*.example.com".to_string(),
+                    matchers: vec![],
+                    directives: vec![
+                        rp("127.0.0.1:4000"),
+                        Directive::Tls(TlsDirective::DnsChallenge {
+                            provider: "cloudflare".to_string(),
+                            api_token: "tok456".to_string(),
+                        }),
+                    ],
+                },
+            ],
+        };
+        let entries = compile_dns01_domains(&config);
+        // Only the DnsChallenge site should appear
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "*.example.com");
+    }
+
+    #[test]
+    fn compile_dns01_domains_empty_when_no_dns_challenge() {
+        let config = DwaarConfig {
+            global_options: None,
+            sites: vec![SiteBlock {
+                address: "plain.example.com".to_string(),
+                matchers: vec![],
+                directives: vec![rp("127.0.0.1:3000")],
+            }],
+        };
+        let entries = compile_dns01_domains(&config);
+        assert!(entries.is_empty());
+    }
+
     // ── Rate limit extraction (ISSUE-031) ───────────────────
 
     #[test]

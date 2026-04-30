@@ -481,6 +481,32 @@ mod tests {
         assert!(!svc.needs_issuance("valid.example.com").await);
     }
 
+    // ── needs_dns01 ──────────────────────────────────────────
+
+    #[test]
+    fn needs_dns01_wildcard_returns_true() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let svc = make_service(vec!["*.example.com".into()], dir.path());
+        assert!(svc.needs_dns01("*.example.com"));
+    }
+
+    #[test]
+    fn needs_dns01_explicit_dns_domain_returns_true() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut svc = make_service(vec![], dir.path());
+        svc.dns_domains = Arc::new(ArcSwap::from_pointee(vec!["api.example.com".into()]));
+        assert!(svc.needs_dns01("api.example.com"));
+    }
+
+    #[test]
+    fn needs_dns01_unregistered_non_wildcard_returns_false() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let svc = make_service(vec!["www.example.com".into()], dir.path());
+        // www.example.com is in `domains` (acme list) but not in dns_domains
+        // and is not a wildcard, so needs_dns01 must return false.
+        assert!(!svc.needs_dns01("www.example.com"));
+    }
+
     #[test]
     fn revoked_cert_paths_match_issuer_convention() {
         let (cert, key) = revoked_cert_paths("/tmp/certs", "example.com");

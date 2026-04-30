@@ -31,8 +31,8 @@ use dwaar_tls::cert_store::CertStore;
 
 use crate::MAX_CONFIG_SIZE;
 use crate::compile::{
-    collect_pools, compile_acme_domains, compile_l4_servers, compile_l4_wrappers, compile_routes,
-    compile_tls_configs,
+    collect_pools, compile_acme_domains, compile_dns01_domains, compile_l4_servers,
+    compile_l4_wrappers, compile_routes, compile_tls_configs,
 };
 use crate::parser;
 
@@ -78,6 +78,13 @@ pub struct ConfigWatcher {
     /// Shared ACME domain list. Swapped on reload so `TlsBackgroundService`
     /// picks up new/removed `tls auto` domains without a restart.
     acme_domains: Option<Arc<ArcSwap<Vec<String>>>>,
+    /// Shared DNS-01 domain list. Swapped on reload so `TlsBackgroundService`
+    /// uses the correct challenge type for newly added/removed `tls { dns … }`
+    /// sites without a restart.
+    ///
+    /// Note: only the domain list is hot-swapped; provider/token changes still
+    /// require a process restart (the provider is wired once at startup).
+    dns_domains: Option<Arc<ArcSwap<Vec<String>>>>,
     /// Shared cache backend (ISSUE-111). On reload, if the max cache size
     /// changed, a new backend is leaked and swapped in.
     cache_backend: Option<dwaar_core::cache::SharedCacheBackend>,
@@ -133,6 +140,7 @@ impl ConfigWatcher {
             sni_domain_map: None,
             health_pools: None,
             acme_domains: None,
+            dns_domains: None,
             cache_backend: None,
             cert_store: None,
             l4_servers: None,
@@ -182,6 +190,17 @@ impl ConfigWatcher {
     #[must_use]
     pub fn with_acme_domains(mut self, domains: Arc<ArcSwap<Vec<String>>>) -> Self {
         self.acme_domains = Some(domains);
+        self
+    }
+
+    /// Attach the shared DNS-01 domain list so hot-reload swaps in the
+    /// correct set of domains that must use DNS-01.
+    ///
+    /// Only the domain list is hot-swapped; provider/token changes still
+    /// require a process restart (the provider is constructed once at startup).
+    #[must_use]
+    pub fn with_dns_domains(mut self, domains: Arc<ArcSwap<Vec<String>>>) -> Self {
+        self.dns_domains = Some(domains);
         self
     }
 
@@ -389,6 +408,16 @@ impl ConfigWatcher {
             let domains = compile_acme_domains(&config);
             ad.store(Arc::new(domains));
             debug!("ACME domain list refreshed");
+        }
+
+        // Refresh DNS-01 domain list from the new config so that newly added
+        // `tls { dns … }` sites use DNS-01 without a restart.  Only the domain
+        // list is swapped here; provider/token changes require a restart.
+        if let Some(ref dd) = self.dns_domains {
+            let dns_entries = compile_dns01_domains(&config);
+            let dns_domain_list: Vec<String> = dns_entries.into_iter().map(|(d, _, _)| d).collect();
+            dd.store(Arc::new(dns_domain_list));
+            debug!("DNS-01 domain list refreshed");
         }
 
         refresh_cache_backend(self.cache_backend.as_ref(), &new_table);

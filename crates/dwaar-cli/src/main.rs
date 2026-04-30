@@ -1710,6 +1710,10 @@ fn register_background_services(
         info!("upstream health checker registered");
     }
 
+    // Holds the dns_domains Arc built inside the TLS block so ConfigWatcher
+    // can hot-swap the list when `tls { dns … }` sites change at runtime.
+    let mut dns_domains_for_watcher: Option<Arc<ArcSwap<Vec<String>>>> = None;
+
     // ACME + OCSP background service
     if let Some(solver) = challenge_solver {
         let issuer = Arc::new(CertIssuer::new(
@@ -1732,6 +1736,22 @@ fn register_background_services(
             // Dwaarfile share the same Cloudflare zone. We collect the domain list
             // for routing inside TlsBackgroundService.
             let (_, provider_name, api_token) = &dns01_entries[0];
+
+            // Warn if multiple distinct tokens exist for the same provider — the
+            // second and subsequent tokens are silently ignored.
+            let distinct_tokens = dns01_entries
+                .iter()
+                .filter(|(_, p, _)| p == provider_name)
+                .map(|(_, _, t)| t.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            if distinct_tokens.len() > 1 {
+                tracing::warn!(
+                    provider = %provider_name,
+                    "multiple distinct API tokens for provider {} not supported; \
+                     using token from first entry",
+                    provider_name
+                );
+            }
             if provider_name == "cloudflare" {
                 let cf = Arc::new(dwaar_tls::dns_cloudflare::CloudflareDnsProvider::new(
                     api_token.clone(),
@@ -1739,7 +1759,11 @@ fn register_background_services(
                 let dns_domain_list: Vec<String> =
                     dns01_entries.iter().map(|(d, _, _)| d.clone()).collect();
                 let dns_domains = Arc::new(ArcSwap::from_pointee(dns_domain_list));
-                tls_service = tls_service.with_dns_provider(cf, dns_domains);
+                tls_service = tls_service.with_dns_provider(cf, Arc::clone(&dns_domains));
+                // Hand the same Arc to the ConfigWatcher so hot-reload can
+                // swap the domain list when `tls { dns … }` sites are added or
+                // removed at runtime.
+                dns_domains_for_watcher = Some(dns_domains);
                 info!(
                     count = dns01_entries.len(),
                     "DNS-01 Cloudflare provider registered for ACME"
@@ -1802,6 +1826,11 @@ fn register_background_services(
     .with_acme_domains(acme_domains)
     .with_cert_store(Arc::clone(cert_store))
     .with_l4_servers(l4_servers, l4_reload_notify);
+    let config_watcher = if let Some(dd) = dns_domains_for_watcher {
+        config_watcher.with_dns_domains(dd)
+    } else {
+        config_watcher
+    };
     let config_watcher = if let Some(cb) = cache_backend {
         config_watcher.with_cache_backend(cb)
     } else {
