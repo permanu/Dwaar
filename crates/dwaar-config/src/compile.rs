@@ -710,7 +710,11 @@ pub fn compile_dns01_domains(config: &DwaarConfig) -> Vec<(String, String, Strin
         .iter()
         .filter_map(|site| {
             site.directives.iter().find_map(|d| {
-                if let Directive::Tls(TlsDirective::DnsChallenge { provider, api_token }) = d {
+                if let Directive::Tls(TlsDirective::DnsChallenge {
+                    provider,
+                    api_token,
+                }) = d
+                {
                     Some((
                         site.address.to_lowercase(),
                         provider.clone(),
