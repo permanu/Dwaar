@@ -1718,12 +1718,40 @@ fn register_background_services(
             Arc::clone(solver),
             Arc::clone(cert_store),
         ));
-        let tls_service = TlsBackgroundService::new(
+        let mut tls_service = TlsBackgroundService::new(
             Arc::clone(&acme_domains),
             "/etc/dwaar/certs",
             issuer,
             Arc::clone(cert_store),
         );
+
+        // Wire DNS-01 provider when the config contains `tls { dns cloudflare }` sites.
+        let dns01_entries = dwaar_config::compile::compile_dns01_domains(config);
+        if !dns01_entries.is_empty() {
+            // Use the first entry's provider/token — in practice all sites in one
+            // Dwaarfile share the same Cloudflare zone. We collect the domain list
+            // for routing inside TlsBackgroundService.
+            let (_, provider_name, api_token) = &dns01_entries[0];
+            if provider_name == "cloudflare" {
+                let cf = Arc::new(dwaar_tls::dns_cloudflare::CloudflareDnsProvider::new(
+                    api_token.clone(),
+                ));
+                let dns_domain_list: Vec<String> =
+                    dns01_entries.iter().map(|(d, _, _)| d.clone()).collect();
+                let dns_domains = Arc::new(ArcSwap::from_pointee(dns_domain_list));
+                tls_service = tls_service.with_dns_provider(cf, dns_domains);
+                info!(
+                    count = dns01_entries.len(),
+                    "DNS-01 Cloudflare provider registered for ACME"
+                );
+            } else {
+                tracing::warn!(
+                    provider = %provider_name,
+                    "unsupported DNS-01 provider — only 'cloudflare' is supported; \
+                     DNS-01 domains will fall back to HTTP-01"
+                );
+            }
+        }
 
         let bg = pingora_core::services::background::background_service(
             "TLS cert & OCSP manager",

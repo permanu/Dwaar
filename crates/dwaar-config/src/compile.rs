@@ -697,6 +697,33 @@ pub fn compile_acme_domains(config: &DwaarConfig) -> Vec<String> {
         .collect()
 }
 
+/// Extract `(domain, provider, api_token)` tuples for DNS-01 challenge sites.
+///
+/// Used to build a [`CloudflareDnsProvider`](crate::model::TlsDirective) and
+/// the `dns_domains` list passed to `TlsBackgroundService::with_dns_provider`.
+///
+/// In the common case all DNS-01 sites share the same provider and token
+/// (e.g. one Cloudflare zone). The caller deduplicates as needed.
+pub fn compile_dns01_domains(config: &DwaarConfig) -> Vec<(String, String, String)> {
+    config
+        .sites
+        .iter()
+        .filter_map(|site| {
+            site.directives.iter().find_map(|d| {
+                if let Directive::Tls(TlsDirective::DnsChallenge { provider, api_token }) = d {
+                    Some((
+                        site.address.to_lowercase(),
+                        provider.clone(),
+                        api_token.clone(),
+                    ))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect()
+}
+
 /// The fallback HTTP listen address when no `bind` directive is present.
 const DEFAULT_HTTP_BIND: &str = "0.0.0.0:6188";
 
