@@ -57,6 +57,50 @@ Dwaar Analytics      → JS injection, beacon collection, aggregation
 Dwaar Plugins        → Native Rust + WASM extensibility
 ```
 
+## Dwaarfile directives
+
+### `reverse_proxy`
+
+Proxy HTTP/1 (or HTTP/2 with `transport h2`) requests to one or more backends.
+
+```
+api.example.com {
+    reverse_proxy 10.0.0.1:3000 10.0.0.2:3000
+}
+```
+
+### `grpc`
+
+Proxy gRPC traffic to a backend over **HTTP/2 cleartext (h2c)**. TLS is
+terminated at Dwaar's public listener (auto-provisioned via ACME by default).
+The upstream connection speaks HTTP/2 cleartext — no TLS needed between Dwaar
+and the container.
+
+Trailers, gRPC status codes, streaming semantics, and bidirectional streams
+are preserved end-to-end.
+
+```
+grpc-staging.permanu.com {
+    grpc 172.18.0.10:9090
+}
+```
+
+For existing sites where you want to force h2c on a `reverse_proxy` upstream,
+the bare `grpc` marker still works as before:
+
+```
+api.example.com {
+    grpc
+    reverse_proxy backend:9090
+}
+```
+
+### Other directives
+
+`file_server`, `php_fastcgi`, `tls`, `header`, `redir`, `encode`,
+`rate_limit`, `ip_filter`, `respond`, `rewrite`, `uri`, `basicauth`,
+`forward_auth`, `cache`, `log`, and more — see the Dwaarfile syntax guide.
+
 ## License
 
 [Business Source License 1.1](LICENSE) — free to use, modify, and redistribute. Cannot be used to offer a competing commercial proxy, CDN, or analytics service. Converts to AGPL-3.0 after 10 years per release.

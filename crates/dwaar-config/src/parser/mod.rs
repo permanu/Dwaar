@@ -965,6 +965,7 @@ fn parse_site_block(t: &mut Tokenizer<'_>) -> Result<SiteBlock, ParseError> {
 }
 
 /// Parse a single directive by dispatching on the directive name.
+#[allow(clippy::too_many_lines)]
 fn parse_directive(t: &mut Tokenizer<'_>) -> Result<Directive, ParseError> {
     let name_tok = t.next_token();
     let name = match &name_tok.kind {
@@ -1054,7 +1055,31 @@ fn parse_directive(t: &mut Tokenizer<'_>) -> Result<Directive, ParseError> {
         // ── Simple flags ────────────────────────────────────────────────────
         "abort" => Ok(Directive::Abort),
         "skip_log" | "log_skip" => Ok(Directive::SkipLog),
-        "grpc" => Ok(Directive::Grpc),
+
+        // ── SD-107: gRPC directive — upstream address makes it a full proxy ──
+        // `grpc <host>:<port>` → GrpcProxy (standalone h2c reverse proxy)
+        // bare `grpc` (no address, or next token is another directive) → Grpc marker
+        //
+        // A word is treated as an upstream address only when it contains `:` (the
+        // host:port separator) or when it is NOT a known directive name. This
+        // prevents `grpc\nreverse_proxy backend:9090` from consuming `reverse_proxy`
+        // as the upstream address.
+        "grpc" => {
+            let is_upstream = match &t.peek().kind {
+                TokenKind::Word(w) => {
+                    // Contains `:` → definitely host:port or IP:port
+                    // Does not start with `{` → not a block
+                    // Is not a known directive name → treat as upstream address
+                    w.contains(':') || (!w.starts_with('{') && !helpers::is_directive_name(w))
+                }
+                _ => false,
+            };
+            if is_upstream {
+                Ok(Directive::GrpcProxy(directives::parse_grpc_proxy(t)?))
+            } else {
+                Ok(Directive::Grpc)
+            }
+        }
 
         // import directives are expanded by the preprocessor before parsing.
         // If one reaches here, the preprocessor missed it — that's a bug.

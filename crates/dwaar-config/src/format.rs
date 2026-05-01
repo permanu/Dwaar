@@ -144,6 +144,13 @@ fn format_directive_at_depth(out: &mut String, directive: &Directive, depth: usi
         Directive::Cache(c) => format_cache(out, c, depth),
         Directive::WasmPlugin(wp) => format_wasm_plugin(out, wp, depth),
         Directive::Grpc => out.push_str("grpc"),
+        Directive::GrpcProxy(g) => {
+            out.push_str("grpc ");
+            match &g.upstream {
+                crate::model::UpstreamAddr::SocketAddr(addr) => out.push_str(&addr.to_string()),
+                crate::model::UpstreamAddr::HostPort(hp) => out.push_str(hp),
+            }
+        }
     }
 }
 

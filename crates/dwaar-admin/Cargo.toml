@@ -1,6 +1,6 @@
 [package]
 name = "dwaar-admin"
-version = "0.1.0"
+version = "0.3.18"
 description = "Admin API service — route management, health, metrics, config"
 edition.workspace = true
 publish = false

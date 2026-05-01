@@ -242,6 +242,7 @@ pub(super) fn is_directive_name(w: &str) -> bool {
             | "copy_response_headers"
             | "cache"
             | "wasm_plugin"
+            | "grpc"
     )
 }
 

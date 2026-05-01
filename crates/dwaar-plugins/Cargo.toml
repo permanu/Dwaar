@@ -1,6 +1,6 @@
 [package]
 name = "dwaar-plugins"
-version = "0.1.0"
+version = "0.3.18"
 description = "Plugin trait, plugin chain, built-in plugins (bot detection, rate limiting, compression, security headers)"
 edition.workspace = true
 publish = false

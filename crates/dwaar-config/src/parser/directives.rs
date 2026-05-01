@@ -11,10 +11,11 @@
 
 use crate::error::{ParseError, ParseErrorKind};
 use crate::model::{
-    Directive, FileServerDirective, ForwardAuthDirective, HandleDirective, HandleErrorsDirective,
-    HandlePathDirective, LbPolicy, PhpFastcgiDirective, RedirDirective, RespondDirective,
-    ReverseProxyDirective, RewriteDirective, RootDirective, RouteDirective, ScaleToZeroDirective,
-    TryFilesDirective, UdpProxyConfig, UriDirective, UriOperation, WasmPluginDirective,
+    Directive, FileServerDirective, ForwardAuthDirective, GrpcProxyDirective, HandleDirective,
+    HandleErrorsDirective, HandlePathDirective, LbPolicy, PhpFastcgiDirective, RedirDirective,
+    RespondDirective, ReverseProxyDirective, RewriteDirective, RootDirective, RouteDirective,
+    ScaleToZeroDirective, TryFilesDirective, UdpProxyConfig, UriDirective, UriOperation,
+    WasmPluginDirective,
 };
 use crate::token::{TokenKind, Tokenizer};
 
@@ -1461,6 +1462,45 @@ fn parse_duration_string(s: &str) -> Option<std::time::Duration> {
     } else {
         s.parse::<u64>().ok().map(std::time::Duration::from_secs)
     }
+}
+
+// ── gRPC reverse-proxy parser (SD-107) ───────────────────────────────────────
+
+/// `grpc <host>:<port>` — forward to a gRPC backend over HTTP/2 cleartext (h2c).
+///
+/// Inline form only: a single upstream address. No block form is needed for the
+/// initial implementation — operators who need load balancing can pair a
+/// `reverse_proxy` block with the bare `grpc` marker.
+///
+/// # Example
+///
+/// ```text
+/// grpc-staging.permanu.com {
+///     grpc 172.18.0.10:9090
+/// }
+/// ```
+pub(super) fn parse_grpc_proxy(t: &mut Tokenizer<'_>) -> Result<GrpcProxyDirective, ParseError> {
+    let (line, col) = t.position();
+    let upstream_str = match t.peek().kind {
+        TokenKind::Word(_) | TokenKind::QuotedString(_) => {
+            expect_word_or_quoted(t, "grpc", "upstream address (host:port)")?
+        }
+        _ => {
+            return Err(ParseError {
+                line,
+                col,
+                kind: ParseErrorKind::InvalidValue {
+                    directive: "grpc".to_string(),
+                    message: "expected upstream address after 'grpc' (e.g. 172.18.0.10:9090)"
+                        .to_string(),
+                    accepted_format: Some("grpc <host>:<port>"),
+                },
+            });
+        }
+    };
+
+    let upstream = parse_upstream_addr(&upstream_str);
+    Ok(GrpcProxyDirective { upstream })
 }
 
 // ── UDP proxy parser ──────────────────────────────────────────────────────────
