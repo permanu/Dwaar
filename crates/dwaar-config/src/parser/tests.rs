@@ -2240,7 +2240,10 @@ fn grpc_proxy_inline_socket_addr() {
     assert_eq!(config.sites[0].directives.len(), 1);
 
     let Directive::GrpcProxy(ref g) = config.sites[0].directives[0] else {
-        panic!("expected GrpcProxy directive, got {:?}", config.sites[0].directives[0]);
+        panic!(
+            "expected GrpcProxy directive, got {:?}",
+            config.sites[0].directives[0]
+        );
     };
     assert_eq!(
         g.upstream,
@@ -2260,7 +2263,10 @@ fn grpc_proxy_inline_host_port() {
     let Directive::GrpcProxy(ref g) = config.sites[0].directives[0] else {
         panic!("expected GrpcProxy directive");
     };
-    assert_eq!(g.upstream, UpstreamAddr::HostPort("grpc-backend:9090".to_string()));
+    assert_eq!(
+        g.upstream,
+        UpstreamAddr::HostPort("grpc-backend:9090".to_string())
+    );
 }
 
 #[test]
@@ -2276,8 +2282,18 @@ fn grpc_proxy_with_tls_directive() {
     .expect("grpc + tls should parse");
 
     assert_eq!(config.sites[0].directives.len(), 2);
-    assert!(config.sites[0].directives.iter().any(|d| matches!(d, Directive::GrpcProxy(_))));
-    assert!(config.sites[0].directives.iter().any(|d| matches!(d, Directive::Tls(TlsDirective::Auto))));
+    assert!(
+        config.sites[0]
+            .directives
+            .iter()
+            .any(|d| matches!(d, Directive::GrpcProxy(_)))
+    );
+    assert!(
+        config.sites[0]
+            .directives
+            .iter()
+            .any(|d| matches!(d, Directive::Tls(TlsDirective::Auto)))
+    );
 }
 
 #[test]
@@ -2292,8 +2308,18 @@ fn bare_grpc_marker_still_parses() {
     )
     .expect("bare grpc marker should still parse");
 
-    assert!(config.sites[0].directives.iter().any(|d| matches!(d, Directive::Grpc)));
-    assert!(config.sites[0].directives.iter().any(|d| matches!(d, Directive::ReverseProxy(_))));
+    assert!(
+        config.sites[0]
+            .directives
+            .iter()
+            .any(|d| matches!(d, Directive::Grpc))
+    );
+    assert!(
+        config.sites[0]
+            .directives
+            .iter()
+            .any(|d| matches!(d, Directive::ReverseProxy(_)))
+    );
 }
 
 #[test]
@@ -2307,7 +2333,10 @@ fn grpc_proxy_missing_upstream_errors() {
             grpc
         }",
     );
-    assert!(result.is_ok(), "bare grpc with no upstream is valid (backward compat)");
+    assert!(
+        result.is_ok(),
+        "bare grpc with no upstream is valid (backward compat)"
+    );
     let config = result.expect("should parse");
     assert!(matches!(config.sites[0].directives[0], Directive::Grpc));
 }

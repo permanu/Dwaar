@@ -3115,12 +3115,18 @@ mod tests {
             sites: vec![grpc_site("grpc-staging.permanu.com", "127.0.0.1:9090")],
         };
         let table = compile_routes(&config);
-        let route = table.resolve("grpc-staging.permanu.com").expect("route should exist");
+        let route = table
+            .resolve("grpc-staging.permanu.com")
+            .expect("route should exist");
         let block = route.handlers.first().expect("has handler block");
 
         // Must compile as ReverseProxy with upstream_h2 = true.
         match &block.handler {
-            Handler::ReverseProxy { upstream, upstream_h2, pre_built_peer } => {
+            Handler::ReverseProxy {
+                upstream,
+                upstream_h2,
+                pre_built_peer,
+            } => {
                 assert_eq!(upstream.to_string(), "127.0.0.1:9090");
                 assert!(*upstream_h2, "grpc directive must force upstream_h2 = true");
                 assert!(pre_built_peer.is_some(), "pre_built_peer must be set");
@@ -3129,7 +3135,10 @@ mod tests {
         }
 
         // is_grpc_route must be set so the proxy engine applies ALPN and trailer forwarding.
-        assert!(block.is_grpc_route, "is_grpc_route must be true for grpc directive");
+        assert!(
+            block.is_grpc_route,
+            "is_grpc_route must be true for grpc directive"
+        );
     }
 
     #[test]

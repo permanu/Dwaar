@@ -1,6 +1,6 @@
 [package]
 name = "dwaar-tls"
-version = "0.1.0"
+version = "0.3.18"
 description = "TLS termination, ACME client (Let's Encrypt + Google Trust Services), certificate management"
 edition.workspace = true
 publish = false
