@@ -467,6 +467,22 @@ pub enum Directive {
     /// When present, the runtime applies H2 ALPN enforcement and a 1 GiB body
     /// cap regardless of `Content-Type`. No arguments.
     Grpc,
+
+    // ── SD-107: gRPC reverse-proxy directive ──────────────────────────────
+    /// `grpc <host>:<port>` — reverse-proxy to a gRPC backend over HTTP/2 cleartext (h2c).
+    ///
+    /// TLS is terminated at the front-end (ACME or manual cert); the upstream
+    /// connection speaks HTTP/2 cleartext so no TLS is required between Dwaar
+    /// and the container network. All gRPC headers, trailers, and streaming
+    /// semantics are preserved end-to-end.
+    ///
+    /// Example:
+    /// ```text
+    /// grpc-staging.permanu.com {
+    ///     grpc 172.18.0.10:9090
+    /// }
+    /// ```
+    GrpcProxy(GrpcProxyDirective),
 }
 
 /// `cache { max_size 1g; match_path /static/* /assets/*; default_ttl 3600; stale_while_revalidate 60 }`
@@ -583,6 +599,17 @@ pub struct ScaleToZeroDirective {
     pub wake_timeout_secs: u64,
     /// Shell command to wake the backend (e.g. `"docker start myapp"`).
     pub wake_command: String,
+}
+
+/// `grpc <host>:<port>` — gRPC reverse-proxy directive (SD-107).
+///
+/// Forwards to a single upstream over HTTP/2 cleartext (h2c). TLS is
+/// terminated at Dwaar's public listener; the upstream connection is
+/// unencrypted HTTP/2 suitable for container-local or VPC traffic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrpcProxyDirective {
+    /// The gRPC backend address (e.g. `172.18.0.10:9090` or `grpc-backend:9090`).
+    pub upstream: UpstreamAddr,
 }
 
 /// An upstream address — either a socket address or a host:port string

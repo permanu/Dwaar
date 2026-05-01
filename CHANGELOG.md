@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.18] - 2026-05-01
+
+### Added
+
+- **`grpc <host>:<port>` directive (SD-107)** — new standalone directive for
+  reverse-proxying gRPC traffic. Terminates TLS at Dwaar's public listener
+  (ACME or manual cert) and forwards to the upstream over HTTP/2 cleartext
+  (h2c). All gRPC semantics are preserved: trailers, status codes, streaming,
+  and bidirectional streams. ALPN is forced to `H2` on the upstream connection
+  so the backend does not need TLS.
+
+  ```
+  grpc-staging.permanu.com {
+      grpc 172.18.0.10:9090
+  }
+  ```
+
+  The legacy bare `grpc` marker (used alongside `reverse_proxy` to opt existing
+  routes into h2c) continues to work unchanged — backward compatible.
+
 ## [0.3.17] - 2026-04-30
 
 ### Added

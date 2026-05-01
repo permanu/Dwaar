@@ -15,6 +15,8 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use pingora_core::prelude::HttpPeer;
+
 use bytes::Bytes;
 use compact_str::CompactString;
 use dwaar_core::route::{
@@ -27,9 +29,9 @@ use dwaar_core::upstream::{BackendConfig, LbPolicy as CoreLbPolicy, RetryConfig,
 use tracing::warn;
 
 use crate::model::{
-    BindDirective, Directive, DwaarConfig, FileServerDirective, HeaderDirective, LbPolicy,
-    MapDirective, MapPattern, PhpFastcgiDirective, RespondDirective, ReverseProxyDirective,
-    RootDirective, TlsDirective, UpstreamAddr, UriOperation,
+    BindDirective, Directive, DwaarConfig, FileServerDirective, GrpcProxyDirective,
+    HeaderDirective, LbPolicy, MapDirective, MapPattern, PhpFastcgiDirective, RespondDirective,
+    ReverseProxyDirective, RootDirective, TlsDirective, UpstreamAddr, UriOperation,
 };
 use dwaar_plugins::basic_auth::BasicAuthConfig;
 use dwaar_plugins::forward_auth::ForwardAuthConfig;
@@ -74,7 +76,9 @@ fn compile_site_middleware(directives: &[Directive], var_registry: &VarRegistry)
         rewrites: collect_rewrites(directives, var_registry),
         basic_auth: compile_basic_auth(directives),
         forward_auth: compile_forward_auth(directives),
-        is_grpc_route: directives.iter().any(|d| matches!(d, Directive::Grpc)),
+        is_grpc_route: directives
+            .iter()
+            .any(|d| matches!(d, Directive::Grpc | Directive::GrpcProxy(_))),
         maps: compile_maps(directives, var_registry),
         log_append_fields: compile_log_append(directives, var_registry),
         log_name: find_log_name(directives),
@@ -216,6 +220,42 @@ fn compile_php_fastcgi_block(
     Some(build_handler_block(handler, mw))
 }
 
+/// Build a `HandlerBlock` for a `grpc <host>:<port>` directive (SD-107).
+///
+/// Forces `upstream_h2 = true` on the handler — h2c cleartext to the upstream
+/// gRPC server. TLS is terminated at Dwaar's public listener (ACME or manual
+/// cert). The `is_grpc_route` flag on the handler block engages the Pingora
+/// ALPN override and trailer-forwarding path in the proxy engine.
+fn compile_grpc_proxy_block(
+    directives: &[Directive],
+    address: &str,
+    mw: SiteMiddleware,
+) -> Option<HandlerBlock> {
+    let grpc = find_grpc_proxy(directives)?;
+    let Some(upstream) = resolve_upstream(std::slice::from_ref(&grpc.upstream)) else {
+        warn!(address = %address, "could not resolve grpc upstream, skipping");
+        return None;
+    };
+
+    // Pre-build the Pingora HttpPeer with H2 ALPN so the hot path skips
+    // per-request construction. h2c = HTTP/2 cleartext (no TLS to upstream).
+    let mut peer = HttpPeer::new(upstream, false, String::new());
+    peer.options.alpn = pingora_core::upstreams::peer::ALPN::H2;
+
+    let handler = Handler::ReverseProxy {
+        upstream,
+        upstream_h2: true,
+        pre_built_peer: Some(Arc::new(peer)),
+    };
+
+    // Ensure is_grpc_route is set — may already be true from the middleware bag
+    // if the operator also added a bare `grpc` marker, but always enforce it here.
+    let mut mw = mw;
+    mw.is_grpc_route = true;
+
+    Some(build_handler_block(handler, mw))
+}
+
 /// Compile a parsed config into a route table for the proxy engine.
 ///
 /// Each site block produces one `Route`. Sites with `reverse_proxy` get a
@@ -268,7 +308,8 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
         // cheap on this cold path (Arc ref-counts + small Vec copies).
         let mw = compile_site_middleware(&site.directives, &var_registry);
 
-        let block = compile_reverse_proxy_block(&site.directives, &site.address, mw.clone())
+        let block = compile_grpc_proxy_block(&site.directives, &site.address, mw.clone())
+            .or_else(|| compile_reverse_proxy_block(&site.directives, &site.address, mw.clone()))
             .or_else(|| compile_respond_block(&site.directives, mw.clone()))
             .or_else(|| compile_file_server_block(&site.directives, &site.address, mw.clone()))
             .or_else(|| compile_php_fastcgi_block(&site.directives, &site.address, mw));
@@ -285,7 +326,7 @@ pub fn compile_routes(config: &DwaarConfig) -> RouteTable {
             None => {
                 warn!(
                     address = %site.address,
-                    "site has no handler directive (reverse_proxy, respond, file_server, php_fastcgi), skipping"
+                    "site has no handler directive (grpc, reverse_proxy, respond, file_server, php_fastcgi), skipping"
                 );
             }
         }
@@ -1004,16 +1045,24 @@ fn compile_single_block(
     let rewrites = collect_rewrites(inner_directives, registry);
     let basic_auth = compile_basic_auth(inner_directives);
     let forward_auth = compile_forward_auth(inner_directives);
-    let mut is_grpc_route = false;
-    for d in inner_directives {
-        if matches!(d, Directive::Grpc) {
-            is_grpc_route = true;
-            break;
-        }
-    }
+    let mut is_grpc_route = inner_directives
+        .iter()
+        .any(|d| matches!(d, Directive::Grpc | Directive::GrpcProxy(_)));
 
-    // Find the handler directive inside the block
-    let mut handler = if let Some(rp) = find_reverse_proxy(inner_directives) {
+    // Find the handler directive inside the block.
+    // `grpc <host>:<port>` is checked first so it wins over a bare `reverse_proxy`
+    // when both appear in the same handle block (unusual but valid for overrides).
+    let mut handler = if let Some(grpc) = find_grpc_proxy(inner_directives) {
+        let addr = resolve_upstream(std::slice::from_ref(&grpc.upstream))?;
+        let mut peer = HttpPeer::new(addr, false, String::new());
+        peer.options.alpn = pingora_core::upstreams::peer::ALPN::H2;
+        is_grpc_route = true;
+        Handler::ReverseProxy {
+            upstream: addr,
+            upstream_h2: true,
+            pre_built_peer: Some(Arc::new(peer)),
+        }
+    } else if let Some(rp) = find_reverse_proxy(inner_directives) {
         compile_reverse_proxy_handler(rp, "handle block")?
     } else if let Some(resp) = find_respond(inner_directives) {
         Handler::StaticResponse {
@@ -1043,7 +1092,7 @@ fn compile_single_block(
         return None;
     };
 
-    // gRPC requires HTTP/2 upstream — force h2 when the grpc directive is present.
+    // gRPC requires HTTP/2 upstream — force h2 when the grpc marker or grpc directive is present.
     if is_grpc_route {
         force_upstream_h2(&mut handler);
     }
@@ -1218,6 +1267,13 @@ fn find_root(directives: &[Directive]) -> Option<&RootDirective> {
 fn find_php_fastcgi(directives: &[Directive]) -> Option<&PhpFastcgiDirective> {
     directives.iter().find_map(|d| match d {
         Directive::PhpFastcgi(f) => Some(f),
+        _ => None,
+    })
+}
+
+fn find_grpc_proxy(directives: &[Directive]) -> Option<&GrpcProxyDirective> {
+    directives.iter().find_map(|d| match d {
+        Directive::GrpcProxy(g) => Some(g),
         _ => None,
     })
 }
@@ -3037,6 +3093,60 @@ mod tests {
         assert!(
             compile_forward_auth(&directives_tls).is_some(),
             "allow_plaintext=false should produce a valid ForwardAuthConfig"
+        );
+    }
+
+    // ── SD-107: grpc directive compile tests ──────────────────────────────────
+
+    fn grpc_site(address: &str, upstream: &str) -> SiteBlock {
+        SiteBlock {
+            address: address.to_string(),
+            matchers: vec![],
+            directives: vec![Directive::GrpcProxy(crate::model::GrpcProxyDirective {
+                upstream: UpstreamAddr::SocketAddr(upstream.parse().expect("valid socket addr")),
+            })],
+        }
+    }
+
+    #[test]
+    fn grpc_proxy_compiles_to_reverse_proxy_with_h2() {
+        let config = DwaarConfig {
+            global_options: None,
+            sites: vec![grpc_site("grpc-staging.permanu.com", "127.0.0.1:9090")],
+        };
+        let table = compile_routes(&config);
+        let route = table.resolve("grpc-staging.permanu.com").expect("route should exist");
+        let block = route.handlers.first().expect("has handler block");
+
+        // Must compile as ReverseProxy with upstream_h2 = true.
+        match &block.handler {
+            Handler::ReverseProxy { upstream, upstream_h2, pre_built_peer } => {
+                assert_eq!(upstream.to_string(), "127.0.0.1:9090");
+                assert!(*upstream_h2, "grpc directive must force upstream_h2 = true");
+                assert!(pre_built_peer.is_some(), "pre_built_peer must be set");
+            }
+            other => panic!("expected ReverseProxy handler, got {other:?}"),
+        }
+
+        // is_grpc_route must be set so the proxy engine applies ALPN and trailer forwarding.
+        assert!(block.is_grpc_route, "is_grpc_route must be true for grpc directive");
+    }
+
+    #[test]
+    fn grpc_proxy_route_resolves() {
+        // Verify the route table can resolve the domain produced by the grpc directive.
+        let config = DwaarConfig {
+            global_options: None,
+            sites: vec![grpc_site("grpc-api.example.com", "127.0.0.1:9090")],
+        };
+        let table = compile_routes(&config);
+        assert!(
+            table.resolve("grpc-api.example.com").is_some(),
+            "grpc directive site must produce a resolvable route"
+        );
+        assert!(
+            table.resolve("other.example.com").is_none(),
+            "unrelated domain must not match"
         );
     }
 }

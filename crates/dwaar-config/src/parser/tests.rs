@@ -2223,3 +2223,111 @@ fn auto_update_unknown_directive_errors() {
         "unknown auto_update directive should produce parse error"
     );
 }
+
+// ── SD-107: grpc directive tests ──────────────────────────────────────────────
+
+#[test]
+fn grpc_proxy_inline_socket_addr() {
+    let config = parse(
+        "grpc-staging.permanu.com {
+            grpc 172.18.0.10:9090
+        }",
+    )
+    .expect("grpc directive with socket addr should parse");
+
+    assert_eq!(config.sites.len(), 1);
+    assert_eq!(config.sites[0].address, "grpc-staging.permanu.com");
+    assert_eq!(config.sites[0].directives.len(), 1);
+
+    let Directive::GrpcProxy(ref g) = config.sites[0].directives[0] else {
+        panic!("expected GrpcProxy directive, got {:?}", config.sites[0].directives[0]);
+    };
+    assert_eq!(
+        g.upstream,
+        UpstreamAddr::SocketAddr("172.18.0.10:9090".parse().expect("valid"))
+    );
+}
+
+#[test]
+fn grpc_proxy_inline_host_port() {
+    let config = parse(
+        "grpc-backend.example.com {
+            grpc grpc-backend:9090
+        }",
+    )
+    .expect("grpc directive with hostname should parse");
+
+    let Directive::GrpcProxy(ref g) = config.sites[0].directives[0] else {
+        panic!("expected GrpcProxy directive");
+    };
+    assert_eq!(g.upstream, UpstreamAddr::HostPort("grpc-backend:9090".to_string()));
+}
+
+#[test]
+fn grpc_proxy_with_tls_directive() {
+    // grpc + explicit tls are valid together — TLS terminates at Dwaar,
+    // h2c goes to the upstream.
+    let config = parse(
+        "grpc.example.com {
+            grpc 10.0.0.5:9090
+            tls auto
+        }",
+    )
+    .expect("grpc + tls should parse");
+
+    assert_eq!(config.sites[0].directives.len(), 2);
+    assert!(config.sites[0].directives.iter().any(|d| matches!(d, Directive::GrpcProxy(_))));
+    assert!(config.sites[0].directives.iter().any(|d| matches!(d, Directive::Tls(TlsDirective::Auto))));
+}
+
+#[test]
+fn bare_grpc_marker_still_parses() {
+    // The legacy bare `grpc` (no address) must still parse — used alongside
+    // `reverse_proxy` to force h2c upstream (backward compat).
+    let config = parse(
+        "api.example.com {
+            grpc
+            reverse_proxy backend:9090
+        }",
+    )
+    .expect("bare grpc marker should still parse");
+
+    assert!(config.sites[0].directives.iter().any(|d| matches!(d, Directive::Grpc)));
+    assert!(config.sites[0].directives.iter().any(|d| matches!(d, Directive::ReverseProxy(_))));
+}
+
+#[test]
+fn grpc_proxy_missing_upstream_errors() {
+    // A lone `grpc` followed immediately by `}` with no upstream should fall
+    // through as the bare Grpc marker (no parse error) — we only error when
+    // there's a word that doesn't look like an address.
+    // This test confirms the bare-marker path still works without panicking.
+    let result = parse(
+        "api.example.com {
+            grpc
+        }",
+    );
+    assert!(result.is_ok(), "bare grpc with no upstream is valid (backward compat)");
+    let config = result.expect("should parse");
+    assert!(matches!(config.sites[0].directives[0], Directive::Grpc));
+}
+
+#[test]
+fn grpc_proxy_use_case_dwaarfile() {
+    // Exact use-case from SD-107 requirements.
+    let config = parse(
+        "grpc-staging.permanu.com {
+            grpc 172.18.0.10:9090
+        }",
+    )
+    .expect("real use-case Dwaarfile should parse");
+
+    assert_eq!(config.sites[0].address, "grpc-staging.permanu.com");
+    let Directive::GrpcProxy(ref g) = config.sites[0].directives[0] else {
+        panic!("expected GrpcProxy");
+    };
+    assert_eq!(
+        g.upstream,
+        UpstreamAddr::SocketAddr("172.18.0.10:9090".parse().expect("valid"))
+    );
+}
