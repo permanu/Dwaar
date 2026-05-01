@@ -965,6 +965,7 @@ fn parse_site_block(t: &mut Tokenizer<'_>) -> Result<SiteBlock, ParseError> {
 }
 
 /// Parse a single directive by dispatching on the directive name.
+#[allow(clippy::too_many_lines)]
 fn parse_directive(t: &mut Tokenizer<'_>) -> Result<Directive, ParseError> {
     let name_tok = t.next_token();
     let name = match &name_tok.kind {
