@@ -129,6 +129,22 @@ download() {
 }
 
 # ---------------------------------------------------------------------------
+# HEAD-style existence check — returns 0 if URL responds 2xx, 1 otherwise.
+# Used to probe optional release assets (e.g. .bundle vs legacy .sig/.cert)
+# without aborting the script under `set -e`.
+# ---------------------------------------------------------------------------
+http_exists() {
+    URL="$1"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSLI -o /dev/null "${URL}" >/dev/null 2>&1
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q --spider "${URL}" >/dev/null 2>&1
+    else
+        die "Neither curl nor wget is available. Please install one and retry."
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # SHA256 verification
 # ---------------------------------------------------------------------------
 verify_sha256() {
@@ -433,6 +449,8 @@ main() {
     BINARY_TMP="${TMPDIR_DWAAR}/${ARTIFACT}"
     SHA256_TMP="${TMPDIR_DWAAR}/${ARTIFACT}.sha256"
 
+    BUNDLE_URL="${BINARY_URL}.bundle"
+    BUNDLE_TMP="${TMPDIR_DWAAR}/${ARTIFACT}.bundle"
     SIG_URL="${BINARY_URL}.sig"
     CERT_URL="${BINARY_URL}.cert"
     SIG_TMP="${TMPDIR_DWAAR}/${ARTIFACT}.sig"
@@ -449,35 +467,66 @@ main() {
     success "SHA256 checksum verified."
 
     # 5a. Cosign signature verification (keyless OIDC).
-    # The .sig and .cert files are published alongside every release binary.
-    # If cosign is installed, we verify the cryptographic signature — the cert
-    # chains to Fulcio with the GitHub Actions OIDC issuer and pins the exact
-    # workflow path that produced this binary.  This is a stronger guarantee
-    # than sha256 alone (sha256 only proves download integrity; cosign proves
-    # build provenance).
     #
-    # If cosign is NOT installed we fall back to sha256-only and print a loud
-    # warning — we never silently bypass signature verification.
+    # As of v0.3.18 every release ships a single sigstore bundle
+    # (`${ARTIFACT}.bundle`) that embeds both the signature and the Fulcio
+    # certificate. Older releases shipped split `.sig` + `.cert` files; we
+    # keep that path as a fallback so re-installs of historical versions
+    # still verify cleanly.
+    #
+    # Verification chains to Fulcio with the GitHub Actions OIDC issuer and
+    # pins the exact workflow path that produced this binary — a stronger
+    # guarantee than sha256 alone (sha256 proves download integrity; cosign
+    # proves build provenance).
+    #
+    # If cosign is NOT installed we fall back to sha256-only and print a
+    # loud warning — we never silently bypass signature verification.
     info "Verifying cosign signature..."
-    download "${SIG_URL}"  "${SIG_TMP}"
-    download "${CERT_URL}" "${CERT_TMP}"
+    SIG_MODE=""
+    if http_exists "${BUNDLE_URL}"; then
+        download "${BUNDLE_URL}" "${BUNDLE_TMP}"
+        SIG_MODE="bundle"
+    elif http_exists "${SIG_URL}" && http_exists "${CERT_URL}"; then
+        download "${SIG_URL}"  "${SIG_TMP}"
+        download "${CERT_URL}" "${CERT_TMP}"
+        SIG_MODE="legacy"
+    else
+        die "No signature artefacts found for ${ARTIFACT}. Looked for:
+  ${BUNDLE_URL}
+  ${SIG_URL} + ${CERT_URL}
+Refusing to install an unverifiable binary."
+    fi
+
     if command -v cosign >/dev/null 2>&1; then
-        cosign verify-blob \
-            --certificate "${CERT_TMP}" \
-            --signature "${SIG_TMP}" \
-            --certificate-identity-regexp "^https://github\.com/permanu/Dwaar/\.github/workflows/release\.yml@.*" \
-            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-            "${BINARY_TMP}"
-        success "Cosign signature verified."
+        if [ "${SIG_MODE}" = "bundle" ]; then
+            cosign verify-blob \
+                --bundle "${BUNDLE_TMP}" \
+                --certificate-identity-regexp "^https://github\.com/permanu/Dwaar/\.github/workflows/release\.yml@.*" \
+                --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+                "${BINARY_TMP}"
+        else
+            cosign verify-blob \
+                --certificate "${CERT_TMP}" \
+                --signature "${SIG_TMP}" \
+                --certificate-identity-regexp "^https://github\.com/permanu/Dwaar/\.github/workflows/release\.yml@.*" \
+                --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+                "${BINARY_TMP}"
+        fi
+        success "Cosign signature verified (${SIG_MODE})."
     else
         printf "%bWarning: cosign not installed, skipping signature verification (sha256 still checked).%b\n" \
             "${YELLOW}" "${RESET}" >&2
         printf "%b         Install cosign from https://github.com/sigstore/cosign/releases%b\n" \
             "${YELLOW}" "${RESET}" >&2
         printf "%b         then verify manually:%b\n" "${YELLOW}" "${RESET}" >&2
-        printf "%b         cosign verify-blob \\%b\n" "${YELLOW}" "${RESET}" >&2
-        printf "%b           --certificate %s.cert \\%b\n" "${YELLOW}" "${ARTIFACT}" "${RESET}" >&2
-        printf "%b           --signature %s.sig \\%b\n" "${YELLOW}" "${ARTIFACT}" "${RESET}" >&2
+        if [ "${SIG_MODE}" = "bundle" ]; then
+            printf "%b         cosign verify-blob \\%b\n" "${YELLOW}" "${RESET}" >&2
+            printf "%b           --bundle %s.bundle \\%b\n" "${YELLOW}" "${ARTIFACT}" "${RESET}" >&2
+        else
+            printf "%b         cosign verify-blob \\%b\n" "${YELLOW}" "${RESET}" >&2
+            printf "%b           --certificate %s.cert \\%b\n" "${YELLOW}" "${ARTIFACT}" "${RESET}" >&2
+            printf "%b           --signature %s.sig \\%b\n" "${YELLOW}" "${ARTIFACT}" "${RESET}" >&2
+        fi
         printf '%b           --certificate-identity-regexp "^https://github\\.com/permanu/Dwaar/\\.github/workflows/release\\.yml@.*" \\%b\n' \
             "${YELLOW}" "${RESET}" >&2
         printf '%b           --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \\%b\n' \

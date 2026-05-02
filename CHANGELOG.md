@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.19] - 2026-05-02
+
+### Fixed
+
+- **`scripts/install.sh` sigstore bundle support** — the public installer
+  served from `dwaar.dev/install.sh` now downloads the single
+  `${ARTIFACT}.bundle` cosign artefact and verifies with
+  `cosign verify-blob --bundle …`. Earlier releases shipped split
+  `.sig` + `.cert` files; that path is preserved as a fallback for
+  re-installs of historical versions, but new releases verify via the
+  bundle. Previously the installer hard-coded a `curl` of the legacy
+  `.sig` / `.cert` filenames, both of which 404 on bundle-only releases
+  and aborted the script under `set -eu` — silently degrading callers
+  (e.g. Permanu's agent installer) that swallowed the failure as
+  non-fatal. The installer now also probes for the artefacts before
+  downloading and exits with an actionable error if neither shape is
+  present, instead of attempting an unverifiable install.
+
 ## [0.3.18] - 2026-05-01
 
 ### Added

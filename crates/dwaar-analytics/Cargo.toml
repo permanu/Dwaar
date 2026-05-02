@@ -1,6 +1,6 @@
 [package]
 name = "dwaar-analytics"
-version = "0.3.18"
+version = "0.3.19"
 description = "First-party analytics — JS injection, beacon collection, in-memory aggregation"
 edition.workspace = true
 publish = false
