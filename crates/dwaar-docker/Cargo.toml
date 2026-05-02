@@ -1,6 +1,6 @@
 [package]
 name = "dwaar-docker"
-version = "0.3.18"
+version = "0.3.19"
 description = "Docker socket watcher — auto-discover containers via labels"
 edition.workspace = true
 publish = false
