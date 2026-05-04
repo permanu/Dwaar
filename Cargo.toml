@@ -167,7 +167,7 @@ assert_cmd = "2.2.1"
 predicates = "3.1.4"
 criterion = { version = "0.8.2", features = ["html_reports"] }
 proptest = "1.11.0"
-reqwest = { version = "0.13.2", default-features = false, features = ["rustls", "blocking", "json", "stream"] }
+reqwest = { version = "0.13.3", default-features = false, features = ["rustls", "blocking", "json", "stream"] }
 
 [workspace.lints.rust]
 unsafe_code = "warn"
