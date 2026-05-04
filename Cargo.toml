@@ -87,7 +87,7 @@ ipnet = "2"
 notify = { version = "8.2.0", default-features = false, features = ["macos_kqueue"] }
 
 # GeoIP
-maxminddb = { version = "0.27.3", features = ["mmap"] }
+maxminddb = { version = "0.28.1", features = ["mmap"] }
 
 # Analytics data structures
 hyperloglog = "1.0.3"
