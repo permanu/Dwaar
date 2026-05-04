@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.20] - 2026-05-04
+
+### Fixed
+
+- **`systemctl reload dwaar` now warm-restarts instead of killing the daemon.**
+  The systemd unit shipped by `scripts/install.sh` set
+  `ExecReload=/bin/kill -HUP $MAINPID`, but dwaar never installed a SIGHUP
+  handler — Pingora's zero-downtime upgrade is wired to SIGUSR2 (see
+  `install_sigusr2_handler` in `crates/dwaar-cli/src/main.rs`). The default
+  SIGHUP disposition (terminate) therefore took down the proxy on every
+  `systemctl reload`. New installs now use `ExecReload=/bin/kill -USR2
+  $MAINPID`, which spawns a child, health-checks it, hands off listen FDs,
+  then gracefully drains the parent — no in-flight connections dropped.
+  Existing installs are auto-migrated in place when the installer re-runs:
+  if `${SYSTEMD_UNIT}` matches the legacy `kill -HUP` line, it is rewritten
+  to `kill -USR2` (idempotent). Also pins `KillSignal=SIGQUIT` so
+  `systemctl stop dwaar` triggers Pingora's graceful drain instead of
+  immediate SIGTERM. Unblocks Permanu's BOOTSTRAP_SECRETS reload-on-ack
+  path (Permanu PR #933) which assumed reload was warm.
+
 ## [0.3.19] - 2026-05-02
 
 ### Fixed

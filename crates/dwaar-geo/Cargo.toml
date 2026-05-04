@@ -1,6 +1,6 @@
 [package]
 name = "dwaar-geo"
-version = "0.3.19"
+version = "0.3.20"
 description = "GeoIP lookup — IP to country/city via MaxMind GeoLite2"
 edition.workspace = true
 publish = false

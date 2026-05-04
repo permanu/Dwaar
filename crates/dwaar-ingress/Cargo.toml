@@ -1,6 +1,6 @@
 [package]
 name = "dwaar-ingress"
-version = "0.3.19"
+version = "0.3.20"
 description = "Kubernetes ingress controller — watches Ingress resources and syncs routes to Dwaar"
 edition.workspace = true
 publish = false

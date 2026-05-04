@@ -302,6 +302,19 @@ install_systemd_unit() {
 
     if [ -f "${SYSTEMD_UNIT}" ]; then
         warn "${SYSTEMD_UNIT} already exists — not overwriting."
+        # Migration: pre-0.3.19 units used `ExecReload=/bin/kill -HUP $MAINPID`,
+        # but dwaar never trapped SIGHUP, so `systemctl reload dwaar` killed the
+        # daemon. Pingora's zero-downtime reload is wired to SIGUSR2 (see
+        # install_sigusr2_handler in dwaar-cli). Patch in place so existing
+        # installs warm-restart instead of dying. Idempotent.
+        if grep -q '^ExecReload=/bin/kill -HUP \$MAINPID$' "${SYSTEMD_UNIT}" 2>/dev/null; then
+            info "Migrating ExecReload to SIGUSR2 (zero-downtime warm-restart)..."
+            if running_as_root; then
+                sed -i 's|^ExecReload=/bin/kill -HUP \$MAINPID$|ExecReload=/bin/kill -USR2 $MAINPID|' "${SYSTEMD_UNIT}"
+            elif has_sudo; then
+                sudo sed -i 's|^ExecReload=/bin/kill -HUP \$MAINPID$|ExecReload=/bin/kill -USR2 $MAINPID|' "${SYSTEMD_UNIT}"
+            fi
+        fi
         # Always reload and re-enable in case binary path changed
         if running_as_root; then
             systemctl daemon-reload
@@ -323,7 +336,12 @@ Documentation=https://github.com/permanu/Dwaar
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/dwaar run --config /etc/dwaar/Dwaarfile
-ExecReload=/bin/kill -HUP $MAINPID
+# SIGUSR2 triggers Pingora-style zero-downtime warm-restart (spawn child,
+# health-check, hand off listen FDs, gracefully drain old). SIGHUP would
+# terminate the process — dwaar does not trap SIGHUP. See
+# install_sigusr2_handler in crates/dwaar-cli/src/main.rs.
+ExecReload=/bin/kill -USR2 $MAINPID
+KillSignal=SIGQUIT
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65535

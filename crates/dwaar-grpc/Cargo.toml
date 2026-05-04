@@ -1,6 +1,6 @@
 [package]
 name = "dwaar-grpc"
-version = "0.3.19"
+version = "0.3.20"
 description = "Bidirectional gRPC control fabric — DwaarControl service (Permanu ↔ Dwaar)"
 edition.workspace = true
 publish = false
