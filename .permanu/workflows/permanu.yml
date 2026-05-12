@@ -15,8 +15,12 @@ jobs:
       - name: Setup Rust
         shell: sh
         run: |
-          export HOME="${HOME:-/root}"
-          export PATH="$HOME/.cargo/bin:$PATH"
+          current_run_dir="$(dirname "$(dirname "$PWD")")"
+          find /tmp/permanu-ci -mindepth 1 -maxdepth 1 -type d ! -path "$current_run_dir" -exec rm -rf {} + 2>/dev/null || true
+          export HOME="/root"
+          export CARGO_HOME="/root/.cargo"
+          export RUSTUP_HOME="/root/.rustup"
+          export PATH="$CARGO_HOME/bin:$PATH"
           while ! mkdir /tmp/permanu-rustup.lock 2>/dev/null; do sleep 2; done
           trap 'rmdir /tmp/permanu-rustup.lock' EXIT
           if ! command -v cmake >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
@@ -46,8 +50,12 @@ jobs:
       - name: Setup Rust
         shell: sh
         run: |
-          export HOME="${HOME:-/root}"
-          export PATH="$HOME/.cargo/bin:$PATH"
+          current_run_dir="$(dirname "$(dirname "$PWD")")"
+          find /tmp/permanu-ci -mindepth 1 -maxdepth 1 -type d ! -path "$current_run_dir" -exec rm -rf {} + 2>/dev/null || true
+          export HOME="/root"
+          export CARGO_HOME="/root/.cargo"
+          export RUSTUP_HOME="/root/.rustup"
+          export PATH="$CARGO_HOME/bin:$PATH"
           while ! mkdir /tmp/permanu-rustup.lock 2>/dev/null; do sleep 2; done
           trap 'rmdir /tmp/permanu-rustup.lock' EXIT
           if ! command -v cmake >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
@@ -80,8 +88,12 @@ jobs:
       - name: Setup Rust
         shell: sh
         run: |
-          export HOME="${HOME:-/root}"
-          export PATH="$HOME/.cargo/bin:$PATH"
+          current_run_dir="$(dirname "$(dirname "$PWD")")"
+          find /tmp/permanu-ci -mindepth 1 -maxdepth 1 -type d ! -path "$current_run_dir" -exec rm -rf {} + 2>/dev/null || true
+          export HOME="/root"
+          export CARGO_HOME="/root/.cargo"
+          export RUSTUP_HOME="/root/.rustup"
+          export PATH="$CARGO_HOME/bin:$PATH"
           while ! mkdir /tmp/permanu-rustup.lock 2>/dev/null; do sleep 2; done
           trap 'rmdir /tmp/permanu-rustup.lock' EXIT
           if ! command -v cmake >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
