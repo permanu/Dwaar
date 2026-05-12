@@ -4,7 +4,7 @@
 // This file is part of Dwaar — https://dwaar.dev
 // Licensed under the Business Source License 1.1
 
-//! End-to-end test for the SocketSink + AggregationService chain.
+//! End-to-end test for the `SocketSink` + `AggregationService` chain.
 //!
 //! Spins up an `AggregationService` wired to a real `SocketSink`, listens
 //! on the matching unix socket from a tokio task, sends an aggregation
@@ -43,7 +43,7 @@ fn sample_event(host: &str) -> AggEvent {
         query: None,
         status: 200,
         bytes_sent: 256,
-        client_ip: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+        client_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
         country: Some("US".into()),
         referer: None,
         user_agent: Some("Mozilla/5.0".into()),
