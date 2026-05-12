@@ -1,0 +1,51 @@
+name: Permanu CI
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  rust-quality:
+    name: Rust Quality
+    runs-on: self-hosted
+    timeout-minutes: 30
+    steps:
+      - name: Format
+        shell: sh
+        run: cargo fmt --all --check
+
+      - name: Lint
+        shell: sh
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  rust-test:
+    name: Rust Test
+    runs-on: self-hosted
+    timeout-minutes: 45
+    steps:
+      - name: Workspace tests
+        shell: sh
+        run: cargo test --workspace --exclude dwaar-cli
+
+      - name: CLI tests
+        shell: sh
+        run: cargo test -p dwaar-cli --bins --test cli_integration
+
+      - name: Ignored tests
+        shell: sh
+        run: cargo test --workspace --exclude dwaar-cli -- --ignored --nocapture
+
+  rust-build:
+    name: Rust Build
+    runs-on: self-hosted
+    timeout-minutes: 30
+    steps:
+      - name: Build workspace
+        shell: sh
+        run: cargo build --workspace
+
+      - name: Release type check
+        shell: sh
+        run: cargo check --workspace --release
