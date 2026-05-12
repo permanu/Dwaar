@@ -244,6 +244,9 @@ fn parse_global_option_line(
         "tracing" => {
             opts.tracing = Some(parse_tracing_block(t, &key_tok)?);
         }
+        "analytics" => {
+            opts.analytics_sink_path = Some(parse_analytics_block(t, &key_tok)?);
+        }
         "layer4" => {
             let result = layer4::parse_layer4_config(t, &key_tok)?;
             opts.layer4 = Some(result.tcp);
@@ -350,6 +353,7 @@ fn is_global_option_key(w: &str) -> bool {
             | "drain_timeout"
             | "timeouts"
             | "auto_update"
+            | "analytics"
             | "layer4"
     )
 }
@@ -573,6 +577,123 @@ fn parse_auto_update_block(
     }
 
     Ok(cfg)
+}
+
+/// Parse `analytics { sink unix <path> }` inside the global options block.
+///
+/// Returns the unix socket path that the aggregation service streams
+/// `DomainMetricsSnapshot` JSON lines to. The grammar is intentionally
+/// minimal — only `sink unix <path>` is recognised today; future sink
+/// transports (e.g. `tcp host:port`) can extend the inner match without
+/// breaking existing configs.
+///
+/// Example:
+/// ```text
+/// {
+///     analytics {
+///         sink unix /run/dwaar/analytics.sock
+///     }
+/// }
+/// ```
+fn parse_analytics_block(
+    t: &mut Tokenizer<'_>,
+    key_tok: &Token,
+) -> Result<std::path::PathBuf, ParseError> {
+    let brace = t.peek();
+    if !matches!(brace.kind, TokenKind::OpenBrace) {
+        return Err(ParseError {
+            line: key_tok.line,
+            col: key_tok.col,
+            kind: ParseErrorKind::Expected {
+                expected: "'{' to open analytics block".to_string(),
+                got: format!("{}", brace.kind),
+            },
+        });
+    }
+    t.next_token(); // consume `{`
+
+    let mut sink_path: Option<std::path::PathBuf> = None;
+
+    loop {
+        let tok = t.peek();
+        match &tok.kind {
+            TokenKind::CloseBrace => {
+                t.next_token();
+                break;
+            }
+            TokenKind::Eof => {
+                return Err(ParseError {
+                    line: key_tok.line,
+                    col: key_tok.col,
+                    kind: ParseErrorKind::Expected {
+                        expected: "'}' to close analytics block".to_string(),
+                        got: "end of file".to_string(),
+                    },
+                });
+            }
+            TokenKind::Word(_) => {
+                let sub_tok = t.next_token();
+                let sub_key = match &sub_tok.kind {
+                    TokenKind::Word(w) => w.clone(),
+                    _ => unreachable!(),
+                };
+                match sub_key.as_str() {
+                    "sink" => {
+                        let transport = peek_consume_word_or_quoted(t);
+                        if transport != "unix" {
+                            return Err(ParseError {
+                                line: sub_tok.line,
+                                col: sub_tok.col,
+                                kind: ParseErrorKind::InvalidValue {
+                                    directive: "analytics.sink".to_string(),
+                                    message: format!(
+                                        "unknown sink transport '{transport}', only 'unix' is supported"
+                                    ),
+                                    accepted_format: Some("sink unix <path>"),
+                                },
+                            });
+                        }
+                        let path = peek_consume_word_or_quoted(t);
+                        if path.is_empty() {
+                            return Err(ParseError {
+                                line: sub_tok.line,
+                                col: sub_tok.col,
+                                kind: ParseErrorKind::InvalidValue {
+                                    directive: "analytics.sink".to_string(),
+                                    message: "missing socket path".to_string(),
+                                    accepted_format: Some("sink unix <path>"),
+                                },
+                            });
+                        }
+                        sink_path = Some(std::path::PathBuf::from(path));
+                    }
+                    other => {
+                        return Err(ParseError {
+                            line: sub_tok.line,
+                            col: sub_tok.col,
+                            kind: ParseErrorKind::UnknownDirective {
+                                name: format!("analytics.{other}"),
+                                suggestion: None,
+                            },
+                        });
+                    }
+                }
+            }
+            _ => {
+                t.next_token();
+            }
+        }
+    }
+
+    sink_path.ok_or(ParseError {
+        line: key_tok.line,
+        col: key_tok.col,
+        kind: ParseErrorKind::InvalidValue {
+            directive: "analytics".to_string(),
+            message: "missing required 'sink' directive".to_string(),
+            accepted_format: Some("analytics { sink unix /path/to/socket }"),
+        },
+    })
 }
 
 /// Parse `tracing { otlp_endpoint <url> }` inside the global options block.

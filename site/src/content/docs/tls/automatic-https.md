@@ -100,6 +100,12 @@ On startup, the service performs an immediate scan before entering the loop, so 
 
 A concurrency guard prevents double-issuance if a renewal is already in progress for a domain. Failed renewals are retried on the next 12-hour cycle — the existing (still-valid) certificate continues to serve traffic until renewal succeeds.
 
+There is no short retry queue for a failed issuance or renewal inside the same
+cycle. After Let's Encrypt and the Google Trust Services fallback both fail,
+Dwaar logs the failure and waits for the next 12-hour background scan, unless
+the process is restarted or the operator fixes the cause and triggers a new
+startup/config path. Plan alerting around that coarse retry interval.
+
 ## Configuration
 
 ### Default behavior (no explicit `tls` directive needed)

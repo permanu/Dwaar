@@ -32,12 +32,12 @@ sequenceDiagram
     participant CA as ACME CA
     participant CS as CertStore
 
-    D->>CF: POST /zones/{id}/dns_records<br/>_acme-challenge.example.com TXT &lt;token&gt;
+    D->>CF: create TXT record for ACME token
     CF-->>D: record_id
 
     D->>CA: ACME challenge ready
     CA->>CF: DNS lookup _acme-challenge.example.com
-    CF-->>CA: TXT &lt;token&gt;
+    CF-->>CA: TXT token
     CA-->>D: challenge validated
 
     D->>CA: finalize(CSR for *.example.com)
@@ -97,6 +97,12 @@ Pass the token through an environment variable to keep it out of the Dwaarfile:
 ```
 
 Dwaar expands `{env.CF_API_TOKEN}` at parse time. If the variable is not set, startup fails with a clear error rather than running with an empty token.
+
+Because DNS provider credentials are resolved while the Dwaarfile is compiled,
+changing `CF_API_TOKEN` in the process environment is not enough for an already
+running process. Restart Dwaar after rotating DNS-01 credentials. A config
+reload can pick up a changed Dwaarfile, but it cannot observe environment
+changes that were not present in the process environment at startup.
 
 ### Multiple wildcard domains
 

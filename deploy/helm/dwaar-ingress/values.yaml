@@ -52,6 +52,14 @@ controller:
   # Dwaar admin API URL. Adjust to match your Dwaar service name.
   adminUrl: "http://dwaar-admin:9000"
 
+  # Secret containing the Dwaar admin bearer token. The controller sends this
+  # value as Authorization: Bearer <token> on every Admin API mutation.
+  # Dwaar's TCP Admin API rejects authenticated endpoints when the token is
+  # unset, so production installs should create this secret and set name/key.
+  adminTokenSecret:
+    name: ""
+    key: "token"
+
   # Only manage Ingresses with this IngressClass name.
   # Leave empty to manage all Ingresses (not recommended in shared clusters).
   ingressClass: "dwaar"

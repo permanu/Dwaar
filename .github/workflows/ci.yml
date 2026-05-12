@@ -85,6 +85,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace
 
+  release-check:
+    # Type-check the workspace under the release profile so type-or-feature
+    # divergences between dev and release (e.g. `cfg(debug_assertions)` arms,
+    # release-only features) surface on every PR without paying for a full
+    # codegen pass — `cargo check` skips link/codegen and finishes in ~30s
+    # on a warm cache, vs ~10min for `cargo build --release`.
+    name: Release Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --release
+
   license-headers:
     name: License Headers
     runs-on: ubuntu-latest

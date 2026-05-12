@@ -48,13 +48,13 @@ sequenceDiagram
     participant U as Upstream
 
     C->>D: GET /api/data
-    D->>A: GET /api/authz/forward-auth<br/>X-Forwarded-Method: GET<br/>X-Forwarded-Uri: /api/data<br/>X-Forwarded-For: &lt;client-ip&gt;
-    alt 2xx — allowed
-        A-->>D: 200 OK<br/>Remote-User: alice<br/>Remote-Groups: admin
-        D->>U: GET /api/data<br/>Remote-User: alice<br/>Remote-Groups: admin
-        U-->>D: 200 OK + body
-        D-->>C: 200 OK + body
-    else 4xx — denied
+    D->>A: GET /api/authz/forward-auth with forwarded headers
+    alt allowed
+        A-->>D: 200 OK with Remote-User headers
+        D->>U: GET /api/data with Remote-User headers
+        U-->>D: 200 OK body
+        D-->>C: 200 OK body
+    else denied
         A-->>D: 401 Unauthorized + body
         D-->>C: 401 Unauthorized + body
     end

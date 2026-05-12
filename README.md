@@ -48,14 +48,25 @@ That's it. HTTPS is automatic. Analytics are injected. Requests are logged.
 
 ## Architecture
 
-Built on Pingora's `ProxyHttp` trait with 30 lifecycle hooks. Dwaar adds:
+Built on Pingora's `ProxyHttp` trait with a workspace split by runtime
+responsibility. The main proxy binary is `dwaar-cli`; the Kubernetes controller
+is a separate `dwaar-ingress` binary that talks to the proxy through the Admin
+API.
 
 ```
-Pingora (engine)     → TLS, connection pooling, HTTP lifecycle
-Dwaar Core (routing) → Dwaarfile parser, route table, admin API
-Dwaar Analytics      → JS injection, beacon collection, aggregation
-Dwaar Plugins        → Native Rust + WASM extensibility
+Pingora (engine)      → TLS, connection pooling, HTTP lifecycle
+dwaar-cli             → process entry point and service wiring
+dwaar-core            → ProxyHttp implementation, route table, handlers
+dwaar-config          → Dwaarfile parser/compiler and hot reload
+dwaar-tls             → ACME, certificate store, SNI, OCSP
+dwaar-admin           → authenticated Admin API
+dwaar-ingress         → Kubernetes Ingress controller, standalone binary
+dwaar-grpc            → gRPC control fabric
 ```
+
+Other workspace crates provide analytics, plugins, Docker discovery, GeoIP, and
+structured logging. See `site/src/content/docs/architecture/crate-map.md` for
+the full crate map.
 
 ## Dwaarfile directives
 
@@ -73,8 +84,10 @@ api.example.com {
 
 Proxy gRPC traffic to a backend over **HTTP/2 cleartext (h2c)**. TLS is
 terminated at Dwaar's public listener (auto-provisioned via ACME by default).
-The upstream connection speaks HTTP/2 cleartext — no TLS needed between Dwaar
-and the container.
+The upstream connection speaks HTTP/2 cleartext by default. Use that only for
+loopback, same-pod, or otherwise trusted private links; if the backend is across
+an untrusted network, terminate upstream TLS or mTLS with `reverse_proxy`
+transport settings instead of relying on the `grpc` shortcut.
 
 Trailers, gRPC status codes, streaming semantics, and bidirectional streams
 are preserved end-to-end.

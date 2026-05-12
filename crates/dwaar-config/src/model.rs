@@ -56,6 +56,11 @@ pub struct GlobalOptions {
     /// Distributed tracing configuration. When `otlp_endpoint` is set,
     /// completed request spans are exported to an OTLP/HTTP collector.
     pub tracing: Option<TracingConfig>,
+    /// Unix socket path that the analytics aggregation service streams
+    /// per-domain `DomainMetricsSnapshot` JSON to once configured. Parsed
+    /// from `analytics { sink unix <path> }` in the global options block.
+    /// `None` keeps the legacy stdout-only flush path.
+    pub analytics_sink_path: Option<std::path::PathBuf>,
     /// Options we recognized but don't act on — stored so we never error
     /// on valid Caddyfile syntax we haven't implemented yet.
     pub passthrough: Vec<(String, Vec<String>)>,

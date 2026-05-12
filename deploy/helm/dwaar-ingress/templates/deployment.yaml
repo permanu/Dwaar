@@ -46,9 +46,18 @@ spec:
             {{- if .Values.controller.watchNamespace }}
             - --namespace={{ .Values.controller.watchNamespace }}
             {{- end }}
-          {{- with .Values.extraEnv }}
+          {{- if or .Values.controller.adminTokenSecret.name .Values.extraEnv }}
           env:
+            {{- if .Values.controller.adminTokenSecret.name }}
+            - name: DWAAR_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.controller.adminTokenSecret.name }}
+                  key: {{ .Values.controller.adminTokenSecret.key }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
             {{- toYaml . | nindent 12 }}
+            {{- end }}
           {{- end }}
           ports:
             - name: health

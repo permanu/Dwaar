@@ -49,7 +49,7 @@ sequenceDiagram
     participant U as Upstream (TCP)
 
     C->>D: HTTPS/1.1 or HTTP/2 request (TCP)
-    D-->>C: Response + Alt-Svc: h3=":443"; ma=86400
+    D-->>C: Response with Alt-Svc for h3 on port 443
 
     Note over C: Client caches Alt-Svc entry (24 h)
 

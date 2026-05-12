@@ -35,6 +35,10 @@ jobs:
         with:
           tool: cargo-audit
       - name: Run audit
+        # Temporary advisory allowlist. Each ignored RUSTSEC must have a
+        # matching tracking note/issue with the affected dependency, why it is
+        # acceptable for now, and the removal condition. Do not add new ignores
+        # without that rationale.
         run: >-
           cargo audit
           --ignore RUSTSEC-2025-0069
