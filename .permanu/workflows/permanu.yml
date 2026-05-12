@@ -15,6 +15,10 @@ jobs:
       - name: Setup Rust
         shell: sh
         run: |
+          export HOME="${HOME:-/root}"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          while ! mkdir /tmp/permanu-rustup.lock 2>/dev/null; do sleep 2; done
+          trap 'rmdir /tmp/permanu-rustup.lock' EXIT
           if ! command -v cargo >/dev/null 2>&1; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           fi
@@ -38,6 +42,10 @@ jobs:
       - name: Setup Rust
         shell: sh
         run: |
+          export HOME="${HOME:-/root}"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          while ! mkdir /tmp/permanu-rustup.lock 2>/dev/null; do sleep 2; done
+          trap 'rmdir /tmp/permanu-rustup.lock' EXIT
           if ! command -v cargo >/dev/null 2>&1; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           fi
@@ -64,6 +72,10 @@ jobs:
       - name: Setup Rust
         shell: sh
         run: |
+          export HOME="${HOME:-/root}"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          while ! mkdir /tmp/permanu-rustup.lock 2>/dev/null; do sleep 2; done
+          trap 'rmdir /tmp/permanu-rustup.lock' EXIT
           if ! command -v cargo >/dev/null 2>&1; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           fi
