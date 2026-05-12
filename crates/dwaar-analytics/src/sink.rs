@@ -268,6 +268,15 @@ mod tests {
     use crate::aggregation::DomainMetrics;
     use std::io::{BufRead, BufReader};
     use std::os::unix::net::UnixListener;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn short_socket_dir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("dwaar-analytics-")
+            .tempdir_in("/tmp")
+            .expect("create short socket temp dir")
+    }
 
     fn test_snapshot() -> DomainMetricsSnapshot {
         let dm = DomainMetrics::new();
@@ -493,17 +502,32 @@ mod tests {
 
     #[test]
     fn socket_sink_sends_json() {
-        let dir = tempfile::tempdir().expect("create temp dir");
+        let dir = short_socket_dir();
         let sock_path = dir.path().join("analytics.sock");
         let listener = UnixListener::bind(&sock_path).expect("bind");
+        let (line_tx, line_rx) = mpsc::channel::<Result<String, String>>();
+        let listener_thread = std::thread::spawn(move || {
+            let (conn, _) = listener.accept().expect("accept");
+            conn.set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("set read timeout");
+            let reader = BufReader::new(conn);
+            let line = reader
+                .lines()
+                .next()
+                .ok_or_else(|| "socket closed before line".to_string())
+                .and_then(|result| result.map_err(|err| err.to_string()));
+            line_tx.send(line).expect("send line");
+        });
         let sink = SocketSink::new(sock_path);
 
         let snap = test_snapshot();
         sink.flush(&snap).expect("socket flush");
 
-        let (conn, _) = listener.accept().expect("accept");
-        let reader = BufReader::new(conn);
-        let line = reader.lines().next().expect("line").expect("read");
+        let line = line_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("receive socket line")
+            .expect("read socket line");
+        listener_thread.join().expect("listener thread");
         let parsed: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
         assert_eq!(parsed["domain"], "test.example.com");
     }
