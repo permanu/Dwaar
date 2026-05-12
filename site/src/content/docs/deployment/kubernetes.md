@@ -14,8 +14,14 @@ Two replicas run by default. Leader election ensures exactly one replica drives 
 helm install dwaar-ingress ./deploy/helm/dwaar-ingress \
   --namespace dwaar-system \
   --create-namespace \
-  --set controller.adminUrl=http://dwaar-admin:9000
+  --set controller.adminUrl=http://dwaar-admin:9000 \
+  --set controller.adminTokenSecret.name=dwaar-admin-token
 ```
+
+Create `dwaar-admin-token` in the release namespace with a `token` key whose
+value matches the proxy's `DWAAR_ADMIN_TOKEN`. The TCP Admin API fails closed on
+authenticated endpoints when no token is configured, and `dwaar-ingress` needs
+that bearer token for route mutations.
 
 ## Architecture
 

@@ -22,8 +22,14 @@ Override the admin URL to match your Dwaar service:
 helm install dwaar-ingress ./deploy/helm/dwaar-ingress \
   --namespace dwaar-system \
   --create-namespace \
-  --set controller.adminUrl=http://dwaar-admin:9000
+  --set controller.adminUrl=http://dwaar-admin:9000 \
+  --set controller.adminTokenSecret.name=dwaar-admin-token
 ```
+
+The secret must exist in the release namespace and contain a `token` key that
+matches the Dwaar proxy's `DWAAR_ADMIN_TOKEN`. Without it, the controller can
+start and watch Kubernetes resources, but Admin API route mutations will be
+rejected with `401`.
 
 ## Chart Values
 
@@ -53,6 +59,8 @@ helm install dwaar-ingress ./deploy/helm/dwaar-ingress \
 | `resources.limits.cpu` | `500m` | CPU limit. |
 | `resources.limits.memory` | `256Mi` | Memory limit. |
 | `controller.adminUrl` | `http://dwaar-admin:9000` | Dwaar admin API base URL (`--admin-url`). |
+| `controller.adminTokenSecret.name` | `""` | Existing Kubernetes Secret that stores the Dwaar admin bearer token. Empty means no token is injected. |
+| `controller.adminTokenSecret.key` | `token` | Secret key read into `DWAAR_ADMIN_TOKEN`. |
 | `controller.ingressClass` | `"dwaar"` | Only manage Ingresses with this class name (`--ingress-class`). |
 | `controller.watchNamespace` | `""` | Restrict watching to one namespace (`--namespace`). Empty = all namespaces. |
 | `controller.leaseName` | `dwaar-ingress-leader` | Leader election Lease name (`--lease-name`). |
@@ -77,7 +85,15 @@ helm install dwaar-ingress ./deploy/helm/dwaar-ingress \
 
 ## RBAC
 
-The chart creates one ClusterRole and one ClusterRoleBinding. When `controller.watchNamespace` is set, it additionally creates a namespace-scoped Role and RoleBinding for Secret access.
+The chart creates one ClusterRole and one ClusterRoleBinding. The default
+`controller.watchNamespace: ""` watches all namespaces, so RBAC is broad by
+design: the controller can list/watch Ingresses, Services, IngressClasses,
+cluster-wide TLS Secrets, and leader-election Leases. Set
+`controller.watchNamespace` in single-tenant or locked-down clusters to reduce
+Secret access to one namespace.
+
+When `controller.watchNamespace` is set, the chart additionally creates a
+namespace-scoped Role and RoleBinding for Secret access.
 
 ### ClusterRole
 
@@ -185,6 +201,9 @@ image:
 
 controller:
   adminUrl: "http://dwaar-admin.dwaar-system.svc.cluster.local:9000"
+  adminTokenSecret:
+    name: "dwaar-admin-token"
+    key: "token"
   ingressClass: "dwaar"
   watchNamespace: ""          # watch all namespaces
   leaseName: "dwaar-ingress-leader"

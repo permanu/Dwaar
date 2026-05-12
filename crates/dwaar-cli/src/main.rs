@@ -1876,13 +1876,29 @@ fn register_background_services(
 
     // Analytics aggregation service — only registered when analytics is enabled
     if let (Some(br), Some(ar)) = (beacon_receiver, agg_receiver) {
-        let agg_service = AggregationService::new(
+        let mut agg_service = AggregationService::new(
             Arc::clone(agg_metrics),
             LiveRouteValidator(Arc::clone(route_table_for_agg)),
             br,
             ar,
         )
         .with_evict_notify(Arc::clone(&agg_evict_notify));
+
+        // If the operator configured `analytics { sink unix <path> }`, route
+        // per-domain snapshots to that socket so the agent can forward them
+        // into VictoriaMetrics. Without this the service falls back to the
+        // default `StdoutSink` and the agent never sees any data.
+        if let Some(path) = config
+            .global_options
+            .as_ref()
+            .and_then(|g| g.analytics_sink_path.as_ref())
+        {
+            agg_service = agg_service.with_sink(Box::new(dwaar_analytics::sink::SocketSink::new(
+                path.clone(),
+            )));
+            info!(path = %path.display(), "analytics SocketSink wired");
+        }
+
         let agg_bg = pingora_core::services::background::background_service(
             "analytics aggregation",
             AggServiceWrapper {

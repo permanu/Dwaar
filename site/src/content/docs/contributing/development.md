@@ -34,10 +34,10 @@ The `Justfile` at the repo root defines the common recipes used by CI and develo
 
 | Recipe | Command | Use for |
 |---|---|---|
-| `just test` | `cargo test --workspace --all-features` | Full workspace test suite. |
+| `just test` | `cargo test --workspace` | Full default-feature workspace test suite. |
 | `just test-crate <crate>` | `cargo test -p <crate>` | Narrow feedback loop on a single crate. |
-| `just lint` | `cargo clippy --workspace --all-targets -- -D warnings` | Zero-warnings lint. |
-| `just build-release` | `cargo build --release -p dwaar-ingress` | Release binary at `target/release/dwaar`. |
+| `just lint` | `cargo fmt && cargo clippy --workspace -- -D warnings` | Format and zero-warnings lint. |
+| `just build-release` | `cargo build --workspace --release` | Release-profile workspace build. |
 | `just ci` | Format + lint + test + build. | What CI runs; run locally before opening a PR. |
 | `just quick` | Fastest-feedback test subset. | Sanity check between keystrokes. |
 
@@ -102,6 +102,17 @@ Run integration tests (requires Docker):
 
 ```bash
 cargo test --workspace --test '*'
+```
+
+CI deliberately excludes test suites that need external runtime dependencies:
+`dwaar-cli`'s `proxy_integration.rs` requires a live Dwaar process on a fixed
+port, and `dwaar-ingress` Kubernetes tests are gated behind the
+`k8s-integration` feature because they require a reachable cluster such as
+kind. Run those suites explicitly when you have the dependency available:
+
+```bash
+cargo test -p dwaar-cli --test proxy_integration
+cargo test -p dwaar-ingress --features k8s-integration -- --test-threads=1
 ```
 
 Benchmarks (requires nightly for some):

@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.21] - 2026-05-09
+
+### Added
+
+- **Wire `SocketSink` into `AggregationService` when `analytics { sink unix … }`
+  is configured (closes the analytics ingest gap with permanu-agent).** The
+  per-route `analytics on` directive populated `DomainMetrics` in memory, but
+  the aggregation service was always constructed with the default `StdoutSink`
+  in `crates/dwaar-cli/src/main.rs`, so `deploy_analytics_*` series never
+  reached VictoriaMetrics. The Dwaarfile parser now accepts a top-level
+  `analytics { sink unix /run/dwaar/analytics.sock }` block; when set, the CLI
+  builds a `SocketSink` for that path and passes it to
+  `AggregationService::with_sink()` before registering the background service.
+  When the directive is absent, behaviour is unchanged (stdout). Covered by
+  the new `socket_sink_e2e` integration test in `dwaar-analytics`, which spins
+  up a real unix listener, sends an `AggEvent` through the service, and
+  asserts a `DomainMetricsSnapshot` arrives over the socket.
+
 ## [0.3.20] - 2026-05-04
 
 ### Fixed

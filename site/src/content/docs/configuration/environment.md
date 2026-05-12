@@ -12,14 +12,14 @@ Dwaar reads a small set of environment variables at startup. Most have a direct 
 |----------|---------|-------------|----------------|
 | `DWAAR_CONFIG` | `./Dwaarfile` | Path to the Dwaarfile to load. | `-c / --config` |
 | `DWAAR_LOG_LEVEL` | `info` | Tracing filter for internal Dwaar logs. Accepts `error`, `warn`, `info`, `debug`, `trace`, or a module-scoped filter like `dwaar_core=debug`. | — |
-| `DWAAR_ADMIN_TOKEN` | — | Bearer token required on Admin API requests. When unset, the Admin API accepts unauthenticated requests from local processes. | — |
+| `DWAAR_ADMIN_TOKEN` | — | Bearer token required on TCP Admin API requests. When unset, authenticated TCP endpoints fail closed with `401`; UDS access is still controlled by socket filesystem permissions. | — |
 | `DWAAR_UAM_SECRET` | auto-generated | 32-byte hex secret used to sign Under Attack Mode (UAM) challenge cookies. Automatically generated and written to the environment by the supervisor process on startup; set explicitly when running multiple workers that must share the same secret. | — |
 
 ### Notes
 
 **`DWAAR_LOG_LEVEL`** controls Dwaar's own structured logs (startup messages, config reload events, worker crashes) — not the HTTP access log. The access log is configured in Dwaarfile via the `log` directive.
 
-**`DWAAR_ADMIN_TOKEN`** protects the Admin API (`/config/reload`, `/routes`, `/metrics`) against unauthorized access. In production, always set this. In development, you can omit it. The token is sent as a `Bearer` header:
+**`DWAAR_ADMIN_TOKEN`** protects the TCP Admin API (`/config/reload`, `/routes`, `/metrics`) against unauthorized access. In production, always set this. If it is omitted, Dwaar still starts, but authenticated TCP endpoints return `401` and log that the admin API will reject authenticated requests. The token is sent as a `Bearer` header:
 
 ```
 curl -H "Authorization: Bearer $DWAAR_ADMIN_TOKEN" http://127.0.0.1:6190/routes

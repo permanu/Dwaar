@@ -59,8 +59,7 @@ sequenceDiagram
 
 | Crate | Purpose |
 |-------|---------|
-| `dwaar-ingress` | Binary entry point, CLI, Pingora server bootstrap |
-| `dwaar-cli` | CLI argument parsing and config path resolution |
+| `dwaar-cli` | Main proxy binary, CLI argument parsing, Pingora server bootstrap, service wiring |
 | `dwaar-core` | `ProxyHttp` implementation, route table, request context, file server, FastCGI, QUIC |
 | `dwaar-config` | Dwaarfile tokenizer, parser, validator, hot-reload watcher |
 | `dwaar-tls` | ACME client, certificate store, SNI routing |
@@ -69,6 +68,8 @@ sequenceDiagram
 | `dwaar-admin` | Admin HTTP API service (reload, status, metrics) |
 | `dwaar-docker` | Docker label discovery and dynamic route registration |
 | `dwaar-geo` | MaxMind GeoIP lookup |
+| `dwaar-grpc` | Bidirectional gRPC control fabric |
+| `dwaar-ingress` | Standalone Kubernetes Ingress controller that reconciles routes through the Admin API |
 | `dwaar-log` | Structured request logging, async batch writer |
 
 ## Key Design Principles
