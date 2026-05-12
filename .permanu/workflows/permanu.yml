@@ -21,8 +21,21 @@ jobs:
           export CARGO_HOME="/root/.cargo"
           export RUSTUP_HOME="/root/.rustup"
           export PATH="$CARGO_HOME/bin:$PATH"
-          while ! mkdir /tmp/permanu-rustup.lock 2>/dev/null; do sleep 2; done
-          trap 'rmdir /tmp/permanu-rustup.lock' EXIT
+          lock=/tmp/permanu-rustup.lock
+          waited=0
+          while ! mkdir "$lock" 2>/dev/null; do
+            if find "$lock" -maxdepth 0 -mmin +10 >/dev/null 2>&1; then
+              rm -rf "$lock"
+              continue
+            fi
+            waited=$((waited + 2))
+            if [ "$waited" -gt 300 ]; then
+              echo "timed out waiting for rustup lock"
+              exit 1
+            fi
+            sleep 2
+          done
+          trap 'rm -rf "$lock"' EXIT
           if ! command -v cmake >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential cmake pkg-config protobuf-compiler
@@ -56,8 +69,21 @@ jobs:
           export CARGO_HOME="/root/.cargo"
           export RUSTUP_HOME="/root/.rustup"
           export PATH="$CARGO_HOME/bin:$PATH"
-          while ! mkdir /tmp/permanu-rustup.lock 2>/dev/null; do sleep 2; done
-          trap 'rmdir /tmp/permanu-rustup.lock' EXIT
+          lock=/tmp/permanu-rustup.lock
+          waited=0
+          while ! mkdir "$lock" 2>/dev/null; do
+            if find "$lock" -maxdepth 0 -mmin +10 >/dev/null 2>&1; then
+              rm -rf "$lock"
+              continue
+            fi
+            waited=$((waited + 2))
+            if [ "$waited" -gt 300 ]; then
+              echo "timed out waiting for rustup lock"
+              exit 1
+            fi
+            sleep 2
+          done
+          trap 'rm -rf "$lock"' EXIT
           if ! command -v cmake >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential cmake pkg-config protobuf-compiler
@@ -94,8 +120,21 @@ jobs:
           export CARGO_HOME="/root/.cargo"
           export RUSTUP_HOME="/root/.rustup"
           export PATH="$CARGO_HOME/bin:$PATH"
-          while ! mkdir /tmp/permanu-rustup.lock 2>/dev/null; do sleep 2; done
-          trap 'rmdir /tmp/permanu-rustup.lock' EXIT
+          lock=/tmp/permanu-rustup.lock
+          waited=0
+          while ! mkdir "$lock" 2>/dev/null; do
+            if find "$lock" -maxdepth 0 -mmin +10 >/dev/null 2>&1; then
+              rm -rf "$lock"
+              continue
+            fi
+            waited=$((waited + 2))
+            if [ "$waited" -gt 300 ]; then
+              echo "timed out waiting for rustup lock"
+              exit 1
+            fi
+            sleep 2
+          done
+          trap 'rm -rf "$lock"' EXIT
           if ! command -v cmake >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential cmake pkg-config protobuf-compiler
