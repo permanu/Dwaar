@@ -12,6 +12,16 @@ jobs:
     runs-on: self-hosted
     timeout-minutes: 30
     steps:
+      - name: Setup Rust
+        shell: sh
+        run: |
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          fi
+          . "$HOME/.cargo/env"
+          rustup component add rustfmt clippy
+          printf '%s\n' "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
       - name: Format
         shell: sh
         run: cargo fmt --all --check
@@ -25,6 +35,15 @@ jobs:
     runs-on: self-hosted
     timeout-minutes: 45
     steps:
+      - name: Setup Rust
+        shell: sh
+        run: |
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          fi
+          . "$HOME/.cargo/env"
+          printf '%s\n' "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
       - name: Workspace tests
         shell: sh
         run: cargo test --workspace --exclude dwaar-cli
@@ -42,6 +61,15 @@ jobs:
     runs-on: self-hosted
     timeout-minutes: 30
     steps:
+      - name: Setup Rust
+        shell: sh
+        run: |
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          fi
+          . "$HOME/.cargo/env"
+          printf '%s\n' "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
       - name: Build workspace
         shell: sh
         run: cargo build --workspace
