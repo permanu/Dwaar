@@ -207,6 +207,13 @@ mod tests {
     use tokio::io::AsyncBufReadExt;
     use tokio::net::UnixListener;
 
+    fn short_socket_dir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("dwaar-log-")
+            .tempdir_in("/tmp")
+            .expect("create short socket temp dir")
+    }
+
     fn dummy_log() -> RequestLog {
         RequestLog {
             timestamp: Utc::now(),
@@ -239,7 +246,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_to_socket_receiver_gets_json() {
-        let dir = tempfile::tempdir().expect("create temp dir");
+        let dir = short_socket_dir();
         let sock_path = dir.path().join("test.sock");
         let listener = UnixListener::bind(&sock_path).expect("bind");
         let writer = UnixSocketWriter::new(sock_path);
@@ -267,7 +274,7 @@ mod tests {
 
     #[tokio::test]
     async fn socket_down_buffers_lines() {
-        let dir = tempfile::tempdir().expect("create temp dir");
+        let dir = short_socket_dir();
         let sock_path = dir.path().join("noexist.sock");
         let writer = UnixSocketWriter::new(sock_path);
 
@@ -282,7 +289,7 @@ mod tests {
 
     #[tokio::test]
     async fn buffer_overflow_drops_oldest() {
-        let dir = tempfile::tempdir().expect("create temp dir");
+        let dir = short_socket_dir();
         let sock_path = dir.path().join("overflow.sock");
         let writer = UnixSocketWriter::new(sock_path);
 
@@ -309,7 +316,7 @@ mod tests {
         use std::sync::Arc;
         use tokio::io::AsyncBufReadExt;
 
-        let dir = tempfile::tempdir().expect("create temp dir");
+        let dir = short_socket_dir();
         let sock_path = dir.path().join("concurrent.sock");
         let listener = UnixListener::bind(&sock_path).expect("bind");
 
