@@ -1,26 +1,45 @@
 name: Permanu CI
 
 on:
+  push:
+    branches: [main]
+    tags:
+      - 'v*'
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
+permissions:
+  contents: write
+  id-token: write
+
 jobs:
+  version-guard:
+    name: Version Guard
+    runs-on: self-hosted
+    timeout-minutes: 5
+    steps:
+      - name: Check release version consistency
+        shell: sh
+        run: |
+          chmod +x scripts/check-version-consistency.sh
+          ./scripts/check-version-consistency.sh
+
   rust-quality:
     name: Rust Quality
+    needs: version-guard
     runs-on: self-hosted
     timeout-minutes: 30
     steps:
       - name: Setup Rust
         shell: sh
         run: |
-          current_run_dir="$(dirname "$(dirname "$PWD")")"
-          find /tmp/permanu-ci -mindepth 1 -maxdepth 1 -type d ! -path "$current_run_dir" -exec rm -rf {} + 2>/dev/null || true
-          export HOME="/root"
-          export CARGO_HOME="/root/.cargo"
-          export RUSTUP_HOME="/root/.rustup"
+          export HOME="${HOME:-$PWD/.permanu-home}"
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
           export PATH="$CARGO_HOME/bin:$PATH"
+          mkdir -p "$HOME" "$CARGO_HOME" "$RUSTUP_HOME"
           lock=/tmp/permanu-rustup.lock
           waited=0
           while ! mkdir "$lock" 2>/dev/null; do
@@ -43,9 +62,13 @@ jobs:
           if ! command -v cargo >/dev/null 2>&1; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           fi
-          . "$HOME/.cargo/env"
-          rustup component add rustfmt clippy
-          printf '%s\n' "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          if [ -f "$CARGO_HOME/env" ]; then
+            . "$CARGO_HOME/env"
+          fi
+          if command -v rustup >/dev/null 2>&1; then
+            rustup component add rustfmt clippy
+          fi
+          printf '%s\n' "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
       - name: Format
         shell: sh
@@ -57,18 +80,18 @@ jobs:
 
   rust-test:
     name: Rust Test
+    needs: version-guard
     runs-on: self-hosted
     timeout-minutes: 45
     steps:
       - name: Setup Rust
         shell: sh
         run: |
-          current_run_dir="$(dirname "$(dirname "$PWD")")"
-          find /tmp/permanu-ci -mindepth 1 -maxdepth 1 -type d ! -path "$current_run_dir" -exec rm -rf {} + 2>/dev/null || true
-          export HOME="/root"
-          export CARGO_HOME="/root/.cargo"
-          export RUSTUP_HOME="/root/.rustup"
+          export HOME="${HOME:-$PWD/.permanu-home}"
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
           export PATH="$CARGO_HOME/bin:$PATH"
+          mkdir -p "$HOME" "$CARGO_HOME" "$RUSTUP_HOME"
           lock=/tmp/permanu-rustup.lock
           waited=0
           while ! mkdir "$lock" 2>/dev/null; do
@@ -91,12 +114,16 @@ jobs:
           if ! command -v cargo >/dev/null 2>&1; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           fi
-          . "$HOME/.cargo/env"
-          printf '%s\n' "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          if [ -f "$CARGO_HOME/env" ]; then
+            . "$CARGO_HOME/env"
+          fi
+          printf '%s\n' "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
       - name: Workspace tests
         shell: sh
-        run: cargo test --workspace --exclude dwaar-cli
+        run: |
+          ulimit -n 4096 2>/dev/null || true
+          RUST_TEST_THREADS=2 cargo test --workspace --exclude dwaar-cli
 
       - name: CLI tests
         shell: sh
@@ -108,18 +135,18 @@ jobs:
 
   rust-build:
     name: Rust Build
+    needs: version-guard
     runs-on: self-hosted
     timeout-minutes: 30
     steps:
       - name: Setup Rust
         shell: sh
         run: |
-          current_run_dir="$(dirname "$(dirname "$PWD")")"
-          find /tmp/permanu-ci -mindepth 1 -maxdepth 1 -type d ! -path "$current_run_dir" -exec rm -rf {} + 2>/dev/null || true
-          export HOME="/root"
-          export CARGO_HOME="/root/.cargo"
-          export RUSTUP_HOME="/root/.rustup"
+          export HOME="${HOME:-$PWD/.permanu-home}"
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
           export PATH="$CARGO_HOME/bin:$PATH"
+          mkdir -p "$HOME" "$CARGO_HOME" "$RUSTUP_HOME"
           lock=/tmp/permanu-rustup.lock
           waited=0
           while ! mkdir "$lock" 2>/dev/null; do
@@ -142,8 +169,10 @@ jobs:
           if ! command -v cargo >/dev/null 2>&1; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           fi
-          . "$HOME/.cargo/env"
-          printf '%s\n' "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          if [ -f "$CARGO_HOME/env" ]; then
+            . "$CARGO_HOME/env"
+          fi
+          printf '%s\n' "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
       - name: Build workspace
         shell: sh
@@ -152,3 +181,54 @@ jobs:
       - name: Release type check
         shell: sh
         run: cargo check --workspace --release
+
+      - name: Install cosign for release signing
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
+
+      - name: Build and sign production release assets
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        shell: sh
+        env:
+          COSIGN_KEY: ${{ secrets.COSIGN_KEY }}
+          PERMANU_COSIGN_KEY: ${{ secrets.PERMANU_COSIGN_KEY }}
+          DWAAR_COSIGN_PUBKEY: ${{ secrets.DWAAR_COSIGN_PUBKEY }}
+          PERMANU_COSIGN_VERIFY_KEY: ${{ secrets.PERMANU_COSIGN_VERIFY_KEY }}
+          COSIGN_VERIFY_KEY: ${{ secrets.COSIGN_VERIFY_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+          SIGSTORE_ID_TOKEN: ${{ secrets.SIGSTORE_ID_TOKEN }}
+          PERMANU_SIGSTORE_ID_TOKEN: ${{ secrets.PERMANU_SIGSTORE_ID_TOKEN }}
+        run: |
+          export HOME="${HOME:-$PWD/.permanu-home}"
+          export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+          export PATH="$CARGO_HOME/bin:$PATH"
+          mkdir -p "$HOME" "$CARGO_HOME" "$RUSTUP_HOME"
+          if [ -f "$CARGO_HOME/env" ]; then
+            . "$CARGO_HOME/env"
+          fi
+          chmod +x scripts/build-release-assets.sh
+          ./scripts/build-release-assets.sh dist
+
+      - name: Verify production release assets
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        shell: sh
+        env:
+          COSIGN_KEY: ${{ secrets.COSIGN_KEY }}
+          PERMANU_COSIGN_KEY: ${{ secrets.PERMANU_COSIGN_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+          SIGSTORE_ID_TOKEN: ${{ secrets.SIGSTORE_ID_TOKEN }}
+          PERMANU_SIGSTORE_ID_TOKEN: ${{ secrets.PERMANU_SIGSTORE_ID_TOKEN }}
+        run: |
+          chmod +x scripts/validate-release-assets.sh
+          ./scripts/validate-release-assets.sh dist
+
+      - name: Publish GitHub Release
+        if: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        shell: sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          chmod +x scripts/publish-github-release-assets.sh
+          ./scripts/publish-github-release-assets.sh dist
