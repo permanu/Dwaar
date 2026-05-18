@@ -61,6 +61,7 @@ use crate::template::{CompiledTemplate, TemplateContext, VarSlots};
 use crate::upstream::UpstreamPool;
 use pingora_core::upstreams::peer::HttpPeer;
 use regex::Regex;
+use serde::Serialize;
 
 /// Validate that a string is a legal hostname or wildcard pattern.
 /// Rejects path traversal, null bytes, and non-hostname characters.
@@ -606,6 +607,27 @@ pub struct Route {
     pub source: Option<String>,
 }
 
+/// Runtime state for one route as exposed by the admin API.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RouteState {
+    pub status: &'static str,
+    pub enabled: bool,
+    pub draining: bool,
+    pub active_connections: u32,
+    pub upstreams: Vec<RouteUpstreamState>,
+    pub cert_state: &'static str,
+}
+
+/// Runtime state for one upstream behind a route.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RouteUpstreamState {
+    pub upstream: String,
+    pub healthy: Option<bool>,
+    pub active_connections: u32,
+    pub tls: bool,
+    pub last_proxy_error: Option<String>,
+}
+
 impl Route {
     /// Create a simple single-upstream route (backward-compatible constructor).
     ///
@@ -743,6 +765,66 @@ impl Route {
     pub fn active_connection_count(&self) -> u32 {
         self.active_connections.load(Ordering::Relaxed)
     }
+
+    /// Snapshot route health/state using only existing runtime state.
+    pub fn state(&self) -> RouteState {
+        let draining = self.is_draining();
+        let upstreams = self.upstream_states();
+        let status = if draining {
+            "draining"
+        } else if upstreams.is_empty() {
+            "static"
+        } else if upstreams.iter().any(|u| u.healthy == Some(true)) {
+            "healthy"
+        } else if upstreams.iter().all(|u| u.healthy == Some(false)) {
+            "unhealthy"
+        } else {
+            "unknown"
+        };
+
+        RouteState {
+            status,
+            enabled: !draining,
+            draining,
+            active_connections: self.active_connection_count(),
+            upstreams,
+            cert_state: if self.tls {
+                "configured"
+            } else {
+                "not_required"
+            },
+        }
+    }
+
+    fn upstream_states(&self) -> Vec<RouteUpstreamState> {
+        let mut states = Vec::new();
+        for block in &self.handlers {
+            match &block.handler {
+                Handler::ReverseProxy { upstream, .. } | Handler::FastCgi { upstream, .. } => {
+                    states.push(RouteUpstreamState {
+                        upstream: upstream.to_string(),
+                        healthy: None,
+                        active_connections: 0,
+                        tls: false,
+                        last_proxy_error: None,
+                    });
+                }
+                Handler::ReverseProxyPool { pool, .. } => {
+                    for backend in &pool.backends {
+                        states.push(RouteUpstreamState {
+                            upstream: backend.addr.to_string(),
+                            healthy: Some(backend.healthy.load(Ordering::Acquire)),
+                            active_connections: backend.active_conns.load(Ordering::Acquire),
+                            tls: backend.tls,
+                            last_proxy_error: backend.last_error.lock().clone(),
+                        });
+                    }
+                }
+                Handler::StaticResponse { .. } | Handler::FileServer { .. } => {}
+            }
+        }
+        states
+    }
 }
 
 /// Custom serialization to keep admin API JSON output stable.
@@ -750,13 +832,14 @@ impl Route {
 impl serde::Serialize for Route {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("Route", 6)?;
+        let mut s = serializer.serialize_struct("Route", 7)?;
         s.serialize_field("domain", &self.domain)?;
         s.serialize_field("upstream", &self.upstream().map(|a| a.to_string()))?;
         s.serialize_field("tls", &self.tls)?;
         s.serialize_field("rate_limit_rps", &self.rate_limit_rps())?;
         s.serialize_field("under_attack", &self.under_attack())?;
         s.serialize_field("source", &self.source)?;
+        s.serialize_field("state", &self.state())?;
         s.end()
     }
 }
@@ -1035,6 +1118,60 @@ mod tests {
         let json = serde_json::to_string(&route).expect("serialize");
         assert!(json.contains("\"domain\":\"example.com\""));
         assert!(json.contains("\"tls\":true"));
+        assert!(json.contains("\"state\":"));
+        assert!(json.contains("\"cert_state\":\"configured\""));
+    }
+
+    #[test]
+    fn route_state_reports_pool_health_and_last_error() {
+        use crate::upstream::{BackendConfig, LbPolicy, UpstreamPool};
+
+        let pool = Arc::new(UpstreamPool::new(
+            vec![
+                BackendConfig {
+                    addr: addr(8080),
+                    max_conns: None,
+                    tls: true,
+                    tls_server_name: "app.example.com".into(),
+                    client_cert_key: None,
+                    trusted_ca: None,
+                },
+                BackendConfig {
+                    addr: addr(8081),
+                    max_conns: None,
+                    tls: false,
+                    tls_server_name: String::new(),
+                    client_cert_key: None,
+                    trusted_ca: None,
+                },
+            ],
+            LbPolicy::RoundRobin,
+            Some("/health".into()),
+            Some(10),
+        ));
+        pool.record_probe_error(addr(8080), "probe timed out".into());
+        pool.mark_unhealthy(addr(8080));
+        assert!(pool.acquire_connection(addr(8081)));
+
+        let mut route = Route::new("example.com", addr(3000), true, None);
+        route.handlers[0].handler = Handler::ReverseProxyPool {
+            pool,
+            upstream_h2: false,
+        };
+
+        let state = route.state();
+        assert_eq!(state.status, "healthy");
+        assert!(state.enabled);
+        assert_eq!(state.cert_state, "configured");
+        assert_eq!(state.upstreams.len(), 2);
+        assert_eq!(state.upstreams[0].upstream, "127.0.0.1:8080");
+        assert_eq!(state.upstreams[0].healthy, Some(false));
+        assert_eq!(
+            state.upstreams[0].last_proxy_error.as_deref(),
+            Some("probe timed out")
+        );
+        assert_eq!(state.upstreams[1].healthy, Some(true));
+        assert_eq!(state.upstreams[1].active_connections, 1);
     }
 
     // ── Rate limit field (ISSUE-031) ─────────────────────────

@@ -393,6 +393,24 @@ impl PrometheusMetrics {
         entry.bytes_received.fetch_add(bytes_rx, Relaxed);
     }
 
+    /// Record upstream connection latency for an upstream socket address.
+    pub fn record_upstream_connect_duration(&self, upstream: &str, duration_us: u64) {
+        let upstream = CompactString::from(upstream);
+        self.upstream_connect_duration
+            .entry(upstream)
+            .or_default()
+            .observe(duration_us);
+    }
+
+    /// Set the latest upstream health gauge value for an upstream socket address.
+    pub fn set_upstream_health(&self, upstream: &str, healthy: bool) {
+        let upstream = CompactString::from(upstream);
+        self.upstream_health
+            .entry(upstream)
+            .or_default()
+            .store(u64::from(healthy), Relaxed);
+    }
+
     /// Increment active connections gauge for a domain.
     ///
     /// Skipped if the domain count exceeds [`MAX_TRACKED_DOMAINS`].
@@ -458,6 +476,27 @@ impl PrometheusMetrics {
                             "dwaar_requests_total{{domain=\"{domain}\",method=\"{method_label}\",status=\"{status_label}\"}} {val}"
                         );
                     }
+                }
+            }
+        }
+
+        out.push_str(
+            "# HELP dwaar_route_status_class_total Total HTTP requests by route and status class.\n",
+        );
+        out.push_str("# TYPE dwaar_route_status_class_total counter\n");
+        for entry in &self.domains {
+            let route = escape_label_value(entry.key());
+            let counters = &entry.value().requests;
+            for (si, &status_label) in STATUS_CODES.iter().enumerate() {
+                let mut total = 0u64;
+                for mi in 0..METHOD_COUNT {
+                    total += counters.counts[si * METHOD_COUNT + mi].load(Relaxed);
+                }
+                if total > 0 {
+                    let _ = writeln!(
+                        out,
+                        "dwaar_route_status_class_total{{route=\"{route}\",status_class=\"{status_label}\"}} {total}"
+                    );
                 }
             }
         }
@@ -776,6 +815,12 @@ mod tests {
         assert!(text.contains(
             "dwaar_requests_total{domain=\"app.example.com\",method=\"POST\",status=\"4xx\"} 1"
         ));
+        assert!(text.contains(
+            "dwaar_route_status_class_total{route=\"app.example.com\",status_class=\"2xx\"} 2"
+        ));
+        assert!(text.contains(
+            "dwaar_route_status_class_total{route=\"app.example.com\",status_class=\"4xx\"} 1"
+        ));
         assert!(text.contains("dwaar_bytes_sent_total{domain=\"app.example.com\"} 1024"));
     }
 
@@ -825,5 +870,21 @@ mod tests {
 
         let text = m.render().await;
         assert!(text.contains("dwaar_active_connections{domain=\"gauge.test\"} 1"));
+    }
+
+    #[tokio::test]
+    async fn render_upstream_health_and_connect_duration() {
+        let m = PrometheusMetrics::new();
+        m.set_upstream_health("127.0.0.1:8080", false);
+        m.record_upstream_connect_duration("127.0.0.1:8080", 25_000);
+
+        let text = m.render().await;
+        assert!(text.contains("dwaar_upstream_health{upstream=\"127.0.0.1:8080\"} 0"));
+        assert!(text.contains(
+            "dwaar_upstream_connect_duration_seconds_bucket{domain=\"127.0.0.1:8080\",le=\"0.025\"} 1"
+        ));
+        assert!(text.contains(
+            "dwaar_upstream_connect_duration_seconds_count{domain=\"127.0.0.1:8080\"} 1"
+        ));
     }
 }

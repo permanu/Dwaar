@@ -24,7 +24,11 @@ const ADMIN_CAPABILITIES: &[&str] = &[
     "admin.healthz",
     "admin.metrics.prometheus",
     "routes.list",
+    "routes.state",
     "routes.snapshot.apply",
+    "metrics.route_status_class",
+    "metrics.upstream_health",
+    "metrics.upstream_connect_duration",
     "analytics.domain",
     "cache.purge",
 ];
@@ -457,7 +461,11 @@ mod tests {
             "admin.healthz",
             "admin.metrics.prometheus",
             "routes.list",
+            "routes.state",
             "routes.snapshot.apply",
+            "metrics.route_status_class",
+            "metrics.upstream_health",
+            "metrics.upstream_connect_duration",
             "analytics.domain",
             "cache.purge",
         ] {
