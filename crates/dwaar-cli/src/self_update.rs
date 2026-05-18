@@ -16,6 +16,7 @@
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 use anyhow::{Context, bail};
 use subtle::ConstantTimeEq;
@@ -29,6 +30,9 @@ use subtle::ConstantTimeEq;
 const BASE_URL: &str = "https://github.com/permanu/Dwaar/releases/download";
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+const LEGACY_CERTIFICATE_IDENTITY_REGEXP: &str =
+    "^https://github\\.com/permanu/Dwaar/\\.github/workflows/release\\.yml@.*";
+const LEGACY_CERTIFICATE_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
 
 /// Run the self-update flow. Returns a human-readable status message.
 // Self-update is an interactive CLI subcommand; println! is correct here.
@@ -52,12 +56,19 @@ pub(crate) fn run(force: bool) -> anyhow::Result<()> {
     let artifact = artifact_name();
     let download_url = format!("{BASE_URL}/{latest_tag}/{artifact}");
     let checksum_url = format!("{download_url}.sha256");
+    let bundle_url = format!("{download_url}.bundle");
+    let sig_url = format!("{download_url}.sig");
+    let cert_url = format!("{download_url}.cert");
 
     println!("\nDownloading {artifact} {latest_tag}...");
 
     let tmp_dir = tempfile::tempdir().context("failed to create temp directory")?;
     let bin_path = tmp_dir.path().join(&artifact);
     let sha_path = tmp_dir.path().join(format!("{artifact}.sha256"));
+    let bundle_path = tmp_dir.path().join(format!("{artifact}.bundle"));
+    let sig_path = tmp_dir.path().join(format!("{artifact}.sig"));
+    let cert_path = tmp_dir.path().join(format!("{artifact}.cert"));
+    let pubkey_path = tmp_dir.path().join("dwaar-release-authority.pub");
 
     // Download binary + checksum
     curl_download(&download_url, &bin_path)?;
@@ -67,6 +78,44 @@ pub(crate) fn run(force: bool) -> anyhow::Result<()> {
     println!("Verifying SHA-256 checksum...");
     verify_sha256(&bin_path, &sha_path)?;
     println!("Checksum OK.");
+
+    let release_key = configured_cosign_public_key()?;
+    let signature_policy = select_signature_policy(
+        http_exists(&bundle_url)?,
+        http_exists(&sig_url)?,
+        http_exists(&cert_url)?,
+        release_key,
+    )?;
+
+    match &signature_policy {
+        SignaturePolicy::ReleaseKey { key } => {
+            curl_download(&bundle_url, &bundle_path)?;
+            if let CosignPublicKey::Url(url) = key {
+                curl_download(url, &pubkey_path)?;
+            }
+        }
+        SignaturePolicy::LegacyBundle => {
+            curl_download(&bundle_url, &bundle_path)?;
+        }
+        SignaturePolicy::LegacyCertificate => {
+            curl_download(&sig_url, &sig_path)?;
+            curl_download(&cert_url, &cert_path)?;
+        }
+    }
+
+    println!("Verifying cosign signature...");
+    verify_cosign_signature(
+        &bin_path,
+        &signature_policy,
+        &bundle_path,
+        &sig_path,
+        &cert_path,
+        &pubkey_path,
+    )?;
+    println!(
+        "Cosign signature OK ({}).",
+        signature_policy.trust_description()
+    );
 
     // Find current binary path
     let current_exe =
@@ -122,6 +171,161 @@ fn curl_download(url: &str, dest: &Path) -> anyhow::Result<()> {
 
     resp.copy_to(&mut file)
         .with_context(|| format!("failed to write download to {}", dest.display()))?;
+
+    Ok(())
+}
+
+fn http_exists(url: &str) -> anyhow::Result<bool> {
+    let client = crate::version_check::build_http_client()?;
+    let resp = client
+        .head(url)
+        .send()
+        .with_context(|| format!("HTTP HEAD failed: {url}"))?;
+
+    Ok(resp.status().is_success())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CosignPublicKey {
+    Path(String),
+    Url(String),
+}
+
+impl CosignPublicKey {
+    fn materialized_path<'a>(&'a self, downloaded_path: &'a Path) -> &'a Path {
+        match self {
+            Self::Path(path) => Path::new(path),
+            Self::Url(_) => downloaded_path,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SignaturePolicy {
+    ReleaseKey { key: CosignPublicKey },
+    LegacyBundle,
+    LegacyCertificate,
+}
+
+impl SignaturePolicy {
+    fn trust_description(&self) -> &'static str {
+        match self {
+            Self::ReleaseKey { .. } => "signed by Permanu/Dwaar release authority",
+            Self::LegacyBundle => "legacy GitHub Actions keyless bundle",
+            Self::LegacyCertificate => "legacy GitHub Actions keyless certificate",
+        }
+    }
+}
+
+fn configured_cosign_public_key() -> anyhow::Result<Option<CosignPublicKey>> {
+    let path = non_empty_env("DWAAR_COSIGN_PUBKEY");
+    let url = non_empty_env("DWAAR_COSIGN_PUBKEY_URL");
+
+    match (path, url) {
+        (Some(_), Some(_)) => {
+            bail!("set only one of DWAAR_COSIGN_PUBKEY or DWAAR_COSIGN_PUBKEY_URL")
+        }
+        (Some(path), None) => Ok(Some(CosignPublicKey::Path(path))),
+        (None, Some(url)) => {
+            if !url.starts_with("https://") {
+                bail!("DWAAR_COSIGN_PUBKEY_URL must be an https:// URL");
+            }
+            Ok(Some(CosignPublicKey::Url(url)))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn select_signature_policy(
+    has_bundle: bool,
+    has_sig: bool,
+    has_cert: bool,
+    release_key: Option<CosignPublicKey>,
+) -> anyhow::Result<SignaturePolicy> {
+    if let Some(key) = release_key {
+        if !has_bundle {
+            bail!(
+                "configured release key requires a cosign bundle; refusing legacy fallback for key-based verification"
+            );
+        }
+        return Ok(SignaturePolicy::ReleaseKey { key });
+    }
+
+    if has_bundle {
+        if !has_sig && !has_cert {
+            bail!(
+                "release bundle appears to be signed by the Permanu/Dwaar release authority, but no verification key is configured; set DWAAR_COSIGN_PUBKEY or DWAAR_COSIGN_PUBKEY_URL"
+            );
+        }
+        return Ok(SignaturePolicy::LegacyBundle);
+    }
+
+    if has_sig && has_cert {
+        return Ok(SignaturePolicy::LegacyCertificate);
+    }
+
+    bail!("no signature artefacts found; refusing to self-update an unverifiable Dwaar binary");
+}
+
+fn verify_cosign_signature(
+    binary: &Path,
+    policy: &SignaturePolicy,
+    bundle: &Path,
+    signature: &Path,
+    certificate: &Path,
+    downloaded_pubkey: &Path,
+) -> anyhow::Result<()> {
+    let mut cmd = Command::new("cosign");
+    cmd.arg("verify-blob").arg(binary);
+
+    match policy {
+        SignaturePolicy::ReleaseKey { key } => {
+            cmd.arg("--bundle")
+                .arg(bundle)
+                .arg("--key")
+                .arg(key.materialized_path(downloaded_pubkey));
+        }
+        SignaturePolicy::LegacyBundle => {
+            cmd.arg("--bundle")
+                .arg(bundle)
+                .arg("--certificate-identity-regexp")
+                .arg(LEGACY_CERTIFICATE_IDENTITY_REGEXP)
+                .arg("--certificate-oidc-issuer")
+                .arg(LEGACY_CERTIFICATE_OIDC_ISSUER);
+        }
+        SignaturePolicy::LegacyCertificate => {
+            cmd.arg("--certificate")
+                .arg(certificate)
+                .arg("--signature")
+                .arg(signature)
+                .arg("--certificate-identity-regexp")
+                .arg(LEGACY_CERTIFICATE_IDENTITY_REGEXP)
+                .arg("--certificate-oidc-issuer")
+                .arg(LEGACY_CERTIFICATE_OIDC_ISSUER);
+        }
+    }
+
+    let output = cmd.output().context(
+        "cosign is required for self-update verification; install cosign or use install.sh with manual verification",
+    )?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        bail!(
+            "cosign verification failed for {}.\nstdout:\n{}\nstderr:\n{}",
+            policy.trust_description(),
+            stdout.trim(),
+            stderr.trim()
+        );
+    }
 
     Ok(())
 }
@@ -318,5 +522,61 @@ mod tests {
         // wire-level behaviour. Issue #147: curl shell-out replaced.
         // Issue #176: builder is now shared across self_update and auto_update.
         crate::version_check::build_http_client().expect("blocking HTTP client should build");
+    }
+
+    #[test]
+    fn signature_policy_prefers_configured_release_key_bundle_over_legacy() {
+        let key = CosignPublicKey::Path("release.pub".into());
+
+        let policy = select_signature_policy(true, true, true, Some(key))
+            .expect("configured public key with bundle should select key verification");
+
+        assert_eq!(
+            policy,
+            SignaturePolicy::ReleaseKey {
+                key: CosignPublicKey::Path("release.pub".into())
+            }
+        );
+    }
+
+    #[test]
+    fn signature_policy_uses_legacy_bundle_without_release_key() {
+        let policy = select_signature_policy(true, true, true, None)
+            .expect("legacy bundle should be accepted during migration");
+
+        assert_eq!(policy, SignaturePolicy::LegacyBundle);
+    }
+
+    #[test]
+    fn signature_policy_rejects_key_bundle_without_configured_release_key() {
+        let err = select_signature_policy(true, false, false, None)
+            .expect_err("key-signed bundle without configured release key must fail closed");
+
+        assert!(
+            err.to_string()
+                .contains("no verification key is configured"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn signature_policy_requires_signature_for_release_key() {
+        let key = CosignPublicKey::Url("https://keys.example.invalid/dwaar.pub".to_string());
+
+        let err = select_signature_policy(false, true, true, Some(key))
+            .expect_err("configured release key must not fall back without a bundle");
+
+        assert!(
+            err.to_string().contains("configured release key"),
+            "error: {err}"
+        );
+    }
+
+    #[test]
+    fn signature_policy_uses_legacy_split_certificate_when_bundle_missing() {
+        let policy = select_signature_policy(false, true, true, None)
+            .expect("legacy split .sig/.cert should remain supported");
+
+        assert_eq!(policy, SignaturePolicy::LegacyCertificate);
     }
 }

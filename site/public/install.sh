@@ -50,6 +50,7 @@ fi
 
 DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/${ARTIFACT}"
 CHECKSUM_URL="${DOWNLOAD_URL}.sha256"
+BUNDLE_URL="${DOWNLOAD_URL}.bundle"
 SIG_URL="${DOWNLOAD_URL}.sig"
 CERT_URL="${DOWNLOAD_URL}.cert"
 
@@ -61,8 +62,6 @@ trap 'rm -rf "$TMP"' EXIT
 
 curl -fSL --progress-bar -o "${TMP}/${ARTIFACT}" "$DOWNLOAD_URL"
 curl -fsSL -o "${TMP}/${ARTIFACT}.sha256" "$CHECKSUM_URL"
-curl -fsSL -o "${TMP}/${ARTIFACT}.sig"    "$SIG_URL"
-curl -fsSL -o "${TMP}/${ARTIFACT}.cert"   "$CERT_URL"
 
 # --- Verify checksum ---
 cd "$TMP"
@@ -74,30 +73,107 @@ else
   printf "Warning: no sha256 tool found, skipping checksum verification\n" >&2
 fi
 
-# --- Verify cosign signature (keyless OIDC) ---
-# The .sig and .cert files are published alongside every release binary.
-# Verification pins the GitHub Actions workflow identity — no pre-shared keys.
-# If cosign is not installed we fall back to sha256-only and print a loud
-# warning. We never silently bypass signature verification.
+http_exists() {
+  curl -fsSLI -o /dev/null "$1" >/dev/null 2>&1
+}
+
+download_pubkey() {
+  if [ -n "${DWAAR_COSIGN_PUBKEY:-}" ] && [ -n "${DWAAR_COSIGN_PUBKEY_URL:-}" ]; then
+    printf "Error: set only one of DWAAR_COSIGN_PUBKEY or DWAAR_COSIGN_PUBKEY_URL\n" >&2
+    exit 1
+  fi
+
+  if [ -n "${DWAAR_COSIGN_PUBKEY:-}" ]; then
+    COSIGN_PUBKEY_PATH="$DWAAR_COSIGN_PUBKEY"
+    return
+  fi
+
+  case "${DWAAR_COSIGN_PUBKEY_URL:-}" in
+    "") printf "Error: DWAAR_COSIGN_PUBKEY or DWAAR_COSIGN_PUBKEY_URL is required for key verification\n" >&2; exit 1 ;;
+    https://*) ;;
+    *) printf "Error: DWAAR_COSIGN_PUBKEY_URL must be an https:// URL\n" >&2; exit 1 ;;
+  esac
+
+  COSIGN_PUBKEY_PATH="${TMP}/dwaar-release-authority.pub"
+  curl -fsSL -o "$COSIGN_PUBKEY_PATH" "$DWAAR_COSIGN_PUBKEY_URL"
+}
+
+# --- Verify cosign signature ---
+# Prefer explicit Permanu/Dwaar release-authority verification when a pinned
+# public key path/URL is configured. Without that, keep the legacy GitHub
+# Actions keyless policy for older releases during migration.
+SIG_MODE=""
+if [ -n "${DWAAR_COSIGN_PUBKEY:-}" ] || [ -n "${DWAAR_COSIGN_PUBKEY_URL:-}" ]; then
+  download_pubkey
+  if ! http_exists "$BUNDLE_URL"; then
+    printf "Error: configured release key requires %s\n" "$BUNDLE_URL" >&2
+    exit 1
+  fi
+  curl -fsSL -o "${TMP}/${ARTIFACT}.bundle" "$BUNDLE_URL"
+  SIG_MODE="key"
+elif http_exists "$BUNDLE_URL" && http_exists "$SIG_URL" && http_exists "$CERT_URL"; then
+  curl -fsSL -o "${TMP}/${ARTIFACT}.bundle" "$BUNDLE_URL"
+  SIG_MODE="legacy-bundle"
+elif http_exists "$BUNDLE_URL"; then
+  curl -fsSL -o "${TMP}/${ARTIFACT}.bundle" "$BUNDLE_URL"
+  SIG_MODE="key-unconfigured"
+else
+  curl -fsSL -o "${TMP}/${ARTIFACT}.sig"    "$SIG_URL"
+  curl -fsSL -o "${TMP}/${ARTIFACT}.cert"   "$CERT_URL"
+  SIG_MODE="legacy-cert"
+fi
+
 if command -v cosign >/dev/null 2>&1; then
   printf "Verifying cosign signature...\n"
-  cosign verify-blob \
-    --certificate "${TMP}/${ARTIFACT}.cert" \
-    --signature   "${TMP}/${ARTIFACT}.sig" \
-    --certificate-identity-regexp "^https://github\.com/permanu/Dwaar/\.github/workflows/release\.yml@.*" \
-    --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-    "${TMP}/${ARTIFACT}"
-  printf "Cosign signature verified.\n"
+  case "$SIG_MODE" in
+    key)
+      cosign verify-blob "${TMP}/${ARTIFACT}" \
+        --bundle "${TMP}/${ARTIFACT}.bundle" \
+        --key "$COSIGN_PUBKEY_PATH"
+      printf "Cosign signature verified (signed by Permanu/Dwaar release authority).\n"
+      ;;
+    legacy-bundle)
+      cosign verify-blob "${TMP}/${ARTIFACT}" \
+        --bundle "${TMP}/${ARTIFACT}.bundle" \
+        --certificate-identity-regexp "^https://github\.com/permanu/Dwaar/\.github/workflows/release\.yml@.*" \
+        --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+      printf "Cosign signature verified (legacy GitHub Actions keyless bundle).\n"
+      ;;
+    legacy-cert)
+      cosign verify-blob "${TMP}/${ARTIFACT}" \
+        --certificate "${TMP}/${ARTIFACT}.cert" \
+        --signature   "${TMP}/${ARTIFACT}.sig" \
+        --certificate-identity-regexp "^https://github\.com/permanu/Dwaar/\.github/workflows/release\.yml@.*" \
+        --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+      printf "Cosign signature verified (legacy GitHub Actions keyless certificate).\n"
+      ;;
+    key-unconfigured)
+      printf "Error: this release is signed by the Permanu/Dwaar release authority, but no verification key is configured.\n" >&2
+      printf "Set DWAAR_COSIGN_PUBKEY to a pinned public key path or DWAAR_COSIGN_PUBKEY_URL to an https:// key URL, then retry.\n" >&2
+      exit 1
+      ;;
+  esac
 else
+  if [ "$SIG_MODE" = "key" ] || [ "$SIG_MODE" = "key-unconfigured" ]; then
+    printf "Error: cosign is required to verify releases signed by the Permanu/Dwaar release authority.\n" >&2
+    if [ "$SIG_MODE" = "key-unconfigured" ]; then
+      printf "Also set DWAAR_COSIGN_PUBKEY or DWAAR_COSIGN_PUBKEY_URL so the installer can verify the key-signed bundle.\n" >&2
+    fi
+    exit 1
+  fi
+
   printf "Warning: cosign not installed, skipping signature verification (sha256 still checked).\n" >&2
   printf "         Install cosign: https://github.com/sigstore/cosign/releases\n" >&2
   printf "         Then verify manually:\n" >&2
-  printf "           cosign verify-blob \\\\\n" >&2
-  printf "             --certificate %s.cert \\\\\n" "$ARTIFACT" >&2
-  printf "             --signature %s.sig \\\\\n" "$ARTIFACT" >&2
+  printf "           cosign verify-blob %s \\\\\n" "$ARTIFACT" >&2
+  if [ "$SIG_MODE" = "legacy-bundle" ]; then
+    printf "             --bundle %s.bundle \\\\\n" "$ARTIFACT" >&2
+  else
+    printf "             --certificate %s.cert \\\\\n" "$ARTIFACT" >&2
+    printf "             --signature %s.sig \\\\\n" "$ARTIFACT" >&2
+  fi
   printf '             --certificate-identity-regexp "^https://github\\.com/permanu/Dwaar/\\.github/workflows/release\\.yml@.*" \\\\\n' >&2
-  printf '             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \\\\\n' >&2
-  printf "             %s\n" "$ARTIFACT" >&2
+  printf '             --certificate-oidc-issuer "https://token.actions.githubusercontent.com"\n' >&2
 fi
 
 # --- Install ---
