@@ -351,6 +351,16 @@ impl AdminService {
                     },
                 }
             }
+            ("PUT", "/routes/snapshot") => {
+                let body = read_body(session, MAX_BODY_SIZE).await;
+                match body {
+                    Err((status, msg)) => json_error(status, &msg),
+                    Ok(data) => match handlers::apply_route_snapshot(&self.route_table, &data) {
+                        Ok(json) => json_response(200, &json),
+                        Err(e) => json_error(400, &e),
+                    },
+                }
+            }
             ("DELETE", _) if path.starts_with("/routes/") => {
                 let domain = path
                     .strip_prefix("/routes/")
@@ -540,6 +550,8 @@ fn allowed_methods_for(path: &str) -> &'static str {
         "GET"
     } else if path == "/routes" {
         "GET, POST"
+    } else if path == "/routes/snapshot" {
+        "PUT"
     } else if path.starts_with("/routes/") {
         "DELETE"
     } else if path == "/analytics" || path.starts_with("/analytics/") || path == "/metrics" {
