@@ -6,9 +6,8 @@
 
 //! HTTP client for the Dwaar admin API.
 //!
-//! Provides `upsert_route`, `delete_route`, and `list_routes` — the three
-//! operations the ingress controller needs to keep Dwaar's route table in sync
-//! with the state of Kubernetes Ingress resources.
+//! Provides route mutation and snapshot operations for keeping Dwaar's route
+//! table in sync with Kubernetes Ingress resources.
 //!
 //! Uses `reqwest` because we're outside Pingora's process boundary here: the
 //! controller is a separate binary that communicates over HTTP, not in-process.
@@ -32,6 +31,31 @@ struct UpsertRouteRequest<'a> {
     tls: bool,
     /// Tags the route so the reconciler can identify controller-owned routes.
     source: &'a str,
+}
+
+/// One route entry inside a source-owned snapshot request.
+#[derive(Debug, Serialize)]
+struct SnapshotRouteRequest<'a> {
+    domain: &'a str,
+    upstream: &'a str,
+    tls: bool,
+}
+
+/// Payload sent to `PUT /routes/snapshot`.
+#[derive(Debug, Serialize)]
+struct ApplyRouteSnapshotRequest<'a> {
+    source: &'a str,
+    routes: Vec<SnapshotRouteRequest<'a>>,
+}
+
+/// Response returned by `PUT /routes/snapshot`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ApplyRouteSnapshotResponse {
+    pub source: String,
+    pub applied: usize,
+    pub removed: usize,
+    pub total_routes: usize,
+    pub route_hash: String,
 }
 
 /// Minimal route descriptor returned by `GET /routes`.
@@ -67,6 +91,43 @@ impl AdminApiClient {
     /// A 10-second request timeout is applied to all calls.
     pub fn new(base_url: impl Into<String>) -> Self {
         Self::new_with_token(base_url, None)
+    }
+
+    /// Apply the complete desired route set owned by this controller.
+    ///
+    /// Dwaar atomically replaces only routes tagged `source = "dwaar-ingress"`.
+    /// Routes created by operators or other controllers are left untouched.
+    #[instrument(skip(self, routes), fields(count = routes.len()))]
+    pub async fn apply_route_snapshot(
+        &self,
+        routes: &[crate::reconciler::DesiredRoute],
+    ) -> Result<ApplyRouteSnapshotResponse, AdminApiError> {
+        let url = format!("{}/routes/snapshot", self.base_url);
+        let body = ApplyRouteSnapshotRequest {
+            source: CONTROLLER_SOURCE,
+            routes: routes
+                .iter()
+                .map(|route| SnapshotRouteRequest {
+                    domain: &route.domain,
+                    upstream: &route.upstream,
+                    tls: route.tls,
+                })
+                .collect(),
+        };
+
+        debug!(count = routes.len(), "applying route snapshot");
+
+        let resp = self.client.put(&url).json(&body).send().await?;
+
+        if !resp.status().is_success() {
+            return Err(AdminApiError::Status {
+                status: resp.status().as_u16(),
+                method: "PUT",
+                path: "/routes/snapshot".to_string(),
+            });
+        }
+
+        Ok(resp.json().await?)
     }
 
     /// Create a client with an optional bearer token for authentication.
@@ -191,6 +252,23 @@ mod tests {
         assert!(json.contains("\"upstream\":\"10.0.0.5:8080\""));
         assert!(json.contains("\"tls\":true"));
         assert!(json.contains("\"source\":\"dwaar-ingress\""));
+    }
+
+    #[test]
+    fn snapshot_request_serializes_correctly() {
+        let req = ApplyRouteSnapshotRequest {
+            source: CONTROLLER_SOURCE,
+            routes: vec![SnapshotRouteRequest {
+                domain: "app.example.com",
+                upstream: "10.0.0.5:8080",
+                tls: true,
+            }],
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        assert!(json.contains("\"source\":\"dwaar-ingress\""));
+        assert!(json.contains("\"domain\":\"app.example.com\""));
+        assert!(json.contains("\"upstream\":\"10.0.0.5:8080\""));
+        assert!(json.contains("\"tls\":true"));
     }
 
     #[test]
