@@ -21,19 +21,15 @@
 //!
 //! ## Reconcile logic (single pass)
 //!
-//! 1. Fetch all routes from the admin API.
-//! 2. Partition into controller-owned and foreign.
-//! 3. Compare controller-owned against the desired state (from the Ingress store).
-//!    - **Orphan** (in API, not in desired) → delete.
-//!    - **Missing** (in desired, not in API) → upsert.
-//!    - **Matching** (domain + upstream + tls unchanged) → skip.
+//! 1. Build the complete desired route set from the Ingress store.
+//! 2. Send it as one source-owned snapshot to the admin API.
+//! 3. Dwaar atomically replaces only routes owned by `source: "dwaar-ingress"`.
 
-use std::collections::HashMap;
 use std::time::Duration;
 
-use tracing::{debug, error, info, warn};
+use tracing::{error, info};
 
-use crate::client::{AdminApiClient, CONTROLLER_SOURCE};
+use crate::client::AdminApiClient;
 use crate::error::AdminApiError;
 
 /// Default interval between full reconciliation passes.
@@ -105,9 +101,10 @@ pub async fn run_reconciler<F>(
                 match reconcile_once(&client, &desired).await {
                     Ok(stats) => {
                         info!(
-                            deleted = stats.deleted,
-                            upserted = stats.upserted,
-                            skipped = stats.skipped,
+                            applied = stats.applied,
+                            removed = stats.removed,
+                            total_routes = stats.total_routes,
+                            route_hash = %stats.route_hash,
                             "reconcile pass complete"
                         );
                     }
@@ -123,106 +120,34 @@ pub async fn run_reconciler<F>(
 /// Statistics from a single reconcile pass.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ReconcileStats {
-    /// Orphaned routes removed from the admin API.
-    pub deleted: usize,
-    /// Missing routes added to the admin API.
-    pub upserted: usize,
-    /// Routes that already matched desired state and were left untouched.
-    pub skipped: usize,
+    /// Desired routes included in the applied snapshot.
+    pub applied: usize,
+    /// Previously controller-owned routes removed because they were absent from the snapshot.
+    pub removed: usize,
+    /// Total route count in Dwaar after the apply.
+    pub total_routes: usize,
+    /// Stable hash returned by Dwaar for this source-owned route snapshot.
+    pub route_hash: String,
 }
 
 /// Perform one reconcile pass.
 ///
-/// Fetches the current admin API state, compares it against `desired`, and
-/// issues the minimum set of mutations needed to converge. Returns aggregate
-/// stats for logging and testing.
+/// Sends the complete source-owned desired state to the admin API.
+///
+/// The admin API owns the atomic swap and source isolation. That keeps the
+/// controller from racing its own add/delete operations and gives operators a
+/// stable route hash for drift detection.
 pub async fn reconcile_once(
     client: &AdminApiClient,
     desired: &[DesiredRoute],
 ) -> Result<ReconcileStats, AdminApiError> {
-    let all_routes = client.list_routes().await?;
-
-    // Partition: controller-owned vs. foreign routes.
-    // Foreign routes are never touched — only log them for debugging.
-    let owned: HashMap<String, _> = all_routes
-        .into_iter()
-        .filter(|r| r.source.as_deref() == Some(CONTROLLER_SOURCE))
-        .map(|r| (r.domain.clone(), r))
-        .collect();
-
-    // Build a lookup of the desired state keyed by domain.
-    let desired_map: HashMap<&str, &DesiredRoute> =
-        desired.iter().map(|r| (r.domain.as_str(), r)).collect();
-
-    let mut stats = ReconcileStats::default();
-
-    // Delete orphans — routes that are controller-owned but no longer desired.
-    for domain in owned.keys() {
-        if !desired_map.contains_key(domain.as_str()) {
-            debug!(%domain, "reconciler: deleting orphaned route");
-            match client.delete_route(domain).await {
-                Ok(()) => {
-                    stats.deleted += 1;
-                }
-                Err(e) => {
-                    warn!(%domain, error = %e, "reconciler: failed to delete orphan — will retry");
-                }
-            }
-        }
-    }
-
-    // Upsert missing or changed routes.
-    for desired_route in desired {
-        let domain = desired_route.domain.as_str();
-
-        if let Some(existing) = owned.get(domain) {
-            // Compare the upstream and tls fields; if they match we skip
-            // the upsert to avoid unnecessary admin API churn.
-            let upstream_matches = existing
-                .upstream
-                .as_deref()
-                .is_some_and(|u| u == desired_route.upstream);
-            let tls_matches = existing.tls == desired_route.tls;
-
-            if upstream_matches && tls_matches {
-                debug!(%domain, "reconciler: route matches desired — skipping");
-                stats.skipped += 1;
-            } else {
-                debug!(
-                    %domain,
-                    upstream = %desired_route.upstream,
-                    tls = desired_route.tls,
-                    "reconciler: route changed — upserting"
-                );
-                match client
-                    .upsert_route(domain, &desired_route.upstream, desired_route.tls)
-                    .await
-                {
-                    Ok(()) => stats.upserted += 1,
-                    Err(e) => {
-                        warn!(%domain, error = %e, "reconciler: failed to upsert — will retry");
-                    }
-                }
-            }
-        } else {
-            debug!(
-                %domain,
-                upstream = %desired_route.upstream,
-                "reconciler: route missing — upserting"
-            );
-            match client
-                .upsert_route(domain, &desired_route.upstream, desired_route.tls)
-                .await
-            {
-                Ok(()) => stats.upserted += 1,
-                Err(e) => {
-                    warn!(%domain, error = %e, "reconciler: failed to upsert — will retry");
-                }
-            }
-        }
-    }
-
-    Ok(stats)
+    let response = client.apply_route_snapshot(desired).await?;
+    Ok(ReconcileStats {
+        applied: response.applied,
+        removed: response.removed,
+        total_routes: response.total_routes,
+        route_hash: response.route_hash,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -236,7 +161,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::client::RouteEntry;
+    use crate::client::{CONTROLLER_SOURCE, RouteEntry};
 
     // ---------------------------------------------------------------------------
     // Mock admin API server using a simple in-process stub.
@@ -287,6 +212,10 @@ mod tests {
         let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let log_clone = Arc::clone(&log);
         let routes_json = serde_json::to_string(&routes).expect("serialize routes");
+        let owned_count = routes
+            .iter()
+            .filter(|route| route.source.as_deref() == Some(CONTROLLER_SOURCE))
+            .count();
 
         let handle = tokio::spawn(async move {
             // Accept a bounded number of connections for the test lifetime.
@@ -331,12 +260,32 @@ mod tests {
                     let req = req_line.trim().to_string();
                     log.lock().expect("log lock").push(req.clone());
 
-                    // GET /routes → return the list; everything else → 200 OK
+                    // GET /routes → return the list. PUT /routes/snapshot →
+                    // return the admin API's applied-state envelope.
                     let response = if req.starts_with("GET /routes") {
                         format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                             routes_json.len(),
                             routes_json
+                        )
+                    } else if req.starts_with("PUT /routes/snapshot") {
+                        let applied = serde_json::from_slice::<serde_json::Value>(&body)
+                            .ok()
+                            .and_then(|value| value["routes"].as_array().map(Vec::len))
+                            .unwrap_or(0);
+                        let removed = owned_count.saturating_sub(applied.min(owned_count));
+                        let response_json = json!({
+                            "source": CONTROLLER_SOURCE,
+                            "applied": applied,
+                            "removed": removed,
+                            "total_routes": applied,
+                            "route_hash": "test-hash"
+                        })
+                        .to_string();
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            response_json.len(),
+                            response_json
                         )
                     } else {
                         "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -369,15 +318,13 @@ mod tests {
 
         let stats = reconcile_once(&client, &[]).await.expect("reconcile");
 
-        assert_eq!(stats.deleted, 1, "orphan should be deleted");
-        assert_eq!(stats.upserted, 0);
+        assert_eq!(stats.removed, 1, "orphan should be removed");
+        assert_eq!(stats.applied, 0);
 
         let calls = log.lock().expect("log lock").clone();
         assert!(
-            calls
-                .iter()
-                .any(|c| c.contains("DELETE /routes/orphan.example.com")),
-            "DELETE call expected, got: {calls:?}"
+            calls.iter().any(|c| c.contains("PUT /routes/snapshot")),
+            "snapshot apply call expected, got: {calls:?}"
         );
 
         handle.abort();
@@ -392,13 +339,13 @@ mod tests {
 
         let stats = reconcile_once(&client, &desired).await.expect("reconcile");
 
-        assert_eq!(stats.upserted, 1);
-        assert_eq!(stats.deleted, 0);
+        assert_eq!(stats.applied, 1);
+        assert_eq!(stats.removed, 0);
 
         let calls = log.lock().expect("log lock").clone();
         assert!(
-            calls.iter().any(|c| c.contains("POST /routes")),
-            "POST call expected, got: {calls:?}"
+            calls.iter().any(|c| c.contains("PUT /routes/snapshot")),
+            "snapshot apply call expected, got: {calls:?}"
         );
 
         handle.abort();
@@ -419,16 +366,14 @@ mod tests {
 
         let stats = reconcile_once(&client, &desired).await.expect("reconcile");
 
-        assert_eq!(stats.skipped, 1);
-        assert_eq!(stats.deleted, 0);
-        assert_eq!(stats.upserted, 0);
+        assert_eq!(stats.applied, 1);
+        assert_eq!(stats.removed, 0);
+        assert_eq!(stats.route_hash, "test-hash");
 
         let calls = log.lock().expect("log lock").clone();
-        // Only the GET /routes call; no POST or DELETE.
-        let mutations: Vec<_> = calls.iter().filter(|c| !c.starts_with("GET")).collect();
         assert!(
-            mutations.is_empty(),
-            "no mutations expected, got: {mutations:?}"
+            calls.iter().any(|c| c.contains("PUT /routes/snapshot")),
+            "snapshot apply call expected, got: {calls:?}"
         );
 
         handle.abort();
@@ -449,13 +394,12 @@ mod tests {
         let stats = reconcile_once(&client, &[]).await.expect("reconcile");
 
         // The foreign route is not in owned set — no delete attempted.
-        assert_eq!(stats.deleted, 0, "foreign route must not be deleted");
+        assert_eq!(stats.removed, 0, "foreign route must not be removed");
 
         let calls = log.lock().expect("log lock").clone();
-        let deletes: Vec<_> = calls.iter().filter(|c| c.starts_with("DELETE")).collect();
         assert!(
-            deletes.is_empty(),
-            "no DELETE calls expected for foreign routes, got: {deletes:?}"
+            calls.iter().any(|c| c.contains("PUT /routes/snapshot")),
+            "snapshot apply call expected, got: {calls:?}"
         );
 
         handle.abort();
@@ -476,8 +420,8 @@ mod tests {
 
         let stats = reconcile_once(&client, &desired).await.expect("reconcile");
 
-        assert_eq!(stats.upserted, 1, "changed upstream should trigger upsert");
-        assert_eq!(stats.skipped, 0);
+        assert_eq!(stats.applied, 1, "desired route should be in snapshot");
+        assert_eq!(stats.removed, 0);
 
         handle.abort();
     }
