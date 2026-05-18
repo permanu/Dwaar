@@ -6,6 +6,7 @@
 
 //! Admin API endpoint handlers.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
@@ -15,7 +16,10 @@ use dashmap::DashMap;
 use dwaar_analytics::aggregation::DomainMetrics;
 use dwaar_analytics::aggregation::snapshot::AnalyticsSnapshot;
 use dwaar_core::route::{Route, RouteTable, is_valid_route_key};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+const MAX_SNAPSHOT_SOURCE_LEN: usize = 128;
 
 /// Request body for `POST /routes`.
 #[derive(Debug, Deserialize)]
@@ -27,6 +31,33 @@ pub struct CreateRouteRequest {
     /// Used by reconcilers to identify their own routes.
     #[serde(default)]
     pub source: Option<String>,
+}
+
+/// Route entry accepted by the desired route snapshot API.
+#[derive(Debug, Deserialize)]
+pub struct SnapshotRouteRequest {
+    pub domain: String,
+    pub upstream: String,
+    pub tls: bool,
+}
+
+/// Request body for `PUT /routes/snapshot`.
+#[derive(Debug, Deserialize)]
+pub struct ApplyRouteSnapshotRequest {
+    /// Controller identity that owns every route in this desired snapshot.
+    pub source: String,
+    /// Complete desired route set for `source`.
+    #[serde(default)]
+    pub routes: Vec<SnapshotRouteRequest>,
+}
+
+#[derive(Debug, Serialize)]
+struct ApplyRouteSnapshotResponse {
+    source: String,
+    applied: usize,
+    removed: usize,
+    total_routes: usize,
+    route_hash: String,
 }
 
 /// Build the health check response body.
@@ -138,6 +169,119 @@ pub fn add_route(route_table: &ArcSwap<RouteTable>, body: &[u8]) -> Result<Strin
         "admin mutation"
     );
     serde_json::to_string(&route).map_err(|e| format!("serialize error: {e}"))
+}
+
+/// Apply a source-owned desired route snapshot.
+///
+/// Routes owned by other sources are left untouched. Routes currently owned by
+/// `source` but absent from the desired snapshot are removed. This gives
+/// reconcilers an idempotent drift-correction operation without broad table
+/// ownership.
+pub fn apply_route_snapshot(
+    route_table: &ArcSwap<RouteTable>,
+    body: &[u8],
+) -> Result<String, String> {
+    let req: ApplyRouteSnapshotRequest =
+        serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))?;
+    validate_snapshot_source(&req.source)?;
+
+    let mut routes = Vec::with_capacity(req.routes.len());
+    let mut domains = HashSet::with_capacity(req.routes.len());
+    for route_req in req.routes {
+        if !is_valid_route_key(&route_req.domain) {
+            return Err(format!("invalid domain: {}", route_req.domain));
+        }
+        let upstream: std::net::SocketAddr = route_req
+            .upstream
+            .parse()
+            .map_err(|e| format!("invalid upstream address: {e}"))?;
+        let route = Route::with_source(
+            &route_req.domain,
+            upstream,
+            route_req.tls,
+            None,
+            Some(req.source.clone()),
+        );
+        if !domains.insert(route.domain.clone()) {
+            return Err(format!("duplicate domain in snapshot: {}", route.domain));
+        }
+        routes.push(route);
+    }
+
+    routes.sort_by(|a, b| a.domain.cmp(&b.domain));
+    let route_hash = hash_route_snapshot(&req.source, &routes);
+    let mut removed = 0;
+    let mut total_routes = 0;
+
+    route_table.rcu(|current| {
+        let old_routes = current.all_routes();
+        let desired_domains = domains.clone();
+        removed = old_routes
+            .iter()
+            .filter(|route| {
+                route.source() == Some(req.source.as_str())
+                    && !desired_domains.contains(&route.domain)
+            })
+            .count();
+
+        let mut next_routes: Vec<Route> = old_routes
+            .into_iter()
+            .filter(|route| route.source() != Some(req.source.as_str()))
+            .collect();
+        next_routes.extend(routes.iter().cloned());
+        total_routes = next_routes.len();
+        Arc::new(RouteTable::new(next_routes))
+    });
+
+    tracing::info!(
+        target: "dwaar::admin::audit",
+        action = "route_snapshot_apply",
+        principal = "admin",
+        resource = %req.source,
+        applied = routes.len(),
+        removed,
+        route_hash = %route_hash,
+        "admin mutation"
+    );
+
+    let response = ApplyRouteSnapshotResponse {
+        source: req.source,
+        applied: routes.len(),
+        removed,
+        total_routes,
+        route_hash,
+    };
+    serde_json::to_string(&response).map_err(|e| format!("serialize error: {e}"))
+}
+
+fn validate_snapshot_source(source: &str) -> Result<(), String> {
+    if source.is_empty() {
+        return Err("source is required".to_string());
+    }
+    if source.len() > MAX_SNAPSHOT_SOURCE_LEN {
+        return Err("source too long".to_string());
+    }
+    if source.bytes().any(|b| b.is_ascii_control()) {
+        return Err("source contains control characters".to_string());
+    }
+    Ok(())
+}
+
+fn hash_route_snapshot(source: &str, routes: &[Route]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(source.as_bytes());
+    hasher.update(b"\n");
+    for route in routes {
+        hasher.update(route.domain.as_bytes());
+        hasher.update(b"\0");
+        if let Some(upstream) = route.upstream() {
+            hasher.update(upstream.to_string().as_bytes());
+        }
+        hasher.update(b"\0");
+        hasher.update(if route.tls { b"1" } else { b"0" });
+        hasher.update(b"\n");
+    }
+    hex::encode(hasher.finalize())
 }
 
 /// Get analytics snapshot for a single domain.
@@ -336,6 +480,73 @@ mod tests {
         let body = br#"{"domain":"valid.com","upstream":"not-an-address","tls":false}"#;
         let result = add_route(&table, body);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn apply_route_snapshot_replaces_only_owned_routes() {
+        let table = make_table(vec![
+            Route::with_source(
+                "old.example.com",
+                addr(1000),
+                false,
+                None,
+                Some("ingress".into()),
+            ),
+            Route::with_source(
+                "keep.example.com",
+                addr(2000),
+                false,
+                None,
+                Some("other".into()),
+            ),
+        ]);
+        let body = br#"{
+            "source":"ingress",
+            "routes":[
+                {"domain":"new.example.com","upstream":"127.0.0.1:3000","tls":true}
+            ]
+        }"#;
+
+        let json = apply_route_snapshot(&table, body).expect("apply snapshot");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse response");
+
+        assert_eq!(parsed["source"], "ingress");
+        assert_eq!(parsed["applied"], 1);
+        assert_eq!(parsed["removed"], 1);
+        assert!(table.load().resolve("old.example.com").is_none());
+        assert!(table.load().resolve("new.example.com").is_some());
+        assert!(table.load().resolve("keep.example.com").is_some());
+    }
+
+    #[test]
+    fn apply_route_snapshot_is_idempotent_and_hash_is_order_stable() {
+        let table = make_table(vec![]);
+        let first = br#"{
+            "source":"ingress",
+            "routes":[
+                {"domain":"b.example.com","upstream":"127.0.0.1:3002","tls":false},
+                {"domain":"a.example.com","upstream":"127.0.0.1:3001","tls":true}
+            ]
+        }"#;
+        let second = br#"{
+            "source":"ingress",
+            "routes":[
+                {"domain":"a.example.com","upstream":"127.0.0.1:3001","tls":true},
+                {"domain":"b.example.com","upstream":"127.0.0.1:3002","tls":false}
+            ]
+        }"#;
+
+        let first_json = apply_route_snapshot(&table, first).expect("first apply");
+        let second_json = apply_route_snapshot(&table, second).expect("second apply");
+        let first_parsed: serde_json::Value =
+            serde_json::from_str(&first_json).expect("parse first");
+        let second_parsed: serde_json::Value =
+            serde_json::from_str(&second_json).expect("parse second");
+
+        assert_eq!(first_parsed["route_hash"], second_parsed["route_hash"]);
+        assert_eq!(second_parsed["applied"], 2);
+        assert_eq!(second_parsed["removed"], 0);
+        assert_eq!(table.load().len(), 2);
     }
 
     #[test]

@@ -17,6 +17,8 @@ pingora-core = { workspace = true }
 pingora-cache = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 arc-swap = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }

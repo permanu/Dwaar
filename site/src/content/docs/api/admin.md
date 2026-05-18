@@ -237,6 +237,67 @@ curl -X DELETE \
 
 ---
 
+### PUT /routes/snapshot
+
+Replace the complete route set for one controller source. Routes owned by other sources are left untouched.
+
+```bash
+curl -X PUT \
+     -H "Authorization: Bearer $TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"source":"permanu-agent","routes":[{"domain":"app.example.com","upstream":"10.0.1.10:8080","tls":false}]}' \
+     http://127.0.0.1:6190/routes/snapshot
+```
+
+**Request body**
+
+```json
+{
+  "source": "permanu-agent",
+  "routes": [
+    {
+      "domain": "app.example.com",
+      "upstream": "10.0.1.10:8080",
+      "tls": false
+    }
+  ]
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `source` | string | yes | Controller identity that owns this desired route set |
+| `routes` | array | no | Complete desired route list for `source`; omitted or empty removes all routes owned by `source` |
+| `routes[].domain` | string | yes | Hostname to route. Wildcards accepted: `*.example.com` |
+| `routes[].upstream` | string | yes | Socket address in `host:port` form |
+| `routes[].tls` | boolean | yes | Connect to upstream with TLS |
+
+**Response** `200 OK`
+
+```json
+{
+  "source": "permanu-agent",
+  "applied": 1,
+  "removed": 0,
+  "total_routes": 4,
+  "route_hash": "b7f3..."
+}
+```
+
+`route_hash` is stable for the same `source` and desired route set regardless of input order. Controllers can store it as the applied-state marker.
+
+**Status codes**
+
+| Code | Meaning |
+|---|---|
+| `200` | Snapshot applied |
+| `400` | Invalid JSON, source, domain, upstream, or duplicate route domain |
+| `401` | Missing or invalid bearer token (TCP only) |
+| `413` | Request body exceeds 64 KB |
+| `429` | Rate limit exceeded |
+
+---
+
 ### GET /metrics
 
 Serve Prometheus metrics in text exposition format (`text/plain; version=0.0.4`). Requires Prometheus support to be enabled at startup (enabled by default; disable with `--no-metrics`).
