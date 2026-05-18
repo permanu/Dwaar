@@ -20,6 +20,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const MAX_SNAPSHOT_SOURCE_LEN: usize = 128;
+const ADMIN_CAPABILITIES: &[&str] = &[
+    "admin.healthz",
+    "admin.metrics.prometheus",
+    "routes.list",
+    "routes.snapshot.apply",
+    "analytics.domain",
+    "cache.purge",
+];
 
 /// Request body for `POST /routes`.
 #[derive(Debug, Deserialize)]
@@ -91,10 +99,13 @@ pub fn version_info(started_at: SystemTime) -> String {
     #[allow(unsafe_code)]
     let pid = unsafe { libc::getpid() };
     let started_rfc3339: DateTime<Utc> = started_at.into();
-    format!(
-        r#"{{"version":"{ver}","started_at":"{ts}","pid":{pid}}}"#,
-        ts = started_rfc3339.to_rfc3339(),
-    )
+    serde_json::json!({
+        "version": ver,
+        "started_at": started_rfc3339.to_rfc3339(),
+        "pid": pid,
+        "capabilities": ADMIN_CAPABILITIES,
+    })
+    .to_string()
 }
 
 /// Outcome of validating a Dwaarfile source string for the `POST /reload`
@@ -435,6 +446,31 @@ mod tests {
     }
 
     #[test]
+    fn version_info_advertises_admin_capabilities() {
+        let parsed: serde_json::Value =
+            serde_json::from_str(&version_info(SystemTime::now())).expect("parse version");
+        let capabilities = parsed["capabilities"]
+            .as_array()
+            .expect("capabilities should be an array");
+
+        for capability in [
+            "admin.healthz",
+            "admin.metrics.prometheus",
+            "routes.list",
+            "routes.snapshot.apply",
+            "analytics.domain",
+            "cache.purge",
+        ] {
+            assert!(
+                capabilities
+                    .iter()
+                    .any(|value| value.as_str() == Some(capability)),
+                "missing capability {capability}"
+            );
+        }
+    }
+
+    #[test]
     fn list_routes_returns_json_array() {
         let table = make_table(vec![
             Route::new("a.com", addr(1000), false, None),
@@ -516,6 +552,42 @@ mod tests {
         assert!(table.load().resolve("old.example.com").is_none());
         assert!(table.load().resolve("new.example.com").is_some());
         assert!(table.load().resolve("keep.example.com").is_some());
+    }
+
+    #[test]
+    fn apply_route_snapshot_preserves_unowned_and_operator_routes() {
+        let table = make_table(vec![
+            Route::with_source(
+                "stale.example.com",
+                addr(1000),
+                false,
+                None,
+                Some("permanu-agent".into()),
+            ),
+            Route::new("legacy.example.com", addr(2000), false, None),
+            Route::with_source(
+                "operator.example.com",
+                addr(3000),
+                true,
+                None,
+                Some("operator".into()),
+            ),
+        ]);
+        let body = br#"{
+            "source":"permanu-agent",
+            "routes":[
+                {"domain":"fresh.example.com","upstream":"127.0.0.1:4000","tls":true}
+            ]
+        }"#;
+
+        let json = apply_route_snapshot(&table, body).expect("apply snapshot");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse response");
+
+        assert_eq!(parsed["removed"], 1);
+        assert!(table.load().resolve("stale.example.com").is_none());
+        assert!(table.load().resolve("fresh.example.com").is_some());
+        assert!(table.load().resolve("legacy.example.com").is_some());
+        assert!(table.load().resolve("operator.example.com").is_some());
     }
 
     #[test]
