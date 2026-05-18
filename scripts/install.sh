@@ -145,6 +145,110 @@ http_exists() {
 }
 
 # ---------------------------------------------------------------------------
+# Cosign release trust policy
+# ---------------------------------------------------------------------------
+COSIGN_PUBKEY_PATH=""
+
+ensure_cosign_pubkey_path() {
+    if [ -n "${COSIGN_PUBKEY_PATH:-}" ]; then
+        return
+    fi
+
+    if [ -n "${DWAAR_COSIGN_PUBKEY:-}" ] && [ -n "${DWAAR_COSIGN_PUBKEY_URL:-}" ]; then
+        die "Set only one of DWAAR_COSIGN_PUBKEY or DWAAR_COSIGN_PUBKEY_URL."
+    fi
+
+    if [ -n "${DWAAR_COSIGN_PUBKEY:-}" ]; then
+        COSIGN_PUBKEY_PATH="${DWAAR_COSIGN_PUBKEY}"
+        return
+    fi
+
+    if [ -n "${DWAAR_COSIGN_PUBKEY_URL:-}" ]; then
+        case "${DWAAR_COSIGN_PUBKEY_URL}" in
+            https://*) ;;
+            *) die "DWAAR_COSIGN_PUBKEY_URL must be an https:// URL." ;;
+        esac
+        COSIGN_PUBKEY_PATH="${TMPDIR_DWAAR}/dwaar-release-authority.pub"
+        download "${DWAAR_COSIGN_PUBKEY_URL}" "${COSIGN_PUBKEY_PATH}"
+        return
+    fi
+
+    die "DWAAR_COSIGN_PUBKEY or DWAAR_COSIGN_PUBKEY_URL is required for key-based verification."
+}
+
+verify_cosign_signature() {
+    SIG_MODE="$1"
+    if [ "${SIG_MODE}" = "key-unconfigured" ]; then
+        die "This release is signed by the Permanu/Dwaar release authority, but no verification key is configured. Set DWAAR_COSIGN_PUBKEY to a pinned public key path or DWAAR_COSIGN_PUBKEY_URL to an https:// key URL, then retry."
+    fi
+
+    if ! command -v cosign >/dev/null 2>&1; then
+        if [ "${SIG_MODE}" = "key" ]; then
+            die "cosign is required to verify releases signed by the Permanu/Dwaar release authority."
+        fi
+
+        printf "%bWarning: cosign not installed, skipping signature verification (sha256 still checked).%b\n" \
+            "${YELLOW}" "${RESET}" >&2
+        printf "%b         Install cosign from https://github.com/sigstore/cosign/releases%b\n" \
+            "${YELLOW}" "${RESET}" >&2
+        printf "%b         then verify manually:%b\n" "${YELLOW}" "${RESET}" >&2
+        if [ "${SIG_MODE}" = "legacy-bundle" ]; then
+            printf "%b         cosign verify-blob %s \\%b\n" "${YELLOW}" "${ARTIFACT}" "${RESET}" >&2
+            printf "%b           --bundle %s.bundle \\%b\n" "${YELLOW}" "${ARTIFACT}" "${RESET}" >&2
+        else
+            printf "%b         cosign verify-blob %s \\%b\n" "${YELLOW}" "${ARTIFACT}" "${RESET}" >&2
+            printf "%b           --certificate %s.cert \\%b\n" "${YELLOW}" "${ARTIFACT}" "${RESET}" >&2
+            printf "%b           --signature %s.sig \\%b\n" "${YELLOW}" "${ARTIFACT}" "${RESET}" >&2
+        fi
+        printf '%b           --certificate-identity-regexp "^https://github\\.com/permanu/Dwaar/\\.github/workflows/release\\.yml@.*" \\%b\n' \
+            "${YELLOW}" "${RESET}" >&2
+        printf '%b           --certificate-oidc-issuer "https://token.actions.githubusercontent.com"%b\n' \
+            "${YELLOW}" "${RESET}" >&2
+        return
+    fi
+
+    case "${SIG_MODE}" in
+        key)
+            ensure_cosign_pubkey_path
+            if cosign verify-blob "${BINARY_TMP}" \
+                --bundle "${BUNDLE_TMP}" \
+                --key "${COSIGN_PUBKEY_PATH}"
+            then
+                success "Cosign signature verified (signed by Permanu/Dwaar release authority)."
+            else
+                die "Cosign verification failed for signed by Permanu/Dwaar release authority."
+            fi
+            ;;
+        legacy-bundle)
+            if cosign verify-blob "${BINARY_TMP}" \
+                --bundle "${BUNDLE_TMP}" \
+                --certificate-identity-regexp "^https://github\.com/permanu/Dwaar/\.github/workflows/release\.yml@.*" \
+                --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+            then
+                success "Cosign signature verified (legacy GitHub Actions keyless bundle)."
+            else
+                die "Cosign verification failed for legacy GitHub Actions keyless bundle."
+            fi
+            ;;
+        legacy-cert)
+            if cosign verify-blob "${BINARY_TMP}" \
+                --certificate "${CERT_TMP}" \
+                --signature "${SIG_TMP}" \
+                --certificate-identity-regexp "^https://github\.com/permanu/Dwaar/\.github/workflows/release\.yml@.*" \
+                --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+            then
+                success "Cosign signature verified (legacy GitHub Actions keyless certificate)."
+            else
+                die "Cosign verification failed for legacy GitHub Actions keyless certificate."
+            fi
+            ;;
+        *)
+            die "Unknown signature verification mode: ${SIG_MODE}"
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
 # SHA256 verification
 # ---------------------------------------------------------------------------
 verify_sha256() {
@@ -484,30 +588,35 @@ main() {
     verify_sha256 "${BINARY_TMP}" "${SHA256_TMP}"
     success "SHA256 checksum verified."
 
-    # 5a. Cosign signature verification (keyless OIDC).
+    # 5a. Cosign signature verification.
     #
-    # As of v0.3.18 every release ships a single sigstore bundle
-    # (`${ARTIFACT}.bundle`) that embeds both the signature and the Fulcio
-    # certificate. Older releases shipped split `.sig` + `.cert` files; we
-    # keep that path as a fallback so re-installs of historical versions
-    # still verify cleanly.
+    # Enterprise/BYOS releases are verified with a pinned/exported public key
+    # via DWAAR_COSIGN_PUBKEY or DWAAR_COSIGN_PUBKEY_URL. That mode expects
+    # a cosign bundle produced by:
+    #   cosign sign-blob --key <KMS/local/env key> --bundle <artifact>.bundle --yes <artifact>
     #
-    # Verification chains to Fulcio with the GitHub Actions OIDC issuer and
-    # pins the exact workflow path that produced this binary — a stronger
-    # guarantee than sha256 alone (sha256 proves download integrity; cosign
-    # proves build provenance).
-    #
-    # If cosign is NOT installed we fall back to sha256-only and print a
-    # loud warning — we never silently bypass signature verification.
+    # During migration, releases without a configured release key still verify
+    # through the legacy GitHub Actions keyless trust policy, using either a
+    # bundle or historical split `.sig` + `.cert` assets.
     info "Verifying cosign signature..."
     SIG_MODE=""
-    if http_exists "${BUNDLE_URL}"; then
+    if [ -n "${DWAAR_COSIGN_PUBKEY:-}" ] || [ -n "${DWAAR_COSIGN_PUBKEY_URL:-}" ]; then
+        ensure_cosign_pubkey_path
+        if ! http_exists "${BUNDLE_URL}"; then
+            die "Configured release key requires ${BUNDLE_URL}. Refusing legacy keyless fallback."
+        fi
         download "${BUNDLE_URL}" "${BUNDLE_TMP}"
-        SIG_MODE="bundle"
+        SIG_MODE="key"
+    elif http_exists "${BUNDLE_URL}" && http_exists "${SIG_URL}" && http_exists "${CERT_URL}"; then
+        download "${BUNDLE_URL}" "${BUNDLE_TMP}"
+        SIG_MODE="legacy-bundle"
+    elif http_exists "${BUNDLE_URL}"; then
+        download "${BUNDLE_URL}" "${BUNDLE_TMP}"
+        SIG_MODE="key-unconfigured"
     elif http_exists "${SIG_URL}" && http_exists "${CERT_URL}"; then
         download "${SIG_URL}"  "${SIG_TMP}"
         download "${CERT_URL}" "${CERT_TMP}"
-        SIG_MODE="legacy"
+        SIG_MODE="legacy-cert"
     else
         die "No signature artefacts found for ${ARTIFACT}. Looked for:
   ${BUNDLE_URL}
@@ -515,42 +624,7 @@ main() {
 Refusing to install an unverifiable binary."
     fi
 
-    if command -v cosign >/dev/null 2>&1; then
-        if [ "${SIG_MODE}" = "bundle" ]; then
-            cosign verify-blob \
-                --bundle "${BUNDLE_TMP}" \
-                --certificate-identity-regexp "^https://github\.com/permanu/Dwaar/\.github/workflows/release\.yml@.*" \
-                --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-                "${BINARY_TMP}"
-        else
-            cosign verify-blob \
-                --certificate "${CERT_TMP}" \
-                --signature "${SIG_TMP}" \
-                --certificate-identity-regexp "^https://github\.com/permanu/Dwaar/\.github/workflows/release\.yml@.*" \
-                --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-                "${BINARY_TMP}"
-        fi
-        success "Cosign signature verified (${SIG_MODE})."
-    else
-        printf "%bWarning: cosign not installed, skipping signature verification (sha256 still checked).%b\n" \
-            "${YELLOW}" "${RESET}" >&2
-        printf "%b         Install cosign from https://github.com/sigstore/cosign/releases%b\n" \
-            "${YELLOW}" "${RESET}" >&2
-        printf "%b         then verify manually:%b\n" "${YELLOW}" "${RESET}" >&2
-        if [ "${SIG_MODE}" = "bundle" ]; then
-            printf "%b         cosign verify-blob \\%b\n" "${YELLOW}" "${RESET}" >&2
-            printf "%b           --bundle %s.bundle \\%b\n" "${YELLOW}" "${ARTIFACT}" "${RESET}" >&2
-        else
-            printf "%b         cosign verify-blob \\%b\n" "${YELLOW}" "${RESET}" >&2
-            printf "%b           --certificate %s.cert \\%b\n" "${YELLOW}" "${ARTIFACT}" "${RESET}" >&2
-            printf "%b           --signature %s.sig \\%b\n" "${YELLOW}" "${ARTIFACT}" "${RESET}" >&2
-        fi
-        printf '%b           --certificate-identity-regexp "^https://github\\.com/permanu/Dwaar/\\.github/workflows/release\\.yml@.*" \\%b\n' \
-            "${YELLOW}" "${RESET}" >&2
-        printf '%b           --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \\%b\n' \
-            "${YELLOW}" "${RESET}" >&2
-        printf "%b           %s%b\n" "${YELLOW}" "${ARTIFACT}" "${RESET}" >&2
-    fi
+    verify_cosign_signature "${SIG_MODE}"
 
     # 6. Install the binary (sets INSTALL_PATH)
     info "Installing to ${SYSTEM_BIN}..."
@@ -575,4 +649,6 @@ Refusing to install an unverifiable binary."
     print_quickstart
 }
 
-main "$@"
+if [ "${DWAAR_INSTALL_SH_LIBRARY:-}" != "1" ]; then
+    main "$@"
+fi

@@ -34,7 +34,17 @@ changelog_top_version() {
 
 # Latest released git tag (any v-prefixed semver). Sorted by version, not date.
 latest_tag() {
-    git tag -l 'v[0-9]*' | sort -V | tail -1 | sed 's/^v//'
+    git tag -l 'v[0-9]*.[0-9]*.[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 | sed 's/^v//'
+}
+
+release_ref_version() {
+    local ref="${GITHUB_REF_NAME:-}"
+    if [ -z "$ref" ] && [ "${GITHUB_REF:-}" != "" ]; then
+        ref="${GITHUB_REF#refs/tags/}"
+    fi
+    if printf '%s\n' "$ref" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+        printf '%s\n' "${ref#v}"
+    fi
 }
 
 # --- Semver helpers ---
@@ -62,18 +72,34 @@ CARGO=$(cargo_version)
 LICENSE=$(license_version)
 CL=$(changelog_top_version)
 TAG=$(latest_tag)
+RELEASE_REF=$(release_ref_version)
 
 printf 'Cargo.toml dwaar-cli version : %s\n' "$CARGO"
 printf 'LICENSE Licensed Work version : %s\n' "$LICENSE"
 printf 'CHANGELOG top entry version  : %s\n' "$CL"
 printf 'Latest git tag                : %s\n' "$TAG"
+[ -n "$RELEASE_REF" ] && printf 'Release ref version           : %s\n' "$RELEASE_REF"
 echo
 
 fail=0
 
+for crate_toml in crates/*/Cargo.toml; do
+    crate_version=$(grep -E '^version = "[0-9]+\.[0-9]+\.[0-9]+"$' "$crate_toml" | head -1 | sed -E 's/version = "([^"]+)"/\1/')
+    if [ -n "$crate_version" ] && [ "$crate_version" != "$CARGO" ]; then
+        printf '✗ %s version (%s) does not match dwaar-cli (%s).\n' "$crate_toml" "$crate_version" "$CARGO" >&2
+        fail=1
+    fi
+done
+
 if [ "$CARGO" != "$LICENSE" ]; then
     printf '✗ Cargo.toml (%s) does not match LICENSE (%s).\n' "$CARGO" "$LICENSE" >&2
     printf '  Run: ./scripts/bump-license-date.sh %s\n' "$CARGO" >&2
+    fail=1
+fi
+
+if [ -n "$RELEASE_REF" ] && [ "$RELEASE_REF" != "$CARGO" ]; then
+    printf '✗ Release tag v%s does not match Cargo.toml (%s).\n' "$RELEASE_REF" "$CARGO" >&2
+    printf '  Bump all crate versions, LICENSE, and CHANGELOG before tagging.\n' >&2
     fail=1
 fi
 

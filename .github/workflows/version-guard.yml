@@ -11,6 +11,13 @@ name: Version Guard
 # fails CI before it can land on main.
 
 on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 permissions:
