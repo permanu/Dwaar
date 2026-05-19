@@ -91,20 +91,26 @@ fn start_dwaar_with_config(config: Option<&std::path::Path>) -> std::process::Ch
     if let Some(path) = config {
         cmd.arg("--config").arg(path);
     }
-    let child = cmd.spawn().expect("failed to start dwaar");
+    let mut child = cmd.spawn().expect("failed to start dwaar");
 
     // Poll until the proxy is accepting connections (or timeout after 10s).
     let start = std::time::Instant::now();
-    let addr = "127.0.0.1:8080"
+    let addr = "127.0.0.1:6188"
         .parse::<std::net::SocketAddr>()
         .expect("valid literal socket addr");
     while start.elapsed() < Duration::from_secs(10) {
         if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
-            break;
+            return child;
         }
         thread::sleep(Duration::from_millis(200));
     }
-    child
+
+    let mut stderr = String::new();
+    child.kill().ok();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    panic!("dwaar proxy did not listen on 127.0.0.1:6188 within 10s: {stderr}");
 }
 
 /// Stop a dwaar subprocess and all its forked workers.
