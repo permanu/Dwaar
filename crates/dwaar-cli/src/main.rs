@@ -1714,6 +1714,11 @@ fn register_background_services(
     // can hot-swap the list when `tls { dns … }` sites change at runtime.
     let mut dns_domains_for_watcher: Option<Arc<ArcSwap<Vec<String>>>> = None;
 
+    // Shared notify for post-reload work. ConfigWatcher fires it after every
+    // successful reload; TLS uses it to issue newly-added domains immediately,
+    // and AggregationService uses it to evict removed-domain metrics. #167
+    let agg_evict_notify = Arc::new(tokio::sync::Notify::new());
+
     // ACME + OCSP background service
     if let Some(solver) = challenge_solver {
         let issuer = Arc::new(CertIssuer::new(
@@ -1727,7 +1732,8 @@ fn register_background_services(
             "/etc/dwaar/certs",
             issuer,
             Arc::clone(cert_store),
-        );
+        )
+        .with_reload_notify(Arc::clone(&agg_evict_notify));
 
         // Wire DNS-01 provider when the config contains `tls { dns cloudflare }` sites.
         let dns01_entries = dwaar_config::compile::compile_dns01_domains(config);
@@ -1799,11 +1805,6 @@ fn register_background_services(
         server.add_service(log_bg);
         info!("log writer registered (JSON lines to stdout)");
     }
-
-    // Shared notify for post-reload eviction. ConfigWatcher fires it after
-    // every successful reload; AggregationService listens and drops DashMap
-    // entries for domains that are no longer in the route table. #167
-    let agg_evict_notify = Arc::new(tokio::sync::Notify::new());
 
     // Config file watcher for hot-reload
     // Hash expanded content so it matches the watcher's hash (which expands imports).

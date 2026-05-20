@@ -1313,7 +1313,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "dwaar-admin"
-version = "0.3.22"
+version = "0.3.23"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1341,7 +1341,7 @@ dependencies = [
 
 [[package]]
 name = "dwaar-analytics"
-version = "0.3.22"
+version = "0.3.23"
 dependencies = [
  "base64",
  "brotli 8.0.2",
@@ -1374,7 +1374,7 @@ dependencies = [
 
 [[package]]
 name = "dwaar-cli"
-version = "0.3.22"
+version = "0.3.23"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1415,7 +1415,7 @@ dependencies = [
 
 [[package]]
 name = "dwaar-config"
-version = "0.3.22"
+version = "0.3.23"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1444,7 +1444,7 @@ dependencies = [
 
 [[package]]
 name = "dwaar-core"
-version = "0.3.22"
+version = "0.3.23"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -1498,7 +1498,7 @@ dependencies = [
 
 [[package]]
 name = "dwaar-docker"
-version = "0.3.22"
+version = "0.3.23"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1515,7 +1515,7 @@ dependencies = [
 
 [[package]]
 name = "dwaar-geo"
-version = "0.3.22"
+version = "0.3.23"
 dependencies = [
  "arc-swap",
  "criterion",
@@ -1526,7 +1526,7 @@ dependencies = [
 
 [[package]]
 name = "dwaar-grpc"
-version = "0.3.22"
+version = "0.3.23"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1550,7 +1550,7 @@ dependencies = [
 
 [[package]]
 name = "dwaar-ingress"
-version = "0.3.22"
+version = "0.3.23"
 dependencies = [
  "anyhow",
  "clap",
@@ -1570,7 +1570,7 @@ dependencies = [
 
 [[package]]
 name = "dwaar-log"
-version = "0.3.22"
+version = "0.3.23"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1587,7 +1587,7 @@ dependencies = [
 
 [[package]]
 name = "dwaar-plugins"
-version = "0.3.22"
+version = "0.3.23"
 dependencies = [
  "ahash",
  "anyhow",
@@ -1624,7 +1624,7 @@ dependencies = [
 
 [[package]]
 name = "dwaar-tls"
-version = "0.3.22"
+version = "0.3.23"
 dependencies = [
  "arc-swap",
  "async-trait",
