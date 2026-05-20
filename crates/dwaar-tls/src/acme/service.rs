@@ -51,6 +51,7 @@ pub struct TlsBackgroundService {
     cert_store: Arc<CertStore>,
     /// Optional DNS provider for DNS-01 challenges (e.g. Cloudflare).
     dns_provider: Option<Arc<dyn DnsProvider>>,
+    reload_notify: Option<Arc<tokio::sync::Notify>>,
     in_flight: tokio::sync::Mutex<HashSet<String>>,
 }
 
@@ -80,6 +81,7 @@ impl TlsBackgroundService {
             issuer,
             cert_store,
             dns_provider: None,
+            reload_notify: None,
             in_flight: tokio::sync::Mutex::new(HashSet::new()),
         }
     }
@@ -97,6 +99,16 @@ impl TlsBackgroundService {
     ) -> Self {
         self.dns_provider = Some(provider);
         self.dns_domains = dns_domains;
+        self
+    }
+
+    /// Wake the TLS manager when config hot-reload adds domains.
+    ///
+    /// Without this, new ACME domains are discovered by `ArcSwap` but only
+    /// issued on process startup or the next renewal tick.
+    #[must_use]
+    pub fn with_reload_notify(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
+        self.reload_notify = Some(notify);
         self
     }
 
@@ -421,14 +433,30 @@ impl BackgroundService for TlsBackgroundService {
         self.refresh_ocsp_responses().await;
 
         loop {
-            tokio::select! {
-                () = tokio::time::sleep(super::SERVICE_CHECK_INTERVAL) => {
-                    self.refresh_ocsp_responses().await;
-                    self.daily_renewal().await;
+            if let Some(reload_notify) = &self.reload_notify {
+                tokio::select! {
+                    () = tokio::time::sleep(super::SERVICE_CHECK_INTERVAL) => {
+                        self.refresh_ocsp_responses().await;
+                        self.daily_renewal().await;
+                    }
+                    () = reload_notify.notified() => {
+                        self.daily_renewal().await;
+                    }
+                    _ = shutdown.changed() => {
+                        info!("TLS background service shutting down");
+                        return;
+                    }
                 }
-                _ = shutdown.changed() => {
-                    info!("TLS background service shutting down");
-                    return;
+            } else {
+                tokio::select! {
+                    () = tokio::time::sleep(super::SERVICE_CHECK_INTERVAL) => {
+                        self.refresh_ocsp_responses().await;
+                        self.daily_renewal().await;
+                    }
+                    _ = shutdown.changed() => {
+                        info!("TLS background service shutting down");
+                        return;
+                    }
                 }
             }
         }

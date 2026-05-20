@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.23] - 2026-05-20
+
+### Fixed
+
+- **Issue ACME certificates immediately after hot-reloading newly-added
+  domains.** The TLS background service already watched the hot-swapped ACME
+  domain list, but it only scanned it on process startup or the next renewal
+  interval. Config reloads now wake the TLS service directly, so a freshly
+  mapped domain can move from route installed to certificate active without
+  restarting Dwaar or waiting for the periodic renewal loop. Config reload
+  post-hooks now wake all subscribers so TLS issuance and analytics eviction
+  both observe the same reload event.
+
 ## [0.3.21] - 2026-05-09
 
 ### Added

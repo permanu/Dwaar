@@ -472,11 +472,11 @@ impl ConfigWatcher {
         let mut last = self.last_hash.lock();
         *last = new_hash;
 
-        // Notify post-reload subscribers (e.g. the aggregation eviction loop).
+        // Notify post-reload subscribers (e.g. TLS issuance and aggregation eviction).
         // The route table swap happened above, so subscribers that enumerate
         // known_hosts() now see the updated domain set. #167
         if let Some(ref n) = self.post_reload_notify {
-            n.notify_one();
+            n.notify_waiters();
         }
     }
 }
