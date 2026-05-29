@@ -1,7 +1,20 @@
 #!/usr/bin/env sh
 set -eu
 
-mode="${1:-cargo}"
+mode="${PERMANU_RUST_MODE:-${1:-cargo}}"
+
+ensure_writable_tmpdir() {
+  tmp="${TMPDIR:-}"
+  if [ -z "$tmp" ] || [ ! -d "$tmp" ] || [ ! -w "$tmp" ]; then
+    export TMPDIR=/tmp
+  fi
+  if [ -z "${TMP:-}" ] || [ ! -d "${TMP:-}" ] || [ ! -w "${TMP:-}" ]; then
+    export TMP="$TMPDIR"
+  fi
+  if [ -z "${TEMP:-}" ] || [ ! -d "${TEMP:-}" ] || [ ! -w "${TEMP:-}" ]; then
+    export TEMP="$TMPDIR"
+  fi
+}
 
 run_bounded() {
   seconds="$1"
@@ -20,14 +33,14 @@ run_bounded() {
     ) &
     watcher="$!"
     wait "$child"
-    status="$?"
+    command_status="$?"
     kill "$watcher" >/dev/null 2>&1 || true
     wait "$watcher" 2>/dev/null || true
-    if [ "$status" -eq 137 ] || [ "$status" -eq 143 ]; then
+    if [ "$command_status" -eq 137 ] || [ "$command_status" -eq 143 ]; then
       echo "command timed out after ${seconds}s: $*" >&2
       return 124
     fi
-    return "$status"
+    return "$command_status"
   fi
 }
 
@@ -51,10 +64,10 @@ with_rustup_lock() {
 
   set +e
   "$@"
-  status="$?"
+  command_status="$?"
   set -e
   rmdir "$lock" 2>/dev/null || rm -rf "$lock"
-  return "$status"
+  return "$command_status"
 }
 
 require_cmd() {
@@ -77,36 +90,92 @@ rust_channel() {
 }
 
 ensure_rustup_toolchain() {
-  if ! command -v rustup >/dev/null 2>&1; then
-    return
-  fi
-
   channel="$(rust_channel)"
   components=""
   case "$mode" in
     quality) components="--component rustfmt --component clippy" ;;
   esac
 
-  echo "ensuring Rust toolchain $channel for $mode"
+  echo "checking active Rust toolchain for $channel/$mode"
+  if active_toolchain_healthy "$channel"; then
+    echo "using active Rust toolchain for $channel"
+    return
+  fi
+
+  if ! command -v rustup >/dev/null 2>&1; then
+    return
+  fi
+
+  echo "checking Rust toolchain $channel for $mode"
+  if rustup_toolchain_healthy "$channel"; then
+    echo "using existing Rust toolchain $channel"
+    return
+  fi
+
+  echo "Rust toolchain $channel is missing or incomplete; reinstalling" >&2
+  with_rustup_lock run_bounded 300 rustup toolchain uninstall "$channel" >/dev/null 2>&1 || true
+  echo "installing Rust toolchain $channel for $mode"
   # shellcheck disable=SC2086
   with_rustup_lock run_bounded 1200 rustup toolchain install "$channel" --profile minimal $components
 
-  echo "verifying Rust toolchain $channel"
+  if rustup_toolchain_healthy "$channel"; then
+    return
+  fi
+
+  echo "Rust toolchain $channel is still incomplete after reinstall" >&2
+  exit 1
+}
+
+rustup_toolchain_healthy() {
+  channel="$1"
   set +e
   rustup run "$channel" rustc --version >/dev/null 2>&1
   rustc_ok="$?"
   rustup run "$channel" cargo --version >/dev/null 2>&1
   cargo_ok="$?"
+  rustfmt_ok=0
+  clippy_ok=0
+  if [ "$mode" = "quality" ]; then
+    rustup run "$channel" rustfmt --version >/dev/null 2>&1
+    rustfmt_ok="$?"
+    rustup run "$channel" clippy-driver --version >/dev/null 2>&1
+    clippy_ok="$?"
+  fi
   set -e
-  if [ "$rustc_ok" -eq 0 ] && [ "$cargo_ok" -eq 0 ]; then
+
+  if [ "$rustc_ok" -eq 0 ] && [ "$cargo_ok" -eq 0 ] && [ "$rustfmt_ok" -eq 0 ] && [ "$clippy_ok" -eq 0 ]; then
     return
   fi
+  return 1
+}
 
-  echo "rustup toolchain $channel is incomplete; reinstalling" >&2
-  with_rustup_lock run_bounded 300 rustup toolchain uninstall "$channel" >/dev/null 2>&1 || true
-  echo "reinstalling Rust toolchain $channel"
-  # shellcheck disable=SC2086
-  with_rustup_lock run_bounded 1200 rustup toolchain install "$channel" --profile minimal $components
+active_toolchain_healthy() {
+  channel="$1"
+  set +e
+  rustc_version="$(rustc --version 2>/dev/null)"
+  rustc_ok="$?"
+  cargo --version >/dev/null 2>&1
+  cargo_ok="$?"
+  rustfmt_ok=0
+  clippy_ok=0
+  if [ "$mode" = "quality" ]; then
+    rustfmt --version >/dev/null 2>&1
+    rustfmt_ok="$?"
+    clippy-driver --version >/dev/null 2>&1
+    clippy_ok="$?"
+  fi
+  set -e
+
+  case "$rustc_version" in
+    "rustc $channel"|"rustc $channel "*) version_ok=0 ;;
+    "rustc $channel."*) version_ok=0 ;;
+    *) version_ok=1 ;;
+  esac
+
+  if [ "$rustc_ok" -eq 0 ] && [ "$cargo_ok" -eq 0 ] && [ "$rustfmt_ok" -eq 0 ] && [ "$clippy_ok" -eq 0 ] && [ "$version_ok" -eq 0 ]; then
+    return
+  fi
+  return 1
 }
 
 case "${CARGO_HOME:-}" in
@@ -114,10 +183,16 @@ case "${CARGO_HOME:-}" in
   *) export PATH="$CARGO_HOME/bin:$PATH" ;;
 esac
 
+case ":${PATH:-}:" in
+  *":/usr/local/cargo/bin:"*) ;;
+  *) export PATH="/usr/local/cargo/bin:${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}" ;;
+esac
+
 if ! command -v cargo >/dev/null 2>&1 && [ -n "${HOME:-}" ]; then
   export PATH="$HOME/.cargo/bin:$PATH"
 fi
 
+ensure_writable_tmpdir
 ensure_rustup_toolchain
 
 require_cmd cargo
