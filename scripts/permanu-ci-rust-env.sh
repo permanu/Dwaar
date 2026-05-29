@@ -9,7 +9,25 @@ run_bounded() {
   if command -v timeout >/dev/null 2>&1; then
     timeout "$seconds" "$@"
   else
-    "$@"
+    "$@" &
+    child="$!"
+    watcher=""
+    (
+      sleep "$seconds"
+      kill "$child" >/dev/null 2>&1 || true
+      sleep 5
+      kill -9 "$child" >/dev/null 2>&1 || true
+    ) &
+    watcher="$!"
+    wait "$child"
+    status="$?"
+    kill "$watcher" >/dev/null 2>&1 || true
+    wait "$watcher" 2>/dev/null || true
+    if [ "$status" -eq 137 ] || [ "$status" -eq 143 ]; then
+      echo "command timed out after ${seconds}s: $*" >&2
+      return 124
+    fi
+    return "$status"
   fi
 }
 
@@ -69,9 +87,11 @@ ensure_rustup_toolchain() {
     quality) components="--component rustfmt --component clippy" ;;
   esac
 
+  echo "ensuring Rust toolchain $channel for $mode"
   # shellcheck disable=SC2086
   with_rustup_lock run_bounded 1200 rustup toolchain install "$channel" --profile minimal $components
 
+  echo "verifying Rust toolchain $channel"
   set +e
   rustup run "$channel" rustc --version >/dev/null 2>&1
   rustc_ok="$?"
@@ -84,6 +104,7 @@ ensure_rustup_toolchain() {
 
   echo "rustup toolchain $channel is incomplete; reinstalling" >&2
   with_rustup_lock run_bounded 300 rustup toolchain uninstall "$channel" >/dev/null 2>&1 || true
+  echo "reinstalling Rust toolchain $channel"
   # shellcheck disable=SC2086
   with_rustup_lock run_bounded 1200 rustup toolchain install "$channel" --profile minimal $components
 }
@@ -118,11 +139,13 @@ case "$mode" in
   quality)
     require_cmd rustfmt
     require_cmd clippy-driver
+    echo "checking rustfmt and clippy-driver"
     with_rustup_lock run_bounded 300 rustfmt --version
     with_rustup_lock run_bounded 300 clippy-driver --version
     ;;
   audit)
     if ! command -v cargo-audit >/dev/null 2>&1; then
+      echo "installing cargo-audit"
       with_rustup_lock run_bounded 900 cargo install cargo-audit --locked
     fi
     ;;
