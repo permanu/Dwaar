@@ -14,7 +14,7 @@ run_bounded() {
 }
 
 with_rustup_lock() {
-  lock_root="${RUNNER_TOOL_CACHE:-${TMPDIR:-/tmp}}"
+  lock_root="${PERMANU_RUSTUP_LOCK_ROOT:-/var/tmp/permanu-ci}"
   mkdir -p "$lock_root"
   lock="$lock_root/permanu-rustup.lock"
   waited=0
