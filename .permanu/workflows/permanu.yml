@@ -55,12 +55,22 @@ jobs:
       - name: Setup Rust
         shell: sh
         run: |
-          export HOME="$PWD/.permanu-home"
-          export CARGO_HOME="$PWD/.permanu-cargo"
-          export RUSTUP_HOME="$PWD/.permanu-rustup"
+          : "${CARGO_HOME:=$PWD/.permanu-cargo}"
+          : "${RUSTUP_HOME:=$PWD/.permanu-rustup}"
+          : "${RUNNER_TOOL_CACHE:=$PWD/.permanu-tool-cache}"
+          export CARGO_HOME RUSTUP_HOME RUNNER_TOOL_CACHE RUSTUP_INIT_SKIP_PATH_CHECK=1
           export PATH="$CARGO_HOME/bin:$PATH"
-          mkdir -p "$HOME" "$CARGO_HOME" "$RUSTUP_HOME"
-          lock=/tmp/permanu-rustup.lock
+          mkdir -p "$CARGO_HOME" "$RUSTUP_HOME" "$RUNNER_TOOL_CACHE"
+          run_bounded() {
+            seconds="$1"
+            shift
+            if command -v timeout >/dev/null 2>&1; then
+              timeout "$seconds" "$@"
+            else
+              "$@"
+            fi
+          }
+          lock="$RUNNER_TOOL_CACHE/permanu-rustup.lock"
           waited=0
           while ! mkdir "$lock" 2>/dev/null; do
             if find "$lock" -maxdepth 0 -mmin +10 >/dev/null 2>&1; then
@@ -80,13 +90,14 @@ jobs:
             DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential cmake pkg-config protobuf-compiler
           fi
           if ! command -v cargo >/dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
           fi
           if [ -f "$CARGO_HOME/env" ]; then
             . "$CARGO_HOME/env"
           fi
           if command -v rustup >/dev/null 2>&1; then
-            rustup component add rustfmt clippy
+            run_bounded 900 rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+            run_bounded 300 rustup default stable
           fi
           printf '%s\n' "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
@@ -108,12 +119,22 @@ jobs:
       - name: Setup Rust
         shell: sh
         run: |
-          export HOME="$PWD/.permanu-home"
-          export CARGO_HOME="$PWD/.permanu-cargo"
-          export RUSTUP_HOME="$PWD/.permanu-rustup"
+          : "${CARGO_HOME:=$PWD/.permanu-cargo}"
+          : "${RUSTUP_HOME:=$PWD/.permanu-rustup}"
+          : "${RUNNER_TOOL_CACHE:=$PWD/.permanu-tool-cache}"
+          export CARGO_HOME RUSTUP_HOME RUNNER_TOOL_CACHE RUSTUP_INIT_SKIP_PATH_CHECK=1
           export PATH="$CARGO_HOME/bin:$PATH"
-          mkdir -p "$HOME" "$CARGO_HOME" "$RUSTUP_HOME"
-          lock=/tmp/permanu-rustup.lock
+          mkdir -p "$CARGO_HOME" "$RUSTUP_HOME" "$RUNNER_TOOL_CACHE"
+          run_bounded() {
+            seconds="$1"
+            shift
+            if command -v timeout >/dev/null 2>&1; then
+              timeout "$seconds" "$@"
+            else
+              "$@"
+            fi
+          }
+          lock="$RUNNER_TOOL_CACHE/permanu-rustup.lock"
           waited=0
           while ! mkdir "$lock" 2>/dev/null; do
             if find "$lock" -maxdepth 0 -mmin +10 >/dev/null 2>&1; then
@@ -133,10 +154,14 @@ jobs:
             DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential cmake pkg-config protobuf-compiler
           fi
           if ! command -v cargo >/dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
           fi
           if [ -f "$CARGO_HOME/env" ]; then
             . "$CARGO_HOME/env"
+          fi
+          if command -v rustup >/dev/null 2>&1; then
+            run_bounded 900 rustup toolchain install stable --profile minimal
+            run_bounded 300 rustup default stable
           fi
           printf '%s\n' "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
@@ -164,12 +189,22 @@ jobs:
       - name: Setup Rust audit tooling
         shell: sh
         run: |
-          export HOME="$PWD/.permanu-home"
-          export CARGO_HOME="$PWD/.permanu-cargo"
-          export RUSTUP_HOME="$PWD/.permanu-rustup"
+          : "${CARGO_HOME:=$PWD/.permanu-cargo}"
+          : "${RUSTUP_HOME:=$PWD/.permanu-rustup}"
+          : "${RUNNER_TOOL_CACHE:=$PWD/.permanu-tool-cache}"
+          export CARGO_HOME RUSTUP_HOME RUNNER_TOOL_CACHE RUSTUP_INIT_SKIP_PATH_CHECK=1
           export PATH="$CARGO_HOME/bin:$PATH"
-          mkdir -p "$HOME" "$CARGO_HOME" "$RUSTUP_HOME"
-          lock=/tmp/permanu-rustup.lock
+          mkdir -p "$CARGO_HOME" "$RUSTUP_HOME" "$RUNNER_TOOL_CACHE"
+          run_bounded() {
+            seconds="$1"
+            shift
+            if command -v timeout >/dev/null 2>&1; then
+              timeout "$seconds" "$@"
+            else
+              "$@"
+            fi
+          }
+          lock="$RUNNER_TOOL_CACHE/permanu-rustup.lock"
           waited=0
           while ! mkdir "$lock" 2>/dev/null; do
             if find "$lock" -maxdepth 0 -mmin +10 >/dev/null 2>&1; then
@@ -185,13 +220,17 @@ jobs:
           done
           trap 'rm -rf "$lock"' EXIT
           if ! command -v cargo >/dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
           fi
           if [ -f "$CARGO_HOME/env" ]; then
             . "$CARGO_HOME/env"
           fi
+          if command -v rustup >/dev/null 2>&1; then
+            run_bounded 900 rustup toolchain install stable --profile minimal
+            run_bounded 300 rustup default stable
+          fi
           if ! command -v cargo-audit >/dev/null 2>&1; then
-            cargo install cargo-audit --locked
+            run_bounded 1800 cargo install cargo-audit --locked
           fi
           printf '%s\n' "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
@@ -220,12 +259,22 @@ jobs:
       - name: Setup Rust
         shell: sh
         run: |
-          export HOME="$PWD/.permanu-home"
-          export CARGO_HOME="$PWD/.permanu-cargo"
-          export RUSTUP_HOME="$PWD/.permanu-rustup"
+          : "${CARGO_HOME:=$PWD/.permanu-cargo}"
+          : "${RUSTUP_HOME:=$PWD/.permanu-rustup}"
+          : "${RUNNER_TOOL_CACHE:=$PWD/.permanu-tool-cache}"
+          export CARGO_HOME RUSTUP_HOME RUNNER_TOOL_CACHE RUSTUP_INIT_SKIP_PATH_CHECK=1
           export PATH="$CARGO_HOME/bin:$PATH"
-          mkdir -p "$HOME" "$CARGO_HOME" "$RUSTUP_HOME"
-          lock=/tmp/permanu-rustup.lock
+          mkdir -p "$CARGO_HOME" "$RUSTUP_HOME" "$RUNNER_TOOL_CACHE"
+          run_bounded() {
+            seconds="$1"
+            shift
+            if command -v timeout >/dev/null 2>&1; then
+              timeout "$seconds" "$@"
+            else
+              "$@"
+            fi
+          }
+          lock="$RUNNER_TOOL_CACHE/permanu-rustup.lock"
           waited=0
           while ! mkdir "$lock" 2>/dev/null; do
             if find "$lock" -maxdepth 0 -mmin +10 >/dev/null 2>&1; then
@@ -245,10 +294,14 @@ jobs:
             DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential cmake pkg-config protobuf-compiler
           fi
           if ! command -v cargo >/dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
           fi
           if [ -f "$CARGO_HOME/env" ]; then
             . "$CARGO_HOME/env"
+          fi
+          if command -v rustup >/dev/null 2>&1; then
+            run_bounded 900 rustup toolchain install stable --profile minimal
+            run_bounded 300 rustup default stable
           fi
           printf '%s\n' "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
@@ -278,8 +331,9 @@ jobs:
           PERMANU_SIGSTORE_ID_TOKEN: ${{ secrets.PERMANU_SIGSTORE_ID_TOKEN }}
         run: |
           export HOME="$PWD/.permanu-home"
-          export CARGO_HOME="$PWD/.permanu-cargo"
-          export RUSTUP_HOME="$PWD/.permanu-rustup"
+          : "${CARGO_HOME:=$PWD/.permanu-cargo}"
+          : "${RUSTUP_HOME:=$PWD/.permanu-rustup}"
+          export CARGO_HOME RUSTUP_HOME
           export PATH="$CARGO_HOME/bin:$PATH"
           mkdir -p "$HOME" "$CARGO_HOME" "$RUSTUP_HOME"
           if [ -f "$CARGO_HOME/env" ]; then
