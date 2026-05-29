@@ -55,51 +55,12 @@ jobs:
       - name: Setup Rust
         shell: sh
         run: |
-          : "${CARGO_HOME:=$PWD/.permanu-cargo}"
-          : "${RUSTUP_HOME:=$PWD/.permanu-rustup}"
-          : "${RUNNER_TOOL_CACHE:=$PWD/.permanu-tool-cache}"
-          export CARGO_HOME RUSTUP_HOME RUNNER_TOOL_CACHE RUSTUP_INIT_SKIP_PATH_CHECK=1
-          export PATH="$CARGO_HOME/bin:$PATH"
-          mkdir -p "$CARGO_HOME" "$RUSTUP_HOME" "$RUNNER_TOOL_CACHE"
-          run_bounded() {
-            seconds="$1"
-            shift
-            if command -v timeout >/dev/null 2>&1; then
-              timeout "$seconds" "$@"
-            else
-              "$@"
-            fi
-          }
-          lock="$RUNNER_TOOL_CACHE/permanu-rustup.lock"
-          waited=0
-          while ! mkdir "$lock" 2>/dev/null; do
-            if find "$lock" -maxdepth 0 -mmin +10 >/dev/null 2>&1; then
-              rm -rf "$lock"
-              continue
-            fi
-            waited=$((waited + 2))
-            if [ "$waited" -gt 300 ]; then
-              echo "timed out waiting for rustup lock"
-              exit 1
-            fi
-            sleep 2
-          done
-          trap 'rm -rf "$lock"' EXIT
+          chmod +x scripts/permanu-ci-rust-env.sh
+          ./scripts/permanu-ci-rust-env.sh quality
           if ! command -v cmake >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential cmake pkg-config protobuf-compiler
           fi
-          if ! command -v cargo >/dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
-          fi
-          if [ -f "$CARGO_HOME/env" ]; then
-            . "$CARGO_HOME/env"
-          fi
-          if command -v rustup >/dev/null 2>&1; then
-            run_bounded 900 rustup toolchain install stable --profile minimal --component rustfmt --component clippy
-            run_bounded 300 rustup default stable
-          fi
-          printf '%s\n' "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
       - name: Format
         shell: sh
@@ -119,51 +80,12 @@ jobs:
       - name: Setup Rust
         shell: sh
         run: |
-          : "${CARGO_HOME:=$PWD/.permanu-cargo}"
-          : "${RUSTUP_HOME:=$PWD/.permanu-rustup}"
-          : "${RUNNER_TOOL_CACHE:=$PWD/.permanu-tool-cache}"
-          export CARGO_HOME RUSTUP_HOME RUNNER_TOOL_CACHE RUSTUP_INIT_SKIP_PATH_CHECK=1
-          export PATH="$CARGO_HOME/bin:$PATH"
-          mkdir -p "$CARGO_HOME" "$RUSTUP_HOME" "$RUNNER_TOOL_CACHE"
-          run_bounded() {
-            seconds="$1"
-            shift
-            if command -v timeout >/dev/null 2>&1; then
-              timeout "$seconds" "$@"
-            else
-              "$@"
-            fi
-          }
-          lock="$RUNNER_TOOL_CACHE/permanu-rustup.lock"
-          waited=0
-          while ! mkdir "$lock" 2>/dev/null; do
-            if find "$lock" -maxdepth 0 -mmin +10 >/dev/null 2>&1; then
-              rm -rf "$lock"
-              continue
-            fi
-            waited=$((waited + 2))
-            if [ "$waited" -gt 300 ]; then
-              echo "timed out waiting for rustup lock"
-              exit 1
-            fi
-            sleep 2
-          done
-          trap 'rm -rf "$lock"' EXIT
+          chmod +x scripts/permanu-ci-rust-env.sh
+          ./scripts/permanu-ci-rust-env.sh cargo
           if ! command -v cmake >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential cmake pkg-config protobuf-compiler
           fi
-          if ! command -v cargo >/dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
-          fi
-          if [ -f "$CARGO_HOME/env" ]; then
-            . "$CARGO_HOME/env"
-          fi
-          if command -v rustup >/dev/null 2>&1; then
-            run_bounded 900 rustup toolchain install stable --profile minimal
-            run_bounded 300 rustup default stable
-          fi
-          printf '%s\n' "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
       - name: Workspace tests
         shell: sh
@@ -189,50 +111,8 @@ jobs:
       - name: Setup Rust audit tooling
         shell: sh
         run: |
-          : "${CARGO_HOME:=$PWD/.permanu-cargo}"
-          : "${RUSTUP_HOME:=$PWD/.permanu-rustup}"
-          : "${RUNNER_TOOL_CACHE:=$PWD/.permanu-tool-cache}"
-          export CARGO_HOME RUSTUP_HOME RUNNER_TOOL_CACHE RUSTUP_INIT_SKIP_PATH_CHECK=1
-          export PATH="$CARGO_HOME/bin:$PATH"
-          mkdir -p "$CARGO_HOME" "$RUSTUP_HOME" "$RUNNER_TOOL_CACHE"
-          run_bounded() {
-            seconds="$1"
-            shift
-            if command -v timeout >/dev/null 2>&1; then
-              timeout "$seconds" "$@"
-            else
-              "$@"
-            fi
-          }
-          lock="$RUNNER_TOOL_CACHE/permanu-rustup.lock"
-          waited=0
-          while ! mkdir "$lock" 2>/dev/null; do
-            if find "$lock" -maxdepth 0 -mmin +10 >/dev/null 2>&1; then
-              rm -rf "$lock"
-              continue
-            fi
-            waited=$((waited + 2))
-            if [ "$waited" -gt 300 ]; then
-              echo "timed out waiting for rustup lock"
-              exit 1
-            fi
-            sleep 2
-          done
-          trap 'rm -rf "$lock"' EXIT
-          if ! command -v cargo >/dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
-          fi
-          if [ -f "$CARGO_HOME/env" ]; then
-            . "$CARGO_HOME/env"
-          fi
-          if command -v rustup >/dev/null 2>&1; then
-            run_bounded 900 rustup toolchain install stable --profile minimal
-            run_bounded 300 rustup default stable
-          fi
-          if ! command -v cargo-audit >/dev/null 2>&1; then
-            run_bounded 1800 cargo install cargo-audit --locked
-          fi
-          printf '%s\n' "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          chmod +x scripts/permanu-ci-rust-env.sh
+          ./scripts/permanu-ci-rust-env.sh audit
 
       - name: Run dependency audit
         shell: sh
@@ -259,51 +139,12 @@ jobs:
       - name: Setup Rust
         shell: sh
         run: |
-          : "${CARGO_HOME:=$PWD/.permanu-cargo}"
-          : "${RUSTUP_HOME:=$PWD/.permanu-rustup}"
-          : "${RUNNER_TOOL_CACHE:=$PWD/.permanu-tool-cache}"
-          export CARGO_HOME RUSTUP_HOME RUNNER_TOOL_CACHE RUSTUP_INIT_SKIP_PATH_CHECK=1
-          export PATH="$CARGO_HOME/bin:$PATH"
-          mkdir -p "$CARGO_HOME" "$RUSTUP_HOME" "$RUNNER_TOOL_CACHE"
-          run_bounded() {
-            seconds="$1"
-            shift
-            if command -v timeout >/dev/null 2>&1; then
-              timeout "$seconds" "$@"
-            else
-              "$@"
-            fi
-          }
-          lock="$RUNNER_TOOL_CACHE/permanu-rustup.lock"
-          waited=0
-          while ! mkdir "$lock" 2>/dev/null; do
-            if find "$lock" -maxdepth 0 -mmin +10 >/dev/null 2>&1; then
-              rm -rf "$lock"
-              continue
-            fi
-            waited=$((waited + 2))
-            if [ "$waited" -gt 300 ]; then
-              echo "timed out waiting for rustup lock"
-              exit 1
-            fi
-            sleep 2
-          done
-          trap 'rm -rf "$lock"' EXIT
+          chmod +x scripts/permanu-ci-rust-env.sh
+          ./scripts/permanu-ci-rust-env.sh release
           if ! command -v cmake >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential cmake pkg-config protobuf-compiler
           fi
-          if ! command -v cargo >/dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
-          fi
-          if [ -f "$CARGO_HOME/env" ]; then
-            . "$CARGO_HOME/env"
-          fi
-          if command -v rustup >/dev/null 2>&1; then
-            run_bounded 900 rustup toolchain install stable --profile minimal
-            run_bounded 300 rustup default stable
-          fi
-          printf '%s\n' "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
       - name: Build workspace
         shell: sh
@@ -330,16 +171,8 @@ jobs:
           SIGSTORE_ID_TOKEN: ${{ secrets.SIGSTORE_ID_TOKEN }}
           PERMANU_SIGSTORE_ID_TOKEN: ${{ secrets.PERMANU_SIGSTORE_ID_TOKEN }}
         run: |
-          export HOME="$PWD/.permanu-home"
-          : "${CARGO_HOME:=$PWD/.permanu-cargo}"
-          : "${RUSTUP_HOME:=$PWD/.permanu-rustup}"
-          export CARGO_HOME RUSTUP_HOME
-          export PATH="$CARGO_HOME/bin:$PATH"
-          mkdir -p "$HOME" "$CARGO_HOME" "$RUSTUP_HOME"
-          if [ -f "$CARGO_HOME/env" ]; then
-            . "$CARGO_HOME/env"
-          fi
-          chmod +x scripts/build-release-assets.sh
+          chmod +x scripts/permanu-ci-rust-env.sh scripts/build-release-assets.sh
+          . ./scripts/permanu-ci-rust-env.sh release
           ./scripts/build-release-assets.sh dist
 
       - name: Verify production release assets
