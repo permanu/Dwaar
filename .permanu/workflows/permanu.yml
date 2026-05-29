@@ -72,7 +72,7 @@ jobs:
 
   rust-test:
     name: permanu-ci / dwaar / rust-test
-    needs: version-guard
+    needs: rust-quality
     if: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && (inputs.lane == 'pr' || inputs.lane == 'main' || inputs.lane == 'release' || inputs.lane == 'all')) }}
     runs-on: self-hosted
     timeout-minutes: 45
@@ -103,10 +103,10 @@ jobs:
 
   dependency-audit:
     name: permanu-ci / dwaar / dependency-audit
-    needs: version-guard
+    needs: rust-test
     if: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && (inputs.lane == 'pr' || inputs.lane == 'main' || inputs.lane == 'release' || inputs.lane == 'all')) }}
     runs-on: self-hosted
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - name: Setup Rust audit tooling
         shell: sh
@@ -131,7 +131,7 @@ jobs:
 
   rust-build:
     name: permanu-ci / dwaar / rust-build-release
-    needs: [version-guard, rust-quality, rust-test, dependency-audit]
+    needs: dependency-audit
     if: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && (inputs.lane == 'main' || inputs.lane == 'release' || inputs.lane == 'all')) }}
     runs-on: self-hosted
     timeout-minutes: 30
