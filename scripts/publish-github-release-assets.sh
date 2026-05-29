@@ -17,7 +17,31 @@ require_cmd() {
 }
 
 json_escape() {
-    sed 's/\\/\\\\/g; s/"/\\"/g'
+    awk 'BEGIN { ORS="" } { gsub(/\\/,"\\\\"); gsub(/"/,"\\\""); if (NR > 1) printf "\\n"; printf "%s", $0 }'
+}
+
+release_notes() {
+    version="${tag#v}"
+    if [ -f CHANGELOG.md ]; then
+        notes=$(awk -v tag="$tag" -v version="$version" '
+            $0 ~ "^##[[:space:]]+\\[?" tag "\\]?" || $0 ~ "^##[[:space:]]+\\[?" version "\\]?" { flag=1; next }
+            /^##[[:space:]]+/ && flag { flag=0 }
+            flag { print }
+        ' CHANGELOG.md)
+        if [ -n "$notes" ]; then
+            printf '%s\n' "$notes"
+            return
+        fi
+    fi
+
+    previous_tag=$(git describe --tags --abbrev=0 "${tag}^" 2>/dev/null || true)
+    if [ -n "$previous_tag" ]; then
+        printf 'Changes since %s:\n\n' "$previous_tag"
+        git log --no-merges --pretty=format:'- %s (%h)' "${previous_tag}..${tag}" || true
+        printf '\n'
+    else
+        printf 'Release %s.\n' "$tag"
+    fi
 }
 
 api_request() {
@@ -93,16 +117,21 @@ esac
 [ -d "$dist_dir" ] || fail "release asset directory does not exist: ${dist_dir}"
 
 require_cmd curl "curl is required to publish release assets"
+require_cmd git "git is required to generate release change descriptions"
 require_cmd sed "sed is required to publish release assets"
 
 release_name=$(printf '%s' "$tag" | json_escape)
-body=$(printf '{"tag_name":"%s","name":"%s","draft":false,"prerelease":false,"generate_release_notes":false}' "$release_name" "$release_name")
+release_body=$(release_notes | json_escape)
+body=$(printf '{"tag_name":"%s","name":"%s","body":"%s","draft":false,"prerelease":false,"generate_release_notes":false}' "$release_name" "$release_name" "$release_body")
 
 release_url="${api_root}/repos/${repo}/releases/tags/${tag}"
 create_url="${api_root}/repos/${repo}/releases"
 
 if response=$(api_request GET "$release_url" 2>/dev/null); then
     echo "Updating existing GitHub release ${tag}"
+    release_id_value=$(release_id "$response")
+    [ -n "$release_id_value" ] || fail "GitHub release response did not include id"
+    response=$(api_request PATCH "${api_root}/repos/${repo}/releases/${release_id_value}" "$body")
 else
     echo "Creating GitHub release ${tag}"
     response=$(api_request POST "$create_url" "$body")
