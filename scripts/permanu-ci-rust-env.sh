@@ -46,6 +46,48 @@ require_cmd() {
   fi
 }
 
+rust_channel() {
+  if [ -f rust-toolchain.toml ]; then
+    sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' rust-toolchain.toml | head -n 1
+    return
+  fi
+  if [ -f rust-toolchain ]; then
+    head -n 1 rust-toolchain
+    return
+  fi
+  printf '%s\n' stable
+}
+
+ensure_rustup_toolchain() {
+  if ! command -v rustup >/dev/null 2>&1; then
+    return
+  fi
+
+  channel="$(rust_channel)"
+  components=""
+  case "$mode" in
+    quality) components="--component rustfmt --component clippy" ;;
+  esac
+
+  # shellcheck disable=SC2086
+  with_rustup_lock run_bounded 1200 rustup toolchain install "$channel" --profile minimal $components
+
+  set +e
+  rustup run "$channel" rustc --version >/dev/null 2>&1
+  rustc_ok="$?"
+  rustup run "$channel" cargo --version >/dev/null 2>&1
+  cargo_ok="$?"
+  set -e
+  if [ "$rustc_ok" -eq 0 ] && [ "$cargo_ok" -eq 0 ]; then
+    return
+  fi
+
+  echo "rustup toolchain $channel is incomplete; reinstalling" >&2
+  with_rustup_lock run_bounded 300 rustup toolchain uninstall "$channel" >/dev/null 2>&1 || true
+  # shellcheck disable=SC2086
+  with_rustup_lock run_bounded 1200 rustup toolchain install "$channel" --profile minimal $components
+}
+
 case "${CARGO_HOME:-}" in
   "") ;;
   *) export PATH="$CARGO_HOME/bin:$PATH" ;;
@@ -54,6 +96,8 @@ esac
 if ! command -v cargo >/dev/null 2>&1 && [ -n "${HOME:-}" ]; then
   export PATH="$HOME/.cargo/bin:$PATH"
 fi
+
+ensure_rustup_toolchain
 
 require_cmd cargo
 require_cmd rustc
