@@ -1,5 +1,8 @@
 name: CI
 
+# Automated PR/main CI is owned by Permanu CI in .permanu/workflows/permanu.yml.
+# This workflow is an explicit manual fallback only, so hosted Actions minutes
+# are not consumed for normal repository activity.
 on:
   workflow_dispatch:
 
