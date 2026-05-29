@@ -50,109 +50,131 @@ jobs:
     needs: version-guard
     if: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && (inputs.lane == 'pr' || inputs.lane == 'main' || inputs.lane == 'release' || inputs.lane == 'all')) }}
     runs-on: self-hosted
+    container:
+      image: rust:1.94.1-bookworm
+      env:
+        CARGO_HOME: /usr/local/cargo
+        RUSTUP_HOME: /usr/local/rustup
+        TMPDIR: /tmp
+        TMP: /tmp
+        TEMP: /tmp
+        PATH: /usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     timeout-minutes: 30
     steps:
-      - name: Setup Rust
+      - name: Format and lint
         shell: sh
         run: |
           chmod +x scripts/permanu-ci-rust-env.sh
-          ./scripts/permanu-ci-rust-env.sh quality
+          PERMANU_RUST_MODE=quality
+          export PERMANU_RUST_MODE
+          . ./scripts/permanu-ci-rust-env.sh
+          unset PERMANU_RUST_MODE
           if ! command -v cmake >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential cmake pkg-config protobuf-compiler
           fi
-
-      - name: Format
-        shell: sh
-        run: cargo fmt --all --check
-
-      - name: Lint
-        shell: sh
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   rust-test:
     name: permanu-ci / dwaar / rust-test
     needs: rust-quality
     if: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && (inputs.lane == 'pr' || inputs.lane == 'main' || inputs.lane == 'release' || inputs.lane == 'all')) }}
     runs-on: self-hosted
+    container:
+      image: rust:1.94.1-bookworm
+      env:
+        CARGO_HOME: /usr/local/cargo
+        RUSTUP_HOME: /usr/local/rustup
+        TMPDIR: /tmp
+        TMP: /tmp
+        TEMP: /tmp
+        PATH: /usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     timeout-minutes: 45
     steps:
-      - name: Setup Rust
+      - name: Workspace and CLI tests
         shell: sh
         run: |
           chmod +x scripts/permanu-ci-rust-env.sh
-          ./scripts/permanu-ci-rust-env.sh cargo
+          PERMANU_RUST_MODE=cargo
+          export PERMANU_RUST_MODE
+          . ./scripts/permanu-ci-rust-env.sh
+          unset PERMANU_RUST_MODE
           if ! command -v cmake >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential cmake pkg-config protobuf-compiler
           fi
-
-      - name: Workspace tests
-        shell: sh
-        run: |
           ulimit -n 4096 2>/dev/null || true
           RUST_TEST_THREADS=2 cargo test --workspace --exclude dwaar-cli
-
-      - name: CLI tests
-        shell: sh
-        run: cargo test -p dwaar-cli --bins --test cli_integration
-
-      - name: Ignored tests
-        shell: sh
-        run: cargo test --workspace --exclude dwaar-cli -- --ignored --nocapture
+          cargo test -p dwaar-cli --bins --test cli_integration
+          cargo test --workspace --exclude dwaar-cli -- --ignored --nocapture
 
   dependency-audit:
     name: permanu-ci / dwaar / dependency-audit
     needs: rust-test
     if: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && (inputs.lane == 'pr' || inputs.lane == 'main' || inputs.lane == 'release' || inputs.lane == 'all')) }}
     runs-on: self-hosted
+    container:
+      image: rust:1.94.1-bookworm
+      env:
+        CARGO_HOME: /usr/local/cargo
+        RUSTUP_HOME: /usr/local/rustup
+        TMPDIR: /tmp
+        TMP: /tmp
+        TEMP: /tmp
+        PATH: /usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     timeout-minutes: 30
     steps:
-      - name: Setup Rust audit tooling
+      - name: Run dependency audit
         shell: sh
         run: |
           chmod +x scripts/permanu-ci-rust-env.sh
-          ./scripts/permanu-ci-rust-env.sh audit
-
-      - name: Run dependency audit
-        shell: sh
-        run: >-
-          cargo audit
-          --ignore RUSTSEC-2025-0069
-          --ignore RUSTSEC-2026-0098
-          --ignore RUSTSEC-2026-0099
-          --ignore RUSTSEC-2026-0114
-          --ignore RUSTSEC-2024-0388
-          --ignore RUSTSEC-2024-0384
-          --ignore RUSTSEC-2024-0437
-          --ignore RUSTSEC-2025-0134
-          --ignore RUSTSEC-2025-0012
-          --ignore RUSTSEC-2026-0097
+          PERMANU_RUST_MODE=audit
+          export PERMANU_RUST_MODE
+          . ./scripts/permanu-ci-rust-env.sh
+          unset PERMANU_RUST_MODE
+          cargo audit \
+            --ignore RUSTSEC-2025-0069 \
+            --ignore RUSTSEC-2026-0098 \
+            --ignore RUSTSEC-2026-0099 \
+            --ignore RUSTSEC-2026-0114 \
+            --ignore RUSTSEC-2024-0388 \
+            --ignore RUSTSEC-2024-0384 \
+            --ignore RUSTSEC-2024-0437 \
+            --ignore RUSTSEC-2025-0134 \
+            --ignore RUSTSEC-2025-0012 \
+            --ignore RUSTSEC-2026-0097
 
   rust-build:
     name: permanu-ci / dwaar / rust-build-release
     needs: dependency-audit
     if: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && (inputs.lane == 'main' || inputs.lane == 'release' || inputs.lane == 'all')) }}
     runs-on: self-hosted
+    container:
+      image: rust:1.94.1-bookworm
+      env:
+        CARGO_HOME: /usr/local/cargo
+        RUSTUP_HOME: /usr/local/rustup
+        TMPDIR: /tmp
+        TMP: /tmp
+        TEMP: /tmp
+        PATH: /usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     timeout-minutes: 30
     steps:
-      - name: Setup Rust
+      - name: Build workspace
         shell: sh
         run: |
           chmod +x scripts/permanu-ci-rust-env.sh
-          ./scripts/permanu-ci-rust-env.sh release
+          PERMANU_RUST_MODE=release
+          export PERMANU_RUST_MODE
+          . ./scripts/permanu-ci-rust-env.sh
+          unset PERMANU_RUST_MODE
           if ! command -v cmake >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential cmake pkg-config protobuf-compiler
           fi
-
-      - name: Build workspace
-        shell: sh
-        run: cargo build --workspace
-
-      - name: Release type check
-        shell: sh
-        run: cargo check --workspace --release
+          cargo build --workspace
+          cargo check --workspace --release
 
       - name: Install cosign for release signing
         if: ${{ startsWith(github.ref, 'refs/tags/v') }}
@@ -172,7 +194,14 @@ jobs:
           PERMANU_SIGSTORE_ID_TOKEN: ${{ secrets.PERMANU_SIGSTORE_ID_TOKEN }}
         run: |
           chmod +x scripts/permanu-ci-rust-env.sh scripts/build-release-assets.sh
-          . ./scripts/permanu-ci-rust-env.sh release
+          PERMANU_RUST_MODE=release
+          export PERMANU_RUST_MODE
+          . ./scripts/permanu-ci-rust-env.sh
+          unset PERMANU_RUST_MODE
+          if ! command -v cmake >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential cmake pkg-config protobuf-compiler
+          fi
           ./scripts/build-release-assets.sh dist
 
       - name: Verify production release assets

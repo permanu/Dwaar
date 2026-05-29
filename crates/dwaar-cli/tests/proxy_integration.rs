@@ -107,6 +107,7 @@ fn start_dwaar_with_config(config: Option<&std::path::Path>) -> std::process::Ch
 
     let mut stderr = String::new();
     child.kill().ok();
+    let _ = child.wait();
     if let Some(mut pipe) = child.stderr.take() {
         let _ = pipe.read_to_string(&mut stderr);
     }
