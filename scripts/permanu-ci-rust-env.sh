@@ -13,6 +13,32 @@ run_bounded() {
   fi
 }
 
+with_rustup_lock() {
+  lock_root="${RUNNER_TOOL_CACHE:-${TMPDIR:-/tmp}}"
+  mkdir -p "$lock_root"
+  lock="$lock_root/permanu-rustup.lock"
+  waited=0
+  while ! mkdir "$lock" 2>/dev/null; do
+    if find "$lock" -maxdepth 0 -mmin +10 >/dev/null 2>&1; then
+      rm -rf "$lock"
+      continue
+    fi
+    waited=$((waited + 2))
+    if [ "$waited" -gt 900 ]; then
+      echo "timed out waiting for rustup lock: $lock" >&2
+      exit 1
+    fi
+    sleep 2
+  done
+
+  set +e
+  "$@"
+  status="$?"
+  set -e
+  rmdir "$lock" 2>/dev/null || rm -rf "$lock"
+  return "$status"
+}
+
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
     echo "missing required CI runner command: $1" >&2
@@ -48,10 +74,12 @@ case "$mode" in
   quality)
     require_cmd rustfmt
     require_cmd clippy-driver
+    with_rustup_lock run_bounded 300 rustfmt --version
+    with_rustup_lock run_bounded 300 clippy-driver --version
     ;;
   audit)
     if ! command -v cargo-audit >/dev/null 2>&1; then
-      run_bounded 900 cargo install cargo-audit --locked
+      with_rustup_lock run_bounded 900 cargo install cargo-audit --locked
     fi
     ;;
   release)
@@ -65,5 +93,5 @@ case "$mode" in
     ;;
 esac
 
-rustc --version
-cargo --version
+with_rustup_lock run_bounded 900 rustc --version
+with_rustup_lock run_bounded 900 cargo --version
