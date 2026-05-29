@@ -1,9 +1,10 @@
 name: Release
 
+# Automated release builds and GitHub Release uploads are owned by Permanu CI in
+# .permanu/workflows/permanu.yml so GitHub Actions minutes are not consumed.
+# Keep this workflow as an explicit emergency/manual fallback only.
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: write

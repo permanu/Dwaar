@@ -1,10 +1,8 @@
 name: Documentation Site
 
+# Site deploys are explicit/manual from GitHub Actions. Automated CI/release
+# behavior lives in .permanu/workflows/permanu.yml to avoid Actions spend.
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'site/**'
   workflow_dispatch:
 
 permissions:

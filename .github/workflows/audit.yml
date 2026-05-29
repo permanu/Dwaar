@@ -1,9 +1,8 @@
 name: Security Audit
 
+# Automated dependency audit should run through Permanu CI when enabled for this
+# repo. GitHub Actions stays manual-only to avoid background runner charges.
 on:
-  schedule:
-    # Run daily at 06:00 UTC to catch new advisories
-    - cron: '0 6 * * *'
   workflow_dispatch:
 
 permissions:

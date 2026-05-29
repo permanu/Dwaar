@@ -154,9 +154,65 @@ jobs:
         shell: sh
         run: cargo test --workspace --exclude dwaar-cli -- --ignored --nocapture
 
+  dependency-audit:
+    name: permanu-ci / dwaar / dependency-audit
+    needs: version-guard
+    if: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && (inputs.lane == 'pr' || inputs.lane == 'main' || inputs.lane == 'release' || inputs.lane == 'all')) }}
+    runs-on: self-hosted
+    timeout-minutes: 15
+    steps:
+      - name: Setup Rust audit tooling
+        shell: sh
+        run: |
+          export HOME="$PWD/.permanu-home"
+          export CARGO_HOME="$PWD/.permanu-cargo"
+          export RUSTUP_HOME="$PWD/.permanu-rustup"
+          export PATH="$CARGO_HOME/bin:$PATH"
+          mkdir -p "$HOME" "$CARGO_HOME" "$RUSTUP_HOME"
+          lock=/tmp/permanu-rustup.lock
+          waited=0
+          while ! mkdir "$lock" 2>/dev/null; do
+            if find "$lock" -maxdepth 0 -mmin +10 >/dev/null 2>&1; then
+              rm -rf "$lock"
+              continue
+            fi
+            waited=$((waited + 2))
+            if [ "$waited" -gt 300 ]; then
+              echo "timed out waiting for rustup lock"
+              exit 1
+            fi
+            sleep 2
+          done
+          trap 'rm -rf "$lock"' EXIT
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          fi
+          if [ -f "$CARGO_HOME/env" ]; then
+            . "$CARGO_HOME/env"
+          fi
+          if ! command -v cargo-audit >/dev/null 2>&1; then
+            cargo install cargo-audit --locked
+          fi
+          printf '%s\n' "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Run dependency audit
+        shell: sh
+        run: >-
+          cargo audit
+          --ignore RUSTSEC-2025-0069
+          --ignore RUSTSEC-2026-0098
+          --ignore RUSTSEC-2026-0099
+          --ignore RUSTSEC-2026-0114
+          --ignore RUSTSEC-2024-0388
+          --ignore RUSTSEC-2024-0384
+          --ignore RUSTSEC-2024-0437
+          --ignore RUSTSEC-2025-0134
+          --ignore RUSTSEC-2025-0012
+          --ignore RUSTSEC-2026-0097
+
   rust-build:
     name: permanu-ci / dwaar / rust-build-release
-    needs: version-guard
+    needs: [version-guard, rust-quality, rust-test, dependency-audit]
     if: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && (inputs.lane == 'main' || inputs.lane == 'release' || inputs.lane == 'all')) }}
     runs-on: self-hosted
     timeout-minutes: 30

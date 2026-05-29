@@ -1,8 +1,9 @@
 name: Stale Issues
 
+# GitHub Actions is manual-only for Dwaar so repository automation does not
+# consume hosted Actions minutes in the background.
 on:
-  schedule:
-    - cron: '0 0 * * 1'  # Every Monday at midnight
+  workflow_dispatch:
 
 permissions:
   issues: write
