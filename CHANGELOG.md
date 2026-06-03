@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.24] - 2026-06-03
+
+### Fixed
+
+- Serve the complete configured TLS certificate chain for SNI-selected
+  certificates. This fixes clients that do not already have the issuing
+  intermediate cached, including newly onboarded Azure VPS agents connecting to
+  Permanu's production gRPC endpoint.
+
 ## [0.3.23] - 2026-05-20
 
 ### Fixed
