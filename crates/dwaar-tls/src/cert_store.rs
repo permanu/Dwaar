@@ -57,6 +57,7 @@ pub struct CachedCert {
     pub cert: X509,
     pub key: PKey<Private>,
     pub issuer: Option<X509>,
+    pub chain: Vec<X509>,
     pub ocsp_response: Option<Vec<u8>>,
     /// When the OCSP response was last refreshed. `None` means never refreshed
     /// (e.g. freshly loaded from disk with no prior staple). Used by the TLS
@@ -338,6 +339,7 @@ fn load_pem_pair(cert_path: &Path, key_path: &Path) -> Option<CachedCert> {
     };
 
     let cert = certs[0].clone();
+    let chain: Vec<X509> = certs.iter().skip(1).cloned().collect();
     let issuer = if certs.len() > 1 {
         Some(certs[1].clone())
     } else {
@@ -385,6 +387,7 @@ fn load_pem_pair(cert_path: &Path, key_path: &Path) -> Option<CachedCert> {
         cert,
         key,
         issuer,
+        chain,
         ocsp_response: None,
         ocsp_last_refresh: None,
     })
@@ -496,7 +499,36 @@ mod tests {
             cached.issuer.is_some(),
             "issuer should be parsed from chain"
         );
+        assert_eq!(cached.chain.len(), 1, "chain should include issuer");
         assert!(cached.ocsp_response.is_none(), "no OCSP response yet");
+    }
+
+    #[test]
+    fn load_pem_pair_keeps_full_chain() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (cert_pem, key_pem, ca_pem) =
+            crate::test_util::generate_ca_signed("full-chain.example.com");
+
+        let mut chain = cert_pem;
+        chain.extend_from_slice(&ca_pem);
+        chain.extend_from_slice(&ca_pem);
+        std::fs::write(dir.path().join("full-chain.example.com.pem"), &chain).expect("write chain");
+        std::fs::write(dir.path().join("full-chain.example.com.key"), &key_pem).expect("write key");
+
+        let store = CertStore::new(dir.path(), 100);
+        let cached = store
+            .get("full-chain.example.com")
+            .expect("should load full chain");
+
+        assert!(
+            cached.issuer.is_some(),
+            "first chain cert should remain available for OCSP"
+        );
+        assert_eq!(
+            cached.chain.len(),
+            2,
+            "all non-leaf certificates should be retained for the TLS handshake"
+        );
     }
 
     #[test]
@@ -514,6 +546,7 @@ mod tests {
             cached.issuer.is_none(),
             "self-signed has no issuer in chain"
         );
+        assert!(cached.chain.is_empty(), "self-signed has no chain");
     }
 
     #[test]
@@ -672,6 +705,7 @@ mod tests {
             cert,
             key,
             issuer: None,
+            chain: Vec::new(),
             ocsp_response: Some(vec![0xA]),
             ocsp_last_refresh: Some(old_ts),
         };
