@@ -1,7 +1,27 @@
 // @ts-check
+import { copyFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 import rehypeMermaid from 'rehype-mermaid';
+
+// Single source of truth for the installer. dwaar.dev/install.sh must always be
+// byte-identical to scripts/install.sh — the two used to be separate files and
+// drift between them shipped a broken installer (v0.3.23 cosign trap). Copy the
+// canonical script into public/ at config time so both `astro dev` and
+// `astro build` serve it. public/install.sh is generated (gitignored).
+function syncInstaller() {
+	return {
+		name: 'dwaar-sync-installer',
+		hooks: {
+			'astro:config:setup': () => {
+				const src = fileURLToPath(new URL('../scripts/install.sh', import.meta.url));
+				const dest = fileURLToPath(new URL('./public/install.sh', import.meta.url));
+				copyFileSync(src, dest);
+			},
+		},
+	};
+}
 
 export default defineConfig({
 	site: 'https://dwaar.dev',
@@ -12,6 +32,7 @@ export default defineConfig({
 		rehypePlugins: [[rehypeMermaid, { strategy: 'img-svg' }]],
 	},
 	integrations: [
+		syncInstaller(),
 		starlight({
 			title: 'Dwaar',
 			description: 'High-performance reverse proxy. Pingora performance. Caddy simplicity.',

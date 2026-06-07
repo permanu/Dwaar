@@ -14,6 +14,38 @@ Dwaar (द्वार — "gateway" in Hindi) is a high-performance reverse pro
 | Bot detection | + fail2ban (~30 MB) | Included |
 | **Total** | **~260+ MB, 3-4 services** | **~25 MB, 1 binary** |
 
+## Install
+
+```bash
+curl -fsSL https://dwaar.dev/install.sh | sh
+```
+
+No keys, no extra tooling. The installer detects your OS/arch, downloads the
+latest release, **verifies the SHA-256 checksum**, and — if [`cosign`](https://github.com/sigstore/cosign)
+is installed — verifies the keyless Sigstore signature (no public key required).
+On Linux with systemd it also installs and enables a `dwaar` service; on macOS it
+installs a launchd agent.
+
+```bash
+# Pin a specific version
+DWAAR_VERSION=0.3.23 curl -fsSL https://dwaar.dev/install.sh | sh
+
+# Uninstall
+curl -fsSL https://dwaar.dev/uninstall.sh | sh
+```
+
+| Platform | Binary |
+|----------|--------|
+| Linux x86_64 | `dwaar-linux-amd64` |
+| Linux ARM64 | `dwaar-linux-arm64` |
+| macOS ARM64 (Apple Silicon) | `dwaar-darwin-arm64` |
+
+Intel Macs (x86_64) have no published binary — build from source (`cargo build --release`)
+or run the ARM binary via Rosetta 2. Docker images are at `ghcr.io/permanu/dwaar`.
+
+See [release signing](https://dwaar.dev/security/release-signing/) for the full
+verification model, including the enterprise key-pinning path.
+
 ## Quick Start
 
 ```

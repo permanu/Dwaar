@@ -82,16 +82,26 @@ out=$(run_case "key_path" 0 '
     verify_cosign_signature key
 ')
 assert_contains "${COSIGN_ARGS_FILE}" "verify-blob /tmp/dwaar-linux-amd64 --bundle /tmp/dwaar-linux-amd64.bundle --key /opt/dwaar/cosign.pub"
-assert_contains "${out}" "Cosign signature verified (signed by Permanu/Dwaar release authority)."
+assert_contains "${out}" "Cosign signature verified (Permanu/Dwaar release-authority key)."
 
-out=$(run_case "legacy_bundle" 0 '
+out=$(run_case "keyless_bundle" 0 '
     ARTIFACT=dwaar-linux-amd64
     BINARY_TMP=/tmp/dwaar-linux-amd64
     BUNDLE_TMP=/tmp/dwaar-linux-amd64.bundle
-    verify_cosign_signature legacy-bundle
+    verify_cosign_signature keyless-bundle
 ')
-assert_contains "${COSIGN_ARGS_FILE}" "verify-blob /tmp/dwaar-linux-amd64 --bundle /tmp/dwaar-linux-amd64.bundle"
-assert_contains "${out}" "Cosign signature verified (legacy GitHub Actions keyless bundle)."
+assert_contains "${COSIGN_ARGS_FILE}" "verify-blob /tmp/dwaar-linux-amd64 --bundle /tmp/dwaar-linux-amd64.bundle --certificate-identity-regexp"
+assert_contains "${out}" "Cosign signature verified (GitHub Actions keyless OIDC)."
+
+out=$(run_case "keyless_cert" 0 '
+    ARTIFACT=dwaar-linux-amd64
+    BINARY_TMP=/tmp/dwaar-linux-amd64
+    SIG_TMP=/tmp/dwaar-linux-amd64.sig
+    CERT_TMP=/tmp/dwaar-linux-amd64.cert
+    verify_cosign_signature keyless-cert
+')
+assert_contains "${COSIGN_ARGS_FILE}" "verify-blob /tmp/dwaar-linux-amd64 --certificate /tmp/dwaar-linux-amd64.cert --signature /tmp/dwaar-linux-amd64.sig"
+assert_contains "${out}" "Cosign signature verified (GitHub Actions keyless OIDC)."
 
 out=$(run_case "key_failure" 1 '
     ARTIFACT=dwaar-linux-amd64
@@ -102,12 +112,18 @@ out=$(run_case "key_failure" 1 '
     export DWAAR_COSIGN_PUBKEY COSIGN_BEHAVIOR
     verify_cosign_signature key
 ')
-assert_contains "${out}" "Cosign verification failed for signed by Permanu/Dwaar release authority."
+assert_contains "${out}" "Cosign verification failed against the configured release key."
 
-out=$(run_case "key_unconfigured" 1 '
+# A bundle-only release with no configured key must verify keylessly, NOT
+# demand a public key. This is the regression that broke v0.3.23 installs.
+out=$(run_case "keyless_bundle_failure_hint" 1 '
     ARTIFACT=dwaar-linux-amd64
-    verify_cosign_signature key-unconfigured
+    BINARY_TMP=/tmp/dwaar-linux-amd64
+    BUNDLE_TMP=/tmp/dwaar-linux-amd64.bundle
+    COSIGN_BEHAVIOR=fail
+    export COSIGN_BEHAVIOR
+    verify_cosign_signature keyless-bundle
 ')
-assert_contains "${out}" "no verification key is configured"
+assert_contains "${out}" "If this is an enterprise key-signed release"
 
 printf 'install trust policy tests passed\n'
