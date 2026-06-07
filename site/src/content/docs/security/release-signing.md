@@ -5,29 +5,45 @@ description: How Dwaar release binaries are signed and how to verify them
 
 # Release Signing
 
-Every Dwaar release binary is cryptographically signed using [cosign](https://github.com/sigstore/cosign). The recommended production path for Permanu BYOS runners is key/KMS-backed signing with verification through a pinned or exported public key. Legacy GitHub Actions keyless verification is retained for older releases during migration.
+Every Dwaar release binary is cryptographically signed using [cosign](https://github.com/sigstore/cosign).
 
-## Trust chain
+**The public releases on GitHub are signed keylessly** by the `release.yml`
+GitHub Actions workflow via Sigstore. This is the default path and it requires
+**no public key** to verify — the signing certificate and transparency-log proof
+are embedded in the `.bundle`. Verification only checks that the bundle was
+signed by Dwaar's release workflow identity and chains back to Fulcio.
+
+A separate **enterprise / BYOS** path exists for organizations that run their own
+release pipeline with a KMS- or file-backed cosign key. That path verifies the
+bundle against a public key you pin via `DWAAR_COSIGN_PUBKEY` /
+`DWAAR_COSIGN_PUBKEY_URL`. It is opt-in and does not apply to the binaries
+published at `github.com/permanu/Dwaar`.
+
+## Trust chain (default — keyless)
 
 ```
-Enterprise KMS/local/env cosign key
-        ↓
-cosign sign-blob --key <key> --bundle <artifact>.bundle --yes <artifact>
-        ↓
-Verifier checks the bundle with the configured public key
-```
-
-Legacy token/OIDC releases additionally chain through Fulcio:
-
-```
-GitHub Actions or explicit Sigstore OIDC token
+GitHub Actions OIDC token (release.yml workflow identity)
         ↓
 Fulcio exchanges it for a short-lived signing certificate
         ↓
-Binary is signed; bundle, detached signature, and certificate are attached
+cosign sign-blob --bundle <artifact>.bundle <artifact>
+        ↓
+Verifier checks the bundle's cert identity + Fulcio chain (no key needed)
 ```
 
-For key/KMS releases, installer and self-update verification is based on the trusted public key rather than a Fulcio certificate identity or provider API access. For token/OIDC releases, the certificate's Subject Alternative Name (SAN) is the workflow URI and verification checks that the cert chains back to Fulcio.
+The certificate's Subject Alternative Name (SAN) is the workflow URI
+`https://github.com/permanu/Dwaar/.github/workflows/release.yml@refs/tags/<tag>`,
+and verification confirms it chains back to Fulcio with the expected OIDC issuer.
+
+## Trust chain (enterprise / BYOS — key-pinned)
+
+```
+Your KMS/local/env cosign key
+        ↓
+cosign sign-blob --key <key> --bundle <artifact>.bundle <artifact>
+        ↓
+Verifier checks the bundle against your configured public key
+```
 
 ## Artifacts published per release
 
@@ -37,42 +53,47 @@ For each platform binary (e.g. `dwaar-linux-amd64`) the following files are atta
 |------|----------|
 | `dwaar-<os>-<arch>` | The binary |
 | `dwaar-<os>-<arch>.sha256` | SHA256 checksum |
-| `dwaar-<os>-<arch>.bundle` | Required cosign bundle |
-| `dwaar-<os>-<arch>.sig` | Optional detached cosign signature when emitted by the signing command |
-| `dwaar-<os>-<arch>.cert` | Token/OIDC releases only: short-lived signing certificate (PEM) |
+| `dwaar-<os>-<arch>.bundle` | Self-contained cosign bundle (cert + signature + log proof) — this is all you need to verify |
+| `dwaar-<os>-<arch>.sig` | Optional detached signature (not published by every release; redundant with the bundle) |
+| `dwaar-<os>-<arch>.cert` | Optional short-lived signing certificate, PEM (not published by every release; redundant with the bundle) |
 | `SHASUMS.txt` | Aggregated SHA256 for all binaries |
 
 ## Verifying a binary
 
 ### Automatic (via install.sh)
 
-`install.sh` verifies the cosign signature automatically if `cosign` is installed on the system.
-
-For key/KMS releases, set one explicit public-key source:
-
 ```sh
-DWAAR_COSIGN_PUBKEY=/path/to/dwaar-release.pub sh install.sh
+curl -fsSL https://dwaar.dev/install.sh | sh
 ```
 
-or:
+By default the installer:
+
+1. **Always** verifies the SHA-256 checksum.
+2. Verifies the keyless cosign signature **if `cosign` is installed** — no key
+   or extra configuration required. A self-contained `.bundle` is all that is
+   needed.
+3. If `cosign` is **not** installed, prints a prominent warning and continues,
+   relying on the SHA-256 check for integrity. (This is best-effort, Caddy-style
+   verification — it never blocks a normal install on a missing tool.)
+
+To **require** keyless verification instead of warning, simply install `cosign`
+first (`brew install cosign`, or download the binary — see below).
+
+For the **enterprise / BYOS key-pinned** path, set exactly one public-key source.
+In this mode cosign is mandatory and keyless fallback is refused:
 
 ```sh
-DWAAR_COSIGN_PUBKEY_URL=https://example.com/pinned/dwaar-release.pub sh install.sh
+DWAAR_COSIGN_PUBKEY=/path/to/dwaar-release.pub        sh install.sh
+# or
+DWAAR_COSIGN_PUBKEY_URL=https://example.com/dwaar.pub sh install.sh
 ```
 
-The installer does not fetch a mutable key URL by default. If a release key is configured, cosign is required and the installer refuses legacy keyless fallback. If a release only has a `.bundle` and no legacy `.sig`/`.cert`, the installer treats it as key-signed and fails closed until `DWAAR_COSIGN_PUBKEY` or `DWAAR_COSIGN_PUBKEY_URL` is configured. Without a configured release key, the installer uses the legacy GitHub Actions keyless policy only for older releases that still publish legacy signature material; if cosign is not present in that legacy mode, it falls back to SHA256 verification with a prominent warning.
+The installer never fetches a mutable key URL unless you explicitly set one.
 
 ### Manual verification
 
-For key/KMS releases, download the binary, `.bundle`, and pinned public key, then run:
-
-```sh
-cosign verify-blob dwaar-linux-amd64 \
-  --bundle dwaar-linux-amd64.bundle \
-  --key dwaar-release.pub
-```
-
-For legacy token/OIDC releases, download the binary and either its `.bundle` sibling:
+**Default (keyless).** Download the binary and its `.bundle` sibling — no key
+needed:
 
 ```sh
 cosign verify-blob dwaar-linux-amd64 \
@@ -81,7 +102,8 @@ cosign verify-blob dwaar-linux-amd64 \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
 ```
 
-or historical `.sig` / `.cert` siblings:
+Older releases that published split `.sig` / `.cert` instead of a bundle verify
+the same way:
 
 ```sh
 cosign verify-blob dwaar-linux-amd64 \
@@ -89,6 +111,15 @@ cosign verify-blob dwaar-linux-amd64 \
   --signature   dwaar-linux-amd64.sig \
   --certificate-identity-regexp "^https://github\.com/permanu/Dwaar/\.github/workflows/release\.yml@.*" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+```
+
+**Enterprise / BYOS (key-pinned).** Download the binary, `.bundle`, and your
+pinned public key, then run:
+
+```sh
+cosign verify-blob dwaar-linux-amd64 \
+  --bundle dwaar-linux-amd64.bundle \
+  --key dwaar-release.pub
 ```
 
 Replace `dwaar-linux-amd64` with your platform artifact name (`dwaar-linux-arm64`, `dwaar-darwin-arm64`).
@@ -130,4 +161,9 @@ To additionally pin to a specific tag:
 
 ## Self-update verification
 
-`dwaar self-update` uses the same trust policy as the installer. It verifies a configured release-authority public key against the release bundle, otherwise it uses the legacy GitHub Actions keyless bundle or split `.sig` + `.cert` fallback only when legacy signature material exists. Key-signed bundles without a configured public key fail closed. Self-update requires `cosign` and refuses to swap the binary if verification fails.
+`dwaar self-update` uses the same trust policy as the installer. By default it
+verifies the keyless cosign bundle against the release workflow identity (no key
+needed). If you have configured `DWAAR_COSIGN_PUBKEY` / `DWAAR_COSIGN_PUBKEY_URL`,
+it verifies against that pinned key instead and refuses keyless fallback. Unlike
+the installer, self-update **requires** `cosign` and refuses to swap the binary
+if verification fails or cosign is missing.

@@ -30,9 +30,9 @@ use subtle::ConstantTimeEq;
 const BASE_URL: &str = "https://github.com/permanu/Dwaar/releases/download";
 
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-const LEGACY_CERTIFICATE_IDENTITY_REGEXP: &str =
+const KEYLESS_CERTIFICATE_IDENTITY_REGEXP: &str =
     "^https://github\\.com/permanu/Dwaar/\\.github/workflows/release\\.yml@.*";
-const LEGACY_CERTIFICATE_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
+const KEYLESS_CERTIFICATE_OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
 
 /// Run the self-update flow. Returns a human-readable status message.
 // Self-update is an interactive CLI subcommand; println! is correct here.
@@ -94,10 +94,10 @@ pub(crate) fn run(force: bool) -> anyhow::Result<()> {
                 curl_download(url, &pubkey_path)?;
             }
         }
-        SignaturePolicy::LegacyBundle => {
+        SignaturePolicy::KeylessBundle => {
             curl_download(&bundle_url, &bundle_path)?;
         }
-        SignaturePolicy::LegacyCertificate => {
+        SignaturePolicy::KeylessCertificate => {
             curl_download(&sig_url, &sig_path)?;
             curl_download(&cert_url, &cert_path)?;
         }
@@ -202,17 +202,22 @@ impl CosignPublicKey {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum SignaturePolicy {
+    /// Enterprise / BYOS: verify the bundle against an explicitly configured
+    /// public key (DWAAR_COSIGN_PUBKEY[_URL]).
     ReleaseKey { key: CosignPublicKey },
-    LegacyBundle,
-    LegacyCertificate,
+    /// Default public path: self-contained keyless cosign bundle signed by the
+    /// release.yml GitHub Actions workflow via Fulcio OIDC. No key needed.
+    KeylessBundle,
+    /// Older releases that published split `.sig` + `.cert` instead of a bundle.
+    KeylessCertificate,
 }
 
 impl SignaturePolicy {
     fn trust_description(&self) -> &'static str {
         match self {
-            Self::ReleaseKey { .. } => "signed by Permanu/Dwaar release authority",
-            Self::LegacyBundle => "legacy GitHub Actions keyless bundle",
-            Self::LegacyCertificate => "legacy GitHub Actions keyless certificate",
+            Self::ReleaseKey { .. } => "Permanu/Dwaar release-authority key",
+            Self::KeylessBundle => "GitHub Actions keyless OIDC",
+            Self::KeylessCertificate => "GitHub Actions keyless OIDC (split cert)",
         }
     }
 }
@@ -252,23 +257,22 @@ fn select_signature_policy(
     if let Some(key) = release_key {
         if !has_bundle {
             bail!(
-                "configured release key requires a cosign bundle; refusing legacy fallback for key-based verification"
+                "configured release key requires a cosign bundle; refusing keyless fallback for key-based verification"
             );
         }
         return Ok(SignaturePolicy::ReleaseKey { key });
     }
 
+    // A `.bundle` alone is the normal keyless case: the Sigstore bundle is
+    // self-contained (it embeds the Fulcio certificate and transparency-log
+    // proof), so it verifies against the workflow identity with no public key.
+    // The `.sig`/`.cert` siblings are redundant and no longer required.
     if has_bundle {
-        if !has_sig && !has_cert {
-            bail!(
-                "release bundle appears to be signed by the Permanu/Dwaar release authority, but no verification key is configured; set DWAAR_COSIGN_PUBKEY or DWAAR_COSIGN_PUBKEY_URL"
-            );
-        }
-        return Ok(SignaturePolicy::LegacyBundle);
+        return Ok(SignaturePolicy::KeylessBundle);
     }
 
     if has_sig && has_cert {
-        return Ok(SignaturePolicy::LegacyCertificate);
+        return Ok(SignaturePolicy::KeylessCertificate);
     }
 
     bail!("no signature artefacts found; refusing to self-update an unverifiable Dwaar binary");
@@ -292,23 +296,23 @@ fn verify_cosign_signature(
                 .arg("--key")
                 .arg(key.materialized_path(downloaded_pubkey));
         }
-        SignaturePolicy::LegacyBundle => {
+        SignaturePolicy::KeylessBundle => {
             cmd.arg("--bundle")
                 .arg(bundle)
                 .arg("--certificate-identity-regexp")
-                .arg(LEGACY_CERTIFICATE_IDENTITY_REGEXP)
+                .arg(KEYLESS_CERTIFICATE_IDENTITY_REGEXP)
                 .arg("--certificate-oidc-issuer")
-                .arg(LEGACY_CERTIFICATE_OIDC_ISSUER);
+                .arg(KEYLESS_CERTIFICATE_OIDC_ISSUER);
         }
-        SignaturePolicy::LegacyCertificate => {
+        SignaturePolicy::KeylessCertificate => {
             cmd.arg("--certificate")
                 .arg(certificate)
                 .arg("--signature")
                 .arg(signature)
                 .arg("--certificate-identity-regexp")
-                .arg(LEGACY_CERTIFICATE_IDENTITY_REGEXP)
+                .arg(KEYLESS_CERTIFICATE_IDENTITY_REGEXP)
                 .arg("--certificate-oidc-issuer")
-                .arg(LEGACY_CERTIFICATE_OIDC_ISSUER);
+                .arg(KEYLESS_CERTIFICATE_OIDC_ISSUER);
         }
     }
 
@@ -540,23 +544,22 @@ mod tests {
     }
 
     #[test]
-    fn signature_policy_uses_legacy_bundle_without_release_key() {
+    fn signature_policy_uses_keyless_bundle_without_release_key() {
         let policy = select_signature_policy(true, true, true, None)
-            .expect("legacy bundle should be accepted during migration");
+            .expect("keyless bundle should be accepted without a configured key");
 
-        assert_eq!(policy, SignaturePolicy::LegacyBundle);
+        assert_eq!(policy, SignaturePolicy::KeylessBundle);
     }
 
     #[test]
-    fn signature_policy_rejects_key_bundle_without_configured_release_key() {
-        let err = select_signature_policy(true, false, false, None)
-            .expect_err("key-signed bundle without configured release key must fail closed");
+    fn signature_policy_accepts_bundle_only_release_keylessly() {
+        // Regression: v0.3.23 shipped a `.bundle` with no `.sig`/`.cert` and no
+        // configured key. That is the normal keyless case and must verify
+        // keylessly, NOT demand a (nonexistent) pinned public key.
+        let policy = select_signature_policy(true, false, false, None)
+            .expect("bundle-only release must verify keylessly");
 
-        assert!(
-            err.to_string()
-                .contains("no verification key is configured"),
-            "error: {err}"
-        );
+        assert_eq!(policy, SignaturePolicy::KeylessBundle);
     }
 
     #[test]
@@ -573,10 +576,10 @@ mod tests {
     }
 
     #[test]
-    fn signature_policy_uses_legacy_split_certificate_when_bundle_missing() {
+    fn signature_policy_uses_split_certificate_when_bundle_missing() {
         let policy = select_signature_policy(false, true, true, None)
-            .expect("legacy split .sig/.cert should remain supported");
+            .expect("split .sig/.cert should remain supported");
 
-        assert_eq!(policy, SignaturePolicy::LegacyCertificate);
+        assert_eq!(policy, SignaturePolicy::KeylessCertificate);
     }
 }

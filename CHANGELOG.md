@@ -7,14 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.24] - 2026-06-03
+## [0.3.24] - 2026-06-08
 
 ### Fixed
 
+- **`install.sh` no longer demands a nonexistent public key.** Public releases
+  are signed keyless by GitHub Actions (Sigstore/Fulcio); the `.bundle` is
+  self-contained and verifies with no key. The installer previously treated a
+  bundle-only release (e.g. v0.3.23) as "key-signed" and failed closed,
+  demanding `DWAAR_COSIGN_PUBKEY` — a key that is neither needed nor published.
+  A bundle now verifies keylessly by default, and a missing `cosign` downgrades
+  to a warning instead of a hard error (SHA-256 is still always verified). This
+  makes `curl -fsSL https://dwaar.dev/install.sh | sh` work with no extra setup.
+- **`dwaar self-update` had the same trust-policy bug** and is fixed the same
+  way: a bundle-only release verifies keylessly instead of requiring a key.
 - Serve the complete configured TLS certificate chain for SNI-selected
   certificates. This fixes clients that do not already have the issuing
   intermediate cached, including newly onboarded Azure VPS agents connecting to
   Permanu's production gRPC endpoint.
+
+### Changed
+
+- **Single source of truth for the installer.** `dwaar.dev/install.sh` is now
+  generated from `scripts/install.sh` at site-build time, so the served script
+  can never drift from the canonical one again (that drift is what shipped the
+  broken installer).
+- Installer resolves the latest version via the GitHub `releases/latest`
+  redirect instead of the rate-limited API endpoint, and fails with actionable
+  guidance on Intel macOS (no published binary).
+- `uninstall.sh` now also removes the systemd unit / launchd agent the installer
+  creates, leaving user config and logs in place.
+- Documentation (`README`, installation and release-signing guides) rewritten to
+  reflect keyless-by-default verification; the pinned-key path is documented as
+  an enterprise/BYOS opt-in.
+- Releases are published by GitHub Actions keyless OIDC; Permanu CI builds and
+  tests but no longer signs/publishes (it cannot mint a Fulcio-accepted
+  identity).
 
 ## [0.3.23] - 2026-05-20
 

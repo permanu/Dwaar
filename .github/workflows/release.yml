@@ -1,9 +1,16 @@
 name: Release
 
-# Automated release builds and GitHub Release uploads are owned by Permanu CI in
-# .permanu/workflows/permanu.yml so GitHub Actions minutes are not consumed.
-# Keep this workflow as an explicit emergency/manual fallback only.
+# Release publishing is owned by GitHub Actions because Dwaar's cosign trust
+# chain is KEYLESS (Sigstore/Fulcio OIDC). Public Fulcio only accepts a small
+# set of OIDC issuers (GitHub Actions among them), and the installer/self-update
+# verify against this workflow's identity:
+#   https://github.com/permanu/Dwaar/.github/workflows/release.yml@refs/tags/<tag>
+# Permanu CI (self-hosted) builds and tests, but cannot mint a Fulcio-accepted
+# identity, so it does NOT sign/publish releases — see .permanu/workflows/permanu.yml.
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 permissions:

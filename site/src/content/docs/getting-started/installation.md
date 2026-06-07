@@ -8,26 +8,62 @@ title: "Installation"
 curl -fsSL https://dwaar.dev/install.sh | sh
 ```
 
-This detects your OS and architecture, downloads the latest release, verifies the SHA-256 checksum, and installs to `/usr/local/bin/dwaar`.
+That's it — no keys, no extra tooling. The installer:
+
+1. Detects your OS and architecture.
+2. Downloads the latest release from GitHub.
+3. Verifies the **SHA-256 checksum** (always).
+4. Verifies the **cosign signature** if `cosign` is installed. Releases are
+   signed keylessly by GitHub Actions (Sigstore/Fulcio), so verification needs
+   **no public key**. If `cosign` isn't installed, the installer prints a
+   warning and continues — the SHA-256 check is the integrity guarantee.
+5. Installs `dwaar` to `/usr/local/bin` (using `sudo` if needed), or falls back
+   to `~/.local/bin` when you have no root access.
+6. On Linux with systemd, writes a default `/etc/dwaar/Dwaarfile` and installs
+   (and enables) a `dwaar` systemd service. On macOS, installs a launchd agent.
 
 **Options:**
 
 ```bash
 # Install a specific version
-DWAAR_VERSION=v0.1.0 curl -fsSL https://dwaar.dev/install.sh | sh
-
-# Install to a custom directory
-DWAAR_INSTALL_DIR=~/.local/bin curl -fsSL https://dwaar.dev/install.sh | sh
+DWAAR_VERSION=0.3.23 curl -fsSL https://dwaar.dev/install.sh | sh
 ```
 
 **Supported platforms:**
 
-| Platform | Binary |
-|----------|--------|
-| Linux x86_64 | `dwaar-linux-amd64` |
-| Linux ARM64 | `dwaar-linux-arm64` |
-| macOS x86_64 | `dwaar-darwin-amd64` |
-| macOS ARM64 (Apple Silicon) | `dwaar-darwin-arm64` |
+| Platform | Binary | Status |
+|----------|--------|--------|
+| Linux x86_64 | `dwaar-linux-amd64` | ✅ Published |
+| Linux ARM64 | `dwaar-linux-arm64` | ✅ Published |
+| macOS ARM64 (Apple Silicon) | `dwaar-darwin-arm64` | ✅ Published |
+| macOS x86_64 (Intel) | — | Build from source / Rosetta 2 |
+
+> The installer is the same script everywhere: `https://dwaar.dev/install.sh`
+> is generated from [`scripts/install.sh`](https://github.com/permanu/Dwaar/blob/main/scripts/install.sh)
+> in the repository, so the two can never drift.
+
+---
+
+## Verifying the download yourself (optional)
+
+Every release is signed keylessly with [cosign](https://github.com/sigstore/cosign).
+You do **not** need a public key — the `.bundle` is self-contained:
+
+```bash
+VERSION=0.3.23   # the release you downloaded
+ART=dwaar-linux-amd64
+base="https://github.com/permanu/Dwaar/releases/download/v${VERSION}"
+curl -fLO "${base}/${ART}"
+curl -fLO "${base}/${ART}.bundle"
+
+cosign verify-blob "${ART}" \
+  --bundle "${ART}.bundle" \
+  --certificate-identity-regexp "^https://github\.com/permanu/Dwaar/\.github/workflows/release\.yml@.*" \
+  --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
+```
+
+See [Release Signing](../../security/release-signing/) for the full trust model,
+including the enterprise key-pinning path (`DWAAR_COSIGN_PUBKEY`).
 
 ---
 

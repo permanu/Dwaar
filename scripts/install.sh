@@ -76,6 +76,15 @@ detect_platform() {
         *) die "Unsupported architecture: ${ARCH}. Only x86_64 and aarch64/arm64 are supported." ;;
     esac
 
+    # Intel Macs (x86_64) have no published binary — Apple ended Intel support,
+    # so the release matrix omits darwin-amd64. Fail with actionable guidance
+    # instead of 404-ing on a nonexistent asset.
+    if [ "${OS_KEY}" = "darwin" ] && [ "${ARCH_KEY}" = "amd64" ]; then
+        die "Intel Mac (x86_64) binaries are not published.
+  Build from source:                  cargo build --release
+  Or run the ARM binary via Rosetta:  arch -arm64 dwaar"
+    fi
+
     ARTIFACT="${BINARY_NAME}-${OS_KEY}-${ARCH_KEY}"
     PLATFORM_LABEL="${OS} ${ARCH}"
 }
@@ -85,17 +94,18 @@ detect_platform() {
 # ---------------------------------------------------------------------------
 resolve_version() {
     if [ -n "${DWAAR_VERSION:-}" ]; then
-        VERSION="${DWAAR_VERSION}"
+        VERSION="${DWAAR_VERSION#v}"
         return
     fi
 
-    info "Fetching latest release version from GitHub..."
-    # Try curl first, then wget
+    info "Resolving latest release version..."
+    LATEST_URL="https://github.com/${GITHUB_REPO}/releases/latest"
     if command -v curl >/dev/null 2>&1; then
-        LATEST=$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" \
-            | grep '"tag_name"' \
-            | head -1 \
-            | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/')
+        # Follow the /releases/latest redirect and read the tag from the final
+        # URL. This avoids the rate-limited api.github.com JSON endpoint, which
+        # frequently 403s on shared/CI IPs.
+        RESOLVED=$(curl -fsSL -o /dev/null -w '%{url_effective}' "${LATEST_URL}")
+        LATEST=$(printf '%s\n' "${RESOLVED}" | sed 's#.*/tag/v\{0,1\}##')
     elif command -v wget >/dev/null 2>&1; then
         LATEST=$(wget -qO- "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" \
             | grep '"tag_name"' \
@@ -178,27 +188,27 @@ ensure_cosign_pubkey_path() {
 
 verify_cosign_signature() {
     SIG_MODE="$1"
-    if [ "${SIG_MODE}" = "key-unconfigured" ]; then
-        die "This release is signed by the Permanu/Dwaar release authority, but no verification key is configured. Set DWAAR_COSIGN_PUBKEY to a pinned public key path or DWAAR_COSIGN_PUBKEY_URL to an https:// key URL, then retry."
-    fi
 
     if ! command -v cosign >/dev/null 2>&1; then
+        # Enterprise key verification is an explicit opt-in — cosign is required.
         if [ "${SIG_MODE}" = "key" ]; then
-            die "cosign is required to verify releases signed by the Permanu/Dwaar release authority."
+            die "cosign is required to verify enterprise key-signed releases (DWAAR_COSIGN_PUBKEY is set). Install it from https://github.com/sigstore/cosign/releases and retry."
         fi
 
-        printf "%bWarning: cosign not installed, skipping signature verification (sha256 still checked).%b\n" \
+        # Keyless path: SHA256 already verified the download. Signature
+        # verification is best-effort, so warn and continue (Caddy-style).
+        printf "%bWarning: cosign not installed — skipping signature verification (SHA256 already verified).%b\n" \
             "${YELLOW}" "${RESET}" >&2
-        printf "%b         Install cosign from https://github.com/sigstore/cosign/releases%b\n" \
-            "${YELLOW}" "${RESET}" >&2
+        printf "%b         For full supply-chain verification install cosign:%b\n" "${YELLOW}" "${RESET}" >&2
+        printf "%b         https://github.com/sigstore/cosign/releases%b\n" "${YELLOW}" "${RESET}" >&2
         printf "%b         then verify manually:%b\n" "${YELLOW}" "${RESET}" >&2
-        if [ "${SIG_MODE}" = "legacy-bundle" ]; then
-            printf "%b         cosign verify-blob %s \\%b\n" "${YELLOW}" "${ARTIFACT}" "${RESET}" >&2
-            printf "%b           --bundle %s.bundle \\%b\n" "${YELLOW}" "${ARTIFACT}" "${RESET}" >&2
-        else
+        if [ "${SIG_MODE}" = "keyless-cert" ]; then
             printf "%b         cosign verify-blob %s \\%b\n" "${YELLOW}" "${ARTIFACT}" "${RESET}" >&2
             printf "%b           --certificate %s.cert \\%b\n" "${YELLOW}" "${ARTIFACT}" "${RESET}" >&2
             printf "%b           --signature %s.sig \\%b\n" "${YELLOW}" "${ARTIFACT}" "${RESET}" >&2
+        else
+            printf "%b         cosign verify-blob %s \\%b\n" "${YELLOW}" "${ARTIFACT}" "${RESET}" >&2
+            printf "%b           --bundle %s.bundle \\%b\n" "${YELLOW}" "${ARTIFACT}" "${RESET}" >&2
         fi
         printf '%b           --certificate-identity-regexp "^https://github\\.com/permanu/Dwaar/\\.github/workflows/release\\.yml@.*" \\%b\n' \
             "${YELLOW}" "${RESET}" >&2
@@ -214,32 +224,34 @@ verify_cosign_signature() {
                 --bundle "${BUNDLE_TMP}" \
                 --key "${COSIGN_PUBKEY_PATH}"
             then
-                success "Cosign signature verified (signed by Permanu/Dwaar release authority)."
+                success "Cosign signature verified (Permanu/Dwaar release-authority key)."
             else
-                die "Cosign verification failed for signed by Permanu/Dwaar release authority."
+                die "Cosign verification failed against the configured release key."
             fi
             ;;
-        legacy-bundle)
+        keyless-bundle)
             if cosign verify-blob "${BINARY_TMP}" \
                 --bundle "${BUNDLE_TMP}" \
                 --certificate-identity-regexp "^https://github\.com/permanu/Dwaar/\.github/workflows/release\.yml@.*" \
                 --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
             then
-                success "Cosign signature verified (legacy GitHub Actions keyless bundle)."
+                success "Cosign signature verified (GitHub Actions keyless OIDC)."
             else
-                die "Cosign verification failed for legacy GitHub Actions keyless bundle."
+                die "Cosign verification failed for ${ARTIFACT}.
+If this is an enterprise key-signed release, set DWAAR_COSIGN_PUBKEY to the
+release public key (or DWAAR_COSIGN_PUBKEY_URL) and retry."
             fi
             ;;
-        legacy-cert)
+        keyless-cert)
             if cosign verify-blob "${BINARY_TMP}" \
                 --certificate "${CERT_TMP}" \
                 --signature "${SIG_TMP}" \
                 --certificate-identity-regexp "^https://github\.com/permanu/Dwaar/\.github/workflows/release\.yml@.*" \
                 --certificate-oidc-issuer "https://token.actions.githubusercontent.com"
             then
-                success "Cosign signature verified (legacy GitHub Actions keyless certificate)."
+                success "Cosign signature verified (GitHub Actions keyless OIDC)."
             else
-                die "Cosign verification failed for legacy GitHub Actions keyless certificate."
+                die "Cosign verification failed for ${ARTIFACT}."
             fi
             ;;
         *)
@@ -590,33 +602,36 @@ main() {
 
     # 5a. Cosign signature verification.
     #
-    # Enterprise/BYOS releases are verified with a pinned/exported public key
-    # via DWAAR_COSIGN_PUBKEY or DWAAR_COSIGN_PUBKEY_URL. That mode expects
-    # a cosign bundle produced by:
-    #   cosign sign-blob --key <KMS/local/env key> --bundle <artifact>.bundle --yes <artifact>
+    # Default (public) path: every GitHub release is signed keylessly by the
+    # release.yml GitHub Actions workflow (cosign sign-blob --bundle, OIDC via
+    # Fulcio). The resulting `.bundle` is self-contained — it embeds the signing
+    # certificate and transparency-log proof — so it verifies against the
+    # workflow identity with NO public key to fetch or pin. This is the
+    # no-brainer path: if cosign is present we verify, otherwise SHA256 (already
+    # checked above) is the integrity guarantee and we warn.
     #
-    # During migration, releases without a configured release key still verify
-    # through the legacy GitHub Actions keyless trust policy, using either a
-    # bundle or historical split `.sig` + `.cert` assets.
+    # Enterprise/BYOS path: set DWAAR_COSIGN_PUBKEY (or DWAAR_COSIGN_PUBKEY_URL)
+    # to verify a KMS/local key-signed bundle against your own pinned public
+    # key. In that mode cosign is mandatory and keyless fallback is refused.
     info "Verifying cosign signature..."
     SIG_MODE=""
     if [ -n "${DWAAR_COSIGN_PUBKEY:-}" ] || [ -n "${DWAAR_COSIGN_PUBKEY_URL:-}" ]; then
+        # Enterprise / BYOS: verify against an explicitly configured public key.
         ensure_cosign_pubkey_path
         if ! http_exists "${BUNDLE_URL}"; then
-            die "Configured release key requires ${BUNDLE_URL}. Refusing legacy keyless fallback."
+            die "Configured release key requires ${BUNDLE_URL}. Refusing keyless fallback."
         fi
         download "${BUNDLE_URL}" "${BUNDLE_TMP}"
         SIG_MODE="key"
-    elif http_exists "${BUNDLE_URL}" && http_exists "${SIG_URL}" && http_exists "${CERT_URL}"; then
-        download "${BUNDLE_URL}" "${BUNDLE_TMP}"
-        SIG_MODE="legacy-bundle"
     elif http_exists "${BUNDLE_URL}"; then
+        # Default: self-contained keyless cosign bundle. No public key needed.
         download "${BUNDLE_URL}" "${BUNDLE_TMP}"
-        SIG_MODE="key-unconfigured"
+        SIG_MODE="keyless-bundle"
     elif http_exists "${SIG_URL}" && http_exists "${CERT_URL}"; then
+        # Older releases that published split .sig + .cert instead of a bundle.
         download "${SIG_URL}"  "${SIG_TMP}"
         download "${CERT_URL}" "${CERT_TMP}"
-        SIG_MODE="legacy-cert"
+        SIG_MODE="keyless-cert"
     else
         die "No signature artefacts found for ${ARTIFACT}. Looked for:
   ${BUNDLE_URL}
