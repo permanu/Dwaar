@@ -32,6 +32,10 @@ concurrency:
   group: dwaar-ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_BUILD_JOBS: 1
+  CARGO_INCREMENTAL: 0
+
 jobs:
   version-guard:
     name: permanu-ci / dwaar / version-guard
