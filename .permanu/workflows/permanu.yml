@@ -22,11 +22,8 @@ on:
           - all
 
 permissions:
-  contents: write
-  checks: write
-  statuses: write
+  contents: read
   pull-requests: read
-  id-token: write
 
 concurrency:
   group: dwaar-ci-${{ github.workflow }}-${{ github.ref }}
@@ -179,60 +176,3 @@ jobs:
           fi
           cargo build --workspace
           cargo check --workspace --release
-
-      # Release signing/publishing is owned by GitHub Actions (.github/workflows/
-      # release.yml). Dwaar releases are signed KEYLESS via Sigstore/Fulcio, and
-      # public Fulcio only accepts a small set of OIDC issuers — Permanu CI's
-      # self-hosted OIDC is not one of them, so it cannot mint an installer-trusted
-      # identity. These steps stay here (disabled) as a documented reference for a
-      # future key/KMS-based Permanu signing path. Permanu CI still builds + tests.
-      - name: Install cosign for release signing
-        if: ${{ false }}
-        uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v4.1.1
-
-      - name: Build and sign production release assets
-        if: ${{ false }}
-        shell: sh
-        env:
-          COSIGN_KEY: ${{ secrets.COSIGN_KEY }}
-          PERMANU_COSIGN_KEY: ${{ secrets.PERMANU_COSIGN_KEY }}
-          DWAAR_COSIGN_PUBKEY: ${{ secrets.DWAAR_COSIGN_PUBKEY }}
-          PERMANU_COSIGN_VERIFY_KEY: ${{ secrets.PERMANU_COSIGN_VERIFY_KEY }}
-          COSIGN_VERIFY_KEY: ${{ secrets.COSIGN_VERIFY_KEY }}
-          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
-          SIGSTORE_ID_TOKEN: ${{ secrets.SIGSTORE_ID_TOKEN }}
-          PERMANU_SIGSTORE_ID_TOKEN: ${{ secrets.PERMANU_SIGSTORE_ID_TOKEN }}
-        run: |
-          chmod +x scripts/permanu-ci-rust-env.sh scripts/build-release-assets.sh
-          PERMANU_RUST_MODE=release
-          export PERMANU_RUST_MODE
-          . ./scripts/permanu-ci-rust-env.sh
-          unset PERMANU_RUST_MODE
-          if ! command -v cmake >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
-            apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential cmake pkg-config protobuf-compiler
-          fi
-          ./scripts/build-release-assets.sh dist
-
-      - name: Verify production release assets
-        if: ${{ false }}
-        shell: sh
-        env:
-          COSIGN_KEY: ${{ secrets.COSIGN_KEY }}
-          PERMANU_COSIGN_KEY: ${{ secrets.PERMANU_COSIGN_KEY }}
-          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
-          SIGSTORE_ID_TOKEN: ${{ secrets.SIGSTORE_ID_TOKEN }}
-          PERMANU_SIGSTORE_ID_TOKEN: ${{ secrets.PERMANU_SIGSTORE_ID_TOKEN }}
-        run: |
-          chmod +x scripts/validate-release-assets.sh
-          ./scripts/validate-release-assets.sh dist
-
-      - name: Publish GitHub Release
-        if: ${{ false }}
-        shell: sh
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
-        run: |
-          chmod +x scripts/publish-github-release-assets.sh
-          ./scripts/publish-github-release-assets.sh dist
