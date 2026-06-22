@@ -28,7 +28,7 @@ jobs:
     name: Version Consistency
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # Need full history so `git tag -l` resolves the latest tag.
           fetch-depth: 0
