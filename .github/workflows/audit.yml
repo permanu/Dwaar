@@ -17,7 +17,7 @@ jobs:
     name: Dependency Audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       # Install cargo-audit from prebuilt binaries (~5s) instead of
       # compiling from source (~2-3min). cargo-audit only inspects
       # Cargo.lock — it doesn't need the Rust toolchain.
