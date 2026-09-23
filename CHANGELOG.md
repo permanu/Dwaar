@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Webhook intake routes.** `POST /routes` and `PUT /routes/snapshot` accept
+  `"kind": "webhook"`: only `/hooks/*` is forwarded, to a loopback upstream,
+  with a 1 MiB body cap that a gRPC `Content-Type` cannot lift, no response
+  cache, no WebSocket or HTTP/3; other paths are 404. Advertised as the
+  `routes.webhook` admin capability.
+- **`--state-dir <DIR>`** (`DWAAR_STATE_DIR`, default `/etc/dwaar`) moves the
+  ACME account and managed certificates to `<DIR>/acme` and `<DIR>/certs`.
+- Access log lines carry `route`, the route key the request matched.
+- `scripts/build-linux-glibc235.sh` builds linux amd64 and arm64 binaries in an
+  `ubuntu:22.04` builder (glibc 2.35 floor, checked) with SHA-256 files.
+
+### Security
+
+- `X-Real-IP` and `X-Forwarded-For` from the client are dropped when Dwaar has
+  no peer address (Unix-socket listeners) instead of being forwarded.
+
 ## [0.3.24] - 2026-06-08
 
 ### Fixed

@@ -180,6 +180,19 @@ curl -X POST \
 | `upstream` | string | yes | Socket address in `host:port` form |
 | `tls` | boolean | yes | Connect to upstream with TLS |
 | `source` | string | no | Controller identity tag for ownership tracking |
+| `kind` | string | no | `proxy` (default) or `webhook`, see below |
+
+**Webhook routes** (`"kind": "webhook"`, capability `routes.webhook` in `GET /version`). A webhook intake route forwards only `/hooks/*` on its host, path and query unchanged, to a **loopback** upstream (`127.0.0.1` or `::1`; anything else is `400`). The request body is capped at 1 MiB (`413`, also for chunked bodies and regardless of a gRPC `Content-Type`), the response is never cached, gRPC and WebSocket handling are off, `X-Real-IP` / `X-Forwarded-For` are always Dwaar's view of the client, HTTP/3 requests get `421` so clients retry over HTTP/1.1 or HTTP/2, and every other path on the host is `404`. The domain must be an exact hostname (no wildcard). `GET /routes` lists such a route with `"kind": "webhook"`; proxy routes carry no `kind` field. `PUT /routes/snapshot` entries take the same optional `kind`.
+
+```json
+{
+  "domain": "hooks.example.com",
+  "upstream": "127.0.0.1:7461",
+  "tls": true,
+  "source": "permanu",
+  "kind": "webhook"
+}
+```
 
 **Response** `201 Created`
 

@@ -15,7 +15,7 @@ use arc_swap::ArcSwap;
 use dwaar_plugins::plugin::PluginCtx;
 use pingora_http::{RequestHeader, ResponseHeader};
 
-use crate::route::{Handler, RouteTable};
+use crate::route::{Handler, RouteKind, RouteTable};
 
 /// Errors from the h3 request header parsing step.
 #[derive(Debug, thiserror::Error)]
@@ -165,6 +165,12 @@ pub fn resolve_upstream_addr(
     let Some(route) = table.resolve(host) else {
         return Err(502);
     };
+    // Webhook routes are served only over HTTP/1.1 and HTTP/2, where the
+    // body cap and client-address headers are enforced; 421 makes the
+    // client retry on such a connection.
+    if route.kind == RouteKind::Webhook {
+        return Err(421);
+    }
 
     for block in &route.handlers {
         if block.matcher.matches(path).is_none() {
@@ -254,5 +260,25 @@ mod tests {
         assert!(is_hop_by_hop("keep-alive"));
         assert!(!is_hop_by_hop("content-type"));
         assert!(!is_hop_by_hop("x-custom-header"));
+    }
+
+    #[test]
+    fn h3_refuses_webhook_routes() {
+        use crate::route::Route;
+        let upstream: SocketAddr = "127.0.0.1:7461".parse().expect("addr");
+        let table = ArcSwap::from_pointee(RouteTable::new(vec![
+            Route::webhook("hooks.example.com", upstream, true, None),
+            Route::new("app.example.com", upstream, true, None),
+        ]));
+        // 421: the client retries over HTTP/1.1 or HTTP/2, where the webhook
+        // body cap and X-Real-IP handling apply.
+        assert_eq!(
+            resolve_upstream_addr(&table, "hooks.example.com", "/hooks/prj_1"),
+            Err(421)
+        );
+        assert_eq!(
+            resolve_upstream_addr(&table, "app.example.com", "/"),
+            Ok((upstream, false))
+        );
     }
 }

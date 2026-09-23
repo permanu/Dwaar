@@ -1266,6 +1266,12 @@ impl ProxyHttp for DwaarProxy {
                         break;
                     }
                 }
+
+                // Webhook intake (agent-protocol §11.1): after the block has
+                // set its limits, drop every client-selected widening.
+                if route.kind == crate::route::RouteKind::Webhook {
+                    ctx.enforce_webhook_policy();
+                }
             }
         }
 
@@ -2022,37 +2028,7 @@ impl ProxyHttp for DwaarProxy {
     where
         Self::CTX: Send + Sync,
     {
-        if let Some(ip) = &ctx.plugin_ctx.client_ip {
-            // Write IP to a stack buffer — avoids a heap allocation per request.
-            // Max IPv6 text representation is 45 bytes (e.g. with zone id).
-            let mut ip_buf = [0u8; 45];
-            let ip_str = {
-                use std::io::Write;
-                let mut cursor = std::io::Cursor::new(&mut ip_buf[..]);
-                write!(cursor, "{ip}").map_err(|e| {
-                    pingora_error::Error::because(
-                        pingora_error::ErrorType::InternalError,
-                        "IP format failed",
-                        e,
-                    )
-                })?;
-                let len = cursor.position() as usize;
-                // SAFETY: IpAddr Display only emits ASCII digits, colons, and dots.
-                std::str::from_utf8(&ip_buf[..len]).map_err(|e| {
-                    pingora_error::Error::because(
-                        pingora_error::ErrorType::InternalError,
-                        "IP UTF-8 failed",
-                        e,
-                    )
-                })?
-            };
-            upstream_request.insert_header("X-Real-IP", ip_str)?;
-
-            // Replace (not append) — client-supplied XFF is stripped to prevent
-            // IP spoofing. Only the direct connection IP is trusted.
-            upstream_request.remove_header("X-Forwarded-For");
-            upstream_request.insert_header("X-Forwarded-For", ip_str)?;
-        }
+        set_client_ip_headers(upstream_request, ctx.plugin_ctx.client_ip)?;
 
         let proto = if Self::is_tls_connection(session) {
             "https"
@@ -2744,10 +2720,54 @@ impl ProxyHttp for DwaarProxy {
             upstream_error_body: ctx.upstream_error_body.take(),
             rejected_by: ctx.rejected_by,
             blocked_by: ctx.blocked_by,
+            route: ctx.plugin_ctx.route_domain.take(),
         };
 
         sender.send(log);
     }
+}
+
+/// Set `X-Real-IP` and `X-Forwarded-For` to the direct peer address.
+///
+/// Client-supplied values are never forwarded: with a peer address both
+/// headers are replaced by it, and without one (a Unix-socket listener) both
+/// are removed. The agent's pre-authentication limit keys on `X-Real-IP`
+/// (agent-protocol §11.1), so a spoofed value must never reach an upstream.
+fn set_client_ip_headers(
+    upstream_request: &mut RequestHeader,
+    client_ip: Option<std::net::IpAddr>,
+) -> Result<()> {
+    upstream_request.remove_header("X-Real-IP");
+    upstream_request.remove_header("X-Forwarded-For");
+    let Some(ip) = client_ip else {
+        return Ok(());
+    };
+    // Write IP to a stack buffer — avoids a heap allocation per request.
+    // Max IPv6 text representation is 45 bytes (e.g. with zone id).
+    let mut ip_buf = [0u8; 45];
+    let ip_str = {
+        use std::io::Write;
+        let mut cursor = std::io::Cursor::new(&mut ip_buf[..]);
+        write!(cursor, "{ip}").map_err(|e| {
+            pingora_error::Error::because(
+                pingora_error::ErrorType::InternalError,
+                "IP format failed",
+                e,
+            )
+        })?;
+        let len = cursor.position() as usize;
+        // IpAddr Display only emits ASCII digits, colons, and dots.
+        std::str::from_utf8(&ip_buf[..len]).map_err(|e| {
+            pingora_error::Error::because(
+                pingora_error::ErrorType::InternalError,
+                "IP UTF-8 failed",
+                e,
+            )
+        })?
+    };
+    upstream_request.insert_header("X-Real-IP", ip_str)?;
+    upstream_request.insert_header("X-Forwarded-For", ip_str)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3371,5 +3391,35 @@ mod tests {
             assert!(!is_healthcheck_path("/api/v1/users"));
             assert!(!is_healthcheck_path("/admin"));
         }
+    }
+
+    // ── Client address headers (agent-protocol §11.1: X-Real-IP is Dwaar's) ──
+
+    fn spoofed_request() -> RequestHeader {
+        let mut req = RequestHeader::build("POST", b"/hooks/prj_1", None).expect("request");
+        req.insert_header("X-Real-IP", "6.6.6.6").expect("header");
+        req.insert_header("X-Forwarded-For", "6.6.6.6, 7.7.7.7")
+            .expect("header");
+        req
+    }
+
+    #[test]
+    fn client_ip_headers_overwrite_client_values() {
+        let mut req = spoofed_request();
+        set_client_ip_headers(&mut req, Some("203.0.113.9".parse().expect("ip"))).expect("set");
+        let real: Vec<_> = req.headers.get_all("x-real-ip").iter().collect();
+        assert_eq!(real.len(), 1);
+        assert_eq!(real[0], "203.0.113.9");
+        let xff: Vec<_> = req.headers.get_all("x-forwarded-for").iter().collect();
+        assert_eq!(xff.len(), 1);
+        assert_eq!(xff[0], "203.0.113.9");
+    }
+
+    #[test]
+    fn client_ip_headers_are_stripped_without_a_peer_address() {
+        let mut req = spoofed_request();
+        set_client_ip_headers(&mut req, None).expect("set");
+        assert!(req.headers.get("x-real-ip").is_none());
+        assert!(req.headers.get("x-forwarded-for").is_none());
     }
 }

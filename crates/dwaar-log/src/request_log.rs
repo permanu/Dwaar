@@ -565,6 +565,13 @@ pub struct RequestLog {
     /// `&'static str` — zero per-request allocation (#128).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked_by: Option<&'static str>,
+
+    /// Route key the request matched (e.g. `app.example.com` or
+    /// `*.example.com`), as `GET /routes` lists it. Unlike `host` it has no
+    /// port and names the route, so log consumers can attribute the request
+    /// to the service behind that route. Omitted when no route matched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route: Option<CompactString>,
 }
 
 #[cfg(test)]
@@ -599,6 +606,7 @@ mod tests {
             upstream_error_body: None,
             rejected_by: None,
             blocked_by: None,
+            route: None,
         }
     }
 
@@ -919,5 +927,18 @@ mod tests {
         entry.referer = Some(payload.clone().into());
         let json = serde_json::to_string(&entry).expect("serialize");
         assert!(!json.contains(&payload));
+    }
+
+    #[test]
+    fn route_is_logged_when_matched_and_omitted_otherwise() {
+        let mut log = sample_log();
+        let json = serde_json::to_value(&log).expect("serialize");
+        assert!(json.get("route").is_none());
+
+        log.host = "shop.example.com:443".into();
+        log.route = Some("*.example.com".into());
+        let json = serde_json::to_value(&log).expect("serialize");
+        assert_eq!(json["route"], "*.example.com");
+        assert_eq!(json["host"], "shop.example.com:443");
     }
 }
