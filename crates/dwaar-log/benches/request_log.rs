@@ -47,6 +47,7 @@ fn sample_log() -> RequestLog {
         upstream_error_body: None,
         rejected_by: None,
         blocked_by: None,
+        route: None,
     }
 }
 

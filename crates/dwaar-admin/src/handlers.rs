@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use dwaar_analytics::aggregation::DomainMetrics;
 use dwaar_analytics::aggregation::snapshot::AnalyticsSnapshot;
-use dwaar_core::route::{Route, RouteTable, is_valid_route_key};
+use dwaar_core::route::{Route, RouteKind, RouteTable, is_valid_domain, is_valid_route_key};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -31,6 +31,7 @@ const ADMIN_CAPABILITIES: &[&str] = &[
     "metrics.upstream_connect_duration",
     "analytics.domain",
     "cache.purge",
+    "routes.webhook",
 ];
 
 /// Request body for `POST /routes`.
@@ -43,6 +44,9 @@ pub struct CreateRouteRequest {
     /// Used by reconcilers to identify their own routes.
     #[serde(default)]
     pub source: Option<String>,
+    /// `proxy` (default) or `webhook` (agent-protocol §11.1 intake route).
+    #[serde(default)]
+    pub kind: RouteKind,
 }
 
 /// Route entry accepted by the desired route snapshot API.
@@ -51,6 +55,9 @@ pub struct SnapshotRouteRequest {
     pub domain: String,
     pub upstream: String,
     pub tls: bool,
+    /// `proxy` (default) or `webhook`.
+    #[serde(default)]
+    pub kind: RouteKind,
 }
 
 /// Request body for `PUT /routes/snapshot`.
@@ -158,16 +165,7 @@ pub fn add_route(route_table: &ArcSwap<RouteTable>, body: &[u8]) -> Result<Strin
     let req: CreateRouteRequest =
         serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))?;
 
-    if !is_valid_route_key(&req.domain) {
-        return Err(format!("invalid domain: {}", req.domain));
-    }
-
-    let upstream: std::net::SocketAddr = req
-        .upstream
-        .parse()
-        .map_err(|e| format!("invalid upstream address: {e}"))?;
-
-    let route = Route::with_source(&req.domain, upstream, req.tls, None, req.source);
+    let route = build_route(&req.domain, &req.upstream, req.tls, req.source, req.kind)?;
 
     route_table.rcu(|current| {
         let mut routes = current.all_routes();
@@ -181,6 +179,7 @@ pub fn add_route(route_table: &ArcSwap<RouteTable>, body: &[u8]) -> Result<Strin
         action = "route_add",
         principal = "admin",
         resource = %route.domain,
+        kind = ?route.kind,
         "admin mutation"
     );
     serde_json::to_string(&route).map_err(|e| format!("serialize error: {e}"))
@@ -203,20 +202,13 @@ pub fn apply_route_snapshot(
     let mut routes = Vec::with_capacity(req.routes.len());
     let mut domains = HashSet::with_capacity(req.routes.len());
     for route_req in req.routes {
-        if !is_valid_route_key(&route_req.domain) {
-            return Err(format!("invalid domain: {}", route_req.domain));
-        }
-        let upstream: std::net::SocketAddr = route_req
-            .upstream
-            .parse()
-            .map_err(|e| format!("invalid upstream address: {e}"))?;
-        let route = Route::with_source(
+        let route = build_route(
             &route_req.domain,
-            upstream,
+            &route_req.upstream,
             route_req.tls,
-            None,
             Some(req.source.clone()),
-        );
+            route_req.kind,
+        )?;
         if !domains.insert(route.domain.clone()) {
             return Err(format!("duplicate domain in snapshot: {}", route.domain));
         }
@@ -269,6 +261,40 @@ pub fn apply_route_snapshot(
     serde_json::to_string(&response).map_err(|e| format!("serialize error: {e}"))
 }
 
+/// Validate an admin-API route request and build the route.
+///
+/// A webhook route needs an exact hostname (no wildcard, path or `_default`)
+/// and a loopback upstream: it exists to reach a local listener (the Permanu
+/// agent on `127.0.0.1:7461`), never to expose another host.
+fn build_route(
+    domain: &str,
+    upstream: &str,
+    tls: bool,
+    source: Option<String>,
+    kind: RouteKind,
+) -> Result<Route, String> {
+    if !is_valid_route_key(domain) {
+        return Err(format!("invalid domain: {domain}"));
+    }
+    let upstream: std::net::SocketAddr = upstream
+        .parse()
+        .map_err(|e| format!("invalid upstream address: {e}"))?;
+    match kind {
+        RouteKind::Proxy => Ok(Route::with_source(domain, upstream, tls, None, source)),
+        RouteKind::Webhook => {
+            if !is_valid_domain(domain) || domain.contains('*') {
+                return Err(format!("webhook route needs an exact hostname: {domain}"));
+            }
+            if !upstream.ip().is_loopback() {
+                return Err(format!(
+                    "webhook route upstream must be a loopback address: {upstream}"
+                ));
+            }
+            Ok(Route::webhook(domain, upstream, tls, source))
+        }
+    }
+}
+
 fn validate_snapshot_source(source: &str) -> Result<(), String> {
     if source.is_empty() {
         return Err("source is required".to_string());
@@ -294,6 +320,10 @@ fn hash_route_snapshot(source: &str, routes: &[Route]) -> String {
         }
         hasher.update(b"\0");
         hasher.update(if route.tls { b"1" } else { b"0" });
+        // Proxy routes hash exactly as before `kind` existed.
+        if route.kind == RouteKind::Webhook {
+            hasher.update(b"\0webhook");
+        }
         hasher.update(b"\n");
     }
     hex::encode(hasher.finalize())
@@ -468,6 +498,7 @@ mod tests {
             "metrics.upstream_connect_duration",
             "analytics.domain",
             "cache.purge",
+            "routes.webhook",
         ] {
             assert!(
                 capabilities
@@ -690,5 +721,110 @@ mod tests {
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).expect("parse");
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0]["domain"], "test.example.com");
+    }
+
+    // ── Webhook routes (agent-protocol §11.1, WS4) ───────────
+
+    #[test]
+    fn add_route_installs_a_webhook_route() {
+        let table = make_table(vec![]);
+        let body = br#"{"domain":"Hooks.Example.com","upstream":"127.0.0.1:7461","tls":true,"source":"permanu","kind":"webhook"}"#;
+        let json = add_route(&table, body).expect("webhook route");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(parsed["kind"], "webhook");
+        assert_eq!(parsed["domain"], "hooks.example.com");
+
+        let guard = table.load();
+        let route = guard.resolve("hooks.example.com").expect("installed");
+        assert_eq!(route.kind, RouteKind::Webhook);
+        assert_eq!(route.upstream(), Some(addr(7461)));
+        assert_eq!(route.source(), Some("permanu"));
+
+        let listed: Vec<serde_json::Value> =
+            serde_json::from_str(&list_routes(&table).expect("list")).expect("parse");
+        assert_eq!(listed[0]["kind"], "webhook");
+    }
+
+    #[test]
+    fn add_route_defaults_to_a_proxy_route() {
+        let table = make_table(vec![]);
+        let body = br#"{"domain":"app.example.com","upstream":"127.0.0.1:3000","tls":false,"kind":"proxy"}"#;
+        add_route(&table, body).expect("proxy route");
+        assert_eq!(
+            table.load().resolve("app.example.com").expect("route").kind,
+            RouteKind::Proxy
+        );
+    }
+
+    #[test]
+    fn webhook_route_must_target_loopback() {
+        let table = make_table(vec![]);
+        for upstream in ["10.0.0.5:7461", "0.0.0.0:7461", "[::]:7461"] {
+            let body = format!(
+                r#"{{"domain":"hooks.example.com","upstream":"{upstream}","tls":true,"kind":"webhook"}}"#
+            );
+            assert!(add_route(&table, body.as_bytes()).is_err(), "{upstream}");
+        }
+        let body = br#"{"domain":"hooks.example.com","upstream":"[::1]:7461","tls":true,"kind":"webhook"}"#;
+        assert!(add_route(&table, body).is_ok());
+    }
+
+    #[test]
+    fn webhook_route_needs_an_exact_hostname() {
+        let table = make_table(vec![]);
+        for domain in ["*.example.com", "_default", "hooks.example.com/hooks"] {
+            let body = format!(
+                r#"{{"domain":"{domain}","upstream":"127.0.0.1:7461","tls":true,"kind":"webhook"}}"#
+            );
+            assert!(add_route(&table, body.as_bytes()).is_err(), "{domain}");
+        }
+        assert!(table.load().is_empty());
+    }
+
+    #[test]
+    fn add_route_rejects_an_unknown_kind() {
+        let table = make_table(vec![]);
+        let body =
+            br#"{"domain":"a.example.com","upstream":"127.0.0.1:7461","tls":true,"kind":"hooks"}"#;
+        assert!(add_route(&table, body).is_err());
+    }
+
+    #[test]
+    fn route_snapshot_keeps_webhook_kind_and_hash_of_proxy_routes() {
+        let table = make_table(vec![]);
+        let plain = br#"{"source":"permanu","routes":[{"domain":"app.example.com","upstream":"127.0.0.1:3000","tls":true}]}"#;
+        let first: serde_json::Value =
+            serde_json::from_str(&apply_route_snapshot(&table, plain).expect("apply"))
+                .expect("parse");
+
+        let with_hook = br#"{"source":"permanu","routes":[{"domain":"app.example.com","upstream":"127.0.0.1:3000","tls":true},{"domain":"hooks.example.com","upstream":"127.0.0.1:7461","tls":true,"kind":"webhook"}]}"#;
+        let second: serde_json::Value =
+            serde_json::from_str(&apply_route_snapshot(&table, with_hook).expect("apply"))
+                .expect("parse");
+        assert_ne!(first["route_hash"], second["route_hash"]);
+        let guard = table.load();
+        assert_eq!(
+            guard.resolve("hooks.example.com").expect("hook").kind,
+            RouteKind::Webhook
+        );
+        assert_eq!(
+            guard.resolve("app.example.com").expect("app").kind,
+            RouteKind::Proxy
+        );
+
+        // Turning the hook route into a plain route changes the hash.
+        let as_proxy = br#"{"source":"permanu","routes":[{"domain":"app.example.com","upstream":"127.0.0.1:3000","tls":true},{"domain":"hooks.example.com","upstream":"127.0.0.1:7461","tls":true}]}"#;
+        let third: serde_json::Value =
+            serde_json::from_str(&apply_route_snapshot(&table, as_proxy).expect("apply"))
+                .expect("parse");
+        assert_ne!(second["route_hash"], third["route_hash"]);
+    }
+
+    #[test]
+    fn route_snapshot_rejects_a_non_loopback_webhook() {
+        let table = make_table(vec![]);
+        let body = br#"{"source":"permanu","routes":[{"domain":"hooks.example.com","upstream":"192.0.2.1:7461","tls":true,"kind":"webhook"}]}"#;
+        assert!(apply_route_snapshot(&table, body).is_err());
+        assert!(table.load().is_empty());
     }
 }
