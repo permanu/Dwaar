@@ -1251,6 +1251,7 @@ type ListenerOutputs = (
 ///
 /// The proxy service is added to `server` before returning; QUIC runs as a
 /// separate `BackgroundService` alongside it.
+#[allow(clippy::too_many_arguments)]
 fn bind_proxy_listeners(
     server: &mut Server,
     dwaar_config: &dwaar_config::model::DwaarConfig,
@@ -1259,6 +1260,7 @@ fn bind_proxy_listeners(
     features_plugin_chain: Arc<dwaar_plugins::plugin::PluginChain>,
     timeouts: &dwaar_config::model::TimeoutsConfig,
     worker_count: usize,
+    cert_dir: &std::path::Path,
 ) -> anyhow::Result<ListenerOutputs> {
     let h3_enabled = dwaar_config
         .global_options
@@ -1312,7 +1314,7 @@ fn bind_proxy_listeners(
         }
     }
 
-    let cert_store = Arc::new(CertStore::new("/etc/dwaar/certs", 1000));
+    let cert_store = Arc::new(CertStore::new(cert_dir, 1000));
 
     // sni_domain_map is shared between SniResolver (which reads it on every
     // TLS handshake) and ConfigWatcher (which swaps in a new map on reload).
@@ -1594,6 +1596,7 @@ fn run_server(
         plugin_chain_for_quic,
         &timeouts,
         worker_count,
+        &cli.cert_dir(),
     )?;
 
     let agg_metrics = add_admin_service(
@@ -1721,15 +1724,23 @@ fn register_background_services(
 
     // ACME + OCSP background service
     if let Some(solver) = challenge_solver {
+        let acme_dir = cli.acme_dir();
+        let cert_dir = cli.cert_dir();
+        info!(
+            acme_dir = %acme_dir.display(),
+            cert_dir = %cert_dir.display(),
+            "TLS state directories"
+        );
         let issuer = Arc::new(CertIssuer::new(
-            "/etc/dwaar/acme",
-            "/etc/dwaar/certs",
+            &acme_dir,
+            &cert_dir,
             Arc::clone(solver),
             Arc::clone(cert_store),
         ));
         let mut tls_service = TlsBackgroundService::new(
             Arc::clone(&acme_domains),
-            "/etc/dwaar/certs",
+            // Lossless: --state-dir is parsed from a UTF-8 argument.
+            &cert_dir.to_string_lossy(),
             issuer,
             Arc::clone(cert_store),
         )
