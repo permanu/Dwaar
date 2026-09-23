@@ -17,6 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`--state-dir <DIR>`** (`DWAAR_STATE_DIR`, default `/etc/dwaar`) moves the
   ACME account and managed certificates to `<DIR>/acme` and `<DIR>/certs`.
 - Access log lines carry `route`, the route key the request matched.
+- **`route_path`**: access log lines and the new `/metrics` series
+  `dwaar_route_path_requests_total{route,route_path,status_class}` and
+  `dwaar_route_path_request_duration_seconds{route,route_path}` carry a
+  low-cardinality template of the request path (query and fragment dropped,
+  at most 6 segments with deeper paths ending in `*`, id-like segments as
+  `:id`, lowercased; `/api/users/42/orders` → `/api/users/:id/orders`). Each
+  route keeps its first 200 templates; any further one is `other`. The
+  existing per-route series keep their labels.
 - `scripts/build-linux-glibc235.sh` builds linux amd64 and arm64 binaries in an
   `ubuntu:22.04` builder (glibc 2.35 floor, checked) with SHA-256 files.
 

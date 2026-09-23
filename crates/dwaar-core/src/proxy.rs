@@ -257,6 +257,10 @@ pub struct DwaarProxy {
     /// within one TTL window, but long enough to absorb burst traffic
     /// without hammering the upstream with redundant probes.
     scale_to_zero_probe_cache: dashmap::DashMap<std::net::SocketAddr, std::time::Instant>,
+    /// Path templates kept per route for the `route_path` metric label and
+    /// access log field (contracts v1.1.3, D-061): at most 200 per route,
+    /// the rest `other`.
+    route_paths: dwaar_analytics::route_path::RoutePathRegistry,
 }
 
 /// Registries consulted by the proxy hot path, populated by the gRPC
@@ -327,6 +331,7 @@ impl DwaarProxy {
             otlp_exporter: None,
             trace_sample_ratio: 1.0,
             scale_to_zero_probe_cache: dashmap::DashMap::new(),
+            route_paths: dwaar_analytics::route_path::RoutePathRegistry::default(),
         }
     }
 
@@ -2527,6 +2532,24 @@ impl ProxyHttp for DwaarProxy {
             );
         }
 
+        // Low-cardinality path template of the matched route (D-061), shared
+        // by the metrics below and the access log line.
+        let route_path = ctx
+            .plugin_ctx
+            .route_domain
+            .as_deref()
+            .filter(|_| self.prometheus.is_some() || self.log_sender.is_some())
+            .map(|route| {
+                self.route_paths
+                    .resolve(route, ctx.plugin_ctx.path.as_str())
+            });
+        if let Some(ref prom) = self.prometheus
+            && let Some(ref route) = ctx.plugin_ctx.route_domain
+            && let Some(ref route_path) = route_path
+        {
+            prom.record_route_path(route, route_path, status, response_time_us);
+        }
+
         // Prometheus metrics (ISSUE-072) — recorded before host.take() moves it
         if let Some(ref prom) = self.prometheus
             && let Some(ref host) = ctx.plugin_ctx.host
@@ -2721,6 +2744,7 @@ impl ProxyHttp for DwaarProxy {
             rejected_by: ctx.rejected_by,
             blocked_by: ctx.blocked_by,
             route: ctx.plugin_ctx.route_domain.take(),
+            route_path,
         };
 
         sender.send(log);
