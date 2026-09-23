@@ -193,6 +193,7 @@ mod tests {
             rejected_by: None,
             blocked_by: None,
             route: None,
+            route_path: None,
         }
     }
 
