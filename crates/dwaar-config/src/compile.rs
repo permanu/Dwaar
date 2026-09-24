@@ -845,8 +845,9 @@ pub fn extract_bind_addresses(config: &DwaarConfig) -> Vec<BindAddress> {
 /// Extract TLS listener addresses from a parsed config.
 ///
 /// Similar to [`extract_bind_addresses`] but only considers sites that have
-/// TLS directives (i.e. `site_has_tls` returns true). Falls back to
-/// `"0.0.0.0:6189"` when no TLS site specifies a `bind` directive.
+/// TLS directives (i.e. `site_has_tls` returns true). When no TLS site
+/// specifies a `bind` directive it falls back to `https_port`, then to
+/// `0.0.0.0:443` when `http_port` is 80, then to `"0.0.0.0:6189"`.
 pub fn extract_tls_bind_addresses(config: &DwaarConfig) -> Vec<BindAddress> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut addrs: Vec<BindAddress> = Vec::new();
@@ -868,13 +869,20 @@ pub fn extract_tls_bind_addresses(config: &DwaarConfig) -> Vec<BindAddress> {
         }
     }
 
-    // Fall back to the global https_port directive, or the built-in default.
+    // Fall back to the global https_port directive; then to 443 when
+    // http_port is 80 (the HTTPS redirect targets the implicit port 443, and
+    // an admin-API TLS route needs the standard pair); else the built-in
+    // unprivileged default.
     if addrs.is_empty() {
-        let default = config
-            .global_options
-            .as_ref()
-            .and_then(|g| g.https_port)
-            .map_or_else(|| DEFAULT_TLS_BIND.to_owned(), |p| format!("0.0.0.0:{p}"));
+        let global = config.global_options.as_ref();
+        let https_port = global.and_then(|g| g.https_port).or_else(|| {
+            global
+                .and_then(|g| g.http_port)
+                .filter(|&p| p == 80)
+                .map(|_| 443)
+        });
+        let default =
+            https_port.map_or_else(|| DEFAULT_TLS_BIND.to_owned(), |p| format!("0.0.0.0:{p}"));
         addrs.push(BindAddress::Tcp(default));
     }
 
@@ -2692,6 +2700,40 @@ mod tests {
             matchers: vec![],
             directives: vec![bind(addrs)],
         }
+    }
+
+    #[test]
+    fn tls_bind_default_is_443_when_http_port_is_80() {
+        // Permanu's installer writes `{ http_port 80 }` only: the TLS
+        // listener pairs with it on 443 (the port HTTPS redirects point at).
+        let config = crate::parser::parse("{\n    http_port 80\n}\n").expect("parse");
+        assert_eq!(
+            extract_tls_bind_addresses(&config),
+            vec![BindAddress::Tcp("0.0.0.0:443".to_string())]
+        );
+    }
+
+    #[test]
+    fn tls_bind_default_keeps_https_port_and_6189() {
+        let config =
+            crate::parser::parse("{\n    http_port 80\n    https_port 8443\n}\n").expect("parse");
+        assert_eq!(
+            extract_tls_bind_addresses(&config),
+            vec![BindAddress::Tcp("0.0.0.0:8443".to_string())]
+        );
+        let config = crate::parser::parse("{\n    http_port 8080\n}\n").expect("parse");
+        assert_eq!(
+            extract_tls_bind_addresses(&config),
+            vec![BindAddress::Tcp("0.0.0.0:6189".to_string())]
+        );
+        let config = DwaarConfig {
+            global_options: None,
+            sites: vec![],
+        };
+        assert_eq!(
+            extract_tls_bind_addresses(&config),
+            vec![BindAddress::Tcp("0.0.0.0:6189".to_string())]
+        );
     }
 
     #[test]

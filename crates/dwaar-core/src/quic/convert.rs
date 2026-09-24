@@ -77,6 +77,24 @@ pub fn h3_to_pingora_headers(
     Ok(pingora_req)
 }
 
+/// Set `X-Real-IP` and `X-Forwarded-For` to the QUIC peer's address.
+///
+/// Client-supplied values are never forwarded (agent-protocol 11.1: the
+/// agent's pre-authentication limit keys on `X-Real-IP`); without a peer
+/// address both are removed. Mirrors the HTTP/1 and HTTP/2 proxy path.
+pub fn set_client_ip_headers(headers: &mut http::HeaderMap, client_ip: Option<std::net::IpAddr>) {
+    headers.remove("x-real-ip");
+    headers.remove("x-forwarded-for");
+    let Some(ip) = client_ip else {
+        return;
+    };
+    let ip = ip.to_canonical();
+    if let Ok(value) = http::HeaderValue::from_str(&ip.to_string()) {
+        headers.insert("x-real-ip", value.clone());
+        headers.insert("x-forwarded-for", value);
+    }
+}
+
 /// Convert a `pingora_http::ResponseHeader` into an `http::Response<()>` for h3.
 ///
 /// h3's `send_response` takes `http::Response<()>` — this builds one from the
@@ -236,6 +254,35 @@ mod tests {
 
         let req = h3_to_pingora_headers(&method, &uri, &headers).expect("conversion ok");
         assert!(req.headers.get(":path").is_none());
+    }
+
+    #[test]
+    fn client_address_headers_are_dwaars_over_h3() {
+        // agent-protocol 11.1: X-Real-IP is the address Dwaar saw, overwriting
+        // any client value — on HTTP/3 as on HTTP/1 and HTTP/2.
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-real-ip", "6.6.6.6".parse().expect("value"));
+        headers.append("x-forwarded-for", "6.6.6.6".parse().expect("value"));
+        headers.append("x-forwarded-for", "7.7.7.7".parse().expect("value"));
+        headers.insert("x-custom", "kept".parse().expect("value"));
+
+        set_client_ip_headers(&mut headers, Some("203.0.113.9".parse().expect("ip")));
+        let real: Vec<_> = headers.get_all("x-real-ip").iter().collect();
+        assert_eq!(real, ["203.0.113.9"]);
+        let xff: Vec<_> = headers.get_all("x-forwarded-for").iter().collect();
+        assert_eq!(xff, ["203.0.113.9"]);
+        assert_eq!(headers.get("x-custom").expect("kept"), "kept");
+
+        // An IPv4-mapped IPv6 peer is reported as IPv4.
+        set_client_ip_headers(
+            &mut headers,
+            Some("::ffff:198.51.100.7".parse().expect("ip")),
+        );
+        assert_eq!(headers.get("x-real-ip").expect("set"), "198.51.100.7");
+
+        set_client_ip_headers(&mut headers, None);
+        assert!(headers.get("x-real-ip").is_none());
+        assert!(headers.get("x-forwarded-for").is_none());
     }
 
     #[test]

@@ -14,6 +14,7 @@
 //! The [`route`] module provides the domain→upstream mapping that
 //! `upstream_peer()` consults on every request.
 
+pub mod admin_routes;
 pub mod cache;
 pub mod context;
 pub mod fastcgi;

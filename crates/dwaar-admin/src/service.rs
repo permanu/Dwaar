@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use dwaar_analytics::aggregation::DomainMetrics;
 use dwaar_analytics::prometheus::PrometheusMetrics;
+use dwaar_core::admin_routes::{AdminRouteError, AdminRoutes};
 use dwaar_core::route::RouteTable;
 use http::Response;
 use pingora_core::apps::http_app::ServeHttp;
@@ -76,6 +77,9 @@ pub struct AdminService {
     /// `GET /healthz` returns 503 while this flag is set so the upgrade
     /// orchestrator (Mission B installer) can detect the drain window.
     shutting_down: Arc<AtomicBool>,
+    /// Admin-API routes, kept (and persisted under `--state-dir`) apart from
+    /// the Dwaarfile's so they survive reloads and restarts.
+    admin_routes: Arc<AdminRoutes>,
 }
 
 impl std::fmt::Debug for AdminService {
@@ -113,6 +117,7 @@ impl AdminService {
             window_start: AtomicU64::new(0),
             last_reload: AtomicU64::new(0),
             shutting_down: Arc::new(AtomicBool::new(false)),
+            admin_routes: Arc::new(AdminRoutes::in_memory()),
         }
     }
 
@@ -121,6 +126,14 @@ impl AdminService {
     /// internal shutdown completes. Once set, `GET /healthz` returns 503.
     pub fn shutting_down_handle(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.shutting_down)
+    }
+
+    /// Keep admin-API route changes in `admin_routes` (persisted when it was
+    /// opened on a state directory).
+    #[must_use]
+    pub fn with_admin_routes(mut self, admin_routes: Arc<AdminRoutes>) -> Self {
+        self.admin_routes = admin_routes;
+        self
     }
 
     /// Set the reload notifier for `POST /reload` support.
@@ -332,32 +345,39 @@ impl AdminService {
                 let body = read_body(session, MAX_BODY_SIZE).await;
                 match body {
                     Err((status, msg)) => json_error(status, &msg),
-                    Ok(data) => match handlers::add_route(&self.route_table, &data) {
-                        Ok(json) => {
-                            let resource = serde_json::from_slice::<serde_json::Value>(&data)
-                                .ok()
-                                .and_then(|v| v["domain"].as_str().map(str::to_owned))
-                                .unwrap_or_else(|| "<unknown>".to_owned());
-                            tracing::info!(
-                                target: "dwaar::admin::audit",
-                                action = "route_add",
-                                principal = "admin",
-                                resource = %resource,
-                                "admin mutation"
-                            );
-                            json_response(201, &json)
+                    Ok(data) => {
+                        match handlers::add_route_with(&self.route_table, &self.admin_routes, &data)
+                        {
+                            Ok(json) => {
+                                let resource = serde_json::from_slice::<serde_json::Value>(&data)
+                                    .ok()
+                                    .and_then(|v| v["domain"].as_str().map(str::to_owned))
+                                    .unwrap_or_else(|| "<unknown>".to_owned());
+                                tracing::info!(
+                                    target: "dwaar::admin::audit",
+                                    action = "route_add",
+                                    principal = "admin",
+                                    resource = %resource,
+                                    "admin mutation"
+                                );
+                                json_response(201, &json)
+                            }
+                            Err(e) => admin_route_error(&e),
                         }
-                        Err(e) => json_error(400, &e),
-                    },
+                    }
                 }
             }
             ("PUT", "/routes/snapshot") => {
                 let body = read_body(session, MAX_BODY_SIZE).await;
                 match body {
                     Err((status, msg)) => json_error(status, &msg),
-                    Ok(data) => match handlers::apply_route_snapshot(&self.route_table, &data) {
+                    Ok(data) => match handlers::apply_route_snapshot_with(
+                        &self.route_table,
+                        &self.admin_routes,
+                        &data,
+                    ) {
                         Ok(json) => json_response(200, &json),
-                        Err(e) => json_error(400, &e),
+                        Err(e) => admin_route_error(&e),
                     },
                 }
             }
@@ -374,8 +394,9 @@ impl AdminService {
                 if domain.len() > MAX_PATH_SEGMENT_LEN {
                     return json_response(414, r#"{"error":"domain too long"}"#);
                 }
-                match handlers::delete_route(&self.route_table, domain) {
-                    Some(deleted) => {
+                match handlers::delete_route_with(&self.route_table, &self.admin_routes, domain) {
+                    Err(e) => admin_route_error(&e),
+                    Ok(Some(deleted)) => {
                         tracing::info!(
                             target: "dwaar::admin::audit",
                             action = "route_delete",
@@ -385,7 +406,7 @@ impl AdminService {
                         );
                         json_deleted(&deleted)
                     }
-                    None => json_response(404, r#"{"error":"route not found"}"#),
+                    Ok(None) => json_response(404, r#"{"error":"route not found"}"#),
                 }
             }
             ("GET", "/analytics") => match handlers::list_all_analytics(&self.metrics) {
@@ -569,6 +590,15 @@ fn allowed_methods_for(path: &str) -> &'static str {
 ///
 /// Uses `serde_json` to escape any quotes or backslashes in the message so
 /// injected strings can't break out of the JSON value.
+/// 400 for an invalid route request, 500 when the change could not be
+/// persisted (nothing changed then).
+fn admin_route_error(err: &AdminRouteError) -> Response<Vec<u8>> {
+    match err {
+        AdminRouteError::Invalid(msg) => json_error(400, msg),
+        AdminRouteError::Persist(_) => json_error(500, "cannot persist admin routes"),
+    }
+}
+
 fn json_error(status: u16, message: &str) -> Response<Vec<u8>> {
     let body = serde_json::json!({"error": message}).to_string();
     json_response(status, &body)

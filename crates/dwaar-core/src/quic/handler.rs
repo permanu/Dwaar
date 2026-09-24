@@ -103,6 +103,7 @@ pub async fn handle_h3_connection(
     conn_pool: Arc<UpstreamConnPool>,
     h2_pool: Arc<super::h2_pool::H2ConnPool>,
 ) -> Result<(), ConnectionHandlerError> {
+    let client_ip = conn.remote_address().ip();
     let h3_conn = h3_quinn::Connection::new(conn);
     let mut h3_server: h3::server::Connection<_, Bytes> = h3::server::Connection::new(h3_conn)
         .await
@@ -146,6 +147,7 @@ pub async fn handle_h3_connection(
 
                     if let Err(e) = handle_h3_request(
                         resolver,
+                        client_ip,
                         route_table,
                         plugin_chain,
                         conn_pool,
@@ -206,6 +208,7 @@ pub async fn handle_h3_connection(
 /// 10. Release connection to pool if reusable
 async fn handle_h3_request<C, B>(
     resolver: h3::server::RequestResolver<C, B>,
+    client_ip: std::net::IpAddr,
     route_table: Arc<ArcSwap<RouteTable>>,
     plugin_chain: Arc<PluginChain>,
     conn_pool: Arc<UpstreamConnPool>,
@@ -225,7 +228,8 @@ where
 
     let method = req.method().clone();
     let uri = req.uri().clone();
-    let headers = req.headers().clone();
+    let mut headers = req.headers().clone();
+    super::convert::set_client_ip_headers(&mut headers, Some(client_ip));
 
     if is_early_data && !is_idempotent_method(&method) {
         warn!(method = %method, "rejecting non-idempotent 0-RTT request");

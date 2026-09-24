@@ -194,6 +194,8 @@ curl -X POST \
 }
 ```
 
+**Persistence and certificates.** Routes added with `POST /routes` or `PUT /routes/snapshot` are written to `<state-dir>/admin-routes.json` (mode `0600`, replaced atomically) before they take effect, and restored at the next start; a Dwaarfile reload keeps them (they are laid over the Dwaarfile's routes). Without an existing state directory they live in memory only. If the file cannot be written the change is refused with `500` and nothing changes. A route with `"tls": true` on a public hostname gets its certificate by ACME (TLS-ALPN-01, then HTTP-01) like a Dwaarfile site; IP addresses and special-use names (`.test`, `.example`, `.invalid`, `.local`, `.localhost`, `.home.arpa`) never do. With `--admin-socket` the HTTPS listener is bound at start even when no Dwaarfile site uses TLS, on `https_port`, or `443` when `http_port` is `80`.
+
 **Response** `201 Created`
 
 ```json
@@ -213,6 +215,7 @@ curl -X POST \
 |---|---|
 | `201` | Route created or replaced |
 | `400` | Invalid JSON, invalid domain, or invalid upstream address |
+| `500` | The route could not be persisted under the state directory; nothing changed |
 | `401` | Missing or invalid bearer token (TCP only) |
 | `413` | Request body exceeds 64 KB |
 | `429` | Rate limit exceeded |
