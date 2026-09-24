@@ -12,12 +12,15 @@
 //! most [`MAX_ROUTE_PATHS_PER_ROUTE`] distinct templates, first come first
 //! kept; any further template is reported as [`ROUTE_PATH_OTHER`].
 //!
-//! Template rules: the query and fragment are dropped; the path is split on
-//! `/` (empty segments are skipped) into at most [`MAX_SEGMENTS`] segments,
-//! the last of which becomes `*` when the path is deeper; a segment that is
-//! all digits, a UUID, 16 or more hex characters, or longer than 32
-//! characters becomes `:id`; everything is lowercased.
-//! `/api/users/42/orders?x=1` → `/api/users/:id/orders`.
+//! Template rules (contracts v1.1.5, D-063 #12): the query and fragment are
+//! dropped; the path is split on `/` and empty segments are dropped, so
+//! doubled slashes and a trailing slash disappear; a segment that is all
+//! digits, a UUID, 16 or more hex characters, or longer than 32 characters
+//! becomes `:id`; everything is lowercased; the first [`MAX_SEGMENTS`] (5)
+//! segments are kept and, when there are more, the 6th and every deeper
+//! segment together become one `*` segment; the root path is `/`.
+//! `/api/users/42/orders?x=1` → `/api/users/:id/orders`,
+//! `/a/b/c/d/e/f/g` → `/a/b/c/d/e/*`.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
@@ -32,8 +35,8 @@ pub const ROUTE_PATH_OTHER: &str = "other";
 /// Distinct templates kept per route (the contract's per-service cap).
 pub const MAX_ROUTE_PATHS_PER_ROUTE: usize = 200;
 
-/// Maximum number of path segments in a template; deeper paths end in `*`.
-pub const MAX_SEGMENTS: usize = 6;
+/// Path segments kept in a template; a deeper path gets one more `*` segment.
+pub const MAX_SEGMENTS: usize = 5;
 
 /// Templates kept across all routes. Bounds memory when many routes exist
 /// (up to [`crate::MAX_TRACKED_DOMAINS`]); beyond it every new template is
@@ -49,7 +52,7 @@ const MIN_HEX_ID_CHARS: usize = 16;
 /// Template of a request path (see the module docs).
 ///
 /// Pure; the result has at most `MAX_SEGMENTS` segments of at most
-/// `MAX_LITERAL_SEGMENT_CHARS` characters each.
+/// `MAX_LITERAL_SEGMENT_CHARS` characters each, plus a final `*`.
 #[must_use]
 pub fn route_path_template(path: &str) -> CompactString {
     let end = path.find(['?', '#']).unwrap_or(path.len());
@@ -58,11 +61,7 @@ pub fn route_path_template(path: &str) -> CompactString {
         return CompactString::const_new("/");
     }
     let deeper = segments.len() > MAX_SEGMENTS;
-    let literal = if deeper {
-        MAX_SEGMENTS - 1
-    } else {
-        segments.len()
-    };
+    let literal = segments.len().min(MAX_SEGMENTS);
     let mut out = CompactString::default();
     for segment in &segments[..literal] {
         out.push('/');
@@ -262,10 +261,21 @@ mod tests {
     }
 
     #[test]
-    fn at_most_six_segments_deeper_ones_become_one_star() {
-        assert_eq!(route_path_template("/a/b/c/d/e/f"), "/a/b/c/d/e/f");
+    fn first_five_segments_kept_sixth_and_deeper_become_one_star() {
+        // contracts v1.1.5, D-063 #12 (agent-protocol.md 9.5).
+        assert_eq!(route_path_template("/a/b/c/d/e"), "/a/b/c/d/e");
+        assert_eq!(route_path_template("/a/b/c/d/e/"), "/a/b/c/d/e");
+        assert_eq!(route_path_template("/a/b/c/d/e/f"), "/a/b/c/d/e/*");
         assert_eq!(route_path_template("/a/b/c/d/e/f/g"), "/a/b/c/d/e/*");
         assert_eq!(route_path_template("/a/b/c/d/e/f/g/h/i/j"), "/a/b/c/d/e/*");
+        // Empty segments are dropped before counting.
+        assert_eq!(route_path_template("//a//b/c/d/e//"), "/a/b/c/d/e");
+        assert_eq!(route_path_template("/a/b//c/d/e//f/"), "/a/b/c/d/e/*");
+        // Ids are templated inside the kept five.
+        assert_eq!(
+            route_path_template("/API/Users/42/Orders/7/items/9"),
+            "/api/users/:id/orders/:id/*"
+        );
     }
 
     #[test]
@@ -273,8 +283,9 @@ mod tests {
         let seg = "x".repeat(32);
         let path = format!("/{seg}").repeat(50);
         let t = route_path_template(&path);
-        assert_eq!(t.split('/').count(), MAX_SEGMENTS + 1);
-        assert!(t.len() <= MAX_SEGMENTS * (MAX_LITERAL_SEGMENT_CHARS + 1));
+        // "" + five kept segments + "*".
+        assert_eq!(t.split('/').count(), MAX_SEGMENTS + 2);
+        assert!(t.len() <= MAX_SEGMENTS * (MAX_LITERAL_SEGMENT_CHARS + 1) + 2);
     }
 
     #[test]
