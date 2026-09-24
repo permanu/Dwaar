@@ -59,6 +59,7 @@ use dwaar_config::compile::{
     extract_bind_addresses, extract_tls_bind_addresses, has_tls_sites,
 };
 use dwaar_config::watcher::{ConfigWatcher, hash_content};
+use dwaar_core::admin_routes::AdminRoutes;
 use dwaar_core::proxy::DwaarProxy;
 use dwaar_log::{StdoutWriter, channel as log_channel, run_writer};
 use dwaar_tls::acme::ChallengeSolver;
@@ -824,6 +825,14 @@ struct RouteState {
     config_notify: Arc<tokio::sync::Notify>,
     acme_domains: Arc<ArcSwap<Vec<String>>>,
     challenge_solver: Option<Arc<ChallengeSolver>>,
+    /// Admin-API routes (persisted under `--state-dir`), laid over the
+    /// Dwaarfile's routes at start and on every reload.
+    admin_routes: Arc<AdminRoutes>,
+    /// Wakes the ACME service when an admin-API route adds a TLS hostname.
+    acme_notify: Arc<tokio::sync::Notify>,
+    /// Bind the TLS listener although no Dwaarfile site uses TLS: TLS routes
+    /// arrive (or were restored) through the admin API.
+    admin_tls: bool,
 }
 
 /// Per-feature channels and optional subsystems that the proxy and background
@@ -916,12 +925,13 @@ fn build_pingora_server(
     // watchdog: if the drain takes longer than this, we SIGKILL ourselves.
     let conf_drain_secs: u64 = drain_timeout.as_secs();
 
+    let (stop_grace_secs, runtime_shutdown_secs) = stop_timing(dwaar_config);
     let conf = ServerConf {
         threads,
         work_stealing: true,
         upstream_keepalive_pool_size,
-        grace_period_seconds: Some(conf_drain_secs),
-        graceful_shutdown_timeout_seconds: Some(conf_drain_secs),
+        grace_period_seconds: Some(stop_grace_secs),
+        graceful_shutdown_timeout_seconds: Some(runtime_shutdown_secs),
         // Direct Pingora to the rendezvous socket used for FD transfer.
         // The child process calls `Server::new_with_opt_and_conf` with
         // `upgrade: true` and connects to this same socket to receive the
@@ -953,17 +963,43 @@ fn build_pingora_server(
     (server, upgrade_sock, conf_drain_secs)
 }
 
+/// Pingora grace period when the Dwaarfile sets no `drain_timeout`.
+const DEFAULT_STOP_GRACE_SECS: u64 = 5;
+
+/// How long Pingora gives its runtimes after the grace period.
+const RUNTIME_SHUTDOWN_SECS: u64 = 1;
+
+/// `(grace_period_seconds, graceful_shutdown_timeout_seconds)` for Pingora.
+///
+/// On SIGTERM (and SIGQUIT after an upgrade) Pingora stops accepting, sleeps
+/// the whole grace period while in-flight requests finish, then shuts its
+/// runtimes down with the timeout — and sleeps that timeout once more. With
+/// the old `(drain, drain)` a default stop took 60 s (`QA_M2` F16); now it is
+/// about 5 + 1 + 1 s unless the Dwaarfile asks for a longer `drain_timeout`.
+/// The SIGUSR2 upgrade watchdog keeps using the full drain timeout.
+fn stop_timing(config: &dwaar_config::model::DwaarConfig) -> (u64, u64) {
+    let grace = config
+        .global_options
+        .as_ref()
+        .and_then(|g| g.drain_timeout_secs)
+        .unwrap_or(DEFAULT_STOP_GRACE_SECS);
+    (grace, RUNTIME_SHUTDOWN_SECS)
+}
+
 /// Compile routes, wrap them in `ArcSwap` hot-reload handles, and initialise
 /// ACME domain tracking. The returned `RouteState` is the single source of
 /// truth that `FeatureState`, `ProxyState`, and all background services
 /// reference via `Arc::clone`.
-fn build_route_state(dwaar_config: &dwaar_config::model::DwaarConfig) -> RouteState {
+fn build_route_state(cli: &Cli, dwaar_config: &dwaar_config::model::DwaarConfig) -> RouteState {
     let has_l4 = dwaar_config
         .global_options
         .as_ref()
         .is_some_and(|g| g.layer4.is_some() || !g.layer4_listener_wrappers.is_empty());
 
-    let route_table = compile_routes(dwaar_config);
+    let admin_routes = open_admin_routes(cli);
+    let route_table = dwaar_core::route::RouteTable::new(
+        admin_routes.merge_into(compile_routes(dwaar_config).all_routes()),
+    );
     if route_table.is_empty() && !has_l4 {
         warn!("no routes configured — proxy is idle, waiting for config reload");
     }
@@ -985,8 +1021,17 @@ fn build_route_state(dwaar_config: &dwaar_config::model::DwaarConfig) -> RouteSt
 
     // ACME domain list — wrapped in ArcSwap so ConfigWatcher can swap in
     // new domains on hot-reload.
+    // The published list is the Dwaarfile's domains plus the admin routes'
+    // TLS hostnames (see `AdminRoutes::with_acme`).
     let acme_domains = Arc::new(ArcSwap::from_pointee(compile_acme_domains(dwaar_config)));
-    let challenge_solver = if acme_domains.load().is_empty() {
+    let acme_notify = Arc::new(tokio::sync::Notify::new());
+    let admin_routes =
+        Arc::new(admin_routes.with_acme(Arc::clone(&acme_domains), Arc::clone(&acme_notify)));
+
+    // With an admin socket, TLS routes can arrive at any time, so the TLS
+    // listener and the ACME service (HTTP-01 solver) exist from the start.
+    let admin_tls = cli.admin_socket.is_some() || admin_routes.has_tls_routes();
+    let challenge_solver = if acme_domains.load().is_empty() && !admin_tls {
         None
     } else {
         Some(Arc::new(ChallengeSolver::new()))
@@ -999,6 +1044,26 @@ fn build_route_state(dwaar_config: &dwaar_config::model::DwaarConfig) -> RouteSt
         config_notify,
         acme_domains,
         challenge_solver,
+        admin_routes,
+        acme_notify,
+        admin_tls,
+    }
+}
+
+/// Admin-API routes persisted in `<state-dir>/admin-routes.json`. Without an
+/// existing state directory they are kept in memory only.
+fn open_admin_routes(cli: &Cli) -> AdminRoutes {
+    if cli.state_dir.is_dir() {
+        AdminRoutes::open(
+            cli.state_dir
+                .join(dwaar_core::admin_routes::ADMIN_ROUTES_FILE),
+        )
+    } else {
+        warn!(
+            state_dir = %cli.state_dir.display(),
+            "state directory missing — admin API routes are not persisted"
+        );
+        AdminRoutes::in_memory()
     }
 }
 
@@ -1320,7 +1385,7 @@ fn bind_proxy_listeners(
     // TLS handshake) and ConfigWatcher (which swaps in a new map on reload).
     // When TLS is disabled the map stays empty and is never written to.
     let tls_bind_addrs = extract_tls_bind_addresses(dwaar_config);
-    let sni_domain_map: DomainConfigMap = if has_tls_sites(dwaar_config) {
+    let sni_domain_map: DomainConfigMap = if has_tls_sites(dwaar_config) || routes.admin_tls {
         setup_tls_listener(
             dwaar_config,
             &mut proxy_service,
@@ -1394,7 +1459,8 @@ fn add_admin_service(
         std::time::Instant::now(),
         admin_token,
     )
-    .with_reload_notify(Arc::clone(&routes.config_notify));
+    .with_reload_notify(Arc::clone(&routes.config_notify))
+    .with_admin_routes(Arc::clone(&routes.admin_routes));
 
     let admin_service = if let Some(prom) = features_prometheus {
         admin_service.with_prometheus(Arc::clone(prom))
@@ -1548,7 +1614,7 @@ fn run_server(
     let (mut server, upgrade_sock, conf_drain_secs) =
         build_pingora_server(cli, dwaar_config, drain_timeout, worker_id, worker_count);
 
-    let routes = build_route_state(dwaar_config);
+    let routes = build_route_state(cli, dwaar_config);
 
     let FeatureState {
         log_sender,
@@ -1634,6 +1700,8 @@ fn run_server(
         &agg_metrics,
         routes.health_pools,
         routes.acme_domains,
+        &routes.admin_routes,
+        &routes.acme_notify,
         drain_timeout,
         sni_domain_map,
         cache_for_watcher,
@@ -1694,6 +1762,8 @@ fn register_background_services(
     agg_metrics: &Arc<DashMap<String, dwaar_analytics::aggregation::DomainMetrics>>,
     health_pools: Arc<ArcSwap<Vec<Arc<dwaar_core::upstream::UpstreamPool>>>>,
     acme_domains: Arc<ArcSwap<Vec<String>>>,
+    admin_routes: &Arc<AdminRoutes>,
+    acme_notify: &Arc<tokio::sync::Notify>,
     drain_timeout: std::time::Duration,
     sni_domain_map: DomainConfigMap,
     cache_backend: Option<dwaar_core::cache::SharedCacheBackend>,
@@ -1744,7 +1814,8 @@ fn register_background_services(
             issuer,
             Arc::clone(cert_store),
         )
-        .with_reload_notify(Arc::clone(&agg_evict_notify));
+        .with_reload_notify(Arc::clone(&agg_evict_notify))
+        .with_domains_notify(Arc::clone(acme_notify));
 
         // Wire DNS-01 provider when the config contains `tls { dns cloudflare }` sites.
         let dns01_entries = dwaar_config::compile::compile_dns01_domains(config);
@@ -1836,6 +1907,7 @@ fn register_background_services(
     .with_sni_domain_map(sni_domain_map)
     .with_health_pools(health_pools)
     .with_acme_domains(acme_domains)
+    .with_admin_routes(Arc::clone(admin_routes))
     .with_cert_store(Arc::clone(cert_store))
     .with_l4_servers(l4_servers, l4_reload_notify);
     let config_watcher = if let Some(dd) = dns_domains_for_watcher {
@@ -2679,6 +2751,17 @@ mod tests {
     /// test exists to fail loudly if a refactor regression breaks compilation
     /// in subtle ways — e.g. a helper signature changes while the orchestrator
     /// still calls the old one.
+    #[test]
+    fn stop_timing_defaults_under_ten_seconds_and_honours_drain_timeout() {
+        use super::stop_timing;
+        let config = dwaar_config::parser::parse("{\n    http_port 80\n}\n").expect("parse");
+        let (grace, runtime) = stop_timing(&config);
+        // Pingora sleeps grace + 2 × runtime on a graceful stop.
+        assert!(grace + 2 * runtime < 10, "{grace} + 2 × {runtime}");
+        let config = dwaar_config::parser::parse("{\n    drain_timeout 20\n}\n").expect("parse");
+        assert_eq!(stop_timing(&config).0, 20);
+    }
+
     #[test]
     fn fork_workers_compiles_and_helpers_callable() {
         // No-op: the test passes if the file compiles. Issue #172.

@@ -91,10 +91,11 @@ If you are scraping the `/analytics` JSON endpoint or the analytics-sourced rows
 
 `route_path` is a low-cardinality template of the request path, also written to
 access log lines: the query and fragment are dropped, empty segments are
-skipped, at most 6 segments are kept (a deeper path ends in `*`), a segment that
-is all digits, a UUID, 16 or more hex characters or longer than 32 characters
-becomes `:id`, and everything is lowercased (`/api/users/42/orders` →
-`/api/users/:id/orders`). Each route keeps its first 200 templates for the life
+dropped (so doubled and trailing slashes disappear), a segment that is all
+digits, a UUID, 16 or more hex characters or longer than 32 characters becomes
+`:id`, everything is lowercased, and the first 5 segments are kept — the 6th and
+every deeper segment together become one `*` (`/a/b/c/d/e/f/g` → `/a/b/c/d/e/*`;
+`/api/users/42/orders` → `/api/users/:id/orders`). Each route keeps its first 200 templates for the life
 of the process; any further template is reported as `other`.
 
 ### Upstream Metrics

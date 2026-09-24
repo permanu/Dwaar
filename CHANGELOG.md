@@ -21,14 +21,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dwaar_route_path_requests_total{route,route_path,status_class}` and
   `dwaar_route_path_request_duration_seconds{route,route_path}` carry a
   low-cardinality template of the request path (query and fragment dropped,
-  at most 6 segments with deeper paths ending in `*`, id-like segments as
-  `:id`, lowercased; `/api/users/42/orders` → `/api/users/:id/orders`). Each
+  id-like segments as `:id`, lowercased, the first 5 segments kept and the
+  6th and deeper collapsed into one `*`; `/api/users/42/orders` →
+  `/api/users/:id/orders`). Each
   route keeps its first 200 templates; any further one is `other`. The
   existing per-route series keep their labels.
+- **Admin-API routes persist.** Routes added with `POST /routes` or
+  `PUT /routes/snapshot` are written to `<state-dir>/admin-routes.json` (0600,
+  atomic) before they take effect, restored at start and kept across Dwaarfile
+  reloads; a failed write is `500` and changes nothing.
+- **ACME for admin-API routes.** A `"tls": true` admin route on a public
+  hostname gets its certificate like a Dwaarfile site, issued as soon as the
+  route is added (never for IP addresses or special-use names).
+- With `--admin-socket` (or a restored TLS admin route) the HTTPS listener is
+  bound at start even without a TLS site in the Dwaarfile.
 - `scripts/build-linux-glibc235.sh` builds linux amd64 and arm64 binaries in an
   `ubuntu:22.04` builder (glibc 2.35 floor, checked) with SHA-256 files.
 
+### Changed
+
+- The HTTPS listener defaults to `:443` when `http_port` is `80` and no
+  `https_port` is set (else `:6189` as before).
+- A graceful stop (SIGTERM) takes about 7 s instead of 60 s: Pingora's grace
+  period is `drain_timeout` only when the Dwaarfile sets one, else 5 s, and
+  the runtime shutdown timeout is 1 s.
+
 ### Security
+
+- Over HTTP/3, `X-Real-IP` and `X-Forwarded-For` are replaced with the QUIC
+  peer address like on HTTP/1 and HTTP/2 (client values were forwarded).
 
 - `X-Real-IP` and `X-Forwarded-For` from the client are dropped when Dwaar has
   no peer address (Unix-socket listeners) instead of being forwarded.
