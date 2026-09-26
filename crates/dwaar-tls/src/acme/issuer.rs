@@ -9,7 +9,7 @@
 //! Orchestrates the full ACME protocol for a single domain:
 //! account setup → order → HTTP-01 challenge → finalize → write cert.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use instant_acme::{
@@ -555,43 +555,56 @@ impl CertIssuer {
         cert_pem: &str,
         key_pem: &str,
     ) -> Result<(), AcmeError> {
-        // Reject any domain that could escape the cert directory via traversal.
-        // A valid DNS hostname never contains '/', '..', or null bytes.
-        if domain.contains('/') || domain.contains("..") || domain.contains('\0') {
-            return Err(AcmeError::CertWrite(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("domain '{domain}' contains unsafe characters for file path use"),
-            )));
-        }
+        store_cert_pair(&self.cert_dir, domain, cert_pem, key_pem).await
+    }
+}
 
-        let cert_path = self.cert_dir.join(format!("{domain}.pem"));
-        let key_path = self.cert_dir.join(format!("{domain}.key"));
+/// Write a cert chain and private key under `cert_dir` using atomic rename.
+///
+/// The directory is created only when this is called. A domain that could
+/// escape the directory is rejected before any file is created.
+pub(crate) async fn store_cert_pair(
+    cert_dir: &Path,
+    domain: &str,
+    cert_pem: &str,
+    key_pem: &str,
+) -> Result<(), AcmeError> {
+    // Reject any domain that could escape the cert directory via traversal.
+    // A valid DNS hostname never contains '/', '..', or null bytes.
+    if domain.contains('/') || domain.contains("..") || domain.contains('\0') {
+        return Err(AcmeError::CertWrite(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("domain '{domain}' contains unsafe characters for file path use"),
+        )));
+    }
 
-        // Ensure cert directory exists with 0700 permissions so only the
-        // dwaar user can list or read the directory contents. Mirrors the
-        // account.rs `ensure_acme_dir` pattern (private key material must
-        // never be world-readable). Permissions are re-applied on every
-        // call so an operator's out-of-band chmod can't leave the
-        // directory world-readable long-term.
-        fs::create_dir_all(&self.cert_dir)
+    let cert_path = cert_dir.join(format!("{domain}.pem"));
+    let key_path = cert_dir.join(format!("{domain}.key"));
+
+    // Ensure cert directory exists with 0700 permissions so only the
+    // dwaar user can list or read the directory contents. Mirrors the
+    // account.rs `ensure_acme_dir` pattern (private key material must
+    // never be world-readable). Permissions are re-applied on every
+    // call so an operator's out-of-band chmod can't leave the
+    // directory world-readable long-term.
+    fs::create_dir_all(cert_dir)
+        .await
+        .map_err(AcmeError::CertWrite)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o700);
+        fs::set_permissions(cert_dir, perms)
             .await
             .map_err(AcmeError::CertWrite)?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o700);
-            fs::set_permissions(&self.cert_dir, perms)
-                .await
-                .map_err(AcmeError::CertWrite)?;
-        }
-
-        atomic_write_pem(&cert_path, cert_pem, 0o644).await?;
-        atomic_write_pem(&key_path, key_pem, 0o600).await?;
-
-        debug!(domain, cert = %cert_path.display(), "cert files written");
-        Ok(())
     }
+
+    atomic_write_pem(&cert_path, cert_pem, 0o644).await?;
+    atomic_write_pem(&key_path, key_pem, 0o600).await?;
+
+    debug!(domain, cert = %cert_path.display(), "cert files written");
+    Ok(())
 }
 
 /// Write a PEM string to disk atomically via an unpredictable temp file

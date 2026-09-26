@@ -17,6 +17,7 @@
 pub mod admin_routes;
 pub mod cache;
 pub mod context;
+mod fake_issuer;
 pub mod fastcgi;
 pub mod file_server;
 pub mod grpc_web;
