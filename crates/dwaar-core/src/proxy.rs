@@ -208,6 +208,8 @@ pub struct ProxyConfig {
 pub struct DwaarProxy {
     route_table: Arc<ArcSwap<RouteTable>>,
     challenge_solver: Option<Arc<ChallengeSolver>>,
+    /// Permanu ownership tokens served at `/.well-known/permanu-challenge/<token>`.
+    permanu_challenges: Arc<crate::permanu_challenge::PermanuChallenges>,
     log_sender: Option<LogSender>,
     beacon_sender: Option<BeaconSender>,
     agg_sender: Option<AggSender>,
@@ -315,6 +317,7 @@ impl DwaarProxy {
         Self {
             route_table: config.route_table,
             challenge_solver: config.challenge_solver,
+            permanu_challenges: Arc::new(crate::permanu_challenge::PermanuChallenges::new()),
             log_sender: config.log_sender,
             beacon_sender: config.beacon_sender,
             agg_sender: config.agg_sender,
@@ -333,6 +336,15 @@ impl DwaarProxy {
             scale_to_zero_probe_cache: dashmap::DashMap::new(),
             route_paths: dwaar_analytics::route_path::RoutePathRegistry::default(),
         }
+    }
+
+    /// Tokens served at `/.well-known/permanu-challenge/<token>`.
+    ///
+    /// Register a token for an IP on the returned store. A `GET` for that IP
+    /// answers with the token; an unknown token is 404.
+    #[must_use]
+    pub const fn permanu_challenges(&self) -> &Arc<crate::permanu_challenge::PermanuChallenges> {
+        &self.permanu_challenges
     }
 
     /// Install the gRPC control-plane registries so Wheel #2 Weeks 4-5
@@ -679,6 +691,40 @@ impl DwaarProxy {
         Ok(true)
     }
 
+    /// Serve a Permanu ownership challenge without contacting an upstream.
+    ///
+    /// `200` body is the registered token. `404` is an empty body.
+    async fn send_permanu_challenge(
+        session: &mut Session,
+        reply: crate::permanu_challenge::ChallengeReply,
+    ) -> Result<bool> {
+        let end_of_body = reply.body.is_empty();
+        let header_count = if reply.status == 200 { 3 } else { 1 };
+        let mut resp = ResponseHeader::build(reply.status, Some(header_count))?;
+        let mut cl_buf = itoa::Buffer::new();
+        resp.insert_header("Content-Length", cl_buf.format(reply.body.len()))
+            .map_err(|e| Error::explain(HTTPStatus(reply.status), format!("bad header: {e}")))?;
+        if reply.status == 200 {
+            resp.insert_header("Content-Type", "text/plain")
+                .map_err(|e| {
+                    Error::explain(HTTPStatus(reply.status), format!("bad header: {e}"))
+                })?;
+            resp.insert_header("Cache-Control", "no-store")
+                .map_err(|e| {
+                    Error::explain(HTTPStatus(reply.status), format!("bad header: {e}"))
+                })?;
+        }
+        session
+            .write_response_header(Box::new(resp), end_of_body)
+            .await?;
+        if !end_of_body {
+            session
+                .write_response_body(Some(Bytes::from(reply.body)), true)
+                .await?;
+        }
+        Ok(true)
+    }
+
     /// Send a plugin-generated short-circuit response to the client.
     async fn send_plugin_response(
         session: &mut Session,
@@ -950,6 +996,23 @@ impl ProxyHttp for DwaarProxy {
                 );
                 return Self::send_internal_health_response(session).await;
             }
+        }
+
+        // Permanu ownership proof. GET only, and only this well-known path.
+        // Answered before plugins, auth, and the HTTPS redirect so a verifier
+        // hitting `http://<ip>/.well-known/permanu-challenge/<token>` gets the
+        // token (or 404) even when the IP has no route.
+        if let Some(reply) = self.permanu_challenges.reply(
+            ctx.plugin_ctx.host.as_deref(),
+            ctx.plugin_ctx.method.as_str(),
+            ctx.plugin_ctx.path.as_str(),
+        ) {
+            debug!(
+                request_id = %ctx.request_id(),
+                status = reply.status,
+                "serving permanu ownership challenge"
+            );
+            return Self::send_permanu_challenge(session, reply).await;
         }
 
         // --- Populate route-level plugin config ---

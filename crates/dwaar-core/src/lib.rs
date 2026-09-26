@@ -22,6 +22,7 @@ pub mod file_server;
 pub mod grpc_web;
 pub mod l4;
 pub mod l4_udp;
+pub mod permanu_challenge;
 pub mod proxy;
 pub mod quic;
 pub mod registries;
