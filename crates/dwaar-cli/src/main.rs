@@ -1460,7 +1460,8 @@ fn add_admin_service(
         admin_token,
     )
     .with_reload_notify(Arc::clone(&routes.config_notify))
-    .with_admin_routes(Arc::clone(&routes.admin_routes));
+    .with_admin_routes(Arc::clone(&routes.admin_routes))
+    .with_health_pools(Arc::clone(&routes.health_pools));
 
     let admin_service = if let Some(prom) = features_prometheus {
         admin_service.with_prometheus(Arc::clone(prom))

@@ -1134,7 +1134,7 @@ impl ProxyHttp for DwaarProxy {
 
                             // Cookie sticky sessions: read _dwaar_sticky cookie and
                             // use it to pin the visitor to a specific backend.
-                            if pool.policy() == crate::upstream::LbPolicy::Cookie {
+                            let selected = if pool.policy() == crate::upstream::LbPolicy::Cookie {
                                 let cookie_val = session
                                     .req_header()
                                     .headers
@@ -1148,20 +1148,37 @@ impl ProxyHttp for DwaarProxy {
                                     })
                                     .map(String::from);
 
-                                if let Some((addr, needs_set)) =
-                                    pool.select_cookie(cookie_val.as_deref())
-                                {
-                                    ctx.route_upstream = Some(addr);
-                                    if needs_set {
-                                        ctx.sticky_set_cookie = Some(
-                                            crate::upstream::UpstreamPool::sticky_set_cookie(addr),
-                                        );
+                                match pool.select_cookie(cookie_val.as_deref()) {
+                                    Some((addr, needs_set)) => {
+                                        if needs_set {
+                                            ctx.sticky_set_cookie = Some(
+                                                crate::upstream::UpstreamPool::sticky_set_cookie(
+                                                    addr,
+                                                ),
+                                            );
+                                        }
+                                        Some(addr)
                                     }
+                                    None => None,
                                 }
                             } else {
-                                ctx.route_upstream = pool.select(ctx.plugin_ctx.client_ip);
-                            }
+                                pool.select(ctx.plugin_ctx.client_ip)
+                            };
 
+                            // Every backend is unhealthy or at its cap. Do not
+                            // fall back to the route's first address.
+                            let Some(addr) = selected else {
+                                warn!(
+                                    request_id = %ctx.request_id(),
+                                    domain = %route.domain,
+                                    "no healthy upstream — returning 502"
+                                );
+                                let mut resp = ResponseHeader::build(502, Some(0))?;
+                                resp.insert_header("Content-Length", "0")?;
+                                session.write_response_header(Box::new(resp), true).await?;
+                                return Ok(true);
+                            };
+                            ctx.route_upstream = Some(addr);
                             ctx.upstream_pool = Some(pool.clone());
 
                             // Atomically claim the connection slot. `select()` is a
@@ -1169,9 +1186,7 @@ impl ProxyHttp for DwaarProxy {
                             // last slot between our check and this CAS. If we lose
                             // that race, return 503 now rather than letting the
                             // request hit the backend over its cap.
-                            if let Some(addr) = ctx.route_upstream
-                                && !pool.acquire_connection(addr)
-                            {
+                            if !pool.acquire_connection(addr) {
                                 warn!(
                                     request_id = %ctx.request_id(),
                                     upstream = %addr,

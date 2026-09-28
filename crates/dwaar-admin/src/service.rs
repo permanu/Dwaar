@@ -18,6 +18,7 @@ use dwaar_analytics::aggregation::DomainMetrics;
 use dwaar_analytics::prometheus::PrometheusMetrics;
 use dwaar_core::admin_routes::{AdminRouteError, AdminRoutes};
 use dwaar_core::route::RouteTable;
+use dwaar_core::upstream::UpstreamPool;
 use http::Response;
 use pingora_core::apps::http_app::ServeHttp;
 use pingora_core::protocols::http::ServerSession;
@@ -80,6 +81,9 @@ pub struct AdminService {
     /// Admin-API routes, kept (and persisted under `--state-dir`) apart from
     /// the Dwaarfile's so they survive reloads and restarts.
     admin_routes: Arc<AdminRoutes>,
+    /// Pools the existing health checker probes. Refreshed when an admin
+    /// route changes so a replica pool is not left out of that checker.
+    health_pools: Option<Arc<ArcSwap<Vec<Arc<UpstreamPool>>>>>,
 }
 
 impl std::fmt::Debug for AdminService {
@@ -118,6 +122,7 @@ impl AdminService {
             last_reload: AtomicU64::new(0),
             shutting_down: Arc::new(AtomicBool::new(false)),
             admin_routes: Arc::new(AdminRoutes::in_memory()),
+            health_pools: None,
         }
     }
 
@@ -134,6 +139,22 @@ impl AdminService {
     pub fn with_admin_routes(mut self, admin_routes: Arc<AdminRoutes>) -> Self {
         self.admin_routes = admin_routes;
         self
+    }
+
+    /// Probe admin replica pools with the process-wide health checker.
+    #[must_use]
+    pub fn with_health_pools(mut self, pools: Arc<ArcSwap<Vec<Arc<UpstreamPool>>>>) -> Self {
+        self.health_pools = Some(pools);
+        self
+    }
+
+    /// Replace the checker's pool list with the pools on the live route table.
+    fn refresh_health_pools(&self) {
+        let Some(pools) = &self.health_pools else {
+            return;
+        };
+        let collected = dwaar_config::compile::collect_pools(&self.route_table.load());
+        pools.store(Arc::new(collected));
     }
 
     /// Set the reload notifier for `POST /reload` support.
@@ -349,6 +370,7 @@ impl AdminService {
                         match handlers::add_route_with(&self.route_table, &self.admin_routes, &data)
                         {
                             Ok(json) => {
+                                self.refresh_health_pools();
                                 let resource = serde_json::from_slice::<serde_json::Value>(&data)
                                     .ok()
                                     .and_then(|v| v["domain"].as_str().map(str::to_owned))
@@ -376,7 +398,10 @@ impl AdminService {
                         &self.admin_routes,
                         &data,
                     ) {
-                        Ok(json) => json_response(200, &json),
+                        Ok(json) => {
+                            self.refresh_health_pools();
+                            json_response(200, &json)
+                        }
                         Err(e) => admin_route_error(&e),
                     },
                 }
@@ -397,6 +422,7 @@ impl AdminService {
                 match handlers::delete_route_with(&self.route_table, &self.admin_routes, domain) {
                     Err(e) => admin_route_error(&e),
                     Ok(Some(deleted)) => {
+                        self.refresh_health_pools();
                         tracing::info!(
                             target: "dwaar::admin::audit",
                             action = "route_delete",

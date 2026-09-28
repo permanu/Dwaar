@@ -488,6 +488,9 @@ impl ConfigWatcher {
                 // POST /routes that landed after the merge above is kept.
                 admin.store_merged(new_table.all_routes(), |merged| {
                     let merged = RouteTable::new(merged);
+                    if let Some(ref hp) = self.health_pools {
+                        hp.store(Arc::new(collect_pools(&merged)));
+                    }
                     drain_removed_routes(&old_table, &merged, drain_timeout);
                     self.route_table.store(Arc::new(merged));
                 });
@@ -1186,6 +1189,7 @@ a.com {
                 AdminRouteSpec {
                     domain: "hooks.example.com".into(),
                     upstream: "127.0.0.1:7461".into(),
+                    upstreams: Vec::new(),
                     tls: true,
                     source: None,
                     kind: RouteKind::Webhook,

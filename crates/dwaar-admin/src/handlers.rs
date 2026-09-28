@@ -40,6 +40,9 @@ const ADMIN_CAPABILITIES: &[&str] = &[
 pub struct CreateRouteRequest {
     pub domain: String,
     pub upstream: String,
+    /// Replica addresses. Absent or empty keeps the single-upstream path.
+    #[serde(default)]
+    pub upstreams: Vec<String>,
     pub tls: bool,
     /// Which component owns this route (e.g. "dwaar-ingress").
     /// Used by reconcilers to identify their own routes.
@@ -55,6 +58,9 @@ pub struct CreateRouteRequest {
 pub struct SnapshotRouteRequest {
     pub domain: String,
     pub upstream: String,
+    /// Replica addresses. Absent or empty keeps the single-upstream path.
+    #[serde(default)]
+    pub upstreams: Vec<String>,
     pub tls: bool,
     /// `proxy` (default) or `webhook`.
     #[serde(default)]
@@ -180,6 +186,7 @@ pub fn add_route_with(
     let spec = AdminRouteSpec {
         domain: req.domain,
         upstream: req.upstream,
+        upstreams: req.upstreams,
         tls: req.tls,
         source: req.source,
         kind: req.kind,
@@ -237,6 +244,7 @@ pub fn apply_route_snapshot_with(
         .map(|r| AdminRouteSpec {
             domain: r.domain,
             upstream: r.upstream,
+            upstreams: r.upstreams,
             tls: r.tls,
             source: None,
             kind: r.kind,
@@ -319,6 +327,11 @@ fn hash_route_snapshot(source: &str, routes: &[Route]) -> String {
             hasher.update(upstream.to_string().as_bytes());
         }
         hasher.update(b"\0");
+        // Further replicas only. A single upstream hashes exactly as before.
+        for extra in route.state().upstreams.iter().skip(1) {
+            hasher.update(extra.upstream.as_bytes());
+            hasher.update(b"\0");
+        }
         hasher.update(if route.tls { b"1" } else { b"0" });
         // Proxy routes hash exactly as before `kind` existed.
         if route.kind == RouteKind::Webhook {
