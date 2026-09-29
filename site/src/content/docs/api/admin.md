@@ -180,6 +180,21 @@ curl -X POST \
 | `upstream` | string | yes | Socket address in `host:port` form |
 | `tls` | boolean | yes | Connect to upstream with TLS |
 | `source` | string | no | Controller identity tag for ownership tracking |
+| `kind` | string | no | `proxy` (default) or `webhook`, see below |
+
+**Webhook routes** (`"kind": "webhook"`, capability `routes.webhook` in `GET /version`). A webhook intake route forwards only `/hooks/*` on its host, path and query unchanged, to a **loopback** upstream (`127.0.0.1` or `::1`; anything else is `400`). The request body is capped at 1 MiB (`413`, also for chunked bodies and regardless of a gRPC `Content-Type`), the response is never cached, gRPC and WebSocket handling are off, `X-Real-IP` / `X-Forwarded-For` are always Dwaar's view of the client, HTTP/3 requests get `421` so clients retry over HTTP/1.1 or HTTP/2, and every other path on the host is `404`. The domain must be an exact hostname (no wildcard). `GET /routes` lists such a route with `"kind": "webhook"`; proxy routes carry no `kind` field. `PUT /routes/snapshot` entries take the same optional `kind`.
+
+```json
+{
+  "domain": "hooks.example.com",
+  "upstream": "127.0.0.1:7461",
+  "tls": true,
+  "source": "permanu",
+  "kind": "webhook"
+}
+```
+
+**Persistence and certificates.** Routes added with `POST /routes` or `PUT /routes/snapshot` are written to `<state-dir>/admin-routes.json` (mode `0600`, replaced atomically) before they take effect, and restored at the next start; a Dwaarfile reload keeps them (they are laid over the Dwaarfile's routes). Without an existing state directory they live in memory only. If the file cannot be written the change is refused with `500` and nothing changes. A route with `"tls": true` on a public hostname gets its certificate by ACME (TLS-ALPN-01, then HTTP-01) like a Dwaarfile site; IP addresses and special-use names (`.test`, `.example`, `.invalid`, `.local`, `.localhost`, `.home.arpa`) never do. With `--admin-socket` the HTTPS listener is bound at start even when no Dwaarfile site uses TLS, on `https_port`, or `443` when `http_port` is `80`.
 
 **Response** `201 Created`
 
@@ -200,6 +215,7 @@ curl -X POST \
 |---|---|
 | `201` | Route created or replaced |
 | `400` | Invalid JSON, invalid domain, or invalid upstream address |
+| `500` | The route could not be persisted under the state directory; nothing changed |
 | `401` | Missing or invalid bearer token (TCP only) |
 | `413` | Request body exceeds 64 KB |
 | `429` | Rate limit exceeded |

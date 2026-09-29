@@ -52,6 +52,9 @@ pub struct TlsBackgroundService {
     /// Optional DNS provider for DNS-01 challenges (e.g. Cloudflare).
     dns_provider: Option<Arc<dyn DnsProvider>>,
     reload_notify: Option<Arc<tokio::sync::Notify>>,
+    /// Woken when admin-API routes add a TLS hostname (`notify_one`, so a
+    /// change made during an issuance is not missed).
+    domains_notify: Option<Arc<tokio::sync::Notify>>,
     in_flight: tokio::sync::Mutex<HashSet<String>>,
 }
 
@@ -82,6 +85,7 @@ impl TlsBackgroundService {
             cert_store,
             dns_provider: None,
             reload_notify: None,
+            domains_notify: None,
             in_flight: tokio::sync::Mutex::new(HashSet::new()),
         }
     }
@@ -109,6 +113,13 @@ impl TlsBackgroundService {
     #[must_use]
     pub fn with_reload_notify(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
         self.reload_notify = Some(notify);
+        self
+    }
+
+    /// Wake the TLS manager when admin-API routes change the domain list.
+    #[must_use]
+    pub fn with_domains_notify(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
+        self.domains_notify = Some(notify);
         self
     }
 
@@ -433,33 +444,31 @@ impl BackgroundService for TlsBackgroundService {
         self.refresh_ocsp_responses().await;
 
         loop {
-            if let Some(reload_notify) = &self.reload_notify {
-                tokio::select! {
-                    () = tokio::time::sleep(super::SERVICE_CHECK_INTERVAL) => {
-                        self.refresh_ocsp_responses().await;
-                        self.daily_renewal().await;
-                    }
-                    () = reload_notify.notified() => {
-                        self.daily_renewal().await;
-                    }
-                    _ = shutdown.changed() => {
-                        info!("TLS background service shutting down");
-                        return;
-                    }
+            tokio::select! {
+                () = tokio::time::sleep(super::SERVICE_CHECK_INTERVAL) => {
+                    self.refresh_ocsp_responses().await;
+                    self.daily_renewal().await;
                 }
-            } else {
-                tokio::select! {
-                    () = tokio::time::sleep(super::SERVICE_CHECK_INTERVAL) => {
-                        self.refresh_ocsp_responses().await;
-                        self.daily_renewal().await;
-                    }
-                    _ = shutdown.changed() => {
-                        info!("TLS background service shutting down");
-                        return;
-                    }
+                () = notified(self.reload_notify.as_deref()) => {
+                    self.daily_renewal().await;
+                }
+                () = notified(self.domains_notify.as_deref()) => {
+                    self.daily_renewal().await;
+                }
+                _ = shutdown.changed() => {
+                    info!("TLS background service shutting down");
+                    return;
                 }
             }
         }
+    }
+}
+
+/// Wait on `notify`, or forever when there is none.
+async fn notified(notify: Option<&tokio::sync::Notify>) {
+    match notify {
+        Some(n) => n.notified().await,
+        None => std::future::pending().await,
     }
 }
 

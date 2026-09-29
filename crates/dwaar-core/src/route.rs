@@ -452,6 +452,33 @@ pub struct HandlerBlock {
     pub is_grpc_route: bool,
 }
 
+impl HandlerBlock {
+    /// A `handle` block with no middleware, limits or cache: just `matcher`
+    /// and `handler`.
+    pub fn plain(matcher: PathMatcher, handler: Handler) -> Self {
+        Self {
+            kind: BlockKind::Handle,
+            matcher,
+            rate_limit_rps: None,
+            under_attack: false,
+            rewrites: vec![],
+            basic_auth: None,
+            forward_auth: None,
+            maps: vec![],
+            log_append_fields: vec![],
+            log_name: None,
+            handler,
+            intercepts: vec![],
+            copy_response_headers: None,
+            ip_filter: None,
+            request_body_max_size: None,
+            response_body_max_size: None,
+            cache: None,
+            is_grpc_route: false,
+        }
+    }
+}
+
 // ── Compiled Map (ISSUE-056) ──────────────────────────────────────
 
 /// A compiled `map {source} {dest_var} { ... }` directive.
@@ -546,6 +573,30 @@ pub fn build_single_backend_peer(upstream: SocketAddr) -> HttpPeer {
     peer
 }
 
+// ── Route kinds ──────────────────────────────────────────────
+
+/// Path prefix a [`RouteKind::Webhook`] route forwards (agent-protocol §11.1:
+/// `POST /hooks/<project_id>`). Everything else on the host is answered 404.
+pub const WEBHOOK_PATH_PREFIX: &str = "/hooks/";
+
+/// Request body cap of a [`RouteKind::Webhook`] route: 1 MiB. Larger bodies
+/// get 413 before anything reaches the upstream (agent-protocol §11.1).
+pub const WEBHOOK_MAX_BODY_BYTES: u64 = 1024 * 1024;
+
+/// What a route is for. Admin-API clients choose it with `kind`; routes from a
+/// Dwaarfile are always [`RouteKind::Proxy`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteKind {
+    /// Ordinary reverse-proxy site (the default).
+    #[default]
+    Proxy,
+    /// Webhook intake: only `/hooks/*` is forwarded, to a loopback listener,
+    /// as plain HTTP/1 with a [`WEBHOOK_MAX_BODY_BYTES`] body cap, no response
+    /// cache and no gRPC or WebSocket treatment; every other path is 404.
+    Webhook,
+}
+
 // ── Route ────────────────────────────────────────────────────
 
 /// A site: one domain with its handler blocks.
@@ -605,6 +656,9 @@ pub struct Route {
     /// without specifying a source. Used by the reconciler to identify
     /// controller-owned routes and avoid touching foreign ones.
     pub source: Option<String>,
+
+    /// What the route is for; see [`RouteKind`].
+    pub kind: RouteKind,
 }
 
 /// Runtime state for one route as exposed by the admin API.
@@ -684,6 +738,7 @@ impl Route {
             active_connections: Arc::new(AtomicU32::new(0)),
             draining: Arc::new(AtomicBool::new(false)),
             source,
+            kind: RouteKind::Proxy,
         }
     }
 
@@ -721,7 +776,40 @@ impl Route {
             active_connections: Arc::new(AtomicU32::new(0)),
             draining: Arc::new(AtomicBool::new(false)),
             source: None, // Dwaarfile-compiled routes have no external source
+            kind: RouteKind::Proxy,
         }
+    }
+
+    /// Create a webhook intake route ([`RouteKind::Webhook`]).
+    ///
+    /// `/hooks/*` goes to `upstream` unchanged (path and query kept) with a
+    /// [`WEBHOOK_MAX_BODY_BYTES`] body cap and no cache; any other path gets an
+    /// empty 404 without touching the upstream. The caller validates that
+    /// `upstream` is a loopback address.
+    pub fn webhook(domain: &str, upstream: SocketAddr, tls: bool, source: Option<String>) -> Self {
+        let forward = HandlerBlock {
+            request_body_max_size: Some(WEBHOOK_MAX_BODY_BYTES),
+            ..HandlerBlock::plain(
+                PathMatcher::Prefix(CompactString::const_new(WEBHOOK_PATH_PREFIX)),
+                Handler::ReverseProxy {
+                    upstream,
+                    upstream_h2: false,
+                    pre_built_peer: Some(Arc::new(build_single_backend_peer(upstream))),
+                },
+            )
+        };
+        let not_found = HandlerBlock::plain(
+            PathMatcher::Any,
+            Handler::StaticResponse {
+                status: 404,
+                body: bytes::Bytes::new(),
+            },
+        );
+        let mut route =
+            Self::with_handlers(domain, tls, vec![forward, not_found], VarSlots::default());
+        route.source = source;
+        route.kind = RouteKind::Webhook;
+        route
     }
 
     /// The source tag, if any.
@@ -832,13 +920,19 @@ impl Route {
 impl serde::Serialize for Route {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("Route", 7)?;
+        let mut s = serializer.serialize_struct("Route", 8)?;
         s.serialize_field("domain", &self.domain)?;
         s.serialize_field("upstream", &self.upstream().map(|a| a.to_string()))?;
         s.serialize_field("tls", &self.tls)?;
         s.serialize_field("rate_limit_rps", &self.rate_limit_rps())?;
         s.serialize_field("under_attack", &self.under_attack())?;
         s.serialize_field("source", &self.source)?;
+        // Proxy routes keep their pre-`kind` JSON shape byte for byte.
+        if self.kind == RouteKind::Proxy {
+            s.skip_field("kind")?;
+        } else {
+            s.serialize_field("kind", &self.kind)?;
+        }
         s.serialize_field("state", &self.state())?;
         s.end()
     }
@@ -1559,5 +1653,87 @@ mod tests {
     #[test]
     fn route_key_rejects_empty() {
         assert!(!is_valid_route_key(""));
+    }
+
+    // ── Webhook routes (agent-protocol §11.1) ────────────────
+
+    fn webhook_block<'a>(route: &'a Route, path: &str) -> &'a HandlerBlock {
+        route
+            .handlers
+            .iter()
+            .find(|b| b.matcher.matches(path).is_some())
+            .expect("a block matches every path")
+    }
+
+    #[test]
+    fn webhook_route_forwards_hooks_paths_with_body_cap_and_no_cache() {
+        let route = Route::webhook(
+            "hooks.example.com",
+            addr(7461),
+            true,
+            Some("permanu".into()),
+        );
+        assert_eq!(route.kind, RouteKind::Webhook);
+        assert_eq!(route.domain, "hooks.example.com");
+        assert_eq!(route.upstream(), Some(addr(7461)));
+        assert_eq!(route.source(), Some("permanu"));
+
+        let block = webhook_block(&route, "/hooks/prj_01H");
+        match &block.handler {
+            Handler::ReverseProxy {
+                upstream,
+                upstream_h2,
+                pre_built_peer,
+            } => {
+                assert_eq!(*upstream, addr(7461));
+                assert!(!upstream_h2);
+                assert!(pre_built_peer.is_some());
+            }
+            other => panic!("expected ReverseProxy, got {other:?}"),
+        }
+        assert_eq!(block.kind, BlockKind::Handle, "path is forwarded unchanged");
+        assert_eq!(block.request_body_max_size, Some(WEBHOOK_MAX_BODY_BYTES));
+        assert_eq!(WEBHOOK_MAX_BODY_BYTES, 1024 * 1024);
+        assert!(block.cache.is_none());
+        assert!(!block.is_grpc_route);
+    }
+
+    #[test]
+    fn webhook_route_answers_404_outside_hooks_prefix() {
+        let route = Route::webhook("hooks.example.com", addr(7461), true, None);
+        for path in ["/", "/hooks", "/hook/x", "/admin", "/HOOKS/x"] {
+            match &webhook_block(&route, path).handler {
+                Handler::StaticResponse { status, body } => {
+                    assert_eq!(*status, 404, "{path}");
+                    assert!(body.is_empty());
+                }
+                other => panic!("{path}: expected 404, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn webhook_route_serializes_its_kind_and_proxy_routes_do_not() {
+        let hook = Route::webhook("hooks.example.com", addr(7461), true, None);
+        let json = serde_json::to_value(&hook).expect("serialize");
+        assert_eq!(json["kind"], "webhook");
+        assert_eq!(json["upstream"], "127.0.0.1:7461");
+
+        let plain = Route::new("app.example.com", addr(3000), false, None);
+        let json = serde_json::to_value(&plain).expect("serialize");
+        assert!(
+            json.get("kind").is_none(),
+            "proxy routes keep the old shape"
+        );
+        assert_eq!(plain.kind, RouteKind::Proxy);
+    }
+
+    #[test]
+    fn route_kind_parses_from_snake_case() {
+        let kind: RouteKind = serde_json::from_str("\"webhook\"").expect("parse");
+        assert_eq!(kind, RouteKind::Webhook);
+        let kind: RouteKind = serde_json::from_str("\"proxy\"").expect("parse");
+        assert_eq!(kind, RouteKind::Proxy);
+        assert!(serde_json::from_str::<RouteKind>("\"other\"").is_err());
     }
 }

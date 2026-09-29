@@ -11,6 +11,7 @@
 //! Dwaar-specific names (--upgrade, --daemon, --test, --config).
 
 use clap::{Parser, Subcommand};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -38,6 +39,27 @@ impl FromStr for WorkerCount {
                 "invalid worker count '{s}': expected 'auto' or a positive integer"
             )),
         }
+    }
+}
+
+/// `--state-dir` must be absolute so the ACME and certificate paths never
+/// depend on the working directory the service manager happens to use.
+fn parse_admin_address(value: &str) -> Result<SocketAddr, String> {
+    let address: SocketAddr = value
+        .parse()
+        .map_err(|_| "admin address must be an IP address and port".to_string())?;
+    if !address.ip().is_loopback() || address.port() == 0 {
+        return Err("admin address must use loopback and a nonzero port".to_string());
+    }
+    Ok(address)
+}
+
+fn parse_state_dir(s: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(s);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Err(format!("state dir must be an absolute path, got '{s}'"))
     }
 }
 
@@ -79,10 +101,26 @@ pub(crate) struct Cli {
     #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "/var/run/dwaar-admin.sock")]
     pub admin_socket: Option<PathBuf>,
 
+    /// Directory for Dwaar's state: the ACME account (`<DIR>/acme`) and the
+    /// issued certificates (`<DIR>/certs`). Must be absolute. Under systemd
+    /// point it at the unit's state directory, e.g. `/var/lib/dwaar`.
+    #[arg(
+        long,
+        value_name = "DIR",
+        env = "DWAAR_STATE_DIR",
+        default_value = "/etc/dwaar",
+        value_parser = parse_state_dir
+    )]
+    pub state_dir: PathBuf,
+
     /// Listening address for the `DwaarControl` gRPC server (Wheel #2).
     /// Defaults to 127.0.0.1:9091. Set to an empty string to disable.
     #[arg(long, env = "DWAAR_GRPC_ADDR", default_value = "127.0.0.1:9091")]
     pub grpc_addr: String,
+
+    /// Loopback TCP address for the admin API. A UDS can also be enabled.
+    #[arg(long, default_value = "127.0.0.1:6190", value_parser = parse_admin_address)]
+    pub admin_address: SocketAddr,
 
     /// Bare mode — disable all optional features (logging, plugins, analytics, geoip).
     /// Use for maximum throughput in CDN edge nodes.
@@ -192,6 +230,16 @@ impl Cli {
     /// the import isolated to this module.
     pub(crate) fn parse_args() -> Self {
         <Self as Parser>::parse()
+    }
+
+    /// ACME account directory: `<state-dir>/acme`.
+    pub(crate) fn acme_dir(&self) -> PathBuf {
+        self.state_dir.join("acme")
+    }
+
+    /// Managed certificate directory: `<state-dir>/certs`.
+    pub(crate) fn cert_dir(&self) -> PathBuf {
+        self.state_dir.join("certs")
     }
 
     /// --bare implies all individual --no-* flags.
@@ -473,6 +521,14 @@ mod tests {
     }
 
     #[test]
+    fn admin_address_accepts_only_explicit_loopback_ports() {
+        assert!(Cli::try_parse_from(["dwaar", "--admin-address", "127.0.0.1:45678"]).is_ok());
+        assert!(Cli::try_parse_from(["dwaar", "--admin-address", "[::1]:45678"]).is_ok());
+        assert!(Cli::try_parse_from(["dwaar", "--admin-address", "0.0.0.0:45678"]).is_err());
+        assert!(Cli::try_parse_from(["dwaar", "--admin-address", "127.0.0.1:0"]).is_err());
+    }
+
+    #[test]
     fn bare_flag() {
         let cli = Cli::try_parse_from(["dwaar", "--bare"]).expect("parse");
         assert!(cli.bare);
@@ -527,5 +583,26 @@ mod tests {
         assert!(cli.plugins_enabled());
         assert!(cli.analytics_enabled());
         assert!(cli.geoip_enabled());
+    }
+
+    #[test]
+    fn state_dir_defaults_to_etc_dwaar() {
+        let cli = Cli::try_parse_from(["dwaar"]).expect("parse");
+        assert_eq!(cli.acme_dir(), PathBuf::from("/etc/dwaar/acme"));
+        assert_eq!(cli.cert_dir(), PathBuf::from("/etc/dwaar/certs"));
+    }
+
+    #[test]
+    fn state_dir_moves_acme_and_cert_dirs() {
+        let cli = Cli::try_parse_from(["dwaar", "--state-dir", "/var/lib/dwaar"]).expect("parse");
+        assert_eq!(cli.state_dir, PathBuf::from("/var/lib/dwaar"));
+        assert_eq!(cli.acme_dir(), PathBuf::from("/var/lib/dwaar/acme"));
+        assert_eq!(cli.cert_dir(), PathBuf::from("/var/lib/dwaar/certs"));
+    }
+
+    #[test]
+    fn state_dir_rejects_a_relative_path() {
+        assert!(Cli::try_parse_from(["dwaar", "--state-dir", "var/lib/dwaar"]).is_err());
+        assert!(Cli::try_parse_from(["dwaar", "--state-dir", ""]).is_err());
     }
 }

@@ -203,10 +203,13 @@ fn child_exited(pid: libc::pid_t) -> Option<String> {
 /// If a UDS path was supplied we prefer it — it is deterministic and only
 /// worker 0 binds it. Otherwise fall back to the TCP admin listener, which
 /// is unconditionally registered on `127.0.0.1:6190` by worker 0.
-pub(crate) fn target_from_admin_socket(admin_socket: Option<&Path>) -> ReadinessTarget {
+pub(crate) fn target_from_admin_socket(
+    admin_socket: Option<&Path>,
+    admin_address: &str,
+) -> ReadinessTarget {
     match admin_socket {
         Some(path) => ReadinessTarget::Uds(path.to_path_buf()),
-        None => ReadinessTarget::Tcp("127.0.0.1:6190".to_string()),
+        None => ReadinessTarget::Tcp(admin_address.to_string()),
     }
 }
 
@@ -257,7 +260,7 @@ mod tests {
     #[test]
     fn target_from_admin_socket_prefers_uds() {
         let path = PathBuf::from("/var/run/dwaar-admin.sock");
-        match target_from_admin_socket(Some(&path)) {
+        match target_from_admin_socket(Some(&path), "127.0.0.1:6190") {
             ReadinessTarget::Uds(p) => assert_eq!(p, path),
             ReadinessTarget::Tcp(_) => panic!("expected UDS target when admin_socket is set"),
         }
@@ -265,7 +268,7 @@ mod tests {
 
     #[test]
     fn target_from_admin_socket_falls_back_to_tcp() {
-        match target_from_admin_socket(None) {
+        match target_from_admin_socket(None, "127.0.0.1:6190") {
             ReadinessTarget::Tcp(addr) => assert_eq!(addr, "127.0.0.1:6190"),
             ReadinessTarget::Uds(_) => panic!("expected TCP target when admin_socket is None"),
         }

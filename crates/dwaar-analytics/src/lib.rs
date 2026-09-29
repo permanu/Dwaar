@@ -34,6 +34,7 @@ pub mod otel;
 pub mod process_metrics;
 pub mod prometheus;
 pub mod rate_cache_metrics;
+pub mod route_path;
 pub mod sink;
 
 #[cfg(test)]
