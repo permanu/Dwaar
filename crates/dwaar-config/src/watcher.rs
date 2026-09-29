@@ -218,8 +218,8 @@ impl ConfigWatcher {
         self
     }
 
-    /// Attach the shared cache backend so hot-reload can resize the LRU
-    /// eviction budget without a restart (ISSUE-111).
+    /// Attach the process cache backend. Changes to its capacity require a
+    /// restart; a rejected reload retains all active configuration.
     #[must_use]
     pub fn with_cache_backend(mut self, backend: dwaar_core::cache::SharedCacheBackend) -> Self {
         self.cache_backend = Some(backend);
@@ -408,6 +408,10 @@ impl ConfigWatcher {
             return;
         }
 
+        if !refresh_cache_backend(self.cache_backend.as_ref(), &new_table) {
+            return;
+        }
+
         refresh_sni_map(
             self.sni_domain_map.as_ref(),
             self.cert_store.as_ref(),
@@ -440,8 +444,6 @@ impl ConfigWatcher {
             dd.store(Arc::new(dns_domain_list));
             debug!("DNS-01 domain list refreshed");
         }
-
-        refresh_cache_backend(self.cache_backend.as_ref(), &new_table);
 
         // ISSUE-120: diff WASM module references against the previous reload
         // and invalidate anything that was removed or whose file changed.
@@ -804,13 +806,12 @@ fn refresh_wasm_cache(
     *guard = new_snapshot;
 }
 
-/// Resize the cache backend if the max cache size in the new route table
-/// differs from the current one. Skips reallocation when unchanged.
+/// A changed cache capacity requires restart; retain the entire active config.
 fn refresh_cache_backend(
     cache_backend: Option<&dwaar_core::cache::SharedCacheBackend>,
     new_table: &RouteTable,
-) {
-    let Some(cb) = cache_backend else { return };
+) -> bool {
+    let Some(cb) = cache_backend else { return true };
     let new_max = new_table
         .all_routes()
         .iter()
@@ -818,9 +819,17 @@ fn refresh_cache_backend(
         .filter_map(|h| h.cache.as_ref())
         .map(|c| c.max_size)
         .max();
-    if let Some(size) = new_max {
-        dwaar_core::cache::realloc_cache_backend(cb, size);
+    if let Some(size) = new_max
+        && let Err(required) = dwaar_core::cache::realloc_cache_backend(cb, size)
+    {
+        warn!(
+            active_size = required.active_size,
+            requested_size = required.requested_size,
+            "restart_required: cache capacity changed; keeping current config"
+        );
+        return false;
     }
+    true
 }
 
 /// Swap in a freshly compiled set of explicit TLS cert paths.
@@ -1179,6 +1188,7 @@ a.com {
         std::fs::write(&config_path, initial).expect("write");
         let config = parser::parse(initial).expect("parse");
         let table = Arc::new(ArcSwap::from_pointee(compile_routes(&config)));
+
         let acme_domains = Arc::new(ArcSwap::from_pointee(compile_acme_domains(&config)));
         let admin = Arc::new(AdminRoutes::in_memory().with_acme(
             Arc::clone(&acme_domains),
@@ -1344,51 +1354,46 @@ b.com {
     }
 
     #[test]
-    fn reload_resizes_cache_backend() {
+    fn cache_resize_requires_restart_and_retains_active_configuration() {
         use dwaar_core::cache::{SharedCacheBackend, new_cache_backend};
 
         let dir = tempfile::tempdir().expect("tempdir");
         let config_path = dir.path().join("Dwaarfile");
 
-        let initial = "\
-a.com {
-    reverse_proxy 127.0.0.1:8080
-    cache {
-        max_size 1m
-    }
-}
-";
-        std::fs::write(&config_path, initial).expect("write");
+        let active = new_cache_backend(1_048_576).max_size;
+        let initial = format!(
+            "a.com {{\n reverse_proxy 127.0.0.1:8080\n cache {{\n max_size {active}\n }}\n}}\n"
+        );
+        std::fs::write(&config_path, &initial).expect("write");
         let initial_hash = hash_content(initial.as_bytes());
 
-        let config = parser::parse(initial).expect("parse");
+        let config = parser::parse(&initial).expect("parse");
         let table = Arc::new(ArcSwap::from_pointee(compile_routes(&config)));
 
         let cache_backend: SharedCacheBackend =
-            Arc::new(ArcSwap::from_pointee(Some(new_cache_backend(1_048_576))));
-        assert_eq!(read_cache_max_size(&cache_backend), 1_048_576);
+            Arc::new(ArcSwap::from_pointee(Some(new_cache_backend(active))));
+        let active_table = table.load_full();
+        assert_eq!(read_cache_max_size(&cache_backend), active);
 
         let watcher = ConfigWatcher::new(config_path.clone(), Arc::clone(&table), initial_hash)
             .with_cache_backend(Arc::clone(&cache_backend));
 
         // Reload with larger cache
-        let updated = "\
-a.com {
-    reverse_proxy 127.0.0.1:8080
-    cache {
-        max_size 4m
-    }
-}
-";
-        std::fs::write(&config_path, updated).expect("write");
+        let updated = format!(
+            "a.com {{\n reverse_proxy 127.0.0.1:8080\n cache {{\n max_size {}\n }}\n}}\n",
+            active + 1
+        );
+        std::fs::write(&config_path, &updated).expect("write");
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         watcher.try_reload(&shutdown_rx);
 
         assert_eq!(
             read_cache_max_size(&cache_backend),
-            4_194_304,
-            "cache backend should reflect new max_size after reload"
+            active,
+            "cache resize must retain the active backend until restart"
         );
+        assert!(Arc::ptr_eq(&active_table, &table.load_full()));
+        assert_eq!(*watcher.last_hash.lock(), initial_hash);
     }
 
     #[test]
@@ -1398,37 +1403,28 @@ a.com {
         let dir = tempfile::tempdir().expect("tempdir");
         let config_path = dir.path().join("Dwaarfile");
 
-        let initial = "\
-a.com {
-    reverse_proxy 127.0.0.1:8080
-    cache {
-        max_size 2m
-    }
-}
-";
-        std::fs::write(&config_path, initial).expect("write");
+        let active = new_cache_backend(2_097_152).max_size;
+        let initial = format!(
+            "a.com {{\n reverse_proxy 127.0.0.1:8080\n cache {{\n max_size {active}\n }}\n}}\n"
+        );
+        std::fs::write(&config_path, &initial).expect("write");
         let initial_hash = hash_content(initial.as_bytes());
 
-        let config = parser::parse(initial).expect("parse");
+        let config = parser::parse(&initial).expect("parse");
         let table = Arc::new(ArcSwap::from_pointee(compile_routes(&config)));
 
         let cache_backend: SharedCacheBackend =
-            Arc::new(ArcSwap::from_pointee(Some(new_cache_backend(2_097_152))));
+            Arc::new(ArcSwap::from_pointee(Some(new_cache_backend(active))));
         let ptr_before = cache_storage_addr(&cache_backend);
 
         let watcher = ConfigWatcher::new(config_path.clone(), Arc::clone(&table), initial_hash)
             .with_cache_backend(Arc::clone(&cache_backend));
 
         // Reload with different route but same cache size
-        let updated = "\
-a.com {
-    reverse_proxy 127.0.0.1:9090
-    cache {
-        max_size 2m
-    }
-}
-";
-        std::fs::write(&config_path, updated).expect("write");
+        let updated = format!(
+            "a.com {{\n reverse_proxy 127.0.0.1:9090\n cache {{\n max_size {active}\n }}\n}}\n"
+        );
+        std::fs::write(&config_path, &updated).expect("write");
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         watcher.try_reload(&shutdown_rx);
 

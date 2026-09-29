@@ -1152,8 +1152,8 @@ fn build_feature_state(
         None
     };
 
-    // Cache backend (ISSUE-073, ISSUE-111 hot-reload): wrapped in ArcSwap
-    // so ConfigWatcher can swap in a resized backend on reload.
+    // One process cache backend. The watcher rejects capacity changes until
+    // restart, retaining active routes and their cache policy.
     let cache_backend: Option<dwaar_core::cache::SharedCacheBackend> = if cli.cache_enabled() {
         let max_cache_size = route_table
             .load()

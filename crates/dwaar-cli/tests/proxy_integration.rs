@@ -1163,6 +1163,68 @@ fn cache_miss_then_hit() {
     thread::sleep(Duration::from_secs(1));
 }
 
+fn verify_shared_cache_bypass(request_header: Option<(&str, &str)>, response_header: &str) {
+    let _lock = PORT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let upstream = TcpListener::bind(upstream_address()).expect("upstream");
+    let (_directory, config) = write_test_config(
+        "private-cache.dwaarfile",
+        "127.0.0.1 {\n reverse_proxy 127.0.0.1:8080\n cache {\n default_ttl 60\n }\n}\n",
+    );
+    let child = start_dwaar_with_config(Some(&config));
+    let count = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&count);
+    let control = format!("public, max-age=60{response_header}");
+    let handle = thread::spawn(move || {
+        serve_cacheable_upstream(&upstream, &control, "isolated", 2, &observed);
+    });
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("client");
+    for _ in 0..2 {
+        let mut request = client.get(format!("http://{}/same", proxy_address()));
+        if let Some((name, value)) = request_header {
+            request = request.header(name, value);
+        }
+        let response = request.send().expect("response");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_ne!(
+            response
+                .headers()
+                .get("x-cache")
+                .and_then(|value| value.to_str().ok()),
+            Some("HIT")
+        );
+        assert_eq!(response.text().expect("body"), "isolated");
+    }
+    handle.join().expect("upstream");
+    assert_eq!(count.load(Ordering::SeqCst), 2);
+    stop_dwaar(child);
+}
+
+#[test]
+fn authorized_requests_bypass_shared_cache() {
+    verify_shared_cache_bypass(Some(("authorization", "Bearer fixture")), "");
+}
+
+#[test]
+fn cookie_requests_bypass_shared_cache() {
+    verify_shared_cache_bypass(Some(("cookie", "session=fixture")), "");
+}
+
+#[test]
+fn vary_responses_bypass_shared_cache() {
+    verify_shared_cache_bypass(None, "\r\nVary: Accept-Language");
+}
+
+#[test]
+fn set_cookie_responses_bypass_shared_cache() {
+    verify_shared_cache_bypass(None, "\r\nSet-Cookie: session=fixture");
+}
+
 /// ISSUE-073: When the upstream responds with Cache-Control: no-store,
 /// the proxy must NOT cache the response. Both requests should be MISS.
 #[test]

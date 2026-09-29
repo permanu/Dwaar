@@ -6,6 +6,7 @@
 
 //! Admin API service implementing Pingora's `ServeHttp`.
 
+use std::fmt::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -458,7 +459,17 @@ impl AdminService {
                 }
             }
             ("GET", "/metrics") => match &self.prometheus {
-                Some(prom) => prometheus_response(&prom.render().await),
+                Some(prom) => {
+                    let mut body = prom.render().await;
+                    let _ = write!(
+                        body,
+                        "# TYPE dwaar_cache_admitted_bytes gauge\ndwaar_cache_admitted_bytes {}\n# TYPE dwaar_cache_capacity_bytes gauge\ndwaar_cache_capacity_bytes {}\n# TYPE dwaar_cache_process_backends gauge\ndwaar_cache_process_backends {}\n",
+                        dwaar_core::cache::cache_admitted_bytes(),
+                        dwaar_core::cache::cache_capacity_bytes(),
+                        dwaar_core::cache::leaked_cache_backend_count(),
+                    );
+                    prometheus_response(&body)
+                }
                 None => json_response(
                     404,
                     r#"{"error":"metrics not enabled — start with --no-metrics=false"}"#,
