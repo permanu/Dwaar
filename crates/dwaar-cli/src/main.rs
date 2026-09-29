@@ -29,6 +29,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 pub static malloc_conf: &[u8] = b"thp:never,narenas:2,muzzy_decay_ms:1000,dirty_decay_ms:500\0";
 
 mod admin_client;
+mod admin_runtime;
 mod auto_update;
 mod cli;
 mod readiness;
@@ -727,7 +728,7 @@ fn main() -> anyhow::Result<()> {
             return cmd_certs(cert_dir);
         }
         Some(Commands::Reload { admin }) => {
-            return cmd_reload(admin);
+            return cmd_reload(admin, &cli.state_dir);
         }
         Some(Commands::Upgrade { binary, pid_file }) => {
             return cmd_upgrade(binary.as_deref(), pid_file);
@@ -801,7 +802,10 @@ fn main() -> anyhow::Result<()> {
         return run_server(&cli, &dwaar_config, config_path, drain_timeout, 0, 1);
     }
 
-    let readiness_target = readiness::target_from_admin_socket(cli.admin_socket.as_deref());
+    let readiness_target = readiness::target_from_admin_socket(
+        cli.admin_socket.as_deref(),
+        &cli.admin_address.to_string(),
+    );
     match fork_workers(worker_count, &readiness_target)? {
         WorkerRole::Supervisor => Ok(()),
         WorkerRole::Worker(id) => run_server(
@@ -1482,7 +1486,8 @@ fn add_admin_service(
     // to bind the same TCP port or UDS path — there is no SO_REUSEPORT here,
     // so every additional bind races to EADDRINUSE or corrupts the socket file.
     if worker_id == 0 {
-        admin_listening.add_tcp("127.0.0.1:6190");
+        let admin_address = cli.admin_address.to_string();
+        admin_listening.add_tcp(&admin_address);
 
         if let Some(ref socket_path) = cli.admin_socket {
             let path_str = socket_path
@@ -1500,7 +1505,7 @@ fn add_admin_service(
             info!(socket = path_str, "admin API UDS listener registered");
         }
 
-        info!(listen = "127.0.0.1:6190", "admin API registered");
+        info!(listen = %admin_address, "admin API registered");
 
         // Write the active admin endpoint to a runtime file so `dwaar reload`
         // can discover it without hardcoded paths. UDS is preferred over TCP.
@@ -1508,8 +1513,8 @@ fn add_admin_service(
             .admin_socket
             .as_ref()
             .and_then(|p| p.to_str())
-            .unwrap_or("127.0.0.1:6190");
-        if let Err(e) = write_admin_addr(preferred_addr) {
+            .unwrap_or(&admin_address);
+        if let Err(e) = write_admin_addr(&cli.state_dir, preferred_addr) {
             warn!(error = %e, "failed to write admin address file — dwaar reload may need --admin flag");
         }
     }
@@ -2452,19 +2457,12 @@ fn parse_cert_info(pem_data: &[u8], path: &std::path::Path) -> anyhow::Result<Ce
 
 /// Runtime file where the server writes the active admin endpoint on startup.
 /// `dwaar reload` reads this to discover the correct address without hardcoding.
-const ADMIN_ADDR_FILE: &str = "/tmp/dwaar-admin.addr";
-
-/// Write the active admin endpoint so `dwaar reload` can discover it.
-fn write_admin_addr(addr: &str) -> std::io::Result<()> {
-    std::fs::write(ADMIN_ADDR_FILE, addr)
+fn write_admin_addr(state_dir: &std::path::Path, addr: &str) -> std::io::Result<()> {
+    admin_runtime::write(state_dir, addr)
 }
 
-/// Read the admin endpoint written by the running server.
-fn read_admin_addr() -> Option<String> {
-    std::fs::read_to_string(ADMIN_ADDR_FILE)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+fn read_admin_addr(state_dir: &std::path::Path) -> Option<String> {
+    admin_runtime::read(state_dir)
 }
 
 /// `dwaar reload` — trigger config reload on the running instance.
@@ -2473,12 +2471,12 @@ fn read_admin_addr() -> Option<String> {
 /// 1. If the user passed an explicit `--admin` value, use it directly.
 /// 2. Otherwise, read the runtime file written by the server on startup.
 /// 3. Fall back to the default TCP address `127.0.0.1:6190`.
-fn cmd_reload(admin_addr: &str) -> anyhow::Result<()> {
+fn cmd_reload(admin_addr: &str, state_dir: &std::path::Path) -> anyhow::Result<()> {
     use std::io::Write;
 
     // If the user passed an explicit --admin, use it. Otherwise try discovery.
     let effective_addr = if admin_addr == "127.0.0.1:6190" {
-        read_admin_addr().unwrap_or_else(|| admin_addr.to_string())
+        read_admin_addr(state_dir).unwrap_or_else(|| admin_addr.to_string())
     } else {
         admin_addr.to_string()
     };
@@ -2767,4 +2765,19 @@ mod tests {
     fn fork_workers_compiles_and_helpers_callable() {
         // No-op: the test passes if the file compiles. Issue #172.
     }
+}
+#[test]
+fn admin_endpoint_discovery_is_scoped_to_state_directory() {
+    let first = tempfile::tempdir().expect("create test state directory");
+    let second = tempfile::tempdir().expect("create test state directory");
+    write_admin_addr(first.path(), "127.0.0.1:12345").expect("write first endpoint");
+    write_admin_addr(second.path(), "127.0.0.1:23456").expect("write second endpoint");
+    assert_eq!(
+        read_admin_addr(first.path()).as_deref(),
+        Some("127.0.0.1:12345")
+    );
+    assert_eq!(
+        read_admin_addr(second.path()).as_deref(),
+        Some("127.0.0.1:23456")
+    );
 }

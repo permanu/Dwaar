@@ -11,6 +11,7 @@
 //! Dwaar-specific names (--upgrade, --daemon, --test, --config).
 
 use clap::{Parser, Subcommand};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -43,6 +44,16 @@ impl FromStr for WorkerCount {
 
 /// `--state-dir` must be absolute so the ACME and certificate paths never
 /// depend on the working directory the service manager happens to use.
+fn parse_admin_address(value: &str) -> Result<SocketAddr, String> {
+    let address: SocketAddr = value
+        .parse()
+        .map_err(|_| "admin address must be an IP address and port".to_string())?;
+    if !address.ip().is_loopback() || address.port() == 0 {
+        return Err("admin address must use loopback and a nonzero port".to_string());
+    }
+    Ok(address)
+}
+
 fn parse_state_dir(s: &str) -> Result<PathBuf, String> {
     let path = PathBuf::from(s);
     if path.is_absolute() {
@@ -106,6 +117,10 @@ pub(crate) struct Cli {
     /// Defaults to 127.0.0.1:9091. Set to an empty string to disable.
     #[arg(long, env = "DWAAR_GRPC_ADDR", default_value = "127.0.0.1:9091")]
     pub grpc_addr: String,
+
+    /// Loopback TCP address for the admin API. A UDS can also be enabled.
+    #[arg(long, default_value = "127.0.0.1:6190", value_parser = parse_admin_address)]
+    pub admin_address: SocketAddr,
 
     /// Bare mode — disable all optional features (logging, plugins, analytics, geoip).
     /// Use for maximum throughput in CDN edge nodes.
@@ -503,6 +518,14 @@ mod tests {
     fn workers_zero_rejected() {
         let result = Cli::try_parse_from(["dwaar", "--workers", "0"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn admin_address_accepts_only_explicit_loopback_ports() {
+        assert!(Cli::try_parse_from(["dwaar", "--admin-address", "127.0.0.1:45678"]).is_ok());
+        assert!(Cli::try_parse_from(["dwaar", "--admin-address", "[::1]:45678"]).is_ok());
+        assert!(Cli::try_parse_from(["dwaar", "--admin-address", "0.0.0.0:45678"]).is_err());
+        assert!(Cli::try_parse_from(["dwaar", "--admin-address", "127.0.0.1:0"]).is_err());
     }
 
     #[test]
