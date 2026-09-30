@@ -30,6 +30,7 @@ class RustCITest(unittest.TestCase):
             'clippy --locked --workspace --all-targets --all-features -- -D warnings',
             'test --locked --workspace --exclude dwaar-cli',
             'test --locked -p dwaar-cli --bins --test cli_integration --test admin_route_state --test multi_upstream --test route_path --test webhook_route',
+            'test --locked -p dwaar-plugins --features wasm --lib',
             'test --locked --workspace --exclude dwaar-cli -- --ignored --nocapture',
             'check --locked --workspace --release',
         ])

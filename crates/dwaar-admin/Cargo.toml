@@ -32,6 +32,7 @@ libc = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]
+pingora-http = { workspace = true }
 tempfile = { workspace = true }
 compact_str = { workspace = true }
 dwaar-log = { workspace = true }
