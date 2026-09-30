@@ -416,7 +416,7 @@ pub async fn purge_cache_key(
     storage: &'static (dyn pingora_cache::storage::Storage + Sync),
     key_str: &str,
 ) -> bool {
-    use pingora_cache::storage::PurgeType;
+    use pingora_cache::storage::{PurgeOutcome, PurgeTarget, PurgeType};
     use pingora_cache::trace::Span;
 
     let (host, path) = key_str.split_once('/').unwrap_or((key_str, "/"));
@@ -432,10 +432,14 @@ pub async fn purge_cache_key(
     let span = Span::inactive();
     let handle = span.handle();
 
-    let purged = storage
-        .purge(&compact, PurgeType::Invalidation, &handle)
-        .await
-        .unwrap_or(false);
+    let outcome = storage
+        .purge(
+            PurgeTarget::Active(&compact),
+            PurgeType::Invalidation,
+            &handle,
+        )
+        .await;
+    let purged = matches!(outcome, Ok(PurgeOutcome::Purged(_)));
 
     if purged {
         tracing::info!(
@@ -455,6 +459,55 @@ mod tests {
     use dashmap::DashMap;
     use dwaar_analytics::aggregation::DomainMetrics;
     use std::net::SocketAddr;
+
+    #[tokio::test]
+    async fn purge_removes_only_the_requested_host_entry() {
+        use pingora_cache::trace::Span;
+        use pingora_cache::{CacheMeta, Storage};
+        use std::time::{Duration, SystemTime};
+
+        let backend = dwaar_core::cache::new_cache_backend(1024 * 1024);
+        let first = dwaar_core::cache::build_cache_key("first.example", "/page", "GET");
+        let second = dwaar_core::cache::build_cache_key("second.example", "/page", "GET");
+        let meta = CacheMeta::new(
+            SystemTime::now() + Duration::from_secs(60),
+            SystemTime::now(),
+            0,
+            0,
+            pingora_http::ResponseHeader::build(200, None).expect("response header"),
+        );
+        let span = Span::inactive();
+        let handle = span.handle();
+        for key in [&first, &second] {
+            let mut miss = backend
+                .storage
+                .get_miss_handler(key, &meta, &handle)
+                .await
+                .expect("miss handler");
+            miss.write_body(vec![1, 2, 3].into(), true)
+                .await
+                .expect("body");
+            miss.finish().await.expect("cache admission");
+        }
+        assert!(purge_cache_key(backend.storage, "first.example/page").await);
+        assert!(!purge_cache_key(backend.storage, "first.example/page").await);
+        assert!(
+            backend
+                .storage
+                .lookup(&first, &handle)
+                .await
+                .expect("lookup")
+                .is_none()
+        );
+        assert!(
+            backend
+                .storage
+                .lookup(&second, &handle)
+                .await
+                .expect("lookup")
+                .is_some()
+        );
+    }
 
     fn make_table(routes: Vec<Route>) -> Arc<ArcSwap<RouteTable>> {
         Arc::new(ArcSwap::from_pointee(RouteTable::new(routes)))

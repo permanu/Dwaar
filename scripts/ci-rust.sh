@@ -16,6 +16,8 @@ cargo test --locked --workspace --exclude dwaar-cli
 cargo test --locked -p dwaar-cli --bins \
   --test cli_integration --test admin_route_state --test multi_upstream \
   --test route_path --test webhook_route
+# Exercise the optional runtime when its dependency is upgraded.
+cargo test --locked -p dwaar-plugins --features wasm --lib
 cargo test --locked --workspace --exclude dwaar-cli -- --ignored --nocapture
 # Tests already compile/link the dev binaries. Check release-only cfg branches
 # without paying for release codegen/LTO (owned by the release workflow).
