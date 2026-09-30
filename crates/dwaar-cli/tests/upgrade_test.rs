@@ -22,56 +22,98 @@
 #![allow(unsafe_code, clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /// Resolve the path to the `dwaar` binary produced by `cargo build`.
 ///
-/// We prefer the release binary (faster shutdown) but fall back to debug.
-/// If neither exists the test is skipped with a clear message.
+/// Cargo supplies the exact binary built for this test invocation.
 fn dwaar_binary() -> PathBuf {
-    // assert_cmd knows the right path regardless of workspace layout.
-    let out = std::process::Command::new("cargo")
-        .args(["build", "--bin", "dwaar", "--message-format=json"])
-        .output()
-        .expect("cargo build should succeed");
-    // Just find the binary via target layout — simpler than parsing JSON.
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace = manifest.ancestors().nth(2).expect("workspace root");
-    let release = workspace.join("target/release/dwaar");
-    let debug = workspace.join("target/debug/dwaar");
-    if release.exists() {
-        return release;
-    }
-    if debug.exists() {
-        return debug;
-    }
-    // Build it now (slow but guaranteed).
-    assert!(
-        out.status.success(),
-        "cargo build failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    debug
+    assert_cmd::cargo::cargo_bin!("dwaar").to_path_buf()
 }
 
 /// Write a minimal valid Dwaarfile to a tempfile and return the path.
 ///
 /// Uses port 6664 for the proxy listener so we don't clash with defaults.
-fn write_dwaarfile(dir: &tempfile::TempDir) -> PathBuf {
+fn write_dwaarfile(dir: &tempfile::TempDir, upstream: std::net::SocketAddr) -> PathBuf {
     let path = dir.path().join("Dwaarfile");
     std::fs::write(
         &path,
-        "{\n    http_port 6664\n}\n\n:6664 {\n    reverse_proxy 127.0.0.1:1\n}\n",
+        format!("{{\n    http_port 6664\n}}\n\nupgrade.test {{\n    tls off\n    reverse_proxy {upstream}\n}}\n"),
     )
     .expect("write Dwaarfile");
     path
+}
+
+struct TestUpstream {
+    address: std::net::SocketAddr,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    held: std::sync::mpsc::Receiver<()>,
+}
+impl TestUpstream {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("owned upstream listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let address = listener.local_addr().expect("upstream address");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = Arc::clone(&stop);
+        let (held, received) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let mut connections = Vec::new();
+            while !stopping.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let held = held.clone();
+                        connections.push(std::thread::spawn(move || {
+                            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                            let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+                            let mut request = [0; 4096];
+                            if let Ok(count) = stream.read(&mut request) {
+                                if request[..count].starts_with(b"GET /hold ") {
+                                    let _ = held.send(());
+                                    std::thread::sleep(Duration::from_secs(2));
+                                }
+                                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nupgrade-ok");
+                            }
+                        }));
+                        if connections.len() >= 128 {
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+            for connection in connections {
+                connection.join().expect("upstream request worker");
+            }
+        });
+        Self {
+            address,
+            stop,
+            thread: Some(thread),
+            held: received,
+        }
+    }
+}
+impl Drop for TestUpstream {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("owned upstream worker");
+        }
+    }
 }
 
 /// Start a dwaar process in the background. Returns the `Child` handle.
@@ -80,8 +122,26 @@ fn start_dwaar(
     dwaarfile: &PathBuf,
     upgrade_sock: &str,
     is_upgrade: bool,
+    workers: usize,
 ) -> Child {
+    use std::os::unix::process::CommandExt;
     let mut cmd = Command::new(binary);
+    std::fs::create_dir_all(
+        dwaarfile
+            .parent()
+            .expect("test configuration directory")
+            .join("state"),
+    )
+    .expect("private instance state");
+    cmd.process_group(0);
+    if dwaarfile
+        .parent()
+        .expect("fixture")
+        .join("fail-child")
+        .exists()
+    {
+        cmd.env("DWAAR_UPGRADE_BINARY", "/bin/true");
+    }
     cmd.arg("--config")
         .arg(dwaarfile)
         .arg("--no-logging")
@@ -89,6 +149,8 @@ fn start_dwaar(
         .arg("--no-geoip")
         .arg("--no-metrics")
         .arg("--no-plugins")
+        .arg("--workers").arg(workers.to_string())
+        .arg("--state-dir").arg(dwaarfile.parent().expect("test configuration directory").join("state"))
         .env("DWAAR_UPGRADE_SOCK", upgrade_sock)
         // Admin token so /version is reachable without auth on loopback.
         .env("DWAAR_ADMIN_TOKEN", "test-token")
@@ -173,9 +235,27 @@ fn fetch_pid_from_version(admin_addr: &str) -> Option<u32> {
 #[test]
 #[ignore = "requires running dwaar binary and Linux signal semantics; run with: cargo test --test upgrade_test -- --ignored"]
 fn sigusr2_upgrade_no_failed_requests() {
+    check_upgrade(1);
+}
+
+#[test]
+#[ignore = "requires Linux fork and listener transfer; run in the owned Linux qualification container"]
+fn sigusr2_multiworker_upgrade_no_failed_requests() {
+    check_upgrade(2);
+}
+
+static UPGRADE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+// One sequential lifecycle makes the traffic, replacement and cleanup evidence reviewable.
+#[allow(clippy::too_many_lines)]
+fn check_upgrade(workers: usize) {
+    let _lock = UPGRADE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::TempDir::new().expect("tempdir");
     let binary = dwaar_binary();
-    let dwaarfile = write_dwaarfile(&dir);
+    let upstream = TestUpstream::start();
+    let dwaarfile = write_dwaarfile(&dir, upstream.address);
 
     // Use a unique socket path per test run to avoid conflicts.
     let upgrade_sock = dir.path().join("upgrade.sock");
@@ -185,7 +265,7 @@ fn sigusr2_upgrade_no_failed_requests() {
     let admin_addr = "127.0.0.1:6190";
 
     // Start the "old" parent process.
-    let mut parent = start_dwaar(&binary, &dwaarfile, upgrade_sock_str, false);
+    let mut parent = start_dwaar(&binary, &dwaarfile, upgrade_sock_str, false, workers);
     let parent_pid = parent.id();
 
     // Wait for /healthz to become 200 (up to 10 s).
@@ -198,15 +278,36 @@ fn sigusr2_upgrade_no_failed_requests() {
     // Capture the initial PID from /version.
     let initial_pid = fetch_pid_from_version(admin_addr)
         .expect("/version should return a pid once the server is up");
-    assert_eq!(
-        initial_pid, parent_pid,
-        "/version pid should match the process we started"
-    );
+    if workers == 1 {
+        assert_eq!(
+            initial_pid, parent_pid,
+            "/version pid should match the process we started"
+        );
+    }
+
+    let mut held = TcpStream::connect("127.0.0.1:6664").expect("held request connection");
+    held.set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("held request timeout");
+    held.write_all(b"GET /hold HTTP/1.1\r\nHost: upgrade.test\r\nConnection: close\r\n\r\n")
+        .expect("held request");
+    if upstream.held.recv_timeout(Duration::from_secs(2)).is_err() {
+        let mut response = [0; 512];
+        let got = held.read(&mut response).unwrap_or_default();
+        unsafe {
+            libc::kill(-parent_pid.cast_signed(), libc::SIGKILL);
+        }
+        let _ = parent.wait();
+        panic!(
+            "held request did not reach owned fixture: {}",
+            String::from_utf8_lossy(&response[..got])
+                .lines()
+                .next()
+                .unwrap_or_default()
+        );
+    }
 
     // Spawn a background thread to make ~50 successive HTTP requests.
-    // The proxy tries to reach 127.0.0.1:1 (which refuses), so we get 502s
-    // from Dwaar — but those are valid responses, not connection resets.
-    // We count connection-refused errors (TcpStream::connect fail) as failures.
+    // Every exchange must reach the owned upstream and return its exact body.
     let failed = Arc::new(AtomicU32::new(0));
     let failed_clone = Arc::clone(&failed);
     let proxy_addr = "127.0.0.1:6664";
@@ -222,13 +323,19 @@ fn sigusr2_upgrade_no_failed_requests() {
                         .set_write_timeout(Some(Duration::from_secs(2)))
                         .unwrap_or(());
                     let mut stream = stream;
-                    let _ = stream.write_all(
-                        b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+                    let sent = stream.write_all(
+                        b"GET / HTTP/1.1\r\nHost: upgrade.test\r\nConnection: close\r\n\r\n",
                     );
-                    // We don't care about the response body, just that the
-                    // connection didn't get RST before we sent the request.
-                    let mut buf = [0u8; 64];
-                    let _ = stream.read(&mut buf);
+                    // Validate the complete routed response across the generation swap.
+                    let mut body = Vec::new();
+                    let received = stream.read_to_end(&mut body);
+                    if sent.is_err()
+                        || received.is_err()
+                        || !body.starts_with(b"HTTP/1.1 200")
+                        || !body.ends_with(b"upgrade-ok")
+                    {
+                        failed_clone.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 Err(_) => {
                     // Proxy port not yet bound or briefly unavailable — count it.
@@ -265,6 +372,10 @@ fn sigusr2_upgrade_no_failed_requests() {
 
     // Join the traffic thread.
     traffic_handle.join().expect("traffic thread panicked");
+    let mut held_response = Vec::new();
+    held.read_to_end(&mut held_response)
+        .expect("held request survived old generation drain");
+    assert!(held_response.starts_with(b"HTTP/1.1 200") && held_response.ends_with(b"upgrade-ok"));
 
     // Assert upgrade happened.
     let new_pid = new_pid.unwrap_or_else(|| {
@@ -284,10 +395,84 @@ fn sigusr2_upgrade_no_failed_requests() {
 
     // Clean up: kill the new child gracefully.
     let new_child_pid = new_pid.cast_signed();
+    let new_group = unsafe { libc::getpgid(new_child_pid) };
     unsafe {
-        libc::kill(new_child_pid, libc::SIGTERM);
+        if new_group > 1 {
+            libc::kill(-new_group, libc::SIGTERM);
+        }
     }
 
     // Reap the parent (it should have exited after the drain).
     let _ = parent.wait();
+    unsafe {
+        libc::kill(-parent_pid.cast_signed(), libc::SIGKILL);
+        if new_group > 1 {
+            libc::kill(-new_group, libc::SIGKILL);
+        }
+    }
+    let stopped_deadline = Instant::now() + Duration::from_secs(3);
+    while TcpStream::connect(admin_addr).is_ok() && Instant::now() < stopped_deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        TcpStream::connect(admin_addr).is_err(),
+        "owned upgrade processes did not release admin listener"
+    );
+}
+
+#[test]
+#[ignore = "requires Linux fork and listener transfer"]
+fn failed_replacement_keeps_old_generation_serving() {
+    for workers in [1, 2] {
+        let _lock = UPGRADE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("fixture");
+        std::fs::write(dir.path().join("fail-child"), "").expect("fixture");
+        let upstream = TestUpstream::start();
+        let config = write_dwaarfile(&dir, upstream.address);
+        let socket = dir.path().join("upgrade.sock");
+        let mut parent = start_dwaar(
+            &dwaar_binary(),
+            &config,
+            socket.to_str().expect("path"),
+            false,
+            workers,
+        );
+        assert!(wait_for_200(
+            "127.0.0.1:6190",
+            "/healthz",
+            Instant::now() + Duration::from_secs(10)
+        ));
+        let original = fetch_pid_from_version("127.0.0.1:6190").expect("version");
+        unsafe {
+            libc::kill(parent.id().cast_signed(), libc::SIGUSR2);
+        }
+        std::thread::sleep(Duration::from_secs(2));
+        let alive = parent.try_wait().expect("child status").is_none();
+        let same = fetch_pid_from_version("127.0.0.1:6190") == Some(original);
+        let mut stream = TcpStream::connect("127.0.0.1:6664").expect("old route");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: upgrade.test\r\nConnection: close\r\n\r\n")
+            .expect("request");
+        let mut body = Vec::new();
+        let received = stream.read_to_end(&mut body);
+        unsafe {
+            libc::kill(-parent.id().cast_signed(), libc::SIGTERM);
+        }
+        let _ = parent.wait();
+        unsafe {
+            libc::kill(-parent.id().cast_signed(), libc::SIGKILL);
+        }
+        assert!(
+            alive
+                && same
+                && received.is_ok()
+                && body.starts_with(b"HTTP/1.1 200")
+                && body.ends_with(b"upgrade-ok")
+        );
+    }
 }

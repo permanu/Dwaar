@@ -33,6 +33,7 @@ const ADMIN_CAPABILITIES: &[&str] = &[
     "analytics.domain",
     "cache.purge",
     "routes.webhook",
+    "routes.healthcheck.v1",
 ];
 
 /// Request body for `POST /routes`.
@@ -533,6 +534,7 @@ mod tests {
             "analytics.domain",
             "cache.purge",
             "routes.webhook",
+            "routes.healthcheck.v1",
         ] {
             assert!(
                 capabilities

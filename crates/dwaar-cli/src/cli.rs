@@ -34,7 +34,8 @@ impl FromStr for WorkerCount {
         }
         match s.parse::<usize>() {
             Ok(0) => Err("worker count must be at least 1".to_string()),
-            Ok(n) => Ok(WorkerCount::Count(n)),
+            Ok(n) if n <= 32 => Ok(WorkerCount::Count(n)),
+            Ok(_) => Err("worker count must not exceed 32".to_string()),
             Err(_) => Err(format!(
                 "invalid worker count '{s}': expected 'auto' or a positive integer"
             )),
@@ -151,7 +152,7 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub no_cache: bool,
 
-    /// Number of worker processes to spawn. "auto" uses all available CPU cores.
+    /// Number of worker processes to spawn (1–32). "auto" uses one worker with all cores.
     /// Each worker gets its own Pingora server and binds independently via `SO_REUSEPORT`.
     #[arg(long, default_value = "auto")]
     pub workers: WorkerCount,
@@ -512,6 +513,12 @@ mod tests {
     fn workers_auto_explicit() {
         let cli = Cli::try_parse_from(["dwaar", "--workers", "auto"]).expect("parse");
         assert!(matches!(cli.workers, WorkerCount::Auto));
+    }
+
+    #[test]
+    fn worker_count_has_a_bounded_supervision_budget() {
+        assert!(Cli::try_parse_from(["dwaar", "--workers", "32"]).is_ok());
+        assert!(Cli::try_parse_from(["dwaar", "--workers", "33"]).is_err());
     }
 
     #[test]

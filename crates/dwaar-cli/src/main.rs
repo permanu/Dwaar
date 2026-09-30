@@ -34,6 +34,7 @@ mod auto_update;
 mod cli;
 mod readiness;
 mod self_update;
+mod upgrade;
 mod version_check;
 
 use std::fs::Permissions;
@@ -93,25 +94,39 @@ enum WorkerRole {
 #[allow(unsafe_code)]
 fn fork_workers(
     count: usize,
-    readiness_target: &readiness::ReadinessTarget,
+    readiness_target: &readiness::WorkerReadiness,
 ) -> anyhow::Result<WorkerRole> {
     let mut children: Vec<libc::pid_t> = Vec::with_capacity(count);
+    let mut pending_readiness = Vec::with_capacity(count);
 
     // Spawn each worker via fork_one_worker. Children return immediately;
     // the supervisor collects their PIDs and continues below.
     for id in 0..count {
-        match fork_one_worker(id)? {
+        let outcome = match fork_one_worker(id, readiness_target) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                stop_workers(&children, false);
+                return Err(error);
+            }
+        };
+        match outcome {
             ForkOutcome::Worker(worker_id) => return Ok(WorkerRole::Worker(worker_id)),
-            ForkOutcome::Supervisor(child_pid) => children.push(child_pid),
+            ForkOutcome::Supervisor(child_pid, nonce) => {
+                children.push(child_pid);
+                pending_readiness.push((child_pid, nonce));
+            }
         }
     }
 
     info!(workers = count, "supervisor: all worker processes started");
 
-    // Block until worker 0 passes its readiness probe. Worker 0 is the only
-    // child that binds the admin listener, so it is the only one we can probe
-    // deterministically.
-    probe_worker0_readiness(&children, readiness_target)?;
+    // Every worker must acknowledge its own listeners before startup succeeds.
+    probe_workers_readiness(&pending_readiness, readiness_target)?;
+    if let Err(error) = upgrade::acknowledge_environment("DWAAR_UPGRADE_ACK", "DWAAR_UPGRADE_NONCE")
+    {
+        stop_workers(&children, false);
+        return Err(error.into());
+    }
 
     // Build reverse mapping so restarts can preserve logical worker IDs.
     let mut pid_to_id: std::collections::HashMap<libc::pid_t, usize> =
@@ -145,7 +160,7 @@ fn fork_workers(
 /// Outcome of a single `fork()` call during initial worker spawning.
 enum ForkOutcome {
     /// This process is the supervisor; child has the given PID.
-    Supervisor(libc::pid_t),
+    Supervisor(libc::pid_t, String),
     /// This process is the new child with the given logical worker ID.
     Worker(usize),
 }
@@ -160,26 +175,29 @@ enum ForkOutcome {
 /// Must be called before any tokio/threading initialisation. `fork()` in a
 /// multi-threaded process is undefined behaviour.
 #[allow(unsafe_code)]
-fn fork_one_worker(id: usize) -> anyhow::Result<ForkOutcome> {
+fn fork_one_worker(
+    id: usize,
+    readiness: &readiness::WorkerReadiness,
+) -> anyhow::Result<ForkOutcome> {
+    let nonce = readiness.prepare_fork();
     // SAFETY: fork() before any tokio/Pingora initialisation — single-threaded.
     let pid = unsafe { libc::fork() };
     match pid {
         -1 => {
+            readiness::WorkerReadiness::clear_fork_environment();
             let err = std::io::Error::last_os_error();
             tracing::error!(worker = id, error = %err, "fork failed");
             anyhow::bail!("fork failed for worker {id}: {err}");
         }
         0 => Ok(ForkOutcome::Worker(id)),
-        child_pid => Ok(ForkOutcome::Supervisor(child_pid)),
+        child_pid => {
+            readiness::WorkerReadiness::clear_fork_environment();
+            Ok(ForkOutcome::Supervisor(child_pid, nonce))
+        }
     }
 }
 
-/// Probe worker 0's readiness after the initial fork loop.
-///
-/// Worker 0 is the only child that binds the admin listener; it is therefore
-/// the only one we can probe deterministically. Non-zero workers share the
-/// public `SO_REUSEPORT` listeners and have no stable endpoint to hit before
-/// sibling workers are running, so their `fork()` success is treated as readiness.
+/// Wait for every child's private acknowledgement under one startup deadline.
 ///
 /// On failure, sends SIGKILL to every child in `children` before returning the
 /// error so the caller doesn't leave half-bound processes around.
@@ -187,39 +205,40 @@ fn fork_one_worker(id: usize) -> anyhow::Result<ForkOutcome> {
 /// # Safety
 /// Sends SIGKILL to known child PIDs via `libc::kill` on readiness failure.
 #[allow(unsafe_code)]
-fn probe_worker0_readiness(
-    children: &[libc::pid_t],
-    readiness_target: &readiness::ReadinessTarget,
+fn probe_workers_readiness(
+    children: &[(libc::pid_t, String)],
+    readiness_target: &readiness::WorkerReadiness,
 ) -> anyhow::Result<()> {
-    let Some(&worker0_pid) = children.first() else {
-        return Ok(());
-    };
-
-    if let Err(e) = readiness::wait_for_child_ready(
-        worker0_pid,
-        readiness_target,
-        readiness::MAX_READINESS_TIMEOUT,
-    ) {
-        tracing::error!(
-            pid = worker0_pid,
-            error = %e,
-            "supervisor: worker 0 failed readiness probe on initial boot — aborting"
-        );
-        // Kill every worker we already started so the launcher doesn't
-        // leave half-bound processes around.
-        for &pid in children {
-            // SAFETY: sending SIGKILL to known child PIDs.
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
+    let deadline = std::time::Instant::now() + readiness::MAX_READINESS_TIMEOUT;
+    for (worker_pid, nonce) in children {
+        if let Err(e) = readiness_target.wait(
+            *worker_pid,
+            nonce,
+            deadline.saturating_duration_since(std::time::Instant::now()),
+        ) {
+            tracing::error!(
+                pid = worker_pid,
+                error = %e,
+                "supervisor: worker 0 failed readiness probe on initial boot — aborting"
+            );
+            // Kill every worker we already started so the launcher doesn't
+            // leave half-bound processes around.
+            for (pid, _) in children {
+                // SAFETY: sending SIGKILL to known child PIDs.
+                unsafe {
+                    libc::kill(*pid, libc::SIGKILL);
+                    let mut status = 0;
+                    libc::waitpid(*pid, &raw mut status, 0);
+                }
             }
+            anyhow::bail!("worker readiness failed: {e}");
         }
-        anyhow::bail!("worker 0 readiness probe failed: {e}");
-    }
 
-    info!(
-        pid = worker0_pid,
-        "supervisor: worker 0 passed readiness probe"
-    );
+        info!(
+            pid = worker_pid,
+            "supervisor: worker passed private readiness"
+        );
+    }
     Ok(())
 }
 
@@ -244,6 +263,10 @@ fn install_supervisor_signal_handlers() {
         libc::signal(
             libc::SIGINT,
             handle_shutdown as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGUSR2,
+            handle_sigusr2 as *const () as libc::sighandler_t,
         );
     }
 }
@@ -301,17 +324,19 @@ fn apply_crash_backoff(
 #[allow(unsafe_code)]
 fn restart_worker(
     dead_id: usize,
-    readiness_target: &readiness::ReadinessTarget,
+    readiness_target: &readiness::WorkerReadiness,
     children: &mut Vec<libc::pid_t>,
     pid_to_id: &mut std::collections::HashMap<libc::pid_t, usize>,
     worker_started: &mut std::collections::HashMap<libc::pid_t, std::time::Instant>,
     backoff: &mut std::time::Duration,
     max_backoff: std::time::Duration,
 ) -> Option<WorkerRole> {
+    let nonce = readiness_target.prepare_fork();
     // SAFETY: same single-threaded fork guarantee as the initial spawn.
     let pid = unsafe { libc::fork() };
     match pid {
         -1 => {
+            readiness::WorkerReadiness::clear_fork_environment();
             let err = std::io::Error::last_os_error();
             tracing::error!(error = %err, "supervisor: restart fork failed");
         }
@@ -319,56 +344,43 @@ fn restart_worker(
             return Some(WorkerRole::Worker(dead_id));
         }
         child_pid => {
-            // Only worker 0 owns the admin listener — its readiness can
-            // be verified by connecting to that endpoint. Non-zero worker
-            // restarts are accepted as ready on fork() success because
-            // they share `SO_REUSEPORT` listeners with their siblings and
-            // have no deterministic bind to probe.
-            if dead_id == 0 {
-                match readiness::wait_for_child_ready(
-                    child_pid,
-                    readiness_target,
-                    readiness::MAX_READINESS_TIMEOUT,
-                ) {
-                    Ok(()) => {
-                        info!(
-                            pid = child_pid,
-                            worker_id = dead_id,
-                            "supervisor: restarted worker passed readiness probe"
-                        );
-                        children.push(child_pid);
-                        pid_to_id.insert(child_pid, dead_id);
-                        worker_started.insert(child_pid, std::time::Instant::now());
-                    }
-                    Err(e) => {
-                        // Readiness failed — SIGKILL and fall back to the
-                        // normal crash-loop backoff so we don't spin.
-                        tracing::warn!(
-                            pid = child_pid,
-                            worker_id = dead_id,
-                            error = %e,
-                            "supervisor: restarted worker failed readiness probe — killing"
-                        );
-                        // SAFETY: SIGKILL to a known child PID.
-                        unsafe {
-                            libc::kill(child_pid, libc::SIGKILL);
-                        }
-                        // Reap the zombie so waitpid() above doesn't
-                        // double-report it in a later iteration.
-                        let mut wstatus: libc::c_int = 0;
-                        // SAFETY: blocking wait on the exact PID we just signalled.
-                        unsafe {
-                            libc::waitpid(child_pid, &raw mut wstatus, 0);
-                        }
-                        let _ = wstatus;
-                        std::thread::sleep(*backoff);
-                        *backoff = (*backoff * 2).min(max_backoff);
-                    }
+            readiness::WorkerReadiness::clear_fork_environment();
+            // A sibling's healthy public endpoint is never readiness evidence.
+            match readiness_target.wait(child_pid, &nonce, readiness::MAX_READINESS_TIMEOUT) {
+                Ok(()) => {
+                    info!(
+                        pid = child_pid,
+                        worker_id = dead_id,
+                        "supervisor: restarted worker passed readiness probe"
+                    );
+                    children.push(child_pid);
+                    pid_to_id.insert(child_pid, dead_id);
+                    worker_started.insert(child_pid, std::time::Instant::now());
                 }
-            } else {
-                children.push(child_pid);
-                pid_to_id.insert(child_pid, dead_id);
-                worker_started.insert(child_pid, std::time::Instant::now());
+                Err(e) => {
+                    // Readiness failed — SIGKILL and fall back to the
+                    // normal crash-loop backoff so we don't spin.
+                    tracing::warn!(
+                        pid = child_pid,
+                        worker_id = dead_id,
+                        error = %e,
+                        "supervisor: restarted worker failed readiness probe — killing"
+                    );
+                    // SAFETY: SIGKILL to a known child PID.
+                    unsafe {
+                        libc::kill(child_pid, libc::SIGKILL);
+                    }
+                    // Reap the zombie so waitpid() above doesn't
+                    // double-report it in a later iteration.
+                    let mut wstatus: libc::c_int = 0;
+                    // SAFETY: blocking wait on the exact PID we just signalled.
+                    unsafe {
+                        libc::waitpid(child_pid, &raw mut wstatus, 0);
+                    }
+                    let _ = wstatus;
+                    std::thread::sleep(*backoff);
+                    *backoff = (*backoff * 2).min(max_backoff);
+                }
             }
         }
     }
@@ -400,25 +412,54 @@ fn run_supervisor_loop(
     max_backoff: std::time::Duration,
     crash_window: std::time::Duration,
     stable_run: std::time::Duration,
-    readiness_target: &readiness::ReadinessTarget,
+    readiness_target: &readiness::WorkerReadiness,
 ) -> WorkerRole {
+    let mut pending_restarts = std::collections::VecDeque::new();
     loop {
+        if UPGRADE_PENDING.swap(false, std::sync::atomic::Ordering::SeqCst)
+            && let Some((&pid, _)) = pid_to_id.iter().find(|(_, id)| **id == 0)
+        {
+            // SAFETY: worker 0 is a recorded child and owns the listener set.
+            unsafe {
+                libc::kill(pid, libc::SIGUSR2);
+            }
+        }
         // H-05: SeqCst pairs with the SeqCst store in handle_shutdown.
         if SHUTTING_DOWN.load(std::sync::atomic::Ordering::SeqCst) {
             info!("supervisor: shutdown signal received, terminating workers");
-            for &pid in children.iter() {
-                // SAFETY: sending SIGTERM to known child PIDs.
-                unsafe {
-                    libc::kill(pid, libc::SIGTERM);
-                }
-            }
+            stop_workers(children, true);
             break;
+        }
+        if let Some(id) = pending_restarts.pop_front() {
+            if let Some(role) = restart_worker(
+                id,
+                readiness_target,
+                children,
+                pid_to_id,
+                worker_started,
+                backoff,
+                max_backoff,
+            ) {
+                return role;
+            }
+            if !pid_to_id.values().any(|worker| *worker == id) {
+                pending_restarts.push_back(id);
+                std::thread::sleep(*backoff);
+            }
         }
 
         let mut status: libc::c_int = 0;
         // SAFETY: standard waitpid call; -1 means "any child".
-        let exited_pid = unsafe { libc::waitpid(-1, &raw mut status, 0) };
+        let exited_pid = unsafe { libc::waitpid(-1, &raw mut status, libc::WNOHANG) };
 
+        if exited_pid == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            continue;
+        }
+
+        if exited_pid < 0 && !pending_restarts.is_empty() {
+            continue;
+        }
         if exited_pid <= 0 {
             break;
         }
@@ -463,9 +504,47 @@ fn run_supervisor_loop(
         ) {
             return role;
         }
+        if !pid_to_id.values().any(|worker| *worker == dead_id) {
+            pending_restarts.push_back(dead_id);
+        }
     }
 
     WorkerRole::Supervisor
+}
+
+#[allow(unsafe_code)]
+fn stop_workers(children: &[libc::pid_t], graceful: bool) {
+    let signal = if graceful {
+        libc::SIGTERM
+    } else {
+        libc::SIGKILL
+    };
+    for &pid in children {
+        // SAFETY: only exact PIDs forked and retained by this supervisor.
+        unsafe {
+            libc::kill(pid, signal);
+        }
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut pending = children.to_vec();
+    while !pending.is_empty() && std::time::Instant::now() < deadline {
+        pending.retain(|pid| {
+            let mut status = 0;
+            // SAFETY: nonblocking wait on our own recorded child.
+            unsafe { libc::waitpid(*pid, &raw mut status, libc::WNOHANG) == 0 }
+        });
+        if !pending.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+    for pid in pending {
+        let mut status = 0;
+        // SAFETY: terminate and reap only a child that missed the drain deadline.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            libc::waitpid(pid, &raw mut status, 0);
+        }
+    }
 }
 
 /// Supervisor shutdown flag — set by SIGTERM/SIGINT handler.
@@ -500,9 +579,8 @@ extern "C" fn handle_sigusr2(_sig: libc::c_int) {
 /// The thread polls `UPGRADE_PENDING` every 100 ms. On seeing it flip:
 ///   1. Resolves the binary path from `DWAAR_UPGRADE_BINARY` env or `argv[0]`.
 ///   2. Spawns `<binary> --upgrade [original-args without "upgrade" tokens]`.
-///   3. Polls `health_check_url` (from `DWAAR_UPGRADE_HEALTH_URL` or the
-///      default `/healthz` on 6663) until 200 or `drain_timeout_secs` elapses.
-///   4. On success: sends SIGQUIT to self → Pingora graceful drain + exit.
+///   3. Transfers owned listeners and awaits the private child/nonce acknowledgement.
+///   4. On success: sends SIGTERM to the old generation for graceful drain.
 ///   5. On failure: kills the child, resets `UPGRADE_PENDING`, keeps running.
 ///
 /// The upgrade socket path is passed so it can be forwarded to the child via
@@ -569,17 +647,17 @@ fn install_sigusr2_handler(drain_timeout_secs: u64, upgrade_sock: String) {
                     "upgrade: spawning new process"
                 );
 
-                let child = std::process::Command::new(&binary)
-                    .arg("--upgrade")
-                    .args(&orig_args)
-                    .env("DWAAR_UPGRADE_SOCK", &upgrade_sock)
-                    // Signal to the child that it is a hot-upgrade child so it
-                    // connects to the upgrade socket instead of binding fresh.
-                    .env("DWAAR_UPGRADE_FROM", "1")
+                let handshake = match upgrade::Handshake::new() {
+                    Ok(handshake) => handshake,
+                    Err(error) => { tracing::error!(%error, "upgrade readiness channel unavailable"); continue; }
+                };
+                let mut command = std::process::Command::new(&binary);
+                command.arg("--upgrade").args(&orig_args)
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::inherit())
-                    .stderr(std::process::Stdio::inherit())
-                    .spawn();
+                    .stderr(std::process::Stdio::inherit());
+                handshake.configure(&mut command);
+                let child = command.spawn();
 
                 let mut child = match child {
                     Ok(c) => c,
@@ -596,51 +674,20 @@ fn install_sigusr2_handler(drain_timeout_secs: u64, upgrade_sock: String) {
                 let new_pid = child.id();
                 tracing::info!(pid = new_pid, "upgrade: new process started");
 
-                // Health-check loop: poll the new process's /healthz until 200
-                // or the drain timeout elapses.
-                let health_url = std::env::var("DWAAR_UPGRADE_HEALTH_URL")
-                    .unwrap_or_else(|_| "http://127.0.0.1:6663/healthz".to_string());
-
-                let deadline =
-                    std::time::Instant::now() + std::time::Duration::from_secs(drain_timeout_secs);
-                let mut healthy = false;
-
-                while std::time::Instant::now() < deadline {
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-
-                    // Check the child is still alive first.
-                    #[allow(unsafe_code)]
-                    let still_alive = unsafe {
-                        let mut status: libc::c_int = 0;
-                        libc::waitpid(new_pid.cast_signed(), &raw mut status, libc::WNOHANG) == 0
-                    };
-                    if !still_alive {
-                        tracing::error!(
-                            pid = new_pid,
-                            "upgrade: new process exited before becoming healthy — rolling back"
-                        );
-                        break;
-                    }
-
-                    // Simple HTTP GET via the standard library — no tokio
-                    // runtime on this thread. We use a raw TCP connection to
-                    // avoid pulling in a full HTTP client crate.
-                    if check_http_200(&health_url) {
-                        healthy = true;
-                        break;
-                    }
-                }
+                let healthy = handshake.await_ready(&mut child, std::time::Duration::from_secs(drain_timeout_secs)).is_ok();
 
                 if healthy {
                     tracing::info!(
                         pid = new_pid,
                         "upgrade: new process is healthy — draining parent"
                     );
-                    // Send SIGQUIT to ourselves: Pingora's graceful-upgrade
-                    // handler sends FDs over the upgrade socket and exits cleanly.
+                    // Descriptors were transferred while this parent kept
+                    // accepting. SIGTERM now performs graceful termination.
                     #[allow(unsafe_code)]
                     unsafe {
-                        libc::kill(libc::getpid(), libc::SIGQUIT);
+                        let parent = std::env::var("DWAAR_SUPERVISOR_PID").ok().and_then(|value| value.parse::<libc::pid_t>().ok());
+                        let pid = parent.filter(|pid| *pid > 1 && *pid == libc::getppid()).unwrap_or_else(|| libc::getpid());
+                        libc::kill(pid, libc::SIGTERM);
                     }
                     // The main thread's `run_forever()` will return after drain.
                     // Our work is done — exit the monitor thread.
@@ -649,59 +696,13 @@ fn install_sigusr2_handler(drain_timeout_secs: u64, upgrade_sock: String) {
                 // Rollback: kill the unhealthy child and stay up.
                 tracing::error!(
                     pid = new_pid,
-                    health_url = %health_url,
                     drain_timeout_secs,
                     "upgrade: health check failed — killing new process, parent stays up"
                 );
-                #[allow(unsafe_code)]
-                unsafe {
-                    libc::kill(new_pid.cast_signed(), libc::SIGKILL);
-                }
-                let _ = child.wait();
+                upgrade::stop_child(&mut child);
             }
         })
         .expect("upgrade-monitor thread spawn must not fail");
-}
-
-/// Perform a single HTTP GET to `url` and return `true` iff the response
-/// status is 200.
-///
-/// Uses a raw TCP connection with a short connect + read timeout. This runs
-/// on the upgrade-monitor thread which has no tokio runtime, so we use
-/// blocking I/O. The URL must be `http://` (no TLS) — the internal health
-/// endpoint never uses HTTPS.
-fn check_http_200(url: &str) -> bool {
-    use std::io::{Read, Write};
-    use std::net::TcpStream;
-    use std::time::Duration;
-
-    // Parse host:port and path from "http://host:port/path".
-    let rest = url.strip_prefix("http://").unwrap_or(url);
-    let (hostport, path) = rest.split_once('/').unwrap_or((rest, ""));
-    let path = format!("/{path}");
-
-    let Ok(stream) = TcpStream::connect(hostport) else {
-        return false;
-    };
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap_or(());
-    stream
-        .set_write_timeout(Some(Duration::from_secs(2)))
-        .unwrap_or(());
-    let mut stream = stream;
-
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {hostport}\r\nConnection: close\r\n\r\n");
-    if stream.write_all(request.as_bytes()).is_err() {
-        return false;
-    }
-
-    let mut buf = [0u8; 16];
-    if stream.read(&mut buf).is_err() {
-        return false;
-    }
-    // HTTP/1.1 200 or HTTP/1.0 200
-    buf.starts_with(b"HTTP/1.1 200") || buf.starts_with(b"HTTP/1.0 200")
 }
 
 fn main() -> anyhow::Result<()> {
@@ -802,10 +803,8 @@ fn main() -> anyhow::Result<()> {
         return run_server(&cli, &dwaar_config, config_path, drain_timeout, 0, 1);
     }
 
-    let readiness_target = readiness::target_from_admin_socket(
-        cli.admin_socket.as_deref(),
-        &cli.admin_address.to_string(),
-    );
+    let readiness_target =
+        readiness::WorkerReadiness::new().context("create private worker readiness channel")?;
     match fork_workers(worker_count, &readiness_target)? {
         WorkerRole::Supervisor => Ok(()),
         WorkerRole::Worker(id) => run_server(
@@ -876,10 +875,11 @@ fn build_pingora_server(
     // `DWAAR_UPGRADE_FROM=1` is an env-var equivalent of `--upgrade` so the
     // installer can set the flag without modifying argv (e.g. when re-exec'ing
     // with execve where changing argv[0] is simpler than injecting flags).
-    let is_upgrade = cli.upgrade
-        || std::env::var("DWAAR_UPGRADE_FROM")
-            .map(|v| v.trim() == "1")
-            .unwrap_or(false);
+    let is_upgrade = worker_id == 0
+        && (cli.upgrade
+            || std::env::var("DWAAR_UPGRADE_FROM")
+                .map(|v| v.trim() == "1")
+                .unwrap_or(false));
 
     // `DWAAR_UPGRADE_SOCK` overrides Pingora's default upgrade socket path
     // (`/tmp/pingora_upgrade.sock`). The installer writes this path to the
@@ -1401,7 +1401,7 @@ fn bind_proxy_listeners(
         domain_config_map_empty()
     };
 
-    server.add_service(proxy_service);
+    upgrade::add_service(server, proxy_service);
 
     // QUIC listener for HTTP/3 (ISSUE-079a). Uses the same PEM cert/key files
     // as the TCP/TLS listener — both OpenSSL and rustls load PEM natively.
@@ -1423,7 +1423,7 @@ fn bind_proxy_listeners(
                         "QUIC/HTTP3 listener",
                         quic_service,
                     );
-                    server.add_service(quic_bg);
+                    upgrade::add_service(server, quic_bg);
                     info!(listen = %quic_addr, protocol = "quic/h3", "QUIC listener registered");
                 }
                 Err(e) => {
@@ -1519,7 +1519,7 @@ fn add_admin_service(
         }
     }
 
-    server.add_service(admin_listening);
+    upgrade::add_service(server, admin_listening);
     Ok(agg_metrics)
 }
 
@@ -1560,7 +1560,7 @@ fn add_grpc_and_l4_services(
             "dwaar-grpc control",
             grpc_wrapper,
         );
-        server.add_service(grpc_bg);
+        upgrade::add_service(server, grpc_bg);
         info!(listen = %grpc_addr, "dwaar-grpc control server registered");
     }
 
@@ -1598,7 +1598,7 @@ fn add_grpc_and_l4_services(
     let l4_service =
         dwaar_core::l4::Layer4Service::new(Arc::clone(&l4_shared), Arc::clone(&l4_reload_notify));
     let l4_bg = pingora_core::services::background::background_service("layer4", l4_service);
-    server.add_service(l4_bg);
+    upgrade::add_service(server, l4_bg);
     if count > 0 {
         info!(listeners = count, "layer4 TCP proxy service registered");
     }
@@ -1743,7 +1743,10 @@ fn run_server(
     // This module-level approach keeps the signal handler itself minimal
     // (just setting an atomic flag, which is signal-safe) and moves the
     // async logic into the background thread.
-    install_sigusr2_handler(conf_drain_secs, upgrade_sock);
+    upgrade::install(&mut server);
+    if worker_id == 0 {
+        install_sigusr2_handler(conf_drain_secs, upgrade_sock);
+    }
 
     info!("entering run loop, waiting for connections or signals");
     server.run_forever();
@@ -1785,7 +1788,7 @@ fn register_background_services(
         let checker = dwaar_core::upstream::HealthChecker::new(Arc::clone(&health_pools));
         let health_bg =
             pingora_core::services::background::background_service("health checker", checker);
-        server.add_service(health_bg);
+        upgrade::add_service(server, health_bg);
         info!("upstream health checker registered");
     }
 
@@ -1875,7 +1878,7 @@ fn register_background_services(
             "TLS cert & OCSP manager",
             tls_service,
         );
-        server.add_service(bg);
+        upgrade::add_service(server, bg);
         info!(
             domains = acme_domains.load().len(),
             "TLS background service registered"
@@ -1890,7 +1893,7 @@ fn register_background_services(
                 receiver: std::sync::Mutex::new(Some(receiver)),
             },
         );
-        server.add_service(log_bg);
+        upgrade::add_service(server, log_bg);
         info!("log writer registered (JSON lines to stdout)");
     }
 
@@ -1933,7 +1936,7 @@ fn register_background_services(
     };
     let config_bg =
         pingora_core::services::background::background_service("config watcher", config_watcher);
-    server.add_service(config_bg);
+    upgrade::add_service(server, config_bg);
     info!(path = %config_path.display(), "config watcher registered");
 
     // Auto-update background service (opt-in via `auto_update {}` in Dwaarfile).
@@ -1944,7 +1947,7 @@ fn register_background_services(
     {
         let svc = auto_update::AutoUpdateService::new(au.clone());
         let bg = pingora_core::services::background::background_service("auto-update", svc);
-        server.add_service(bg);
+        upgrade::add_service(server, bg);
         info!("auto-update service registered (channel: {})", au.channel);
     }
 
@@ -1960,7 +1963,7 @@ fn register_background_services(
             "Docker watcher",
             docker_watcher,
         );
-        server.add_service(docker_bg);
+        upgrade::add_service(server, docker_bg);
         info!(socket = %socket_path.display(), "Docker watcher registered");
     }
 
@@ -1995,7 +1998,7 @@ fn register_background_services(
                 inner: Arc::new(agg_service),
             },
         );
-        server.add_service(agg_bg);
+        upgrade::add_service(server, agg_bg);
         info!("analytics aggregation service registered");
     }
 
@@ -2007,7 +2010,7 @@ fn register_background_services(
             "OTLP exporter",
             OtlpExporterService { exporter },
         );
-        server.add_service(otel_bg);
+        upgrade::add_service(server, otel_bg);
         info!("OTLP exporter background flush service registered");
     }
 }
@@ -2036,7 +2039,24 @@ struct GrpcBackgroundService {
 
 #[async_trait::async_trait]
 impl pingora_core::services::background::BackgroundService for GrpcBackgroundService {
-    async fn start(&self, mut shutdown: pingora_core::server::ShutdownWatch) {
+    async fn start_with_ready_notifier(
+        &self,
+        shutdown: pingora_core::server::ShutdownWatch,
+        ready: pingora_core::services::ServiceReadyNotifier,
+    ) {
+        self.run(shutdown, Some(ready)).await;
+    }
+    async fn start(&self, shutdown: pingora_core::server::ShutdownWatch) {
+        self.run(shutdown, None).await;
+    }
+}
+
+impl GrpcBackgroundService {
+    async fn run(
+        &self,
+        mut shutdown: pingora_core::server::ShutdownWatch,
+        ready: Option<pingora_core::services::ServiceReadyNotifier>,
+    ) {
         // Adapt Pingora's `ShutdownWatch` (a tokio watch channel) into the
         // single-fire future tonic expects. Fires on the first observable
         // change — that's Pingora's "please drain" signal.
@@ -2044,13 +2064,21 @@ impl pingora_core::services::background::BackgroundService for GrpcBackgroundSer
             let _ = shutdown.changed().await;
         };
 
-        let handle = dwaar_grpc::start_grpc_server_with_shutdown(
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let handle = dwaar_grpc::start_grpc_server_with_readiness(
             self.addr,
             self.service.clone(),
             self.tls.clone(),
             shutdown_future,
+            sender,
         );
-
+        if receiver.await.is_ok() {
+            if let Some(ready) = ready {
+                ready.notify_ready();
+            }
+        } else {
+            dwaar_core::readiness::mark_failed();
+        }
         match handle.await {
             Ok(Ok(())) => info!(addr = %self.addr, "dwaar-grpc: server terminated cleanly"),
             Ok(Err(e)) => {
@@ -2502,8 +2530,8 @@ fn cmd_reload(admin_addr: &str, state_dir: &std::path::Path) -> anyhow::Result<(
 /// `dwaar upgrade` — zero-downtime binary upgrade via Pingora's FD transfer.
 ///
 /// 1. Reads the PID of the running instance from the PID file
-/// 2. Starts a new Dwaar process with `--upgrade` (inherits listeners via FD transfer)
-/// 3. Sends SIGQUIT to the old process for graceful shutdown
+/// 2. Requests replacement from the listener-owning parent via SIGUSR2
+/// 3. The parent drains only after its private replacement acknowledgement
 fn cmd_upgrade(binary: Option<&std::path::Path>, pid_file: &std::path::Path) -> anyhow::Result<()> {
     use std::io::Write;
     let mut out = std::io::stdout().lock();
@@ -2518,96 +2546,33 @@ fn cmd_upgrade(binary: Option<&std::path::Path>, pid_file: &std::path::Path) -> 
         bail!("binary not found: {}", binary_path.display());
     }
 
-    // Verify PID file is owned by us and not world-writable to prevent
-    // an attacker from substituting an arbitrary PID.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let meta = std::fs::metadata(pid_file)
-            .with_context(|| format!("cannot stat PID file: {}", pid_file.display()))?;
-        // SAFETY: getuid returns the real user ID of the calling process.
-        #[allow(unsafe_code)]
-        let uid = unsafe { libc::getuid() };
-        if meta.uid() != uid {
-            bail!(
-                "PID file {} is owned by UID {} (expected {})",
-                pid_file.display(),
-                meta.uid(),
-                uid
-            );
-        }
-        if meta.mode() & 0o002 != 0 {
-            bail!(
-                "PID file {} is world-writable — refusing to trust its contents",
-                pid_file.display()
-            );
-        }
-    }
-
-    // Read the PID of the old process
-    let pid_str = std::fs::read_to_string(pid_file)
-        .with_context(|| format!("cannot read PID file: {}", pid_file.display()))?;
-    let old_pid: i32 = pid_str
-        .trim()
-        .parse()
-        .with_context(|| format!("invalid PID in {}: {pid_str:?}", pid_file.display()))?;
+    let old_pid = upgrade::read_parent_pid(pid_file).context("cannot trust Dwaar PID file")?;
 
     writeln!(out, "upgrading dwaar (old PID: {old_pid})")?;
 
-    // Preserve original CLI args (--config, --workers, etc.) for the new process.
-    let original_args: Vec<String> = std::env::args()
-        .skip(1)
-        .filter(|a| a != "upgrade" && a != "--upgrade")
-        .collect();
-
+    if old_pid <= 1 {
+        bail!("refusing invalid Dwaar parent PID");
+    }
+    if binary.is_some() {
+        bail!(
+            "custom upgrade binaries must be configured on the running parent with DWAAR_UPGRADE_BINARY"
+        );
+    }
+    upgrade::verify_parent_process(old_pid).context("cannot verify Dwaar parent identity")?;
+    // Only the running parent owns the listener descriptors and can validate
+    // its replacement. CLI liveness checks cannot establish child readiness.
+    #[allow(unsafe_code)]
+    let result = unsafe { libc::kill(old_pid, libc::SIGUSR2) };
+    if result != 0 {
+        bail!(
+            "failed to request upgrade: {}",
+            std::io::Error::last_os_error()
+        );
+    }
     writeln!(
         out,
-        "starting new process: {} --upgrade {}",
-        binary_path.display(),
-        original_args.join(" ")
+        "upgrade requested — parent will drain only after private child readiness"
     )?;
-
-    let child = std::process::Command::new(&binary_path)
-        .arg("--upgrade")
-        .args(&original_args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .spawn()
-        .with_context(|| format!("failed to start new process: {}", binary_path.display()))?;
-
-    let new_pid = child.id().cast_signed();
-    writeln!(out, "new process started (PID: {new_pid})")?;
-
-    // Poll for up to 10 seconds to verify new process is running.
-    for _ in 0..50 {
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let mut status: libc::c_int = 0;
-        // SAFETY: checking if child is still alive via non-blocking waitpid.
-        #[allow(unsafe_code)]
-        let result = unsafe { libc::waitpid(new_pid, &raw mut status, libc::WNOHANG) };
-        if result != 0 {
-            anyhow::bail!("new process (PID {new_pid}) exited before becoming ready");
-        }
-    }
-
-    // Send SIGQUIT to the old process for graceful shutdown.
-    // SIGQUIT triggers Pingora's graceful drain — it stops accepting new
-    // connections and waits for in-flight requests to complete.
-    writeln!(out, "sending SIGQUIT to old process (PID: {old_pid})")?;
-
-    // SAFETY: libc::kill sends a signal to a process. The PID was read from
-    // a file controlled by the user (the PID file). Sending SIGQUIT to a
-    // non-Dwaar process is the user's responsibility (wrong PID file).
-    #[allow(unsafe_code)]
-    let result = unsafe { libc::kill(old_pid, libc::SIGQUIT) };
-
-    if result != 0 {
-        let err = std::io::Error::last_os_error();
-        bail!("failed to send SIGQUIT to PID {old_pid}: {err}");
-    }
-
-    writeln!(out, "upgrade complete — old process will drain and exit")?;
 
     Ok(())
 }

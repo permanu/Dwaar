@@ -331,13 +331,35 @@ struct LiveListener {
 
 #[async_trait]
 impl BackgroundService for Layer4Service {
+    async fn start_with_ready_notifier(
+        &self,
+        shutdown: ShutdownWatch,
+        ready: pingora_core::services::ServiceReadyNotifier,
+    ) {
+        self.run(shutdown, Some(ready)).await;
+    }
     async fn start(&self, shutdown: ShutdownWatch) {
+        self.run(shutdown, None).await;
+    }
+}
+
+impl Layer4Service {
+    async fn run(
+        &self,
+        shutdown: ShutdownWatch,
+        ready: Option<pingora_core::services::ServiceReadyNotifier>,
+    ) {
         let mut live: std::collections::HashMap<SocketAddr, LiveListener> =
             std::collections::HashMap::new();
         let mut tasks = tokio::task::JoinSet::new();
 
         // Initial bind
-        bind_new_listeners(&self.servers.load(), &mut live, &mut tasks, &shutdown);
+        if !bind_new_listeners(&self.servers.load(), &mut live, &mut tasks, &shutdown).await {
+            return;
+        }
+        if let Some(ready) = ready {
+            ready.notify_ready();
+        }
 
         if live.is_empty() {
             info!("layer4 service started — no initial listeners, waiting for reload");
@@ -370,7 +392,7 @@ impl BackgroundService for Layer4Service {
                         }
                         // else: new address — bind below
                     }
-                    bind_new_listeners(&new_servers, &mut live, &mut tasks, &shutdown);
+                    let _ = bind_new_listeners(&new_servers, &mut live, &mut tasks, &shutdown).await;
                 }
                 _ = tasks.join_next(), if !tasks.is_empty() => {
                     // A listener task completed (cancelled or errored) — no action needed,
@@ -392,12 +414,13 @@ impl BackgroundService for Layer4Service {
 }
 
 /// Bind listeners for addresses not already in `live` and spawn accept loops.
-fn bind_new_listeners(
+async fn bind_new_listeners(
     servers: &[CompiledL4Server],
     live: &mut std::collections::HashMap<SocketAddr, LiveListener>,
     tasks: &mut tokio::task::JoinSet<()>,
     shutdown: &ShutdownWatch,
-) {
+) -> bool {
+    let mut bound = true;
     for server in servers {
         if live.contains_key(&server.listen) {
             continue;
@@ -410,16 +433,31 @@ fn bind_new_listeners(
         let server_clone = Arc::clone(&server_swap);
         let shutdown = shutdown.clone();
 
-        tasks.spawn(async move {
-            match TcpListener::bind(addr).await {
-                Ok(listener) => {
-                    info!(addr = %addr, "L4 listener bound");
-                    run_listener(listener, server_clone, cancel_clone, shutdown).await;
-                }
-                Err(e) => {
-                    error!(addr = %addr, error = %e, "failed to bind L4 listener");
-                }
+        let listener = async {
+            let socket = if addr.is_ipv4() {
+                tokio::net::TcpSocket::new_v4()?
+            } else {
+                tokio::net::TcpSocket::new_v6()?
+            };
+            socket.set_reuseaddr(true)?;
+            #[cfg(unix)]
+            socket.set_reuseport(true)?;
+            socket.bind(addr)?;
+            socket.listen(1024)
+        }
+        .await;
+        let listener = match listener {
+            Ok(listener) => listener,
+            Err(error) => {
+                error!(addr = %addr, error = %error, "failed to bind L4 listener");
+                crate::readiness::mark_failed();
+                bound = false;
+                continue;
             }
+        };
+        tasks.spawn(async move {
+            info!(addr = %addr, "L4 listener bound");
+            run_listener(listener, server_clone, cancel_clone, shutdown).await;
         });
 
         live.insert(
@@ -430,6 +468,7 @@ fn bind_new_listeners(
             },
         );
     }
+    bound
 }
 
 async fn run_listener(
@@ -1395,6 +1434,21 @@ fn parse_duration(s: &str) -> Option<Duration> {
 #[allow(clippy::unwrap_used)] // unwrap() is idiomatic in test code
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_listener_is_not_added_to_the_live_generation() {
+        let occupied = TcpListener::bind("127.0.0.1:0").await.expect("fixture");
+        let server = CompiledL4Server {
+            listen: occupied.local_addr().expect("address"),
+            routes: Vec::new(),
+            matching_timeout: Duration::from_secs(3),
+        };
+        let mut live = std::collections::HashMap::new();
+        let mut tasks = tokio::task::JoinSet::new();
+        let (_, shutdown) = tokio::sync::watch::channel(false);
+        assert!(!bind_new_listeners(&[server], &mut live, &mut tasks, &shutdown).await);
+        assert!(live.is_empty() && tasks.is_empty());
+    }
 
     // -- Protocol detection --
 

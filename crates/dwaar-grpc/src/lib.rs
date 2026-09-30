@@ -52,5 +52,8 @@ pub use routing::{
     HeaderRuleConfig, HeaderRuleRegistry, MirrorConfig, MirrorRegistry, RouteRegistry, SplitConfig,
     SplitRegistry, WeightedEntry, header_rule_from_pb, mirror_from_pb, split_from_pb,
 };
-pub use service::{DwaarControlService, Error, start_grpc_server, start_grpc_server_with_shutdown};
+pub use service::{
+    DwaarControlService, Error, start_grpc_server, start_grpc_server_with_readiness,
+    start_grpc_server_with_shutdown,
+};
 pub use tls::{TlsConfig, TlsError};
