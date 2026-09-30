@@ -208,6 +208,8 @@ pub struct ProxyConfig {
 pub struct DwaarProxy {
     route_table: Arc<ArcSwap<RouteTable>>,
     challenge_solver: Option<Arc<ChallengeSolver>>,
+    /// Permanu ownership tokens served at `/.well-known/permanu-challenge/<token>`.
+    permanu_challenges: Arc<crate::permanu_challenge::PermanuChallenges>,
     log_sender: Option<LogSender>,
     beacon_sender: Option<BeaconSender>,
     agg_sender: Option<AggSender>,
@@ -257,6 +259,10 @@ pub struct DwaarProxy {
     /// within one TTL window, but long enough to absorb burst traffic
     /// without hammering the upstream with redundant probes.
     scale_to_zero_probe_cache: dashmap::DashMap<std::net::SocketAddr, std::time::Instant>,
+    /// Path templates kept per route for the `route_path` metric label and
+    /// access log field (contracts v1.1.3, D-061): at most 200 per route,
+    /// the rest `other`.
+    route_paths: dwaar_analytics::route_path::RoutePathRegistry,
 }
 
 /// Registries consulted by the proxy hot path, populated by the gRPC
@@ -311,6 +317,7 @@ impl DwaarProxy {
         Self {
             route_table: config.route_table,
             challenge_solver: config.challenge_solver,
+            permanu_challenges: Arc::new(crate::permanu_challenge::PermanuChallenges::new()),
             log_sender: config.log_sender,
             beacon_sender: config.beacon_sender,
             agg_sender: config.agg_sender,
@@ -327,7 +334,17 @@ impl DwaarProxy {
             otlp_exporter: None,
             trace_sample_ratio: 1.0,
             scale_to_zero_probe_cache: dashmap::DashMap::new(),
+            route_paths: dwaar_analytics::route_path::RoutePathRegistry::default(),
         }
+    }
+
+    /// Tokens served at `/.well-known/permanu-challenge/<token>`.
+    ///
+    /// Register a token for an IP on the returned store. A `GET` for that IP
+    /// answers with the token; an unknown token is 404.
+    #[must_use]
+    pub const fn permanu_challenges(&self) -> &Arc<crate::permanu_challenge::PermanuChallenges> {
+        &self.permanu_challenges
     }
 
     /// Install the gRPC control-plane registries so Wheel #2 Weeks 4-5
@@ -674,6 +691,40 @@ impl DwaarProxy {
         Ok(true)
     }
 
+    /// Serve a Permanu ownership challenge without contacting an upstream.
+    ///
+    /// `200` body is the registered token. `404` is an empty body.
+    async fn send_permanu_challenge(
+        session: &mut Session,
+        reply: crate::permanu_challenge::ChallengeReply,
+    ) -> Result<bool> {
+        let end_of_body = reply.body.is_empty();
+        let header_count = if reply.status == 200 { 3 } else { 1 };
+        let mut resp = ResponseHeader::build(reply.status, Some(header_count))?;
+        let mut cl_buf = itoa::Buffer::new();
+        resp.insert_header("Content-Length", cl_buf.format(reply.body.len()))
+            .map_err(|e| Error::explain(HTTPStatus(reply.status), format!("bad header: {e}")))?;
+        if reply.status == 200 {
+            resp.insert_header("Content-Type", "text/plain")
+                .map_err(|e| {
+                    Error::explain(HTTPStatus(reply.status), format!("bad header: {e}"))
+                })?;
+            resp.insert_header("Cache-Control", "no-store")
+                .map_err(|e| {
+                    Error::explain(HTTPStatus(reply.status), format!("bad header: {e}"))
+                })?;
+        }
+        session
+            .write_response_header(Box::new(resp), end_of_body)
+            .await?;
+        if !end_of_body {
+            session
+                .write_response_body(Some(Bytes::from(reply.body)), true)
+                .await?;
+        }
+        Ok(true)
+    }
+
     /// Send a plugin-generated short-circuit response to the client.
     async fn send_plugin_response(
         session: &mut Session,
@@ -947,6 +998,23 @@ impl ProxyHttp for DwaarProxy {
             }
         }
 
+        // Permanu ownership proof. GET only, and only this well-known path.
+        // Answered before plugins, auth, and the HTTPS redirect so a verifier
+        // hitting `http://<ip>/.well-known/permanu-challenge/<token>` gets the
+        // token (or 404) even when the IP has no route.
+        if let Some(reply) = self.permanu_challenges.reply(
+            ctx.plugin_ctx.host.as_deref(),
+            ctx.plugin_ctx.method.as_str(),
+            ctx.plugin_ctx.path.as_str(),
+        ) {
+            debug!(
+                request_id = %ctx.request_id(),
+                status = reply.status,
+                "serving permanu ownership challenge"
+            );
+            return Self::send_permanu_challenge(session, reply).await;
+        }
+
         // --- Populate route-level plugin config ---
         // Look up the route before running plugins so rate_limit_rps and
         // under_attack flags are available to the plugin chain.
@@ -1066,7 +1134,7 @@ impl ProxyHttp for DwaarProxy {
 
                             // Cookie sticky sessions: read _dwaar_sticky cookie and
                             // use it to pin the visitor to a specific backend.
-                            if pool.policy() == crate::upstream::LbPolicy::Cookie {
+                            let selected = if pool.policy() == crate::upstream::LbPolicy::Cookie {
                                 let cookie_val = session
                                     .req_header()
                                     .headers
@@ -1080,20 +1148,37 @@ impl ProxyHttp for DwaarProxy {
                                     })
                                     .map(String::from);
 
-                                if let Some((addr, needs_set)) =
-                                    pool.select_cookie(cookie_val.as_deref())
-                                {
-                                    ctx.route_upstream = Some(addr);
-                                    if needs_set {
-                                        ctx.sticky_set_cookie = Some(
-                                            crate::upstream::UpstreamPool::sticky_set_cookie(addr),
-                                        );
+                                match pool.select_cookie(cookie_val.as_deref()) {
+                                    Some((addr, needs_set)) => {
+                                        if needs_set {
+                                            ctx.sticky_set_cookie = Some(
+                                                crate::upstream::UpstreamPool::sticky_set_cookie(
+                                                    addr,
+                                                ),
+                                            );
+                                        }
+                                        Some(addr)
                                     }
+                                    None => None,
                                 }
                             } else {
-                                ctx.route_upstream = pool.select(ctx.plugin_ctx.client_ip);
-                            }
+                                pool.select(ctx.plugin_ctx.client_ip)
+                            };
 
+                            // Every backend is unhealthy or at its cap. Do not
+                            // fall back to the route's first address.
+                            let Some(addr) = selected else {
+                                warn!(
+                                    request_id = %ctx.request_id(),
+                                    domain = %route.domain,
+                                    "no healthy upstream — returning 502"
+                                );
+                                let mut resp = ResponseHeader::build(502, Some(0))?;
+                                resp.insert_header("Content-Length", "0")?;
+                                session.write_response_header(Box::new(resp), true).await?;
+                                return Ok(true);
+                            };
+                            ctx.route_upstream = Some(addr);
                             ctx.upstream_pool = Some(pool.clone());
 
                             // Atomically claim the connection slot. `select()` is a
@@ -1101,9 +1186,7 @@ impl ProxyHttp for DwaarProxy {
                             // last slot between our check and this CAS. If we lose
                             // that race, return 503 now rather than letting the
                             // request hit the backend over its cap.
-                            if let Some(addr) = ctx.route_upstream
-                                && !pool.acquire_connection(addr)
-                            {
+                            if !pool.acquire_connection(addr) {
                                 warn!(
                                     request_id = %ctx.request_id(),
                                     upstream = %addr,
@@ -1265,6 +1348,12 @@ impl ProxyHttp for DwaarProxy {
                     if block.kind != crate::route::BlockKind::Route {
                         break;
                     }
+                }
+
+                // Webhook intake (agent-protocol §11.1): after the block has
+                // set its limits, drop every client-selected widening.
+                if route.kind == crate::route::RouteKind::Webhook {
+                    ctx.enforce_webhook_policy();
                 }
             }
         }
@@ -2022,37 +2111,7 @@ impl ProxyHttp for DwaarProxy {
     where
         Self::CTX: Send + Sync,
     {
-        if let Some(ip) = &ctx.plugin_ctx.client_ip {
-            // Write IP to a stack buffer — avoids a heap allocation per request.
-            // Max IPv6 text representation is 45 bytes (e.g. with zone id).
-            let mut ip_buf = [0u8; 45];
-            let ip_str = {
-                use std::io::Write;
-                let mut cursor = std::io::Cursor::new(&mut ip_buf[..]);
-                write!(cursor, "{ip}").map_err(|e| {
-                    pingora_error::Error::because(
-                        pingora_error::ErrorType::InternalError,
-                        "IP format failed",
-                        e,
-                    )
-                })?;
-                let len = cursor.position() as usize;
-                // SAFETY: IpAddr Display only emits ASCII digits, colons, and dots.
-                std::str::from_utf8(&ip_buf[..len]).map_err(|e| {
-                    pingora_error::Error::because(
-                        pingora_error::ErrorType::InternalError,
-                        "IP UTF-8 failed",
-                        e,
-                    )
-                })?
-            };
-            upstream_request.insert_header("X-Real-IP", ip_str)?;
-
-            // Replace (not append) — client-supplied XFF is stripped to prevent
-            // IP spoofing. Only the direct connection IP is trusted.
-            upstream_request.remove_header("X-Forwarded-For");
-            upstream_request.insert_header("X-Forwarded-For", ip_str)?;
-        }
+        set_client_ip_headers(upstream_request, ctx.plugin_ctx.client_ip)?;
 
         let proto = if Self::is_tls_connection(session) {
             "https"
@@ -2551,6 +2610,24 @@ impl ProxyHttp for DwaarProxy {
             );
         }
 
+        // Low-cardinality path template of the matched route (D-061), shared
+        // by the metrics below and the access log line.
+        let route_path = ctx
+            .plugin_ctx
+            .route_domain
+            .as_deref()
+            .filter(|_| self.prometheus.is_some() || self.log_sender.is_some())
+            .map(|route| {
+                self.route_paths
+                    .resolve(route, ctx.plugin_ctx.path.as_str())
+            });
+        if let Some(ref prom) = self.prometheus
+            && let Some(ref route) = ctx.plugin_ctx.route_domain
+            && let Some(ref route_path) = route_path
+        {
+            prom.record_route_path(route, route_path, status, response_time_us);
+        }
+
         // Prometheus metrics (ISSUE-072) — recorded before host.take() moves it
         if let Some(ref prom) = self.prometheus
             && let Some(ref host) = ctx.plugin_ctx.host
@@ -2744,10 +2821,55 @@ impl ProxyHttp for DwaarProxy {
             upstream_error_body: ctx.upstream_error_body.take(),
             rejected_by: ctx.rejected_by,
             blocked_by: ctx.blocked_by,
+            route: ctx.plugin_ctx.route_domain.take(),
+            route_path,
         };
 
         sender.send(log);
     }
+}
+
+/// Set `X-Real-IP` and `X-Forwarded-For` to the direct peer address.
+///
+/// Client-supplied values are never forwarded: with a peer address both
+/// headers are replaced by it, and without one (a Unix-socket listener) both
+/// are removed. The agent's pre-authentication limit keys on `X-Real-IP`
+/// (agent-protocol §11.1), so a spoofed value must never reach an upstream.
+fn set_client_ip_headers(
+    upstream_request: &mut RequestHeader,
+    client_ip: Option<std::net::IpAddr>,
+) -> Result<()> {
+    upstream_request.remove_header("X-Real-IP");
+    upstream_request.remove_header("X-Forwarded-For");
+    let Some(ip) = client_ip else {
+        return Ok(());
+    };
+    // Write IP to a stack buffer — avoids a heap allocation per request.
+    // Max IPv6 text representation is 45 bytes (e.g. with zone id).
+    let mut ip_buf = [0u8; 45];
+    let ip_str = {
+        use std::io::Write;
+        let mut cursor = std::io::Cursor::new(&mut ip_buf[..]);
+        write!(cursor, "{ip}").map_err(|e| {
+            pingora_error::Error::because(
+                pingora_error::ErrorType::InternalError,
+                "IP format failed",
+                e,
+            )
+        })?;
+        let len = cursor.position() as usize;
+        // IpAddr Display only emits ASCII digits, colons, and dots.
+        std::str::from_utf8(&ip_buf[..len]).map_err(|e| {
+            pingora_error::Error::because(
+                pingora_error::ErrorType::InternalError,
+                "IP UTF-8 failed",
+                e,
+            )
+        })?
+    };
+    upstream_request.insert_header("X-Real-IP", ip_str)?;
+    upstream_request.insert_header("X-Forwarded-For", ip_str)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3371,5 +3493,35 @@ mod tests {
             assert!(!is_healthcheck_path("/api/v1/users"));
             assert!(!is_healthcheck_path("/admin"));
         }
+    }
+
+    // ── Client address headers (agent-protocol §11.1: X-Real-IP is Dwaar's) ──
+
+    fn spoofed_request() -> RequestHeader {
+        let mut req = RequestHeader::build("POST", b"/hooks/prj_1", None).expect("request");
+        req.insert_header("X-Real-IP", "6.6.6.6").expect("header");
+        req.insert_header("X-Forwarded-For", "6.6.6.6, 7.7.7.7")
+            .expect("header");
+        req
+    }
+
+    #[test]
+    fn client_ip_headers_overwrite_client_values() {
+        let mut req = spoofed_request();
+        set_client_ip_headers(&mut req, Some("203.0.113.9".parse().expect("ip"))).expect("set");
+        let real: Vec<_> = req.headers.get_all("x-real-ip").iter().collect();
+        assert_eq!(real.len(), 1);
+        assert_eq!(real[0], "203.0.113.9");
+        let xff: Vec<_> = req.headers.get_all("x-forwarded-for").iter().collect();
+        assert_eq!(xff.len(), 1);
+        assert_eq!(xff[0], "203.0.113.9");
+    }
+
+    #[test]
+    fn client_ip_headers_are_stripped_without_a_peer_address() {
+        let mut req = spoofed_request();
+        set_client_ip_headers(&mut req, None).expect("set");
+        assert!(req.headers.get("x-real-ip").is_none());
+        assert!(req.headers.get("x-forwarded-for").is_none());
     }
 }

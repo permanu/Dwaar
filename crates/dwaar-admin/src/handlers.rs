@@ -15,7 +15,8 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use dwaar_analytics::aggregation::DomainMetrics;
 use dwaar_analytics::aggregation::snapshot::AnalyticsSnapshot;
-use dwaar_core::route::{Route, RouteTable, is_valid_route_key};
+use dwaar_core::admin_routes::{AdminRouteError, AdminRouteSpec, AdminRoutes};
+use dwaar_core::route::{Route, RouteKind, RouteTable};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -31,6 +32,7 @@ const ADMIN_CAPABILITIES: &[&str] = &[
     "metrics.upstream_connect_duration",
     "analytics.domain",
     "cache.purge",
+    "routes.webhook",
 ];
 
 /// Request body for `POST /routes`.
@@ -38,11 +40,17 @@ const ADMIN_CAPABILITIES: &[&str] = &[
 pub struct CreateRouteRequest {
     pub domain: String,
     pub upstream: String,
+    /// Replica addresses. Absent or empty keeps the single-upstream path.
+    #[serde(default)]
+    pub upstreams: Vec<String>,
     pub tls: bool,
     /// Which component owns this route (e.g. "dwaar-ingress").
     /// Used by reconcilers to identify their own routes.
     #[serde(default)]
     pub source: Option<String>,
+    /// `proxy` (default) or `webhook` (agent-protocol §11.1 intake route).
+    #[serde(default)]
+    pub kind: RouteKind,
 }
 
 /// Route entry accepted by the desired route snapshot API.
@@ -50,7 +58,13 @@ pub struct CreateRouteRequest {
 pub struct SnapshotRouteRequest {
     pub domain: String,
     pub upstream: String,
+    /// Replica addresses. Absent or empty keeps the single-upstream path.
+    #[serde(default)]
+    pub upstreams: Vec<String>,
     pub tls: bool,
+    /// `proxy` (default) or `webhook`.
+    #[serde(default)]
+    pub kind: RouteKind,
 }
 
 /// Request body for `PUT /routes/snapshot`.
@@ -154,36 +168,49 @@ pub fn list_routes(route_table: &ArcSwap<RouteTable>) -> Result<String, String> 
 }
 
 /// Add or update a route. Returns the created route as JSON.
+///
+/// The route is not persisted; see [`add_route_with`].
 pub fn add_route(route_table: &ArcSwap<RouteTable>, body: &[u8]) -> Result<String, String> {
-    let req: CreateRouteRequest =
-        serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))?;
+    add_route_with(route_table, &AdminRoutes::in_memory(), body).map_err(|e| e.to_string())
+}
 
-    if !is_valid_route_key(&req.domain) {
-        return Err(format!("invalid domain: {}", req.domain));
-    }
+/// Add or update an admin route: persisted through `admin_routes` first,
+/// then applied to the live table. Returns the created route as JSON.
+pub fn add_route_with(
+    route_table: &ArcSwap<RouteTable>,
+    admin_routes: &AdminRoutes,
+    body: &[u8],
+) -> Result<String, AdminRouteError> {
+    let req: CreateRouteRequest = serde_json::from_slice(body)
+        .map_err(|e| AdminRouteError::Invalid(format!("invalid JSON: {e}")))?;
+    let spec = AdminRouteSpec {
+        domain: req.domain,
+        upstream: req.upstream,
+        upstreams: req.upstreams,
+        tls: req.tls,
+        source: req.source,
+        kind: req.kind,
+    };
 
-    let upstream: std::net::SocketAddr = req
-        .upstream
-        .parse()
-        .map_err(|e| format!("invalid upstream address: {e}"))?;
-
-    let route = Route::with_source(&req.domain, upstream, req.tls, None, req.source);
-
-    route_table.rcu(|current| {
-        let mut routes = current.all_routes();
-        routes.retain(|r| r.domain != route.domain);
-        routes.push(route.clone());
-        Arc::new(RouteTable::new(routes))
-    });
+    let route = admin_routes.upsert(spec, |route| {
+        route_table.rcu(|current| {
+            let mut routes = current.all_routes();
+            routes.retain(|r| r.domain != route.domain);
+            routes.push(route.clone());
+            Arc::new(RouteTable::new(routes))
+        });
+    })?;
 
     tracing::info!(
         target: "dwaar::admin::audit",
         action = "route_add",
         principal = "admin",
         resource = %route.domain,
+        kind = ?route.kind,
         "admin mutation"
     );
-    serde_json::to_string(&route).map_err(|e| format!("serialize error: {e}"))
+    serde_json::to_string(&route)
+        .map_err(|e| AdminRouteError::Invalid(format!("serialize error: {e}")))
 }
 
 /// Apply a source-owned desired route snapshot.
@@ -196,64 +223,70 @@ pub fn apply_route_snapshot(
     route_table: &ArcSwap<RouteTable>,
     body: &[u8],
 ) -> Result<String, String> {
-    let req: ApplyRouteSnapshotRequest =
-        serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))?;
-    validate_snapshot_source(&req.source)?;
+    apply_route_snapshot_with(route_table, &AdminRoutes::in_memory(), body)
+        .map_err(|e| e.to_string())
+}
 
-    let mut routes = Vec::with_capacity(req.routes.len());
-    let mut domains = HashSet::with_capacity(req.routes.len());
-    for route_req in req.routes {
-        if !is_valid_route_key(&route_req.domain) {
-            return Err(format!("invalid domain: {}", route_req.domain));
-        }
-        let upstream: std::net::SocketAddr = route_req
-            .upstream
-            .parse()
-            .map_err(|e| format!("invalid upstream address: {e}"))?;
-        let route = Route::with_source(
-            &route_req.domain,
-            upstream,
-            route_req.tls,
-            None,
-            Some(req.source.clone()),
-        );
-        if !domains.insert(route.domain.clone()) {
-            return Err(format!("duplicate domain in snapshot: {}", route.domain));
-        }
-        routes.push(route);
-    }
+/// [`apply_route_snapshot`], persisted through `admin_routes` before the
+/// live table changes.
+pub fn apply_route_snapshot_with(
+    route_table: &ArcSwap<RouteTable>,
+    admin_routes: &AdminRoutes,
+    body: &[u8],
+) -> Result<String, AdminRouteError> {
+    let req: ApplyRouteSnapshotRequest = serde_json::from_slice(body)
+        .map_err(|e| AdminRouteError::Invalid(format!("invalid JSON: {e}")))?;
+    validate_snapshot_source(&req.source).map_err(AdminRouteError::Invalid)?;
 
-    routes.sort_by(|a, b| a.domain.cmp(&b.domain));
-    let route_hash = hash_route_snapshot(&req.source, &routes);
-    let mut removed = 0;
-    let mut total_routes = 0;
+    let desired: Vec<AdminRouteSpec> = req
+        .routes
+        .into_iter()
+        .map(|r| AdminRouteSpec {
+            domain: r.domain,
+            upstream: r.upstream,
+            upstreams: r.upstreams,
+            tls: r.tls,
+            source: None,
+            kind: r.kind,
+        })
+        .collect();
 
-    route_table.rcu(|current| {
-        let old_routes = current.all_routes();
-        let desired_domains = domains.clone();
-        removed = old_routes
-            .iter()
-            .filter(|route| {
-                route.source() == Some(req.source.as_str())
-                    && !desired_domains.contains(&route.domain)
-            })
-            .count();
+    let (applied, removed, total_routes, route_hash) =
+        admin_routes.replace_source(&req.source, desired, |built| {
+            let mut routes = built.to_vec();
+            routes.sort_by(|a, b| a.domain.cmp(&b.domain));
+            let route_hash = hash_route_snapshot(&req.source, &routes);
+            let domains: HashSet<&str> = routes.iter().map(|r| r.domain.as_str()).collect();
+            let mut removed = 0;
+            let mut total_routes = 0;
 
-        let mut next_routes: Vec<Route> = old_routes
-            .into_iter()
-            .filter(|route| route.source() != Some(req.source.as_str()))
-            .collect();
-        next_routes.extend(routes.iter().cloned());
-        total_routes = next_routes.len();
-        Arc::new(RouteTable::new(next_routes))
-    });
+            route_table.rcu(|current| {
+                let old_routes = current.all_routes();
+                removed = old_routes
+                    .iter()
+                    .filter(|route| {
+                        route.source() == Some(req.source.as_str())
+                            && !domains.contains(route.domain.as_str())
+                    })
+                    .count();
+
+                let mut next_routes: Vec<Route> = old_routes
+                    .into_iter()
+                    .filter(|route| route.source() != Some(req.source.as_str()))
+                    .collect();
+                next_routes.extend(routes.iter().cloned());
+                total_routes = next_routes.len();
+                Arc::new(RouteTable::new(next_routes))
+            });
+            (routes.len(), removed, total_routes, route_hash)
+        })?;
 
     tracing::info!(
         target: "dwaar::admin::audit",
         action = "route_snapshot_apply",
         principal = "admin",
         resource = %req.source,
-        applied = routes.len(),
+        applied,
         removed,
         route_hash = %route_hash,
         "admin mutation"
@@ -261,12 +294,13 @@ pub fn apply_route_snapshot(
 
     let response = ApplyRouteSnapshotResponse {
         source: req.source,
-        applied: routes.len(),
+        applied,
         removed,
         total_routes,
         route_hash,
     };
-    serde_json::to_string(&response).map_err(|e| format!("serialize error: {e}"))
+    serde_json::to_string(&response)
+        .map_err(|e| AdminRouteError::Invalid(format!("serialize error: {e}")))
 }
 
 fn validate_snapshot_source(source: &str) -> Result<(), String> {
@@ -293,7 +327,16 @@ fn hash_route_snapshot(source: &str, routes: &[Route]) -> String {
             hasher.update(upstream.to_string().as_bytes());
         }
         hasher.update(b"\0");
+        // Further replicas only. A single upstream hashes exactly as before.
+        for extra in route.state().upstreams.iter().skip(1) {
+            hasher.update(extra.upstream.as_bytes());
+            hasher.update(b"\0");
+        }
         hasher.update(if route.tls { b"1" } else { b"0" });
+        // Proxy routes hash exactly as before `kind` existed.
+        if route.kind == RouteKind::Webhook {
+            hasher.update(b"\0webhook");
+        }
         hasher.update(b"\n");
     }
     hex::encode(hasher.finalize())
@@ -320,23 +363,38 @@ pub fn list_all_analytics(metrics: &DashMap<String, DomainMetrics>) -> Result<St
 }
 
 /// Delete a route by domain. Returns the deleted domain or None if not found.
+///
+/// Not persisted; see [`delete_route_with`].
 pub fn delete_route(route_table: &ArcSwap<RouteTable>, domain: &str) -> Option<String> {
-    let domain_lower = domain.to_lowercase();
-    let mut existed = false;
+    delete_route_with(route_table, &AdminRoutes::in_memory(), domain).unwrap_or(None)
+}
 
-    // Atomically filter the route inside rcu — the closure may retry on
-    // CAS failure, but the last execution (the one that commits) sets
-    // `existed` to its final correct value.
-    route_table.rcu(|current| {
-        let old_routes = current.all_routes();
-        let old_len = old_routes.len();
-        let routes: Vec<Route> = old_routes
-            .into_iter()
-            .filter(|r| r.domain != domain_lower)
-            .collect();
-        existed = routes.len() < old_len;
-        Arc::new(RouteTable::new(routes))
-    });
+/// Delete a route by domain: an admin route is removed from `admin_routes`
+/// (persisted) first; a Dwaarfile route only leaves the live table (it comes
+/// back on reload or restart).
+pub fn delete_route_with(
+    route_table: &ArcSwap<RouteTable>,
+    admin_routes: &AdminRoutes,
+    domain: &str,
+) -> Result<Option<String>, AdminRouteError> {
+    let domain_lower = domain.to_lowercase();
+    let existed = admin_routes.remove(&domain_lower, || {
+        let mut existed = false;
+        // Atomically filter the route inside rcu — the closure may retry on
+        // CAS failure, but the last execution (the one that commits) sets
+        // `existed` to its final correct value.
+        route_table.rcu(|current| {
+            let old_routes = current.all_routes();
+            let old_len = old_routes.len();
+            let routes: Vec<Route> = old_routes
+                .into_iter()
+                .filter(|r| r.domain != domain_lower)
+                .collect();
+            existed = routes.len() < old_len;
+            Arc::new(RouteTable::new(routes))
+        });
+        existed
+    })?;
 
     if existed {
         tracing::info!(
@@ -347,7 +405,7 @@ pub fn delete_route(route_table: &ArcSwap<RouteTable>, domain: &str) -> Option<S
             "admin mutation"
         );
     }
-    existed.then_some(domain_lower)
+    Ok(existed.then_some(domain_lower))
 }
 
 /// Purge a single cache entry by host/path key.
@@ -468,6 +526,7 @@ mod tests {
             "metrics.upstream_connect_duration",
             "analytics.domain",
             "cache.purge",
+            "routes.webhook",
         ] {
             assert!(
                 capabilities
@@ -690,5 +749,223 @@ mod tests {
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).expect("parse");
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0]["domain"], "test.example.com");
+    }
+
+    // ── Webhook routes (agent-protocol §11.1, WS4) ───────────
+
+    #[test]
+    fn add_route_installs_a_webhook_route() {
+        let table = make_table(vec![]);
+        let body = br#"{"domain":"Hooks.Example.com","upstream":"127.0.0.1:7461","tls":true,"source":"permanu","kind":"webhook"}"#;
+        let json = add_route(&table, body).expect("webhook route");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse");
+        assert_eq!(parsed["kind"], "webhook");
+        assert_eq!(parsed["domain"], "hooks.example.com");
+
+        let guard = table.load();
+        let route = guard.resolve("hooks.example.com").expect("installed");
+        assert_eq!(route.kind, RouteKind::Webhook);
+        assert_eq!(route.upstream(), Some(addr(7461)));
+        assert_eq!(route.source(), Some("permanu"));
+
+        let listed: Vec<serde_json::Value> =
+            serde_json::from_str(&list_routes(&table).expect("list")).expect("parse");
+        assert_eq!(listed[0]["kind"], "webhook");
+    }
+
+    #[test]
+    fn add_route_defaults_to_a_proxy_route() {
+        let table = make_table(vec![]);
+        let body = br#"{"domain":"app.example.com","upstream":"127.0.0.1:3000","tls":false,"kind":"proxy"}"#;
+        add_route(&table, body).expect("proxy route");
+        assert_eq!(
+            table.load().resolve("app.example.com").expect("route").kind,
+            RouteKind::Proxy
+        );
+    }
+
+    #[test]
+    fn webhook_route_must_target_loopback() {
+        let table = make_table(vec![]);
+        for upstream in ["10.0.0.5:7461", "0.0.0.0:7461", "[::]:7461"] {
+            let body = format!(
+                r#"{{"domain":"hooks.example.com","upstream":"{upstream}","tls":true,"kind":"webhook"}}"#
+            );
+            assert!(add_route(&table, body.as_bytes()).is_err(), "{upstream}");
+        }
+        let body = br#"{"domain":"hooks.example.com","upstream":"[::1]:7461","tls":true,"kind":"webhook"}"#;
+        assert!(add_route(&table, body).is_ok());
+    }
+
+    #[test]
+    fn webhook_route_needs_an_exact_hostname() {
+        let table = make_table(vec![]);
+        for domain in ["*.example.com", "_default", "hooks.example.com/hooks"] {
+            let body = format!(
+                r#"{{"domain":"{domain}","upstream":"127.0.0.1:7461","tls":true,"kind":"webhook"}}"#
+            );
+            assert!(add_route(&table, body.as_bytes()).is_err(), "{domain}");
+        }
+        assert!(table.load().is_empty());
+    }
+
+    #[test]
+    fn add_route_rejects_an_unknown_kind() {
+        let table = make_table(vec![]);
+        let body =
+            br#"{"domain":"a.example.com","upstream":"127.0.0.1:7461","tls":true,"kind":"hooks"}"#;
+        assert!(add_route(&table, body).is_err());
+    }
+
+    #[test]
+    fn route_snapshot_keeps_webhook_kind_and_hash_of_proxy_routes() {
+        let table = make_table(vec![]);
+        let plain = br#"{"source":"permanu","routes":[{"domain":"app.example.com","upstream":"127.0.0.1:3000","tls":true}]}"#;
+        let first: serde_json::Value =
+            serde_json::from_str(&apply_route_snapshot(&table, plain).expect("apply"))
+                .expect("parse");
+
+        let with_hook = br#"{"source":"permanu","routes":[{"domain":"app.example.com","upstream":"127.0.0.1:3000","tls":true},{"domain":"hooks.example.com","upstream":"127.0.0.1:7461","tls":true,"kind":"webhook"}]}"#;
+        let second: serde_json::Value =
+            serde_json::from_str(&apply_route_snapshot(&table, with_hook).expect("apply"))
+                .expect("parse");
+        assert_ne!(first["route_hash"], second["route_hash"]);
+        let guard = table.load();
+        assert_eq!(
+            guard.resolve("hooks.example.com").expect("hook").kind,
+            RouteKind::Webhook
+        );
+        assert_eq!(
+            guard.resolve("app.example.com").expect("app").kind,
+            RouteKind::Proxy
+        );
+
+        // Turning the hook route into a plain route changes the hash.
+        let as_proxy = br#"{"source":"permanu","routes":[{"domain":"app.example.com","upstream":"127.0.0.1:3000","tls":true},{"domain":"hooks.example.com","upstream":"127.0.0.1:7461","tls":true}]}"#;
+        let third: serde_json::Value =
+            serde_json::from_str(&apply_route_snapshot(&table, as_proxy).expect("apply"))
+                .expect("parse");
+        assert_ne!(second["route_hash"], third["route_hash"]);
+    }
+
+    #[test]
+    fn route_snapshot_rejects_a_non_loopback_webhook() {
+        let table = make_table(vec![]);
+        let body = br#"{"source":"permanu","routes":[{"domain":"hooks.example.com","upstream":"192.0.2.1:7461","tls":true,"kind":"webhook"}]}"#;
+        assert!(apply_route_snapshot(&table, body).is_err());
+        assert!(table.load().is_empty());
+    }
+    // ── Persistence under --state-dir (`QA_M2` F16) ──
+
+    fn persisted(dir: &std::path::Path) -> AdminRoutes {
+        AdminRoutes::open(dir.join(dwaar_core::admin_routes::ADMIN_ROUTES_FILE))
+    }
+
+    #[test]
+    fn added_routes_are_persisted_and_restored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let table = make_table(vec![]);
+        let admin = persisted(dir.path());
+        add_route_with(
+            &table,
+            &admin,
+            br#"{"domain":"app.example.com","upstream":"172.20.0.4:3000","tls":true,"source":"permanu-runner"}"#,
+        )
+        .expect("add");
+        add_route_with(
+            &table,
+            &admin,
+            br#"{"domain":"hooks.example.com","upstream":"127.0.0.1:7461","tls":true,"kind":"webhook"}"#,
+        )
+        .expect("add webhook");
+        assert!(table.load().resolve("app.example.com").is_some());
+
+        // A restart: a fresh table from the Dwaarfile plus the restored overlay.
+        let restored = persisted(dir.path());
+        let table = make_table(restored.merge_into(vec![Route::new(
+            "site.example.com",
+            addr(1000),
+            false,
+            None,
+        )]));
+        let guard = table.load();
+        assert!(guard.resolve("site.example.com").is_some());
+        let hook = guard
+            .resolve("hooks.example.com")
+            .expect("webhook restored");
+        assert_eq!(hook.kind, RouteKind::Webhook);
+        let app = guard.resolve("app.example.com").expect("route restored");
+        assert!(app.tls);
+        assert_eq!(app.source(), Some("permanu-runner"));
+    }
+
+    #[test]
+    fn deleted_and_snapshot_routes_are_persisted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let table = make_table(vec![]);
+        let admin = persisted(dir.path());
+        add_route_with(
+            &table,
+            &admin,
+            br#"{"domain":"gone.example.com","upstream":"127.0.0.1:3000","tls":false}"#,
+        )
+        .expect("add");
+        assert_eq!(
+            delete_route_with(&table, &admin, "gone.example.com").expect("delete"),
+            Some("gone.example.com".to_owned())
+        );
+        apply_route_snapshot_with(
+            &table,
+            &admin,
+            br#"{"source":"permanu-runner","routes":[{"domain":"snap.example.com","upstream":"127.0.0.1:3001","tls":true}]}"#,
+        )
+        .expect("snapshot");
+
+        let restored: Vec<String> = persisted(dir.path())
+            .routes()
+            .into_iter()
+            .map(|r| r.domain)
+            .collect();
+        assert_eq!(restored, ["snap.example.com"]);
+    }
+
+    #[test]
+    fn a_route_that_cannot_be_persisted_is_not_applied() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let table = make_table(vec![]);
+        let admin = persisted(&dir.path().join("no-such-dir"));
+        let err = add_route_with(
+            &table,
+            &admin,
+            br#"{"domain":"app.example.com","upstream":"127.0.0.1:3000","tls":true}"#,
+        )
+        .expect_err("persist fails");
+        assert!(matches!(err, AdminRouteError::Persist(_)));
+        assert!(table.load().is_empty());
+
+        let err = apply_route_snapshot_with(
+            &table,
+            &admin,
+            br#"{"source":"s","routes":[{"domain":"a.example.com","upstream":"127.0.0.1:3000","tls":false}]}"#,
+        )
+        .expect_err("persist fails");
+        assert!(matches!(err, AdminRouteError::Persist(_)));
+        assert!(table.load().is_empty());
+    }
+
+    #[test]
+    fn invalid_admin_requests_are_bad_requests() {
+        let table = make_table(vec![]);
+        let admin = AdminRoutes::in_memory();
+        for body in [
+            &br#"{"domain":"../evil","upstream":"127.0.0.1:3000","tls":false}"#[..],
+            b"not json",
+            br#"{"domain":"h.example.com","upstream":"192.0.2.1:7461","tls":true,"kind":"webhook"}"#,
+        ] {
+            assert!(matches!(
+                add_route_with(&table, &admin, body),
+                Err(AdminRouteError::Invalid(_))
+            ));
+        }
     }
 }

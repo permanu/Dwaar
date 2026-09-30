@@ -195,6 +195,13 @@ fi
 ensure_writable_tmpdir
 ensure_rustup_toolchain
 
+if [ -z "${CARGO_BUILD_JOBS:-}" ]; then
+  export CARGO_BUILD_JOBS=1
+fi
+if [ -z "${CARGO_INCREMENTAL:-}" ]; then
+  export CARGO_INCREMENTAL=0
+fi
+
 require_cmd cargo
 require_cmd rustc
 

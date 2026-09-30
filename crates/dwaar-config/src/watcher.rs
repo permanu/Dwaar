@@ -16,6 +16,7 @@ use std::time::{Duration, SystemTime};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use dwaar_core::admin_routes::AdminRoutes;
 use dwaar_core::route::{Route, RouteTable};
 use dwaar_tls::sni::DomainConfigMap;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -110,6 +111,9 @@ pub struct ConfigWatcher {
     /// new one — e.g. the aggregation `DashMap` evicting removed domains.
     /// `None` means no subscriber registered. See issue #167.
     post_reload_notify: Option<Arc<tokio::sync::Notify>>,
+    /// Admin-API routes: laid over every recompiled table so a reload never
+    /// drops them, and their ACME hostnames kept in the ACME list.
+    admin_routes: Option<Arc<AdminRoutes>>,
 }
 
 impl std::fmt::Debug for ConfigWatcher {
@@ -148,6 +152,7 @@ impl ConfigWatcher {
             wasm_invalidator: None,
             wasm_mtimes: Mutex::new(HashMap::new()),
             post_reload_notify: None,
+            admin_routes: None,
         }
     }
 
@@ -190,6 +195,15 @@ impl ConfigWatcher {
     #[must_use]
     pub fn with_acme_domains(mut self, domains: Arc<ArcSwap<Vec<String>>>) -> Self {
         self.acme_domains = Some(domains);
+        self
+    }
+
+    /// Keep admin-API routes across reloads: each recompiled table gets them
+    /// laid over it, and the ACME list is published through `admin_routes`
+    /// (the Dwaarfile's domains plus the admin routes' hostnames).
+    #[must_use]
+    pub fn with_admin_routes(mut self, admin_routes: Arc<AdminRoutes>) -> Self {
+        self.admin_routes = Some(admin_routes);
         self
     }
 
@@ -375,8 +389,12 @@ impl ConfigWatcher {
             .and_then(|g| g.drain_timeout_secs)
             .map_or(self.drain_timeout, Duration::from_secs);
 
-        // Compile routes
+        // Compile routes, with the admin-API routes laid over them.
         let new_table = compile_routes(&config);
+        let new_table = match self.admin_routes {
+            Some(ref admin) => RouteTable::new(admin.merge_into(new_table.all_routes())),
+            None => new_table,
+        };
 
         // Warn if new table is empty but old had routes
         let old_table = self.route_table.load();
@@ -404,7 +422,10 @@ impl ConfigWatcher {
         }
 
         // Refresh ACME domain list from the new config.
-        if let Some(ref ad) = self.acme_domains {
+        if let Some(ref admin) = self.admin_routes {
+            admin.set_config_acme_domains(compile_acme_domains(&config));
+            debug!("ACME domain list refreshed (with admin routes)");
+        } else if let Some(ref ad) = self.acme_domains {
             let domains = compile_acme_domains(&config);
             ad.store(Arc::new(domains));
             debug!("ACME domain list refreshed");
@@ -462,9 +483,21 @@ impl ConfigWatcher {
 
             // Drain routes that were removed (ISSUE-075): mark them as draining
             // so in-flight requests complete, then let them drop after timeout.
-            drain_removed_routes(&old_table, &new_table, drain_timeout);
-
-            self.route_table.store(Arc::new(new_table));
+            if let Some(ref admin) = self.admin_routes {
+                // Merge again and store while admin-route changes wait, so a
+                // POST /routes that landed after the merge above is kept.
+                admin.store_merged(new_table.all_routes(), |merged| {
+                    let merged = RouteTable::new(merged);
+                    if let Some(ref hp) = self.health_pools {
+                        hp.store(Arc::new(collect_pools(&merged)));
+                    }
+                    drain_removed_routes(&old_table, &merged, drain_timeout);
+                    self.route_table.store(Arc::new(merged));
+                });
+            } else {
+                drain_removed_routes(&old_table, &new_table, drain_timeout);
+                self.route_table.store(Arc::new(new_table));
+            }
             info!(path = %self.config_path.display(), "config reloaded successfully");
         }
 
@@ -1130,6 +1163,69 @@ a.com {
             health_pools.load().len(),
             1,
             "stale pool removed after reload"
+        );
+    }
+
+    // ── Admin-API routes survive a reload (`QA_M2` F16) ─────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn reload_keeps_admin_api_routes_and_their_acme_domains() {
+        use dwaar_core::admin_routes::{AdminRouteSpec, AdminRoutes};
+        use dwaar_core::route::RouteKind;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("Dwaarfile");
+        let initial = "a.com {\n    tls auto\n    reverse_proxy 127.0.0.1:8080\n}\n";
+        std::fs::write(&config_path, initial).expect("write");
+        let config = parser::parse(initial).expect("parse");
+        let table = Arc::new(ArcSwap::from_pointee(compile_routes(&config)));
+        let acme_domains = Arc::new(ArcSwap::from_pointee(compile_acme_domains(&config)));
+        let admin = Arc::new(AdminRoutes::in_memory().with_acme(
+            Arc::clone(&acme_domains),
+            Arc::new(tokio::sync::Notify::new()),
+        ));
+        admin
+            .upsert(
+                AdminRouteSpec {
+                    domain: "hooks.example.com".into(),
+                    upstream: "127.0.0.1:7461".into(),
+                    upstreams: Vec::new(),
+                    tls: true,
+                    source: None,
+                    kind: RouteKind::Webhook,
+                },
+                |route| {
+                    table.rcu(|current| {
+                        let mut routes = current.all_routes();
+                        routes.push(route.clone());
+                        Arc::new(RouteTable::new(routes))
+                    });
+                },
+            )
+            .expect("admin route");
+
+        let watcher = ConfigWatcher::new(
+            config_path.clone(),
+            Arc::clone(&table),
+            hash_content(initial.as_bytes()),
+        )
+        .with_acme_domains(Arc::clone(&acme_domains))
+        .with_admin_routes(Arc::clone(&admin));
+
+        let updated = "b.com {\n    tls auto\n    reverse_proxy 127.0.0.1:9090\n}\n";
+        std::fs::write(&config_path, updated).expect("write");
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        watcher.try_reload(&shutdown_rx);
+
+        let guard = table.load();
+        assert!(guard.resolve("b.com").is_some(), "new Dwaarfile route");
+        let hook = guard
+            .resolve("hooks.example.com")
+            .expect("admin route kept across the reload");
+        assert_eq!(hook.kind, RouteKind::Webhook);
+        assert_eq!(
+            acme_domains.load().as_ref(),
+            &["b.com".to_string(), "hooks.example.com".to_string()]
         );
     }
 

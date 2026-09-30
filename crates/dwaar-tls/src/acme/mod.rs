@@ -14,6 +14,7 @@
 
 pub mod account;
 pub mod error;
+pub mod fake;
 pub mod issuer;
 pub mod service;
 pub mod solver;

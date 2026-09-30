@@ -32,6 +32,7 @@ libc = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 compact_str = { workspace = true }
 dwaar-log = { workspace = true }
 chrono = { workspace = true }

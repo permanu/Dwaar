@@ -11,6 +11,7 @@
 //! after the first request per domain.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering::Relaxed};
 
@@ -299,6 +300,64 @@ impl Default for DomainRequestMetrics {
     }
 }
 
+/// Per-(route, `route_path`) request metrics (contracts v1.1.3, D-061).
+pub struct RoutePathMetrics {
+    /// Requests per status class, `1xx` … `5xx`.
+    pub status_classes: [AtomicU64; STATUS_GROUP_COUNT],
+    pub duration: Histogram,
+}
+
+impl std::fmt::Debug for RoutePathMetrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RoutePathMetrics")
+            .field("count", &self.duration.count.load(Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for RoutePathMetrics {
+    fn default() -> Self {
+        Self {
+            status_classes: std::array::from_fn(|_| AtomicU64::new(0)),
+            duration: Histogram::new(),
+        }
+    }
+}
+
+impl RoutePathMetrics {
+    fn record(&self, status: u16, duration_us: u64) {
+        self.status_classes[status_group(status)].fetch_add(1, Relaxed);
+        self.duration.observe(duration_us);
+    }
+}
+
+/// Route path series of one route, keyed by `route_path`.
+pub type RoutePathSeries = parking_lot::RwLock<HashMap<CompactString, RoutePathMetrics>>;
+
+/// Record into one route's series, folding a template beyond the per-route
+/// cap into `other`. Known templates take only the read lock.
+fn record_in_series(series: &RoutePathSeries, route_path: &str, status: u16, duration_us: u64) {
+    use crate::route_path::{MAX_ROUTE_PATHS_PER_ROUTE, ROUTE_PATH_OTHER};
+
+    if let Some(m) = series.read().get(route_path) {
+        m.record(status, duration_us);
+        return;
+    }
+    let mut series = series.write();
+    let key = if series.contains_key(route_path)
+        || route_path == ROUTE_PATH_OTHER
+        || series.len() < MAX_ROUTE_PATHS_PER_ROUTE
+    {
+        route_path
+    } else {
+        ROUTE_PATH_OTHER
+    };
+    series
+        .entry(CompactString::from(key))
+        .or_default()
+        .record(status, duration_us);
+}
+
 /// All Prometheus metrics for the Dwaar proxy.
 ///
 /// Created once in `main()`, passed as `Arc<PrometheusMetrics>` to both
@@ -310,6 +369,11 @@ pub struct PrometheusMetrics {
     /// Active connections gauge — separate because it has a different
     /// lifecycle (`connection_start`/`connection_end` vs per-request record).
     pub active_connections: DashMap<CompactString, AtomicI64>,
+    /// Per-route, per-`route_path` series, keyed by the route key. The
+    /// `route_path` values come from
+    /// [`RoutePathRegistry`](crate::route_path::RoutePathRegistry), which
+    /// bounds them; this map re-checks the per-route cap (plus `other`).
+    pub route_paths: DashMap<CompactString, RoutePathSeries>,
 
     // Per-upstream
     pub upstream_connect_duration: DashMap<CompactString, Histogram>,
@@ -346,6 +410,7 @@ impl PrometheusMetrics {
         Self {
             domains: DashMap::new(),
             active_connections: DashMap::new(),
+            route_paths: DashMap::new(),
             upstream_connect_duration: DashMap::new(),
             upstream_health: DashMap::new(),
             tls_handshake_duration: Histogram::new(),
@@ -391,6 +456,26 @@ impl PrometheusMetrics {
         entry.duration.observe(duration_us);
         entry.bytes_sent.fetch_add(bytes_tx, Relaxed);
         entry.bytes_received.fetch_add(bytes_rx, Relaxed);
+    }
+
+    /// Record one request on `route` under its `route_path` label.
+    ///
+    /// `route_path` is the registry's bounded value; a template beyond the
+    /// per-route cap is folded into `other` here as well, and routes beyond
+    /// [`MAX_TRACKED_DOMAINS`] are not recorded.
+    pub fn record_route_path(&self, route: &str, route_path: &str, status: u16, duration_us: u64) {
+        if let Some(series) = self.route_paths.get(route) {
+            record_in_series(&series, route_path, status, duration_us);
+            return;
+        }
+        if self.route_paths.len() >= MAX_TRACKED_DOMAINS {
+            return;
+        }
+        let series = self
+            .route_paths
+            .entry(CompactString::from(route))
+            .or_default();
+        record_in_series(&series, route_path, status, duration_us);
     }
 
     /// Record upstream connection latency for an upstream socket address.
@@ -448,6 +533,7 @@ impl PrometheusMetrics {
 
         self.render_requests(&mut out);
         self.render_request_duration(&mut out);
+        self.render_route_paths(&mut out);
         self.render_bytes(&mut out);
         self.render_active_connections(&mut out);
         self.render_upstream_connect_duration(&mut out);
@@ -512,6 +598,49 @@ impl PrometheusMetrics {
                 entry.key(),
                 &entry.value().duration.snapshot(),
             );
+        }
+    }
+
+    /// `route_path` series (contracts v1.1.3, D-061): requests by route,
+    /// `route_path` and status class, and the latency histogram by route and
+    /// `route_path`. The 1.1.2 per-route series above keep their shape.
+    fn render_route_paths(&self, out: &mut String) {
+        out.push_str(
+            "# HELP dwaar_route_path_requests_total Total HTTP requests by route, path template and status class.\n",
+        );
+        out.push_str("# TYPE dwaar_route_path_requests_total counter\n");
+        for entry in &self.route_paths {
+            let route = escape_label_value(entry.key());
+            for (path, m) in entry.value().read().iter() {
+                let path = escape_label_value(path);
+                for (si, &status_label) in STATUS_CODES.iter().enumerate() {
+                    let val = m.status_classes[si].load(Relaxed);
+                    if val > 0 {
+                        let _ = writeln!(
+                            out,
+                            "dwaar_route_path_requests_total{{route=\"{route}\",route_path=\"{path}\",status_class=\"{status_label}\"}} {val}"
+                        );
+                    }
+                }
+            }
+        }
+
+        out.push_str(
+            "# HELP dwaar_route_path_request_duration_seconds Request duration in seconds by route and path template.\n",
+        );
+        out.push_str("# TYPE dwaar_route_path_request_duration_seconds histogram\n");
+        for entry in &self.route_paths {
+            let route = escape_label_value(entry.key());
+            for (path, m) in entry.value().read().iter() {
+                let path = escape_label_value(path);
+                let labels = format!("route=\"{route}\",route_path=\"{path}\"");
+                render_histogram_with_labels(
+                    out,
+                    "dwaar_route_path_request_duration_seconds",
+                    &labels,
+                    &m.duration.snapshot(),
+                );
+            }
         }
     }
 
@@ -631,6 +760,29 @@ fn render_histogram(out: &mut String, name: &str, domain: &str, snap: &Histogram
     );
     let _ = writeln!(out, "{name}_sum{{domain=\"{domain}\"}} {}", snap.sum_secs);
     let _ = writeln!(out, "{name}_count{{domain=\"{domain}\"}} {}", snap.count);
+}
+
+/// Write a histogram whose labels are already escaped and joined.
+fn render_histogram_with_labels(
+    out: &mut String,
+    name: &str,
+    labels: &str,
+    snap: &HistogramSnapshot,
+) {
+    for (i, &le) in BUCKET_BOUNDS_SECS.iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "{name}_bucket{{{labels},le=\"{le}\"}} {}",
+            snap.buckets[i]
+        );
+    }
+    let _ = writeln!(
+        out,
+        "{name}_bucket{{{labels},le=\"+Inf\"}} {}",
+        snap.buckets[BUCKET_BOUNDS_SECS.len()]
+    );
+    let _ = writeln!(out, "{name}_sum{{{labels}}} {}", snap.sum_secs);
+    let _ = writeln!(out, "{name}_count{{{labels}}} {}", snap.count);
 }
 
 /// Write a histogram without labels (global metrics like TLS handshake).
@@ -886,5 +1038,67 @@ mod tests {
         assert!(text.contains(
             "dwaar_upstream_connect_duration_seconds_count{domain=\"127.0.0.1:8080\"} 1"
         ));
+    }
+    #[tokio::test]
+    async fn route_path_series_render_counter_and_histogram() {
+        let m = PrometheusMetrics::new();
+        m.record_route_path("app.example.com", "/api/users/:id", 200, 3_000);
+        m.record_route_path("app.example.com", "/api/users/:id", 503, 1_000);
+        m.record_route_path("app.example.com", "other", 404, 1_000);
+
+        let text = m.render().await;
+        assert!(text.contains("# TYPE dwaar_route_path_requests_total counter"));
+        assert!(text.contains(
+            "dwaar_route_path_requests_total{route=\"app.example.com\",route_path=\"/api/users/:id\",status_class=\"2xx\"} 1"
+        ));
+        assert!(text.contains(
+            "dwaar_route_path_requests_total{route=\"app.example.com\",route_path=\"/api/users/:id\",status_class=\"5xx\"} 1"
+        ));
+        assert!(text.contains(
+            "dwaar_route_path_requests_total{route=\"app.example.com\",route_path=\"other\",status_class=\"4xx\"} 1"
+        ));
+        assert!(text.contains("# TYPE dwaar_route_path_request_duration_seconds histogram"));
+        assert!(text.contains(
+            "dwaar_route_path_request_duration_seconds_bucket{route=\"app.example.com\",route_path=\"/api/users/:id\",le=\"0.005\"} 2"
+        ));
+        assert!(text.contains(
+            "dwaar_route_path_request_duration_seconds_bucket{route=\"app.example.com\",route_path=\"/api/users/:id\",le=\"+Inf\"} 2"
+        ));
+        assert!(text.contains(
+            "dwaar_route_path_request_duration_seconds_count{route=\"app.example.com\",route_path=\"/api/users/:id\"} 2"
+        ));
+        assert!(text.contains(
+            "dwaar_route_path_request_duration_seconds_sum{route=\"app.example.com\",route_path=\"/api/users/:id\"} 0.004"
+        ));
+        // The 1.1.2 per-route series keep their shape.
+        assert!(
+            !text.contains("dwaar_route_status_class_total{route=\"app.example.com\",route_path")
+        );
+    }
+
+    #[tokio::test]
+    async fn route_path_labels_are_escaped() {
+        let m = PrometheusMetrics::new();
+        m.record_route_path("a\"b", "/x\"y", 200, 1_000);
+        let text = m.render().await;
+        assert!(text.contains(
+            "dwaar_route_path_requests_total{route=\"a\\\"b\",route_path=\"/x\\\"y\",status_class=\"2xx\"} 1"
+        ));
+    }
+
+    #[test]
+    fn route_path_series_are_bounded_per_route() {
+        let m = PrometheusMetrics::new();
+        for i in 0..(crate::route_path::MAX_ROUTE_PATHS_PER_ROUTE + 50) {
+            m.record_route_path("app.example.com", &format!("/p{i}"), 200, 1_000);
+        }
+        m.record_route_path("app.example.com", "other", 200, 1_000);
+        let paths = m.route_paths.get("app.example.com").expect("route tracked");
+        // The registry's 200 templates plus `other`.
+        assert_eq!(
+            paths.read().len(),
+            crate::route_path::MAX_ROUTE_PATHS_PER_ROUTE + 1
+        );
+        assert!(paths.read().contains_key("other"));
     }
 }

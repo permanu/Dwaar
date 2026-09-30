@@ -14,13 +14,16 @@
 //! The [`route`] module provides the domain→upstream mapping that
 //! `upstream_peer()` consults on every request.
 
+pub mod admin_routes;
 pub mod cache;
 pub mod context;
+mod fake_issuer;
 pub mod fastcgi;
 pub mod file_server;
 pub mod grpc_web;
 pub mod l4;
 pub mod l4_udp;
+pub mod permanu_challenge;
 pub mod proxy;
 pub mod quic;
 pub mod registries;

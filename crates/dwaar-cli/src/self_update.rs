@@ -203,7 +203,7 @@ impl CosignPublicKey {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum SignaturePolicy {
     /// Enterprise / BYOS: verify the bundle against an explicitly configured
-    /// public key (DWAAR_COSIGN_PUBKEY[_URL]).
+    /// public key (`DWAAR_COSIGN_PUBKEY`/`DWAAR_COSIGN_PUBKEY_URL`).
     ReleaseKey { key: CosignPublicKey },
     /// Default public path: self-contained keyless cosign bundle signed by the
     /// release.yml GitHub Actions workflow via Fulcio OIDC. No key needed.

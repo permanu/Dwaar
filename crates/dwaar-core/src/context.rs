@@ -322,6 +322,23 @@ impl RequestContext {
         // SAFETY: UUID hyphenated encoding is always valid ASCII/UTF-8
         std::str::from_utf8(&self.request_id_buf).expect("UUID is valid UTF-8")
     }
+
+    /// Pin a request on a [`RouteKind::Webhook`](crate::route::RouteKind)
+    /// route to plain, capped HTTP/1 (agent-protocol §11.1).
+    ///
+    /// Content-Type and Upgrade headers are client-controlled: without this a
+    /// sender could lift the body cap to 1 GiB with `application/grpc`, or ask
+    /// for a tunnel. The response is never cached.
+    pub fn enforce_webhook_policy(&mut self) {
+        self.is_grpc = false;
+        self.grpc_web_mode = None;
+        self.is_websocket = false;
+        self.cache_enabled = false;
+        self.cache_config = None;
+        self.request_body_max_size = self
+            .request_body_max_size
+            .min(crate::route::WEBHOOK_MAX_BODY_BYTES);
+    }
 }
 
 impl Default for RequestContext {
@@ -395,5 +412,27 @@ mod tests {
         assert!(ctx.plugin_ctx.compressor.is_none());
         assert!(!ctx.is_websocket);
         assert!(!ctx.is_grpc);
+    }
+
+    #[test]
+    fn webhook_policy_caps_body_and_drops_protocol_upgrades() {
+        let mut ctx = RequestContext {
+            is_grpc: true,
+            grpc_web_mode: Some(crate::grpc_web::GrpcWebMode::Binary),
+            is_websocket: true,
+            request_body_max_size: 1u64 << 30,
+            cache_enabled: true,
+            ..RequestContext::default()
+        };
+        ctx.enforce_webhook_policy();
+        assert!(!ctx.is_grpc, "a gRPC content type must not lift the cap");
+        assert!(ctx.grpc_web_mode.is_none());
+        assert!(!ctx.is_websocket);
+        assert!(!ctx.cache_enabled);
+        assert!(ctx.cache_config.is_none());
+        assert_eq!(
+            ctx.request_body_max_size,
+            crate::route::WEBHOOK_MAX_BODY_BYTES
+        );
     }
 }

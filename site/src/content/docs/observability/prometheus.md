@@ -86,6 +86,17 @@ If you are scraping the `/analytics` JSON endpoint or the analytics-sourced rows
 | `dwaar_bytes_sent_total` | counter | `domain` | Total response bytes sent to clients. |
 | `dwaar_bytes_received_total` | counter | `domain` | Total request bytes received from clients. |
 | `dwaar_active_connections` | gauge | `domain` | Currently active connections. Incremented on connection open, decremented on close. |
+| `dwaar_route_path_requests_total` | counter | `route`, `route_path`, `status_class` | Requests by matched route key, path template and status class (`1xx` … `5xx`). |
+| `dwaar_route_path_request_duration_seconds` | histogram | `route`, `route_path` | Request duration by route key and path template. Same buckets as `dwaar_request_duration_seconds`. |
+
+`route_path` is a low-cardinality template of the request path, also written to
+access log lines: the query and fragment are dropped, empty segments are
+dropped (so doubled and trailing slashes disappear), a segment that is all
+digits, a UUID, 16 or more hex characters or longer than 32 characters becomes
+`:id`, everything is lowercased, and the first 5 segments are kept — the 6th and
+every deeper segment together become one `*` (`/a/b/c/d/e/f/g` → `/a/b/c/d/e/*`;
+`/api/users/42/orders` → `/api/users/:id/orders`). Each route keeps its first 200 templates for the life
+of the process; any further template is reported as `other`.
 
 ### Upstream Metrics
 
