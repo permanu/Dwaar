@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use dwaar_analytics::aggregation::DomainMetrics;
 use dwaar_analytics::aggregation::snapshot::AnalyticsSnapshot;
-use dwaar_core::admin_routes::{AdminRouteError, AdminRouteSpec, AdminRoutes};
+use dwaar_core::admin_routes::{AdminHealthcheck, AdminRouteError, AdminRouteSpec, AdminRoutes};
 use dwaar_core::route::{Route, RouteKind, RouteTable};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -43,6 +43,8 @@ pub struct CreateRouteRequest {
     /// Replica addresses. Absent or empty keeps the single-upstream path.
     #[serde(default)]
     pub upstreams: Vec<String>,
+    #[serde(default)]
+    pub healthcheck: Option<AdminHealthcheck>,
     pub tls: bool,
     /// Which component owns this route (e.g. "dwaar-ingress").
     /// Used by reconcilers to identify their own routes.
@@ -61,6 +63,8 @@ pub struct SnapshotRouteRequest {
     /// Replica addresses. Absent or empty keeps the single-upstream path.
     #[serde(default)]
     pub upstreams: Vec<String>,
+    #[serde(default)]
+    pub healthcheck: Option<AdminHealthcheck>,
     pub tls: bool,
     /// `proxy` (default) or `webhook`.
     #[serde(default)]
@@ -187,6 +191,7 @@ pub fn add_route_with(
         domain: req.domain,
         upstream: req.upstream,
         upstreams: req.upstreams,
+        healthcheck: req.healthcheck,
         tls: req.tls,
         source: req.source,
         kind: req.kind,
@@ -245,6 +250,7 @@ pub fn apply_route_snapshot_with(
             domain: r.domain,
             upstream: r.upstream,
             upstreams: r.upstreams,
+            healthcheck: r.healthcheck,
             tls: r.tls,
             source: None,
             kind: r.kind,

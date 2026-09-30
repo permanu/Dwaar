@@ -105,8 +105,16 @@ fn serve(listener: &TcpListener, body: &'static str, stop: &AtomicBool) {
             Ok((mut stream, _)) => {
                 stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
                 let mut buf = [0u8; 8192];
-                let _ = stream.read(&mut buf);
-                let _ = stream.write_all(response.as_bytes());
+                let read = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..read]);
+                if body == "protected"
+                    && (!request.starts_with("GET /ready ")
+                        || !request.contains("Host: lb.example.com\r\n"))
+                {
+                    let _ = stream.write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                } else {
+                    let _ = stream.write_all(response.as_bytes());
+                }
                 let _ = stream.shutdown(Shutdown::Both);
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -308,7 +316,7 @@ fn unhealthy_upstream_is_skipped() {
     let (status, reply) = post_route(
         &dwaar.admin,
         &format!(
-            r#"{{"domain":"lb.example.com","upstream":"{}","upstreams":["{}","{}"],"tls":false}}"#,
+            r#"{{"domain":"lb.example.com","upstream":"{}","upstreams":["{}","{}"],"tls":false,"healthcheck":{{"path":"/","host":"lb.example.com","interval_seconds":1,"timeout_seconds":2}}}}"#,
             a.addr, a.addr, b.addr
         ),
     );
@@ -446,4 +454,24 @@ fn upstream_missing_from_upstreams_is_rejected_and_not_persisted() {
         !stored.contains("lb.example.com"),
         "rejected route was persisted: {stored}"
     );
+}
+
+#[test]
+fn explicit_ready_path_keeps_protected_root_backends_healthy() {
+    let _serial = SERIAL.lock().expect("serial");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let first = Backend::start("protected");
+    let second = Backend::start("protected");
+    let dwaar = start_dwaar(dir.path(), |_| {});
+    let body=serde_json::json!({"domain":"lb.example.com","upstream":first.addr,"upstreams":[first.addr,second.addr],"tls":false,"healthcheck":{"path":"/ready","host":"lb.example.com","interval_seconds":1,"timeout_seconds":2}}).to_string();
+    let (status, _) = admin_request(&dwaar.admin, "POST", "/routes", &body);
+    assert_eq!(status, 201);
+    thread::sleep(Duration::from_secs(12));
+    for _ in 0..4 {
+        assert_eq!(
+            proxy_get(dwaar.http_port, "lb.example.com", "/ready").0,
+            200
+        );
+    }
+    assert_eq!(proxy_get(dwaar.http_port, "lb.example.com", "/").0, 401);
 }

@@ -1200,6 +1200,7 @@ a.com {
                     domain: "hooks.example.com".into(),
                     upstream: "127.0.0.1:7461".into(),
                     upstreams: Vec::new(),
+                    healthcheck: None,
                     tls: true,
                     source: None,
                     kind: RouteKind::Webhook,

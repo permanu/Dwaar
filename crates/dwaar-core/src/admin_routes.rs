@@ -41,13 +41,34 @@ const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 /// Format version of [`ADMIN_ROUTES_FILE`].
 const FILE_VERSION: u32 = 1;
 
-/// Path probed by the existing health checker for an admin replica pool.
-/// Pools without a URI are never marked unhealthy.
-const ADMIN_UPSTREAM_HEALTH_URI: &str = "/";
-
-/// Seconds between those probes. The checker still sleeps longer while it
-/// has no pools.
-const ADMIN_UPSTREAM_HEALTH_INTERVAL_SECS: u64 = 1;
+/// Explicit HTTP health policy supplied by the route owner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminHealthcheck {
+    pub path: String,
+    pub host: String,
+    #[serde(default)]
+    pub port: Option<u16>,
+    pub interval_seconds: u64,
+    pub timeout_seconds: u64,
+}
+impl AdminHealthcheck {
+    fn validate(&self) -> Result<(), String> {
+        if !self.path.starts_with('/')
+            || self.path.len() > 2048
+            || self.path.bytes().any(|c| c <= 32 || c == 127)
+            || self.path.starts_with("//")
+            || !is_valid_domain(&self.host)
+            || self.host.contains('*')
+            || self.port == Some(0)
+            || !(1..=300).contains(&self.interval_seconds)
+            || !(1..=60).contains(&self.timeout_seconds)
+        {
+            return Err("invalid upstream health policy".into());
+        }
+        Ok(())
+    }
+}
 
 /// One admin-API route as requested and as persisted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +80,8 @@ pub struct AdminRouteSpec {
     /// `upstream` must be one of the addresses.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub upstreams: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub healthcheck: Option<AdminHealthcheck>,
     pub tls: bool,
     /// Which component owns this route (e.g. `permanu-runner`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -87,6 +110,9 @@ impl AdminRouteSpec {
             return Err(format!("invalid domain: {domain}"));
         }
         let addrs = self.backend_addrs()?;
+        if let Some(check) = &self.healthcheck {
+            check.validate()?;
+        }
         match self.kind {
             RouteKind::Proxy if self.upstreams.is_empty() => Ok(Route::with_source(
                 domain,
@@ -96,7 +122,8 @@ impl AdminRouteSpec {
                 self.source.clone(),
             )),
             RouteKind::Proxy => {
-                let pool = reusable_pool(previous, &addrs).unwrap_or_else(|| new_pool(&addrs));
+                let pool = reusable_pool(previous, &addrs, self.healthcheck.as_ref())
+                    .unwrap_or_else(|| new_pool(&addrs, self.healthcheck.as_ref()));
                 Ok(route_with_pool(domain, pool, self.tls, self.source.clone()))
             }
             RouteKind::Webhook => {
@@ -163,7 +190,7 @@ struct StoredRoute {
     route: Route,
 }
 
-fn new_pool(addrs: &[SocketAddr]) -> Arc<UpstreamPool> {
+fn new_pool(addrs: &[SocketAddr], check: Option<&AdminHealthcheck>) -> Arc<UpstreamPool> {
     let backends = addrs
         .iter()
         .copied()
@@ -176,19 +203,34 @@ fn new_pool(addrs: &[SocketAddr]) -> Arc<UpstreamPool> {
             trusted_ca: None,
         })
         .collect();
-    Arc::new(UpstreamPool::new(
+    let mut pool = UpstreamPool::new(
         backends,
         LbPolicy::RoundRobin,
-        Some(ADMIN_UPSTREAM_HEALTH_URI.to_owned()),
-        Some(ADMIN_UPSTREAM_HEALTH_INTERVAL_SECS),
-    ))
+        check.map(|c| c.path.clone()),
+        check.map(|c| c.interval_seconds),
+    );
+    if let Some(c) = check {
+        pool.health_host = Some(c.host.clone());
+        pool.health_port = c.port;
+        pool.health_timeout = std::time::Duration::from_secs(c.timeout_seconds);
+    }
+    Arc::new(pool)
 }
 
-fn reusable_pool(previous: Option<&Route>, addrs: &[SocketAddr]) -> Option<Arc<UpstreamPool>> {
+fn reusable_pool(
+    previous: Option<&Route>,
+    addrs: &[SocketAddr],
+    check: Option<&AdminHealthcheck>,
+) -> Option<Arc<UpstreamPool>> {
     let previous = previous?;
     for block in &previous.handlers {
         if let Handler::ReverseProxyPool { pool, .. } = &block.handler {
-            let same = pool.backends.len() == addrs.len()
+            let same = pool.health_uri.as_deref() == check.map(|c| c.path.as_str())
+                && pool.health_host.as_deref() == check.map(|c| c.host.as_str())
+                && pool.health_port == check.and_then(|c| c.port)
+                && pool.health_timeout.as_secs() == check.map_or(5, |c| c.timeout_seconds)
+                && pool.health_interval.as_secs() == check.map_or(10, |c| c.interval_seconds)
+                && pool.backends.len() == addrs.len()
                 && pool
                     .backends
                     .iter()
@@ -667,6 +709,7 @@ mod tests {
             domain: domain.to_owned(),
             upstream: upstream.to_owned(),
             upstreams: Vec::new(),
+            healthcheck: None,
             tls,
             source: Some("permanu-runner".to_owned()),
             kind,
@@ -677,6 +720,38 @@ mod tests {
         let mut d: Vec<String> = routes.iter().map(|r| r.domain.clone()).collect();
         d.sort();
         d
+    }
+
+    #[test]
+    fn replica_health_uses_explicit_configuration_and_is_part_of_pool_identity() {
+        let mut request = spec("app.example.com", "127.0.0.1:3000", false, RouteKind::Proxy);
+        request.upstreams = vec!["127.0.0.1:3000".into(), "127.0.0.2:3000".into()];
+        let disabled = request.build().expect("valid route");
+        let Handler::ReverseProxyPool { pool, .. } = &disabled.handlers[0].handler else {
+            panic!("pool");
+        };
+        assert!(!pool.has_health_check());
+        request.healthcheck = Some(AdminHealthcheck {
+            path: "/ready".into(),
+            host: "app.example.com".into(),
+            port: Some(3000),
+            interval_seconds: 17,
+            timeout_seconds: 2,
+        });
+        let configured = request
+            .build_reusing(Some(&disabled))
+            .expect("valid health route");
+        let Handler::ReverseProxyPool { pool: new, .. } = &configured.handlers[0].handler else {
+            panic!("pool");
+        };
+        assert!(!Arc::ptr_eq(pool, new));
+        assert_eq!(new.health_uri.as_deref(), Some("/ready"));
+        assert_eq!(new.health_host.as_deref(), Some("app.example.com"));
+        assert_eq!(new.health_interval.as_secs(), 17);
+        assert_eq!(new.health_timeout.as_secs(), 2);
+        request.healthcheck.as_mut().expect("health policy").path =
+            "/ready\r\nInjected: yes".into();
+        assert!(request.build().is_err());
     }
 
     #[test]

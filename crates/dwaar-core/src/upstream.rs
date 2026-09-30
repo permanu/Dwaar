@@ -110,6 +110,9 @@ pub struct UpstreamPool {
     pub(crate) health_uri: Option<String>,
     /// Seconds between health polls.
     pub(crate) health_interval: Duration,
+    pub(crate) health_host: Option<String>,
+    pub(crate) health_port: Option<u16>,
+    pub(crate) health_timeout: Duration,
     /// Scale-to-zero config (ISSUE-082). When set, the proxy will attempt to wake
     /// a sleeping backend on upstream connection failure instead of returning 502.
     pub(crate) scale_to_zero: Option<Arc<ScaleToZeroConfig>>,
@@ -184,6 +187,9 @@ impl UpstreamPool {
             counter: AtomicU64::new(0),
             health_uri,
             health_interval: Duration::from_secs(health_interval.unwrap_or(10)),
+            health_host: None,
+            health_port: None,
+            health_timeout: Duration::from_secs(5),
             scale_to_zero: None,
             retry_config: RetryConfig::DISABLED,
         }
@@ -720,6 +726,7 @@ impl HealthChecker {
 #[async_trait]
 impl BackgroundService for HealthChecker {
     async fn start(&self, mut shutdown: pingora_core::server::ShutdownWatch) {
+        let mut next_probe = HashMap::<usize, tokio::time::Instant>::new();
         loop {
             // Reload the pool list from ArcSwap on every tick so hot-reloaded
             // pools are picked up without restarting the service.
@@ -749,6 +756,8 @@ impl BackgroundService for HealthChecker {
                 .min()
                 .unwrap_or(Duration::from_secs(10));
 
+            next_probe
+                .retain(|key, _| active.iter().any(|pool| Arc::as_ptr(pool) as usize == *key));
             // Probe all backends across all active pools.
             //
             // Within each pool, backends are probed concurrently via join_all so
@@ -762,6 +771,12 @@ impl BackgroundService for HealthChecker {
             // (typically single-digit to low tens). For pools that could exceed
             // ~100 backends, switch to futures_util::stream::iter(...).buffer_unordered(N).
             for pool in &active {
+                let key = Arc::as_ptr(pool) as usize;
+                let now = tokio::time::Instant::now();
+                if next_probe.get(&key).is_some_and(|at| *at > now) {
+                    continue;
+                }
+                next_probe.insert(key, now + pool.health_interval);
                 let Some(ref uri) = pool.health_uri else {
                     continue;
                 };
@@ -771,7 +786,11 @@ impl BackgroundService for HealthChecker {
                 let probe_futs = pool.backends.iter().map(|backend| {
                     let addr = backend.addr;
                     let uri = uri.clone();
-                    async move { (addr, probe_backend(addr, &uri).await) }
+                    let probe_addr =
+                        SocketAddr::new(addr.ip(), pool.health_port.unwrap_or(addr.port()));
+                    let host = pool.health_host.clone().unwrap_or_else(|| addr.to_string());
+                    let timeout = pool.health_timeout;
+                    async move { (addr, probe_backend(probe_addr, &uri, &host, timeout).await) }
                 });
                 let results: Vec<(
                     SocketAddr,
@@ -819,12 +838,14 @@ impl BackgroundService for HealthChecker {
 async fn probe_backend(
     addr: SocketAddr,
     uri: &str,
+    host: &str,
+    budget: Duration,
 ) -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
-    // 5-second connect + read budget is generous for a health probe.
-    let mut stream = tokio::time::timeout(Duration::from_secs(5), TcpStream::connect(addr))
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut stream = tokio::time::timeout_at(deadline, TcpStream::connect(addr))
         .await
         .map_err(|_| "connect timed out")?
         .or_err(
@@ -832,10 +853,9 @@ async fn probe_backend(
             "health probe connect",
         )?;
 
-    let host = addr.to_string();
     let request = format!("GET {uri} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
 
-    tokio::time::timeout(Duration::from_secs(5), stream.write_all(request.as_bytes()))
+    tokio::time::timeout_at(deadline, stream.write_all(request.as_bytes()))
         .await
         .map_err(|_| "write timed out")?
         .or_err(pingora_error::ErrorType::WriteError, "health probe write")?;
@@ -843,7 +863,6 @@ async fn probe_backend(
     // Read at least the status line — loop to handle partial reads.
     let mut buf = [0u8; 64];
     let mut total = 0;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         match tokio::time::timeout_at(deadline, stream.read(&mut buf[total..])).await {
             Ok(Ok(0)) => break,
