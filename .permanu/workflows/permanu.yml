@@ -47,7 +47,7 @@ jobs:
 
   rust-validation:
     name: permanu-ci / dwaar / rust-validation
-    needs: version-guard
+    needs: [version-guard, dependency-audit]
     runs-on: self-hosted
     container:
       image: rust:1.94.1-bookworm

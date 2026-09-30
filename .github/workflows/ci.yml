@@ -24,6 +24,7 @@ env:
 jobs:
   rust-validation:
     name: Rust Validation
+    needs: [license-headers, deny]
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
