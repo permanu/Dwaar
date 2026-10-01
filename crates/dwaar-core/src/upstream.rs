@@ -741,7 +741,7 @@ impl BackgroundService for HealthChecker {
                 // No pools need health checking right now. Sleep with a default
                 // interval and re-check after reload might have added some.
                 tokio::select! {
-                    () = tokio::time::sleep(Duration::from_secs(10)) => { continue; }
+                    () = tokio::time::sleep(Duration::from_secs(1)) => { continue; }
                     _ = shutdown.changed() => {
                         debug!("health checker: shutdown signal received");
                         return;
@@ -818,9 +818,10 @@ impl BackgroundService for HealthChecker {
                 }
             }
 
-            // Wait for the poll interval or shutdown signal.
+            // Poll dynamic pool changes within one second; next_probe still enforces
+            // each signed interval for existing pools, including slow ones.
             tokio::select! {
-                () = tokio::time::sleep(interval) => {}
+                () = tokio::time::sleep(interval.min(Duration::from_secs(1))) => {}
                 _ = shutdown.changed() => {
                     debug!("health checker: shutdown signal received");
                     return;

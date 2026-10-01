@@ -481,9 +481,11 @@ fn explicit_ready_path_keeps_protected_root_backends_healthy() {
     assert_eq!(status, 201);
     thread::sleep(Duration::from_secs(12));
     for _ in 0..4 {
+        let (status, response) = proxy_get(dwaar.http_port, "lb.example.com", "/ready");
+        let (_, state) = admin_request(&dwaar.admin, "GET", "/routes", "");
         assert_eq!(
-            proxy_get(dwaar.http_port, "lb.example.com", "/ready").0,
-            200
+            status, 200,
+            "readiness response {response}; current routes {state}"
         );
     }
     assert_eq!(proxy_get(dwaar.http_port, "lb.example.com", "/").0, 401);
