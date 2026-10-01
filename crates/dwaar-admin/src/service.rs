@@ -363,6 +363,20 @@ impl AdminService {
                 Ok(json) => json_response(200, &json),
                 Err(e) => json_error(500, &e),
             },
+            ("POST", "/routes/delete-if") => {
+                let data = match read_body(session, 2048).await {
+                    Ok(data) => data,
+                    Err((status, message)) => return json_error(status, &message),
+                };
+                match handlers::delete_route_matching(&self.route_table, &self.admin_routes, &data)
+                {
+                    Ok(_) => {
+                        self.refresh_health_pools();
+                        json_response(200, r#"{"ok":true}"#)
+                    }
+                    Err(error) => admin_route_error(&error),
+                }
+            }
             ("POST", "/routes") => {
                 let body = read_body(session, MAX_BODY_SIZE).await;
                 match body {

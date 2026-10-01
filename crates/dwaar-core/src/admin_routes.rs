@@ -454,6 +454,32 @@ impl AdminRoutes {
         Ok(on_commit())
     }
 
+    /// Removes only the admin route that still has the caller's ownership
+    /// and upstream. Validation, persistence and live removal share the lock.
+    pub fn remove_matching(
+        &self,
+        domain: &str,
+        upstream: &str,
+        source: &str,
+        on_commit: impl FnOnce(),
+    ) -> Result<bool, AdminRouteError> {
+        let key = domain.to_lowercase();
+        let mut specs = self.specs.lock();
+        let Some(current) = specs.get(&key) else {
+            return Ok(false);
+        };
+        if current.spec.upstream != upstream || current.spec.source.as_deref() != Some(source) {
+            return Ok(false);
+        }
+        let mut next = specs.clone();
+        next.remove(&key);
+        self.persist(&next)?;
+        *specs = next;
+        on_commit();
+        self.publish_acme(&specs);
+        Ok(true)
+    }
+
     /// Replace every admin route owned by `source` with `desired` (each is
     /// given that source). `on_commit` runs with the built routes after the
     /// change was persisted.
@@ -714,6 +740,34 @@ mod tests {
             source: Some("permanu-runner".to_owned()),
             kind,
         }
+    }
+
+    #[test]
+    fn conditional_delete_preserves_a_route_reassigned_to_another_owner() {
+        let routes = AdminRoutes::in_memory();
+        routes
+            .upsert(
+                spec("owned.example", "127.0.0.1:8080", false, RouteKind::Proxy),
+                |_| {},
+            )
+            .expect("conditional route mutation");
+        let called = std::cell::Cell::new(false);
+        assert!(
+            !routes
+                .remove_matching("owned.example", "127.0.0.1:9090", "permanu-runner", || {
+                    called.set(true);
+                })
+                .expect("conditional route mutation")
+        );
+        assert!(!called.get());
+        assert!(
+            routes
+                .remove_matching("owned.example", "127.0.0.1:8080", "permanu-runner", || {
+                    called.set(true);
+                })
+                .expect("conditional route mutation")
+        );
+        assert!(called.get());
     }
 
     fn domains(routes: &[Route]) -> Vec<String> {

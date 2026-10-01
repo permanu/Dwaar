@@ -34,6 +34,7 @@ const ADMIN_CAPABILITIES: &[&str] = &[
     "cache.purge",
     "routes.webhook",
     "routes.healthcheck.v1",
+    "routes.delete_if.v1",
 ];
 
 /// Request body for `POST /routes`.
@@ -415,6 +416,45 @@ pub fn delete_route_with(
     Ok(existed.then_some(domain_lower))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConditionalDelete {
+    domain: String,
+    upstream: String,
+    source: String,
+}
+
+/// Delete only a route whose current persisted owner and upstream still match.
+pub fn delete_route_matching(
+    table: &ArcSwap<RouteTable>,
+    admin: &AdminRoutes,
+    body: &[u8],
+) -> Result<bool, AdminRouteError> {
+    let request: ConditionalDelete = serde_json::from_slice(body)
+        .map_err(|_| AdminRouteError::Invalid("invalid conditional deletion".into()))?;
+    if request.domain.len() > 253
+        || request.source.is_empty()
+        || request.source.len() > 64
+        || request.upstream.parse::<std::net::SocketAddr>().is_err()
+    {
+        return Err(AdminRouteError::Invalid(
+            "invalid conditional deletion".into(),
+        ));
+    }
+    let domain = request.domain.to_lowercase();
+    admin.remove_matching(&domain, &request.upstream, &request.source, || {
+        table.rcu(|current| {
+            Arc::new(RouteTable::new(
+                current
+                    .all_routes()
+                    .into_iter()
+                    .filter(|route| route.domain != domain)
+                    .collect(),
+            ))
+        });
+    })
+}
+
 /// Purge a single cache entry by host/path key.
 ///
 /// The key format is `{host}/{path}` — extracted from the PURGE URL.
@@ -535,6 +575,7 @@ mod tests {
             "cache.purge",
             "routes.webhook",
             "routes.healthcheck.v1",
+            "routes.delete_if.v1",
         ] {
             assert!(
                 capabilities
