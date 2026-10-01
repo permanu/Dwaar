@@ -96,6 +96,10 @@ fn fork_workers(
     count: usize,
     readiness_target: &readiness::WorkerReadiness,
 ) -> anyhow::Result<WorkerRole> {
+    // Worker listeners can become reachable before every worker is ready.
+    // Queue operator signals throughout startup rather than taking the
+    // default SIGUSR2 action while the supervisor waits for acknowledgements.
+    install_supervisor_signal_handlers();
     let mut children: Vec<libc::pid_t> = Vec::with_capacity(count);
     let mut pending_readiness = Vec::with_capacity(count);
 
@@ -131,10 +135,6 @@ fn fork_workers(
     // Build reverse mapping so restarts can preserve logical worker IDs.
     let mut pid_to_id: std::collections::HashMap<libc::pid_t, usize> =
         children.iter().enumerate().map(|(i, &p)| (p, i)).collect();
-
-    // Install SIGTERM/SIGINT handlers so the supervisor can relay shutdown to
-    // workers when the operator sends a signal.
-    install_supervisor_signal_handlers();
 
     let max_backoff = std::time::Duration::from_secs(30);
     let crash_window = std::time::Duration::from_secs(5);

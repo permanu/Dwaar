@@ -107,8 +107,15 @@ use std::sync::{Mutex, OnceLock};
 
 static LISTENERS: OnceLock<ListenFds> = OnceLock::new();
 static SERVICES: Mutex<Vec<ServiceHandle>> = Mutex::new(Vec::new());
+static EXPECTED_LISTENERS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 pub(crate) fn add_service<S: ServiceWithDependents + 'static>(server: &mut Server, service: S) {
+    if let Some(addresses) = service.listen_addresses() {
+        EXPECTED_LISTENERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(addresses);
+    }
     let handle = server.add_service(service);
     SERVICES
         .lock()
@@ -139,8 +146,23 @@ impl Service for Coordinator {
     ) {
         let Some(fds) = fds else { return };
         let _ = LISTENERS.set(fds.clone());
-        if fds.lock().await.serialize().0.is_empty() {
-            return;
+        let expected = EXPECTED_LISTENERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let keys = fds.lock().serialize().0;
+            if !keys.is_empty() && expected.iter().all(|address| keys.contains(address)) {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline
+                || *shutdown.borrow()
+                || dwaar_core::readiness::failed()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
         if dwaar_core::readiness::failed() || *shutdown.borrow() {
             return;
@@ -216,7 +238,7 @@ impl Handshake {
             let fds = LISTENERS
                 .get()
                 .ok_or_else(|| std::io::Error::other("running listener descriptors unavailable"))?;
-            let descriptors = fds.blocking_lock();
+            let descriptors = fds.lock();
             let (keys, values) = descriptors.serialize();
             if keys.is_empty() || values.len() > 32 || keys.join(" ").len() > 2048 {
                 return Err(std::io::Error::other(

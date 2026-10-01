@@ -214,19 +214,16 @@ pub fn realloc_cache_backend(
 
 /// Build a [`CacheKey`] scoped to the given host.
 ///
-/// Namespace isolates entries per virtual host so that
-/// `site-a.com/index.html` and `site-b.com/index.html` never collide.
-///
-/// Pre-sizes the composite `method path` string exactly so the allocation
-/// count on the hot path is `1` (was `1 + format!` machinery overhead via
-/// `format!("{method} {path}")` — audit finding M-07).
+/// Each component is length-prefixed so virtual hosts, methods, and paths
+/// remain isolated even when their concatenated bytes would be identical.
+/// Pingora 0.9 hashes a single primary key rather than a separate namespace.
 pub fn build_cache_key(host: &str, path: &str, method: &str) -> CacheKey {
-    let mut composite = String::with_capacity(method.len() + 4 + path.len());
-    composite.push_str("v2 ");
-    composite.push_str(method);
-    composite.push(' ');
-    composite.push_str(path);
-    CacheKey::new(host, composite, "")
+    let mut primary = Vec::with_capacity(24 + host.len() + method.len() + path.len());
+    for component in [host, method, path] {
+        primary.extend_from_slice(&(component.len() as u64).to_be_bytes());
+        primary.extend_from_slice(component.as_bytes());
+    }
+    CacheKey::new(primary, "")
 }
 
 /// Credential-bearing requests bypass both lookup and admission.
@@ -463,6 +460,15 @@ mod tests {
     }
 
     // -- build_cache_key ----------------------------------------------------
+
+    #[test]
+    fn cache_key_frames_host_and_method_boundaries() {
+        use pingora_cache::key::CacheHashKey;
+
+        let first = build_cache_key("aT", "/page", "GET");
+        let second = build_cache_key("a", "/page", "TGET");
+        assert_ne!(first.primary_bin(), second.primary_bin());
+    }
 
     #[test]
     fn different_inputs_produce_different_keys() {

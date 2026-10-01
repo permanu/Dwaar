@@ -155,8 +155,8 @@ fn start_dwaar(
         // Admin token so /version is reachable without auth on loopback.
         .env("DWAAR_ADMIN_TOKEN", "test-token")
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(std::fs::File::create(dwaarfile.parent().expect("fixture").join("stdout.log")).expect("fixture log"))
+        .stderr(std::fs::File::create(dwaarfile.parent().expect("fixture").join("stderr.log")).expect("fixture log"));
 
     if is_upgrade {
         cmd.arg("--upgrade");
@@ -379,7 +379,15 @@ fn check_upgrade(workers: usize) {
 
     // Assert upgrade happened.
     let new_pid = new_pid.unwrap_or_else(|| {
-        panic!("upgrade did not complete within 15s — /version still shows PID {initial_pid}")
+        let mut diagnostic = String::new();
+        for name in ["stdout.log", "stderr.log"] {
+            if let Ok(file) = std::fs::File::open(dir.path().join(name)) {
+                let _ = file.take(16_384).read_to_string(&mut diagnostic);
+            }
+        }
+        unsafe { libc::kill(-parent_pid.cast_signed(), libc::SIGKILL); }
+        let _ = parent.wait();
+        panic!("upgrade did not complete within 15s — /version still shows PID {initial_pid}; fixture: {diagnostic}")
     });
     assert_ne!(
         new_pid, initial_pid,
@@ -449,7 +457,8 @@ fn failed_replacement_keeps_old_generation_serving() {
             libc::kill(parent.id().cast_signed(), libc::SIGUSR2);
         }
         std::thread::sleep(Duration::from_secs(2));
-        let alive = parent.try_wait().expect("child status").is_none();
+        let status = parent.try_wait().expect("child status");
+        let alive = status.is_none();
         let same = fetch_pid_from_version("127.0.0.1:6190") == Some(original);
         let mut stream = TcpStream::connect("127.0.0.1:6664").expect("old route");
         stream
@@ -467,12 +476,18 @@ fn failed_replacement_keeps_old_generation_serving() {
         unsafe {
             libc::kill(-parent.id().cast_signed(), libc::SIGKILL);
         }
+        let mut diagnostic = String::new();
+        if !alive && let Some(stderr) = parent.stderr.take() {
+            let _ = stderr.take(8192).read_to_string(&mut diagnostic);
+        }
         assert!(
             alive
                 && same
                 && received.is_ok()
                 && body.starts_with(b"HTTP/1.1 200")
-                && body.ends_with(b"upgrade-ok")
+                && body.ends_with(b"upgrade-ok"),
+            "workers={workers}, status={status:?}, alive={alive}, same={same}, read={received:?}, diagnostic={diagnostic}, response={}",
+            String::from_utf8_lossy(&body[..body.len().min(128)])
         );
     }
 }
