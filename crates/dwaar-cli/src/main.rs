@@ -586,7 +586,7 @@ extern "C" fn handle_sigusr2(_sig: libc::c_int) {
 /// The upgrade socket path is passed so it can be forwarded to the child via
 /// `DWAAR_UPGRADE_SOCK`; the child's Pingora config picks it up automatically.
 #[allow(clippy::too_many_lines)]
-fn install_sigusr2_handler(drain_timeout_secs: u64, upgrade_sock: String) {
+fn install_sigusr2_handler(drain_timeout_secs: u64, upgrade_sock: String, h3_enabled: bool) {
     use std::sync::atomic::Ordering;
 
     // SAFETY: signal handler only sets an atomic flag — async-signal-safe.
@@ -611,6 +611,12 @@ fn install_sigusr2_handler(drain_timeout_secs: u64, upgrade_sock: String) {
                 // Clear the flag before we start work — if the operator sends
                 // SIGUSR2 again mid-upgrade it will queue for the next iteration.
                 UPGRADE_PENDING.store(false, Ordering::SeqCst);
+
+                // Quinn connection state and CID routing cannot be transferred.
+                if h3_enabled {
+                    tracing::error!("HTTP/3 graceful upgrade is unsupported; parent stays up");
+                    continue;
+                }
 
                 tracing::info!("SIGUSR2 received — starting zero-downtime upgrade");
 
@@ -751,6 +757,16 @@ fn main() -> anyhow::Result<()> {
     let config_path = &cli.config;
     let dwaar_config = load_config(config_path)?;
     let drain_timeout = std::time::Duration::from_secs(extract_drain_timeout(&dwaar_config));
+    let h3_enabled = dwaar_config
+        .global_options
+        .as_ref()
+        .is_some_and(|global| global.h3_enabled);
+    if h3_enabled
+        && (cli.upgrade
+            || std::env::var("DWAAR_UPGRADE_FROM").is_ok_and(|value| value.trim() == "1"))
+    {
+        anyhow::bail!("HTTP/3 graceful upgrade is unsupported; keep the running parent");
+    }
 
     if cli.test {
         info!("config valid");
@@ -1330,6 +1346,7 @@ fn bind_proxy_listeners(
     timeouts: &dwaar_config::model::TimeoutsConfig,
     worker_count: usize,
     cert_dir: &std::path::Path,
+    worker_id: usize,
 ) -> anyhow::Result<ListenerOutputs> {
     let h3_enabled = dwaar_config
         .global_options
@@ -1405,38 +1422,61 @@ fn bind_proxy_listeners(
 
     // QUIC listener for HTTP/3 (ISSUE-079a). Uses the same PEM cert/key files
     // as the TCP/TLS listener — both OpenSSL and rustls load PEM natively.
-    if h3_enabled {
+    // One logical owner avoids sibling restarts taking the UDP endpoint.
+    if h3_enabled && worker_id == 0 {
         let tls_configs = compile_tls_configs(dwaar_config);
         if let Some((_domain, tls_cfg)) = tls_configs.iter().next() {
             let quic_addr: std::net::SocketAddr =
                 "0.0.0.0:443".parse().expect("static addr is valid");
-            match dwaar_core::quic::QuicService::new(
-                quic_addr,
-                &tls_cfg.cert_path,
-                &tls_cfg.key_path,
-                route_table_for_quic,
-                features_plugin_chain,
-                None, // max_streams — use default (100)
-            ) {
-                Ok(quic_service) => {
-                    let quic_bg = pingora_core::services::background::background_service(
-                        "QUIC/HTTP3 listener",
-                        quic_service,
-                    );
-                    upgrade::add_service(server, quic_bg);
-                    info!(listen = %quic_addr, protocol = "quic/h3", "QUIC listener registered");
-                }
-                Err(e) => {
-                    // QUIC is optional — warn but don't fail startup
-                    tracing::warn!(error = %e, "failed to start QUIC listener, HTTP/3 disabled");
-                }
-            }
+            let quic_service = QuicBackgroundService {
+                address: quic_addr,
+                cert_path: tls_cfg.cert_path.clone(),
+                key_path: tls_cfg.key_path.clone(),
+                route_table: route_table_for_quic,
+                plugin_chain: features_plugin_chain,
+            };
+            let quic_bg = pingora_core::services::background::background_service(
+                "QUIC/HTTP3 listener",
+                quic_service,
+            );
+            upgrade::add_service(server, quic_bg);
+            info!(listen = %quic_addr, protocol = "quic/h3", "QUIC listener registered");
         } else {
             tracing::warn!("h3 enabled but no TLS certs configured — QUIC listener not started");
         }
     }
 
     Ok((cert_store, sni_domain_map, otlp_exporter, grpc_service))
+}
+
+/// Bind Quinn after Pingora enters its persistent runtime, so its endpoint
+/// driver remains alive for the full background-service lifetime.
+struct QuicBackgroundService {
+    address: std::net::SocketAddr,
+    cert_path: std::path::PathBuf,
+    key_path: std::path::PathBuf,
+    route_table: Arc<ArcSwap<dwaar_core::route::RouteTable>>,
+    plugin_chain: Arc<dwaar_plugins::plugin::PluginChain>,
+}
+
+#[async_trait::async_trait]
+impl pingora_core::services::background::BackgroundService for QuicBackgroundService {
+    async fn start(&self, shutdown: pingora_core::server::ShutdownWatch) {
+        match dwaar_core::quic::QuicService::new(
+            self.address,
+            &self.cert_path,
+            &self.key_path,
+            Arc::clone(&self.route_table),
+            Arc::clone(&self.plugin_chain),
+            None,
+        ) {
+            Ok(service) => service.start(shutdown).await,
+            Err(error) => {
+                // Preserve optional initial-startup semantics.
+                tracing::warn!(%error, "failed to start QUIC listener, HTTP/3 disabled");
+            }
+        }
+    }
 }
 
 /// Build and register the admin HTTP service. Worker 0 binds both the TCP
@@ -1669,6 +1709,7 @@ fn run_server(
         &timeouts,
         worker_count,
         &cli.cert_dir(),
+        worker_id,
     )?;
 
     let agg_metrics = add_admin_service(
@@ -1745,7 +1786,11 @@ fn run_server(
     // async logic into the background thread.
     upgrade::install(&mut server);
     if worker_id == 0 {
-        install_sigusr2_handler(conf_drain_secs, upgrade_sock);
+        let h3_enabled = dwaar_config
+            .global_options
+            .as_ref()
+            .is_some_and(|global| global.h3_enabled);
+        install_sigusr2_handler(conf_drain_secs, upgrade_sock, h3_enabled);
     }
 
     info!("entering run loop, waiting for connections or signals");
