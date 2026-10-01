@@ -1,0 +1,11 @@
+title = "Dwaar secret scanning"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Public WebSocket example handshake nonce in protocol fixtures"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''(?:^|.*/)crates/dwaar-cli/tests/proxy_integration\.rs$''']
+regexes = ['''^dGhlIHNhbXBsZSBub25jZQ==$''']
