@@ -105,7 +105,20 @@ fn serve(listener: &TcpListener, body: &'static str, stop: &AtomicBool) {
             Ok((mut stream, _)) => {
                 stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
                 let mut buf = [0u8; 8192];
-                let read = stream.read(&mut buf).unwrap_or(0);
+                let mut read = 0;
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while read < buf.len() && Instant::now() < deadline {
+                    stream
+                        .set_read_timeout(Some(deadline.saturating_duration_since(Instant::now())))
+                        .ok();
+                    match stream.read(&mut buf[read..]) {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => read += count,
+                    }
+                    if buf[..read].windows(4).any(|part| part == b"\r\n\r\n") {
+                        break;
+                    }
+                }
                 let request = String::from_utf8_lossy(&buf[..read]);
                 if body == "protected"
                     && (!request.starts_with("GET /ready ")

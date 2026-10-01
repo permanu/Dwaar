@@ -70,12 +70,31 @@ pub(crate) fn verify_parent_process(pid: i32) -> std::io::Result<()> {
         "process identity verification is unsupported",
     ));
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    if executable != std::env::current_exe()? {
+    if !same_executable(
+        &executable,
+        &std::env::current_exe()?,
+        cfg!(target_os = "linux"),
+    ) {
         return Err(std::io::Error::other(
             "PID does not identify this Dwaar executable",
         ));
     }
     Ok(())
+}
+
+fn same_executable(actual: &std::path::Path, expected: &std::path::Path, linux: bool) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    if actual == expected {
+        return true;
+    }
+    // Linux appends this kernel-owned suffix after an atomic executable
+    // replacement. Compare the original absolute path, never just its name.
+    linux
+        && actual
+            .as_os_str()
+            .as_bytes()
+            .strip_suffix(b" (deleted)")
+            .is_some_and(|original| original == expected.as_os_str().as_bytes())
 }
 
 fn matches_ack(body: &str, nonce: &str, pid: u32) -> bool {
@@ -353,6 +372,25 @@ pub(crate) fn random_nonce() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linux_replaced_executable_keeps_parent_identity() {
+        assert!(same_executable(
+            std::path::Path::new("/opt/dwaar (deleted)"),
+            std::path::Path::new("/opt/dwaar"),
+            true
+        ));
+        assert!(!same_executable(
+            std::path::Path::new("/opt/other (deleted)"),
+            std::path::Path::new("/opt/dwaar"),
+            true
+        ));
+        assert!(!same_executable(
+            std::path::Path::new("/opt/dwaar (deleted)"),
+            std::path::Path::new("/opt/dwaar"),
+            false
+        ));
+    }
 
     #[test]
     fn pid_file_rejects_symlinks_writable_and_oversized_contents() {
