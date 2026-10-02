@@ -1,285 +1,206 @@
 // Copyright (C) 2026 Permanu
 // SPDX-License-Identifier: BSL-1.1
-//
-// This file is part of Dwaar — https://dwaar.dev
-// Licensed under the Business Source License 1.1
 
-//! Supervisor-side readiness probe for forked worker children.
-//!
-//! After the supervisor `fork()`s a new worker (either as part of initial
-//! startup, a crash-loop restart, or a SIGHUP-driven reload) it must verify
-//! that the child has actually bound its listening sockets before declaring
-//! the restart successful. Without this check, a race window exists where
-//! clients can connect while no worker owns the listening port, or the old
-//! worker is signalled to drain before the replacement is ready.
-//!
-//! This module exposes a small blocking probe that polls a TCP address or a
-//! Unix domain socket until either:
-//!   1. `connect()` succeeds → the child has bound the listener → Ok(())
-//!   2. `waitpid(pid, WNOHANG)` reports the child has exited → `ChildExited`
-//!   3. The overall deadline is reached → Timeout
-//!
-//! We use blocking stdlib sockets rather than Tokio here because the
-//! supervisor loop in `main.rs` is itself synchronous — it runs before
-//! Pingora starts and has no Tokio runtime. Spinning up a current-thread
-//! runtime just for this probe would add complexity for no benefit.
+//! The single-threaded supervisor accepts readiness only from a particular
+//! live child after its listening services have started. A shared public
+//! listener cannot establish which worker is ready.
 
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::io;
-use std::net::TcpStream;
-use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::os::unix::net::UnixListener;
 use std::time::{Duration, Instant};
 
-/// Upper bound for the supervisor readiness probe. A worker that cannot
-/// bind its listeners within this window is assumed wedged and killed.
 pub(crate) const MAX_READINESS_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Delay between probe attempts. Short enough to catch a ready child
-/// within ~50 ms of actual readiness, long enough to avoid a busy loop.
-const PROBE_INTERVAL: Duration = Duration::from_millis(50);
-
-/// Which endpoint to probe.
-#[derive(Debug, Clone)]
-pub(crate) enum ReadinessTarget {
-    /// TCP address — used for the always-on admin listener (127.0.0.1:6190).
-    Tcp(String),
-    /// Unix domain socket path — used when `--admin-socket` is set.
-    Uds(PathBuf),
+pub(crate) struct WorkerReadiness {
+    directory: tempfile::TempDir,
+    listener: UnixListener,
+    received: RefCell<HashSet<(libc::pid_t, String)>>,
 }
 
-impl ReadinessTarget {
-    /// Return a human-readable label for logging.
-    pub(crate) fn label(&self) -> String {
-        match self {
-            Self::Tcp(addr) => format!("tcp://{addr}"),
-            Self::Uds(path) => format!("uds://{}", path.display()),
-        }
+impl WorkerReadiness {
+    pub(crate) fn new() -> io::Result<Self> {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::Builder::new()
+            .prefix("dwaar-workers-")
+            .tempdir_in("/tmp")?;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+        let listener = UnixListener::bind(directory.path().join("ready.sock"))?;
+        listener.set_nonblocking(true)?;
+        Ok(Self {
+            directory,
+            listener,
+            received: RefCell::new(HashSet::new()),
+        })
     }
-}
 
-/// Errors returned by the supervisor readiness probe.
-#[derive(Debug)]
-pub(crate) enum ReadinessError {
-    /// The child did not accept a connection before the deadline.
-    Timeout { target: String, waited: Duration },
-    /// The child exited (crashed or self-terminated) while we were probing.
-    ChildExited {
-        pid: libc::pid_t,
-        description: String,
-    },
-}
-
-impl std::fmt::Display for ReadinessError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Timeout { target, waited } => {
-                write!(
-                    f,
-                    "worker did not become ready on {target} within {waited:?}"
-                )
-            }
-            Self::ChildExited { pid, description } => write!(
-                f,
-                "worker pid {pid} exited before becoming ready: {description}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ReadinessError {}
-
-/// Block until the forked child accepts a connection on `target`, or until
-/// the child exits, or until `timeout` elapses — whichever happens first.
-///
-/// `timeout` is silently clamped to [`MAX_READINESS_TIMEOUT`] so a caller
-/// cannot accidentally pin the supervisor waiting forever on a wedged child.
-///
-/// Blocking by design — the supervisor thread runs outside any Tokio runtime.
-pub(crate) fn wait_for_child_ready(
-    pid: libc::pid_t,
-    target: &ReadinessTarget,
-    timeout: Duration,
-) -> Result<(), ReadinessError> {
-    let effective = timeout.min(MAX_READINESS_TIMEOUT);
-    let started = Instant::now();
-
-    loop {
-        // Short per-attempt timeout so a half-open TCP listener doesn't stall
-        // the probe beyond the overall deadline. 100 ms is plenty for a
-        // localhost connect, well under PROBE_INTERVAL's cadence.
-        match try_connect(target, Duration::from_millis(100)) {
-            Ok(()) => return Ok(()),
-            Err(e) if is_transient(&e) => {
-                // Not yet listening — fall through to child-exit / timeout checks.
-            }
-            Err(e) => {
-                // Unexpected error — treat as transient and keep probing.
-                // If it is persistent we'll still hit the deadline.
-                tracing::debug!(
-                    error = %e,
-                    target = target.label(),
-                    "unexpected error while probing child readiness (will retry)"
-                );
-            }
-        }
-
-        // Did the child die underneath us? `waitpid(pid, WNOHANG)` returns
-        // `pid` on exit, `0` while still alive, `-1` on error.
-        if let Some(description) = child_exited(pid) {
-            return Err(ReadinessError::ChildExited { pid, description });
-        }
-
-        if started.elapsed() >= effective {
-            return Err(ReadinessError::Timeout {
-                target: target.label(),
-                waited: effective,
-            });
-        }
-
-        std::thread::sleep(PROBE_INTERVAL);
-    }
-}
-
-/// Attempt a single synchronous connection to `target`.
-fn try_connect(target: &ReadinessTarget, per_attempt: Duration) -> io::Result<()> {
-    match target {
-        ReadinessTarget::Tcp(addr) => {
-            // Resolve-then-connect with a timeout so we don't block forever
-            // on an unreachable address.
-            let sock_addr = addr
-                .parse::<std::net::SocketAddr>()
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-            let stream = TcpStream::connect_timeout(&sock_addr, per_attempt)?;
-            drop(stream);
-            Ok(())
-        }
-        ReadinessTarget::Uds(path) => {
-            // UnixStream::connect is non-configurable for timeouts but is
-            // effectively instant on an in-kernel socket — either the file
-            // is there and the listener is accepting, or we get ENOENT /
-            // ECONNREFUSED immediately.
-            let stream = UnixStream::connect(path)?;
-            drop(stream);
-            Ok(())
-        }
-    }
-}
-
-/// Return `true` if `err` means "not yet ready" (listener hasn't bound).
-fn is_transient(err: &io::Error) -> bool {
-    matches!(
-        err.kind(),
-        io::ErrorKind::ConnectionRefused
-            | io::ErrorKind::NotFound
-            | io::ErrorKind::TimedOut
-            | io::ErrorKind::WouldBlock
-            | io::ErrorKind::AddrNotAvailable
-    )
-}
-
-/// Poll `waitpid(pid, WNOHANG)`. Returns `Some(description)` if the child
-/// has exited, `None` if it is still running.
-fn child_exited(pid: libc::pid_t) -> Option<String> {
-    let mut status: libc::c_int = 0;
-    // SAFETY: standard waitpid with WNOHANG — does not block.
+    /// Called only in the single-threaded supervisor immediately before fork.
     #[allow(unsafe_code)]
-    let result = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
-    if result == pid {
-        // Child reaped — describe how it died so the caller can log it.
-        if libc::WIFEXITED(status) {
-            Some(format!("exit code {}", libc::WEXITSTATUS(status)))
-        } else if libc::WIFSIGNALED(status) {
-            Some(format!("signal {}", libc::WTERMSIG(status)))
-        } else {
-            Some("unknown status".to_string())
+    pub(crate) fn prepare_fork(&self) -> String {
+        let nonce = crate::upgrade::random_nonce();
+        // SAFETY: the supervisor has not started Tokio, Pingora or threads.
+        unsafe {
+            std::env::set_var(
+                "DWAAR_WORKER_READY_SOCKET",
+                self.directory.path().join("ready.sock"),
+            );
+            std::env::set_var("DWAAR_WORKER_READY_NONCE", &nonce);
+            std::env::set_var("DWAAR_SUPERVISOR_PID", std::process::id().to_string());
         }
-    } else {
-        None
+        nonce
+    }
+
+    #[allow(unsafe_code)]
+    pub(crate) fn clear_fork_environment() {
+        // SAFETY: called only in the single-threaded supervisor after fork.
+        unsafe {
+            std::env::remove_var("DWAAR_WORKER_READY_SOCKET");
+            std::env::remove_var("DWAAR_WORKER_READY_NONCE");
+            std::env::remove_var("DWAAR_SUPERVISOR_PID");
+        }
+    }
+
+    pub(crate) fn wait(&self, pid: libc::pid_t, nonce: &str, timeout: Duration) -> io::Result<()> {
+        let deadline = Instant::now() + timeout.min(MAX_READINESS_TIMEOUT);
+        let key = (pid, nonce.to_owned());
+        while Instant::now() < deadline {
+            if !child_alive(pid)? {
+                return Err(io::Error::other("worker exited before readiness"));
+            }
+            if self.received.borrow_mut().remove(&key) {
+                return Ok(());
+            }
+            match self.listener.accept() {
+                Ok((mut stream, _)) => {
+                    if let Ok(body) = crate::upgrade::read_ack(
+                        &mut stream,
+                        deadline.min(Instant::now() + Duration::from_millis(100)),
+                    ) {
+                        let fields = body
+                            .strip_suffix('\n')
+                            .and_then(|body| body.split_once(' '));
+                        if let Some((received_nonce, received_pid)) = fields
+                            && received_nonce.len() == 32
+                            && received_nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+                            && let Ok(received_pid) = received_pid.parse::<libc::pid_t>()
+                            && received_pid > 1
+                        {
+                            let mut received = self.received.borrow_mut();
+                            if received.len() < 64 {
+                                received.insert((received_pid, received_nonce.to_owned()));
+                            }
+                        }
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "private worker readiness timed out",
+        ))
     }
 }
 
-/// Pick a readiness target given the CLI `--admin-socket` option.
-///
-/// If a UDS path was supplied we prefer it — it is deterministic and only
-/// worker 0 binds it. Otherwise fall back to the TCP admin listener, which
-/// is unconditionally registered on `127.0.0.1:6190` by worker 0.
-pub(crate) fn target_from_admin_socket(admin_socket: Option<&Path>) -> ReadinessTarget {
-    match admin_socket {
-        Some(path) => ReadinessTarget::Uds(path.to_path_buf()),
-        None => ReadinessTarget::Tcp("127.0.0.1:6190".to_string()),
+#[allow(unsafe_code)]
+fn child_alive(pid: libc::pid_t) -> io::Result<bool> {
+    let mut status = 0;
+    // SAFETY: the supervisor checks only its own recorded fork child.
+    let result = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
     }
+    Ok(result == 0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    use std::process::{Child, Command};
 
-    #[test]
-    fn timeout_on_missing_uds_under_500ms() {
-        // Probe a socket path that definitely does not exist. The probe
-        // must return Timeout (not block, not panic) within well under the
-        // configured ceiling.
-        let missing = PathBuf::from("/tmp/dwaar-readiness-test-nonexistent.sock");
-        let target = ReadinessTarget::Uds(missing);
-
-        // PID 1 is always alive on Linux/macOS so child_exited() never
-        // short-circuits during the test — we're strictly exercising the
-        // timeout path.
-        let started = Instant::now();
-        let err = wait_for_child_ready(1, &target, Duration::from_millis(300))
-            .expect_err("missing socket must not connect");
-        let elapsed = started.elapsed();
-
-        assert!(
-            matches!(err, ReadinessError::Timeout { .. }),
-            "expected Timeout, got {err:?}"
-        );
-        assert!(
-            elapsed < Duration::from_millis(500),
-            "probe must respect the 300 ms deadline (waited {elapsed:?})"
-        );
-    }
-
-    #[test]
-    fn timeout_on_unbound_tcp_port() {
-        // 127.0.0.1:1 is reserved and will refuse immediately on every
-        // attempt. The probe should return Timeout after the deadline.
-        let target = ReadinessTarget::Tcp("127.0.0.1:1".to_string());
-        let started = Instant::now();
-        let err = wait_for_child_ready(1, &target, Duration::from_millis(250))
-            .expect_err("unbound port must not connect");
-        let elapsed = started.elapsed();
-        assert!(matches!(err, ReadinessError::Timeout { .. }));
-        assert!(elapsed < Duration::from_millis(600));
-    }
-
-    #[test]
-    fn target_from_admin_socket_prefers_uds() {
-        let path = PathBuf::from("/var/run/dwaar-admin.sock");
-        match target_from_admin_socket(Some(&path)) {
-            ReadinessTarget::Uds(p) => assert_eq!(p, path),
-            ReadinessTarget::Tcp(_) => panic!("expected UDS target when admin_socket is set"),
+    struct TestChild(Child);
+    impl Drop for TestChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
         }
     }
-
-    #[test]
-    fn target_from_admin_socket_falls_back_to_tcp() {
-        match target_from_admin_socket(None) {
-            ReadinessTarget::Tcp(addr) => assert_eq!(addr, "127.0.0.1:6190"),
-            ReadinessTarget::Uds(_) => panic!("expected TCP target when admin_socket is None"),
-        }
+    fn child() -> TestChild {
+        TestChild(Command::new("sleep").arg("5").spawn().expect("test child"))
+    }
+    fn ack(channel: &WorkerReadiness, nonce: &str, pid: u32) {
+        let mut socket = UnixStream::connect(channel.directory.path().join("ready.sock"))
+            .expect("private channel");
+        writeln!(socket, "{nonce} {pid}").expect("acknowledge");
     }
 
     #[test]
-    fn label_formats_cleanly() {
-        assert_eq!(
-            ReadinessTarget::Tcp("127.0.0.1:6190".to_string()).label(),
-            "tcp://127.0.0.1:6190"
+    fn private_worker_readiness_is_not_satisfied_by_an_old_listener() {
+        let channel = WorkerReadiness::new().expect("private readiness channel");
+        let child = child();
+        let started = Instant::now();
+        let result = channel.wait(
+            i32::try_from(child.0.id()).expect("readiness test operation"),
+            "0123456789abcdef0123456789abcdef",
+            Duration::from_millis(100),
         );
-        assert_eq!(
-            ReadinessTarget::Uds(PathBuf::from("/tmp/a.sock")).label(),
-            "uds:///tmp/a.sock"
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn readiness_binds_child_pid_and_fresh_nonce() {
+        let channel = WorkerReadiness::new().expect("readiness test operation");
+        let child = child();
+        let nonce = "0123456789abcdef0123456789abcdef";
+        ack(&channel, "abcdef0123456789abcdef0123456789", child.0.id());
+        ack(&channel, nonce, child.0.id() + 1);
+        assert!(
+            channel
+                .wait(
+                    i32::try_from(child.0.id()).expect("readiness test operation"),
+                    nonce,
+                    Duration::from_millis(50)
+                )
+                .is_err()
         );
+        ack(&channel, nonce, child.0.id());
+        channel
+            .wait(
+                i32::try_from(child.0.id()).expect("readiness test operation"),
+                nonce,
+                Duration::from_millis(100),
+            )
+            .expect("readiness test operation");
+    }
+
+    #[test]
+    fn every_worker_ack_is_retained_when_readiness_arrives_out_of_order() {
+        let channel = WorkerReadiness::new().expect("readiness test operation");
+        let first = child();
+        let second = child();
+        let first_nonce = "0123456789abcdef0123456789abcdef";
+        let second_nonce = "abcdef0123456789abcdef0123456789";
+        ack(&channel, second_nonce, second.0.id());
+        ack(&channel, first_nonce, first.0.id());
+        channel
+            .wait(
+                i32::try_from(first.0.id()).expect("readiness test operation"),
+                first_nonce,
+                Duration::from_millis(100),
+            )
+            .expect("readiness test operation");
+        channel
+            .wait(
+                i32::try_from(second.0.id()).expect("readiness test operation"),
+                second_nonce,
+                Duration::from_millis(100),
+            )
+            .expect("readiness test operation");
     }
 }

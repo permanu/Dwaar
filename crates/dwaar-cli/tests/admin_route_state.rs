@@ -315,3 +315,101 @@ fn graceful_stop_takes_under_ten_seconds() {
         "graceful stop took {took:?}"
     );
 }
+
+#[test]
+fn signed_replica_health_and_conditional_deletion_cross_the_admin_socket() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::tempdir().expect("private fixture");
+    let dwaar = start_dwaar(dir.path(), free_port(), free_port());
+    let mut probes = Vec::new();
+    let mut addresses = Vec::new();
+    for _ in 0..2 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("owned health listener");
+        addresses.push(listener.local_addr().expect("health address").to_string());
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking health listener");
+        probes.push(thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .expect("health read bound");
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .expect("health write bound");
+                    let mut request = [0; 4096];
+                    let Ok(count) = stream.read(&mut request) else {
+                        continue;
+                    };
+                    if count == 0 {
+                        continue;
+                    }
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .expect("health response");
+                    return String::from_utf8_lossy(&request[..count]).into_owned();
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            panic!("signed health policy never reached the owned upstream");
+        }));
+    }
+    let health = serde_json::json!({"path":"/ready/signed","host":"health.example.test","port":null,"interval_seconds":1,"timeout_seconds":1});
+    let body = serde_json::json!({"domain":"replica.example.test","upstream":addresses[0],"upstreams":addresses,"tls":false,"source":"permanu-runner","healthcheck":health}).to_string();
+    let (status, reply) = admin_request(&dwaar.admin, "POST", "/routes", &body);
+    assert_eq!(status, 201, "{reply}");
+    for probe in probes {
+        let request = probe.join().expect("owned health observer");
+        assert!(
+            request.starts_with("GET /ready/signed HTTP/1.1\r\n"),
+            "{request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("host: health.example.test\r\n"),
+            "{request}"
+        );
+    }
+    let state_file = dir.path().join("state/admin-routes.json");
+    let persisted: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_file).expect("persisted routes"))
+            .expect("route JSON");
+    assert_eq!(persisted["routes"][0]["healthcheck"], health);
+    for (source, upstream) in [
+        ("another-owner", addresses[0].as_str()),
+        ("permanu-runner", "127.0.0.1:9"),
+    ] {
+        let deletion = serde_json::json!({"domain":"replica.example.test","source":source,"upstream":upstream}).to_string();
+        assert_eq!(
+            admin_request(&dwaar.admin, "POST", "/routes/delete-if", &deletion).0,
+            200
+        );
+        let (status, listed) = admin_request(&dwaar.admin, "GET", "/routes", "");
+        assert_eq!(status, 200);
+        let routes: Vec<serde_json::Value> = serde_json::from_str(&listed).expect("listed routes");
+        assert!(
+            routes
+                .iter()
+                .any(|route| route["domain"] == "replica.example.test")
+        );
+    }
+    let deletion = serde_json::json!({"domain":"replica.example.test","source":"permanu-runner","upstream":addresses[0]}).to_string();
+    assert_eq!(
+        admin_request(&dwaar.admin, "POST", "/routes/delete-if", &deletion).0,
+        200
+    );
+    let (_, listed) = admin_request(&dwaar.admin, "GET", "/routes", "");
+    let routes: Vec<serde_json::Value> = serde_json::from_str(&listed).expect("listed routes");
+    assert!(
+        !routes
+            .iter()
+            .any(|route| route["domain"] == "replica.example.test")
+    );
+}

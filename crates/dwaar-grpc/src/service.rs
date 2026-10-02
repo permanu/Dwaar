@@ -62,6 +62,8 @@ pub const STATUS_REJECTED: &str = "rejected";
 /// Errors surfaced by the gRPC server.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("gRPC listener initialization failed: {0}")]
+    Listener(#[from] std::io::Error),
     #[error("failed to bind gRPC listener on {addr}: {source}")]
     Bind {
         addr: SocketAddr,
@@ -540,6 +542,33 @@ pub fn start_grpc_server_with_shutdown<F>(
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
+    start_grpc_server_inner(addr, service, tls, shutdown, None)
+}
+
+/// Reports readiness only after this generation has bound its listener and configured TLS.
+pub fn start_grpc_server_with_readiness<F>(
+    addr: SocketAddr,
+    service: DwaarControlService,
+    tls: TlsConfig,
+    shutdown: F,
+    ready: tokio::sync::oneshot::Sender<()>,
+) -> JoinHandle<Result<(), Error>>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    start_grpc_server_inner(addr, service, tls, shutdown, Some(ready))
+}
+
+fn start_grpc_server_inner<F>(
+    addr: SocketAddr,
+    service: DwaarControlService,
+    tls: TlsConfig,
+    shutdown: F,
+    ready: Option<tokio::sync::oneshot::Sender<()>>,
+) -> JoinHandle<Result<(), Error>>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     tokio::spawn(async move {
         let tls_enabled = tls.is_enabled();
         let mtls_enabled = tls.is_mutual();
@@ -554,9 +583,25 @@ where
         if let Some(tls_cfg) = tls.to_tonic() {
             builder = builder.tls_config(tls_cfg).map_err(Error::Serve)?;
         }
+        let socket = if addr.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()?
+        } else {
+            tokio::net::TcpSocket::new_v6()?
+        };
+        socket.set_reuseaddr(true)?;
+        #[cfg(unix)]
+        socket.set_reuseport(true)?;
+        socket.bind(addr)?;
+        let listener = socket.listen(1024)?;
+        if let Some(ready) = ready {
+            let _ = ready.send(());
+        }
         builder
             .add_service(DwaarControlServer::new(service))
-            .serve_with_shutdown(addr, shutdown)
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(listener),
+                shutdown,
+            )
             .await
             .map_err(Error::from)
     })
@@ -860,6 +905,29 @@ mod tests {
         assert_eq!(replies.len(), 1);
         assert_ack(&replies[0], "hdr-bad", STATUS_REJECTED);
         assert!(svc.header_rules.is_empty());
+    }
+
+    #[tokio::test]
+    async fn listener_readiness_requires_its_own_successful_bind() {
+        let occupied = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fixture");
+        let address = occupied.local_addr().expect("address");
+        let (ready, receiver) = tokio::sync::oneshot::channel();
+        let handle = start_grpc_server_with_readiness(
+            address,
+            service(),
+            TlsConfig::Plaintext,
+            std::future::pending::<()>(),
+            ready,
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), receiver)
+                .await
+                .expect("bounded readiness")
+                .is_err()
+        );
+        assert!(handle.await.expect("task").is_err());
     }
 
     #[tokio::test]

@@ -16,7 +16,7 @@ tonic-prost = "0.14"
 # tonic-prost 0.14 requires prost 0.14; bump from 0.13 to match.
 prost = "0.14"
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
 futures-core = "0.3"
 async-trait = { workspace = true }
 tracing = { workspace = true }

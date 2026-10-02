@@ -11,6 +11,7 @@
 //! Dwaar-specific names (--upgrade, --daemon, --test, --config).
 
 use clap::{Parser, Subcommand};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -33,7 +34,8 @@ impl FromStr for WorkerCount {
         }
         match s.parse::<usize>() {
             Ok(0) => Err("worker count must be at least 1".to_string()),
-            Ok(n) => Ok(WorkerCount::Count(n)),
+            Ok(n) if n <= 32 => Ok(WorkerCount::Count(n)),
+            Ok(_) => Err("worker count must not exceed 32".to_string()),
             Err(_) => Err(format!(
                 "invalid worker count '{s}': expected 'auto' or a positive integer"
             )),
@@ -43,6 +45,16 @@ impl FromStr for WorkerCount {
 
 /// `--state-dir` must be absolute so the ACME and certificate paths never
 /// depend on the working directory the service manager happens to use.
+fn parse_admin_address(value: &str) -> Result<SocketAddr, String> {
+    let address: SocketAddr = value
+        .parse()
+        .map_err(|_| "admin address must be an IP address and port".to_string())?;
+    if !address.ip().is_loopback() || address.port() == 0 {
+        return Err("admin address must use loopback and a nonzero port".to_string());
+    }
+    Ok(address)
+}
+
 fn parse_state_dir(s: &str) -> Result<PathBuf, String> {
     let path = PathBuf::from(s);
     if path.is_absolute() {
@@ -107,6 +119,10 @@ pub(crate) struct Cli {
     #[arg(long, env = "DWAAR_GRPC_ADDR", default_value = "127.0.0.1:9091")]
     pub grpc_addr: String,
 
+    /// Loopback TCP address for the admin API. A UDS can also be enabled.
+    #[arg(long, default_value = "127.0.0.1:6190", value_parser = parse_admin_address)]
+    pub admin_address: SocketAddr,
+
     /// Bare mode — disable all optional features (logging, plugins, analytics, geoip).
     /// Use for maximum throughput in CDN edge nodes.
     #[arg(long)]
@@ -136,7 +152,7 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub no_cache: bool,
 
-    /// Number of worker processes to spawn. "auto" uses all available CPU cores.
+    /// Number of worker processes to spawn (1–32). "auto" uses one worker with all cores.
     /// Each worker gets its own Pingora server and binds independently via `SO_REUSEPORT`.
     #[arg(long, default_value = "auto")]
     pub workers: WorkerCount,
@@ -500,9 +516,23 @@ mod tests {
     }
 
     #[test]
+    fn worker_count_has_a_bounded_supervision_budget() {
+        assert!(Cli::try_parse_from(["dwaar", "--workers", "32"]).is_ok());
+        assert!(Cli::try_parse_from(["dwaar", "--workers", "33"]).is_err());
+    }
+
+    #[test]
     fn workers_zero_rejected() {
         let result = Cli::try_parse_from(["dwaar", "--workers", "0"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn admin_address_accepts_only_explicit_loopback_ports() {
+        assert!(Cli::try_parse_from(["dwaar", "--admin-address", "127.0.0.1:45678"]).is_ok());
+        assert!(Cli::try_parse_from(["dwaar", "--admin-address", "[::1]:45678"]).is_ok());
+        assert!(Cli::try_parse_from(["dwaar", "--admin-address", "0.0.0.0:45678"]).is_err());
+        assert!(Cli::try_parse_from(["dwaar", "--admin-address", "127.0.0.1:0"]).is_err());
     }
 
     #[test]

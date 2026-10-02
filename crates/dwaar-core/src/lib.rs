@@ -32,3 +32,6 @@ pub mod template;
 pub mod trace;
 pub mod upstream;
 pub mod wake;
+
+/// Startup failure state used by the private upgrade readiness coordinator.
+pub mod readiness;

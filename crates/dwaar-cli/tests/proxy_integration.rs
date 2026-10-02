@@ -9,11 +9,8 @@
 //! Proves that Dwaar accepts HTTP requests, forwards them to an upstream,
 //! and returns the upstream's response with Dwaar-added headers.
 //!
-//! ## Port constraints
-//!
-//! The upstream is hardcoded at 127.0.0.1:8080. Tests run sequentially
-//! because they share this port. ISSUE-010 (configurable routes) will
-//! allow ephemeral ports and parallel execution.
+//! Test listeners use ephemeral ports, private state directories, and owned
+//! process groups. The mutex bounds resource usage, not shared port ownership.
 
 // Test-only: we need unsafe for libc::kill and u32→i32 cast for PID
 #![allow(unsafe_code, clippy::cast_possible_wrap)]
@@ -21,7 +18,8 @@
 use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -29,10 +27,79 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-/// Mutex to serialize tests that need exclusive access to ports 8080 and 6188.
-/// Tests acquire this lock before binding ports, preventing parallel conflicts.
-/// Removed once ISSUE-010 allows ephemeral ports.
+/// Serialize proxy processes to keep CPU and memory consumption bounded.
 static PORT_LOCK: Mutex<()> = Mutex::new(());
+
+#[derive(Clone, Copy)]
+struct TestPorts {
+    upstream: SocketAddr,
+    proxy: SocketAddr,
+    admin: SocketAddr,
+}
+
+fn unused_address() -> SocketAddr {
+    TcpListener::bind("127.0.0.1:0")
+        .expect("test listener or filesystem operation")
+        .local_addr()
+        .expect("test listener or filesystem operation")
+}
+
+thread_local! {
+    static PORTS: TestPorts = TestPorts {
+        upstream: unused_address(), proxy: unused_address(), admin: unused_address(),
+    };
+}
+
+fn upstream_address() -> SocketAddr {
+    PORTS.with(|ports| ports.upstream)
+}
+
+fn proxy_address() -> SocketAddr {
+    PORTS.with(|ports| ports.proxy)
+}
+
+struct ScopedProxy {
+    child: std::process::Child,
+    directory: tempfile::TempDir,
+}
+
+impl Drop for ScopedProxy {
+    fn drop(&mut self) {
+        let pid = self.child.id() as i32;
+        // Only this command's process group, created with process_group(0).
+        unsafe {
+            libc::kill(-pid, libc::SIGTERM);
+        }
+        let start = std::time::Instant::now();
+        while self.child.try_wait().ok().flatten().is_none()
+            && start.elapsed() < Duration::from_secs(5)
+        {
+            thread::sleep(Duration::from_millis(50));
+        }
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+        let _ = self.child.wait();
+    }
+}
+
+fn write_test_config(name: &str, contents: &str) -> (tempfile::TempDir, PathBuf) {
+    let directory = tempfile::tempdir().expect("temporary configuration directory");
+    let path = directory.path().join(name);
+    std::fs::write(&path, contents).expect("write temporary configuration");
+    (directory, path)
+}
+
+#[test]
+fn generated_configuration_is_outside_the_repository() {
+    let (directory, config) = write_test_config("isolation.dwaarfile", "listen :0\n");
+    assert!(config.starts_with(directory.path()));
+    assert!(!config.starts_with(PathBuf::from(env!("CARGO_MANIFEST_DIR"))));
+    assert_eq!(
+        std::fs::read_to_string(config).expect("test listener or filesystem operation"),
+        "listen :0\n"
+    );
+}
 
 /// Status text for common HTTP status codes.
 fn status_text(code: u16) -> &'static str {
@@ -74,81 +141,70 @@ fn serve_one_request(listener: &TcpListener, status: u16, body: &str) {
     let _ = stream.flush();
 }
 
-/// Start dwaar proxy as a subprocess.
-/// Sets CWD to workspace root so it finds the default Dwaarfile.
-fn start_dwaar_proxy() -> std::process::Child {
+/// Each process receives a private config, runtime directory and ephemeral listeners.
+fn start_dwaar_proxy() -> ScopedProxy {
     start_dwaar_with_config(None)
 }
 
-/// Start dwaar with an optional custom config path.
-/// Waits for port 6188 to become connectable (poll-based, not sleep-based).
-fn start_dwaar_with_config(config: Option<&std::path::Path>) -> std::process::Child {
-    let workspace_root = format!("{}/../..", env!("CARGO_MANIFEST_DIR"));
+fn start_dwaar_with_config(config: Option<&std::path::Path>) -> ScopedProxy {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let source = config.map_or_else(
+        || workspace_root.join("Dwaarfile"),
+        std::path::Path::to_path_buf,
+    );
+    let contents = std::fs::read_to_string(source).expect("read source configuration");
+    let ports = PORTS.with(|ports| *ports);
+    let contents = format!(
+        "{{\n http_port {}\n drain_timeout 1s\n}}\n{}",
+        ports.proxy.port(),
+        contents.replace("127.0.0.1:8080", &ports.upstream.to_string())
+    );
+    let (directory, config) = write_test_config("Dwaarfile", &contents);
+    let errors = std::fs::File::create(directory.path().join("stderr.log"))
+        .expect("test listener or filesystem operation");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_dwaar"));
-    cmd.current_dir(workspace_root)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    if let Some(path) = config {
-        cmd.arg("--config").arg(path);
-    }
-    let mut child = cmd.spawn().expect("failed to start dwaar");
-
-    // Poll until the proxy is accepting connections (or timeout after 10s).
+    cmd.current_dir(directory.path())
+        .arg("--config")
+        .arg(config)
+        .arg("--state-dir")
+        .arg(directory.path())
+        .arg("--admin-address")
+        .arg(ports.admin.to_string())
+        .arg("--grpc-addr")
+        .arg("")
+        .arg("--workers")
+        .arg("1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(errors))
+        .process_group(0);
+    let child = cmd.spawn().expect("start isolated Dwaar");
+    let mut proxy = ScopedProxy { child, directory };
     let start = std::time::Instant::now();
-    let addr = "127.0.0.1:6188"
-        .parse::<std::net::SocketAddr>()
-        .expect("valid literal socket addr");
     while start.elapsed() < Duration::from_secs(10) {
-        if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
-            return child;
+        if proxy
+            .child
+            .try_wait()
+            .expect("check Dwaar process")
+            .is_some()
+        {
+            break;
         }
-        thread::sleep(Duration::from_millis(200));
+        if TcpStream::connect_timeout(&ports.proxy, Duration::from_millis(100)).is_ok() {
+            return proxy;
+        }
+        thread::sleep(Duration::from_millis(100));
     }
-
     let mut stderr = String::new();
-    child.kill().ok();
-    let _ = child.wait();
-    if let Some(mut pipe) = child.stderr.take() {
-        let _ = pipe.read_to_string(&mut stderr);
-    }
-    panic!("dwaar proxy did not listen on 127.0.0.1:6188 within 10s: {stderr}");
+    std::fs::File::open(proxy.directory.path().join("stderr.log"))
+        .expect("test listener or filesystem operation")
+        .take(65536)
+        .read_to_string(&mut stderr)
+        .expect("test listener or filesystem operation");
+    panic!("isolated Dwaar did not listen on {}: {stderr}", ports.proxy);
 }
 
-/// Stop a dwaar subprocess and all its forked workers.
-/// Pingora forks worker processes that inherit the listen socket.
-/// Killing only the parent leaves orphan workers on the port.
-fn stop_dwaar(mut child: std::process::Child) {
-    let pid = child.id() as i32;
-    unsafe {
-        libc::kill(pid, libc::SIGTERM);
-    }
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if start.elapsed() > Duration::from_secs(15) {
-                    child.kill().ok();
-                    break;
-                }
-                thread::sleep(Duration::from_millis(100));
-            }
-            Err(_) => {
-                child.kill().ok();
-                break;
-            }
-        }
-    }
-
-    // Kill any orphan worker processes that Pingora forked.
-    // Workers inherit the listen socket and survive SIGTERM to the parent.
-    // Use negative PID to kill the entire process group, scoped to this
-    // test's Dwaar instance instead of system-wide pkill.
-    #[allow(unsafe_code)]
-    unsafe {
-        libc::kill(-pid, libc::SIGKILL);
-    }
-    thread::sleep(Duration::from_millis(500));
+fn stop_dwaar(proxy: ScopedProxy) {
+    drop(proxy);
 }
 
 /// Response from the proxy: status code, body, and headers.
@@ -160,7 +216,7 @@ struct ProxyResponse {
 
 /// Send a GET request through the proxy and return the full response.
 fn send_through_proxy(path: &str) -> ProxyResponse {
-    let url = format!("http://127.0.0.1:6188{path}");
+    let url = format!("http://{}{path}", proxy_address());
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -170,6 +226,7 @@ fn send_through_proxy(path: &str) -> ProxyResponse {
     rt.block_on(async {
         let client = reqwest::Client::builder()
             .no_proxy()
+            .timeout(Duration::from_secs(5))
             .build()
             .expect("build client");
 
@@ -244,8 +301,7 @@ fn serve_and_capture_headers(listener: &TcpListener) -> HashMap<String, String> 
 /// Returns nothing — caller consumes the upstream side.
 /// Used when reqwest's header normalization would interfere (e.g., Connection, Upgrade).
 fn send_raw_request(path: &str, extra_headers: &[(&str, &str)]) {
-    let mut stream =
-        TcpStream::connect("127.0.0.1:6188").expect("connect to proxy for raw request");
+    let mut stream = TcpStream::connect(proxy_address()).expect("connect to proxy for raw request");
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
 
     let mut request = format!(
@@ -275,7 +331,7 @@ fn proxy_forwards_upstream_responses() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let upstream =
-        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+        TcpListener::bind(upstream_address()).expect("bind to 127.0.0.1:8080 for mock upstream");
 
     let child = start_dwaar_proxy();
 
@@ -320,7 +376,7 @@ fn proxy_adds_x_request_id_header() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let upstream =
-        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+        TcpListener::bind(upstream_address()).expect("bind to 127.0.0.1:8080 for mock upstream");
 
     let child = start_dwaar_proxy();
 
@@ -370,7 +426,7 @@ fn proxy_adds_standard_proxy_headers() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let upstream =
-        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+        TcpListener::bind(upstream_address()).expect("bind to 127.0.0.1:8080 for mock upstream");
 
     let child = start_dwaar_proxy();
 
@@ -428,7 +484,7 @@ fn proxy_appends_to_existing_x_forwarded_for() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let upstream =
-        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+        TcpListener::bind(upstream_address()).expect("bind to 127.0.0.1:8080 for mock upstream");
 
     let child = start_dwaar_proxy();
 
@@ -447,11 +503,12 @@ fn proxy_appends_to_existing_x_forwarded_for() {
     rt.block_on(async {
         let client = reqwest::Client::builder()
             .no_proxy()
+            .timeout(Duration::from_secs(5))
             .build()
             .expect("build client");
 
         let _resp = client
-            .get("http://127.0.0.1:6188/chained")
+            .get(format!("http://{}/chained", proxy_address()))
             .header("X-Forwarded-For", "10.0.0.1")
             .send()
             .await
@@ -485,7 +542,7 @@ fn proxy_adds_security_response_headers() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let upstream =
-        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+        TcpListener::bind(upstream_address()).expect("bind to 127.0.0.1:8080 for mock upstream");
 
     let child = start_dwaar_proxy();
 
@@ -571,7 +628,7 @@ fn websocket_upgrade_headers_preserved() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let upstream =
-        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+        TcpListener::bind(upstream_address()).expect("bind to 127.0.0.1:8080 for mock upstream");
 
     let child = start_dwaar_proxy();
 
@@ -585,7 +642,7 @@ fn websocket_upgrade_headers_preserved() {
         &[
             ("Upgrade", "websocket"),
             ("Connection", "Upgrade"),
-            ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
+            ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="), // gitleaks:allow -- fixture WebSocket handshake nonce, not a credential.
             ("Sec-WebSocket-Version", "13"),
         ],
     );
@@ -615,7 +672,7 @@ fn websocket_upgrade_headers_preserved() {
     let ws_key = upstream_headers
         .get("sec-websocket-key")
         .expect("upstream must receive Sec-WebSocket-Key");
-    assert_eq!(ws_key, "dGhlIHNhbXBsZSBub25jZQ==");
+    assert_eq!(ws_key, "dGhlIHNhbXBsZSBub25jZQ=="); // gitleaks:allow -- fixture WebSocket handshake nonce, not a credential.
 
     // Sec-WebSocket-Version must pass through
     let ws_ver = upstream_headers
@@ -635,7 +692,7 @@ fn non_websocket_upgrade_still_stripped() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let upstream =
-        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+        TcpListener::bind(upstream_address()).expect("bind to 127.0.0.1:8080 for mock upstream");
 
     let child = start_dwaar_proxy();
 
@@ -666,7 +723,7 @@ fn malformed_websocket_missing_connection_upgrade() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let upstream =
-        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+        TcpListener::bind(upstream_address()).expect("bind to 127.0.0.1:8080 for mock upstream");
 
     let child = start_dwaar_proxy();
 
@@ -681,7 +738,7 @@ fn malformed_websocket_missing_connection_upgrade() {
         &[
             ("Upgrade", "websocket"),
             ("Connection", "keep-alive"),
-            ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
+            ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="), // gitleaks:allow -- fixture WebSocket handshake nonce, not a credential.
             ("Sec-WebSocket-Version", "13"),
         ],
     );
@@ -704,7 +761,7 @@ fn send_raw_post_get_status(
     content_length: u64,
     extra_headers: &[(&str, &str)],
 ) -> u16 {
-    let stream = TcpStream::connect("127.0.0.1:6188").expect("connect to proxy for raw POST");
+    let stream = TcpStream::connect(proxy_address()).expect("connect to proxy for raw POST");
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
     stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
 
@@ -752,7 +809,7 @@ fn request_body_under_limit_forwarded() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let upstream =
-        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+        TcpListener::bind(upstream_address()).expect("bind to 127.0.0.1:8080 for mock upstream");
 
     let child = start_dwaar_proxy();
 
@@ -776,7 +833,7 @@ fn request_body_over_limit_rejected() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _upstream =
-        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+        TcpListener::bind(upstream_address()).expect("bind to 127.0.0.1:8080 for mock upstream");
 
     let child = start_dwaar_proxy();
 
@@ -797,7 +854,7 @@ fn request_body_zero_length_allowed() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let upstream =
-        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+        TcpListener::bind(upstream_address()).expect("bind to 127.0.0.1:8080 for mock upstream");
 
     let child = start_dwaar_proxy();
 
@@ -822,11 +879,11 @@ fn request_body_custom_limit_from_config() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _upstream =
-        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+        TcpListener::bind(upstream_address()).expect("bind to 127.0.0.1:8080 for mock upstream");
 
     // Write a Dwaarfile with a tiny 1 KB limit
-    let config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-    std::fs::create_dir_all(&config_path).ok();
+    let config_directory = tempfile::tempdir().expect("temporary configuration directory");
+    let config_path = config_directory.path();
     let config_file = config_path.join("body_limit_test.dwaarfile");
     std::fs::write(
         &config_file,
@@ -857,11 +914,11 @@ fn response_body_over_limit_returns_error() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let upstream =
-        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+        TcpListener::bind(upstream_address()).expect("bind to 127.0.0.1:8080 for mock upstream");
 
     // response_body_limit 100 bytes — upstream will send more than that
-    let config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-    std::fs::create_dir_all(&config_path).ok();
+    let config_directory = tempfile::tempdir().expect("temporary configuration directory");
+    let config_path = config_directory.path();
     let config_file = config_path.join("resp_limit_test.dwaarfile");
     std::fs::write(
         &config_file,
@@ -902,10 +959,10 @@ fn ip_filter_denies_blocked_ip() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _upstream =
-        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+        TcpListener::bind(upstream_address()).expect("bind to 127.0.0.1:8080 for mock upstream");
 
-    let config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-    std::fs::create_dir_all(&config_path).ok();
+    let config_directory = tempfile::tempdir().expect("temporary configuration directory");
+    let config_path = config_directory.path();
     let config_file = config_path.join("ip_filter_deny_test.dwaarfile");
     std::fs::write(
         &config_file,
@@ -932,10 +989,10 @@ fn ip_filter_allows_permitted_ip() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let upstream =
-        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+        TcpListener::bind(upstream_address()).expect("bind to 127.0.0.1:8080 for mock upstream");
 
-    let config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-    std::fs::create_dir_all(&config_path).ok();
+    let config_directory = tempfile::tempdir().expect("temporary configuration directory");
+    let config_path = config_directory.path();
     let config_file = config_path.join("ip_filter_allow_test.dwaarfile");
     std::fs::write(
         &config_file,
@@ -1038,10 +1095,10 @@ fn cache_miss_then_hit() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let upstream =
-        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+        TcpListener::bind(upstream_address()).expect("bind to 127.0.0.1:8080 for mock upstream");
 
-    let config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-    std::fs::create_dir_all(&config_path).ok();
+    let config_directory = tempfile::tempdir().expect("temporary configuration directory");
+    let config_path = config_directory.path();
     let config_file = config_path.join("cache_hit_miss_test.dwaarfile");
     std::fs::write(
         &config_file,
@@ -1106,6 +1163,68 @@ fn cache_miss_then_hit() {
     thread::sleep(Duration::from_secs(1));
 }
 
+fn verify_shared_cache_bypass(request_header: Option<(&str, &str)>, response_header: &str) {
+    let _lock = PORT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let upstream = TcpListener::bind(upstream_address()).expect("upstream");
+    let (_directory, config) = write_test_config(
+        "private-cache.dwaarfile",
+        "127.0.0.1 {\n reverse_proxy 127.0.0.1:8080\n cache {\n default_ttl 60\n }\n}\n",
+    );
+    let child = start_dwaar_with_config(Some(&config));
+    let count = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&count);
+    let control = format!("public, max-age=60{response_header}");
+    let handle = thread::spawn(move || {
+        serve_cacheable_upstream(&upstream, &control, "isolated", 2, &observed);
+    });
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("client");
+    for _ in 0..2 {
+        let mut request = client.get(format!("http://{}/same", proxy_address()));
+        if let Some((name, value)) = request_header {
+            request = request.header(name, value);
+        }
+        let response = request.send().expect("response");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_ne!(
+            response
+                .headers()
+                .get("x-cache")
+                .and_then(|value| value.to_str().ok()),
+            Some("HIT")
+        );
+        assert_eq!(response.text().expect("body"), "isolated");
+    }
+    handle.join().expect("upstream");
+    assert_eq!(count.load(Ordering::SeqCst), 2);
+    stop_dwaar(child);
+}
+
+#[test]
+fn authorized_requests_bypass_shared_cache() {
+    verify_shared_cache_bypass(Some(("authorization", "Bearer fixture")), "");
+}
+
+#[test]
+fn cookie_requests_bypass_shared_cache() {
+    verify_shared_cache_bypass(Some(("cookie", "session=fixture")), "");
+}
+
+#[test]
+fn vary_responses_bypass_shared_cache() {
+    verify_shared_cache_bypass(None, "\r\nVary: Accept-Language");
+}
+
+#[test]
+fn set_cookie_responses_bypass_shared_cache() {
+    verify_shared_cache_bypass(None, "\r\nSet-Cookie: session=fixture");
+}
+
 /// ISSUE-073: When the upstream responds with Cache-Control: no-store,
 /// the proxy must NOT cache the response. Both requests should be MISS.
 #[test]
@@ -1114,10 +1233,10 @@ fn cache_respects_no_store() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let upstream =
-        TcpListener::bind("127.0.0.1:8080").expect("bind to 127.0.0.1:8080 for mock upstream");
+        TcpListener::bind(upstream_address()).expect("bind to 127.0.0.1:8080 for mock upstream");
 
-    let config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-    std::fs::create_dir_all(&config_path).ok();
+    let config_directory = tempfile::tempdir().expect("temporary configuration directory");
+    let config_path = config_directory.path();
     let config_file = config_path.join("cache_no_store_test.dwaarfile");
     std::fs::write(
         &config_file,
@@ -1187,7 +1306,7 @@ fn grpc_response_proxied_without_injection() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    let upstream = TcpListener::bind("127.0.0.1:8080").expect("bind upstream");
+    let upstream = TcpListener::bind(upstream_address()).expect("bind upstream");
 
     let proxy = start_dwaar_proxy();
 
@@ -1226,10 +1345,11 @@ fn grpc_response_proxied_without_injection() {
     let resp = rt.block_on(async {
         let client = reqwest::Client::builder()
             .no_proxy()
+            .timeout(Duration::from_secs(5))
             .build()
             .expect("build client");
         client
-            .get("http://127.0.0.1:6188/grpc.Service/Method")
+            .get(format!("http://{}/grpc.Service/Method", proxy_address()))
             .send()
             .await
             .expect("request should succeed")
@@ -1255,11 +1375,11 @@ fn grpc_request_bypasses_body_limit() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    let upstream = TcpListener::bind("127.0.0.1:8080").expect("bind upstream");
+    let upstream = TcpListener::bind(upstream_address()).expect("bind upstream");
 
     // Dwaarfile with very small body limit (1KB) — gRPC should bypass
-    let config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
-    std::fs::create_dir_all(&config_path).ok();
+    let config_directory = tempfile::tempdir().expect("temporary configuration directory");
+    let config_path = config_directory.path();
     let config_file = config_path.join("grpc_body_limit_test.dwaarfile");
     std::fs::write(
         &config_file,
@@ -1284,10 +1404,11 @@ fn grpc_request_bypasses_body_limit() {
     let resp = rt.block_on(async {
         let client = reqwest::Client::builder()
             .no_proxy()
+            .timeout(Duration::from_secs(5))
             .build()
             .expect("build client");
         client
-            .post("http://127.0.0.1:6188/grpc.Service/Method")
+            .post(format!("http://{}/grpc.Service/Method", proxy_address()))
             .header("Content-Type", "application/grpc")
             .body(large_body)
             .send()

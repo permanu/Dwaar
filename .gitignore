@@ -47,5 +47,6 @@ bench/profiles/
 # Claude/AI
 .claude/
 .fallow
+.mcp.json
 libauth.rlib
 rand_test

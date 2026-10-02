@@ -6,6 +6,7 @@
 
 //! Admin API service implementing Pingora's `ServeHttp`.
 
+use std::fmt::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -362,6 +363,20 @@ impl AdminService {
                 Ok(json) => json_response(200, &json),
                 Err(e) => json_error(500, &e),
             },
+            ("POST", "/routes/delete-if") => {
+                let data = match read_body(session, 2048).await {
+                    Ok(data) => data,
+                    Err((status, message)) => return json_error(status, &message),
+                };
+                match handlers::delete_route_matching(&self.route_table, &self.admin_routes, &data)
+                {
+                    Ok(_) => {
+                        self.refresh_health_pools();
+                        json_response(200, r#"{"ok":true}"#)
+                    }
+                    Err(error) => admin_route_error(&error),
+                }
+            }
             ("POST", "/routes") => {
                 let body = read_body(session, MAX_BODY_SIZE).await;
                 match body {
@@ -458,7 +473,17 @@ impl AdminService {
                 }
             }
             ("GET", "/metrics") => match &self.prometheus {
-                Some(prom) => prometheus_response(&prom.render().await),
+                Some(prom) => {
+                    let mut body = prom.render().await;
+                    let _ = write!(
+                        body,
+                        "# TYPE dwaar_cache_admitted_bytes gauge\ndwaar_cache_admitted_bytes {}\n# TYPE dwaar_cache_capacity_bytes gauge\ndwaar_cache_capacity_bytes {}\n# TYPE dwaar_cache_process_backends gauge\ndwaar_cache_process_backends {}\n",
+                        dwaar_core::cache::cache_admitted_bytes(),
+                        dwaar_core::cache::cache_capacity_bytes(),
+                        dwaar_core::cache::leaked_cache_backend_count(),
+                    );
+                    prometheus_response(&body)
+                }
                 None => json_response(
                     404,
                     r#"{"error":"metrics not enabled — start with --no-metrics=false"}"#,

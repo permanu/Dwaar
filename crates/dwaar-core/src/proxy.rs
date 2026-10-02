@@ -18,8 +18,6 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use chrono::Utc;
-use pingora_cache::cache_control::CacheControl;
-use pingora_cache::filters::resp_cacheable;
 use pingora_cache::{CacheKey, NoCacheReason, RespCacheable};
 use pingora_core::Result;
 use pingora_core::upstreams::peer::{ALPN, HttpPeer};
@@ -770,7 +768,9 @@ impl ProxyHttp for DwaarProxy {
     where
         Self::CTX: Send + Sync,
     {
-        if !ctx.cache_enabled {
+        if !ctx.cache_enabled
+            || !crate::cache::request_may_use_shared_cache(&session.req_header().headers)
+        {
             return Ok(());
         }
         let Some(ref shared) = self.cache_backend else {
@@ -815,20 +815,10 @@ impl ProxyHttp for DwaarProxy {
             return Ok(RespCacheable::Uncacheable(NoCacheReason::NeverEnabled));
         };
 
-        let defaults = crate::cache::make_cache_defaults(
-            cache_cfg.default_ttl,
-            cache_cfg.stale_while_revalidate,
-        );
-        // `from_resp_headers` expects `&http::response::Parts`; `ResponseHeader`
-        // derefs to `Parts` via `AsRef`.
-        let cc = CacheControl::from_resp_headers(resp.as_ref());
-        let has_auth = session.req_header().headers.contains_key("authorization");
-        Ok(resp_cacheable(
-            cc.as_ref(),
-            resp.clone(),
-            has_auth,
-            &defaults,
-        ))
+        if !crate::cache::request_may_use_shared_cache(&session.req_header().headers) {
+            return Ok(RespCacheable::Uncacheable(NoCacheReason::OriginNotCache));
+        }
+        Ok(crate::cache::cache_response(resp, cache_cfg))
     }
 
     /// Serve stale responses per RFC 5861:
